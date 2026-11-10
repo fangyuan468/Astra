@@ -1737,6 +1737,16 @@ async fn execute_cli_command_impl(
                     )
                     .await?;
                 }
+                Some(crate::cli::cli_config::cli_args::ServeMode::Acp) => {
+                    crate::cli::app_server::acp::run(
+                        api,
+                        profile.as_deref(),
+                        global_model.as_deref(),
+                        system_prompt.as_deref(),
+                        auto_approve,
+                    )
+                    .await?;
+                }
             }
             Ok(ExitCode::Success)
         }

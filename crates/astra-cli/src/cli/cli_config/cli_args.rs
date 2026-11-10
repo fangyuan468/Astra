@@ -394,6 +394,11 @@ pub(crate) enum ServeMode {
         after_help = "This mode speaks newline-delimited JSON-RPC on stdin/stdout. The parent process writes requests to stdin, reads responses and notifications from stdout, and may keep the child alive for multiple turns. Do not print human-readable output to stdout in this mode; use stderr or ASTRA_LOG_FILE for diagnostics."
     )]
     Stdio,
+    /// Start an Agent Client Protocol v1 server over stdin/stdout
+    #[command(
+        after_help = "Launch from the session workspace. In OpenMausBot, add a Custom (ACP) engine with CLI: /absolute/path/to/astra serve acp. Sign in with astra login first. stdout is reserved for ACP JSON-RPC messages."
+    )]
+    Acp,
 }
 
 #[derive(Args, Debug)]

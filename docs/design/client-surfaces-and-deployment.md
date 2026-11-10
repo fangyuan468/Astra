@@ -221,3 +221,22 @@ and quality ranking remain Server-owned; CLI turns do not load a separate
 quality tracker or mirror discovery into session state. Existing workspace
 skill history remains an informational field for self-inspection and is retained
 when recovery and subsequent turn commits update other workspace facts.
+
+## ACP stdio surface
+
+`astra serve acp` is an ACP v1 transport of the existing CLI app-server execution
+owner. It shares session binding/resume, execution leases, the turn facade,
+permission admission and durable settlement. Protocol projection must not create
+a second lifecycle or persistence owner. The process launch directory is the
+workspace boundary; another workspace requires another process, never a global
+`chdir` during concurrent turns.
+
+Client-injected MCP definitions belong only to the selected ACP session. They
+are not merged into persistent project/user configuration or ambient MCP
+bindings. Approval replies authorize only the exact outstanding one-shot request;
+cancellation and transport closure deny outstanding requests. ACP completion
+follows durable settlement and admission-guard release. Commit uncertainty
+remains an error, including when cancellation races with settlement.
+
+See the [CLI reference](../reference/cli-commands.md#agent-client-protocol-acp)
+for supported methods, setup and current input limitations.
