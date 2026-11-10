@@ -14,6 +14,63 @@ The approval transport does not provide the `ask_user` question interface.
 Prompt execution without an approval transport or terminal prompt sink fails
 before a model request is admitted.
 
+## Agent Client Protocol (ACP)
+
+`astra serve acp` exposes ACP v1 over newline-delimited JSON-RPC on
+stdin/stdout. Sign in with `astra login` first; this transport uses Astra's
+configured service and local login, rather than importing another CLI's credentials.
+Launch it from the workspace the client will send as `cwd`. Sessions with a
+different workspace require a separate process; the server never changes the
+process working directory while turns are running.
+
+For OpenMausBot, add a **Custom (ACP)** engine in Settings → Engines, name it
+**Astra**, and set its CLI command to:
+
+```text
+/absolute/path/to/astra serve acp
+```
+
+Use the binary built from this checkout (`cargo build -p astra-cli --bin astra`),
+or an installed release that includes `serve acp`. The `~/.astra` directory is
+state, not an executable. Model discovery creates a Server session and reads the
+signed-in user's current model catalog; it does not run inference or tools.
+**Astra configured default** preserves the launch-time `--model` or configured
+default. `session/set_model` selects an advertised Offering ID for subsequent turns,
+so equal display names from different sources keep their exact identity.
+
+Supported methods are `initialize`, `session/new`, `session/load`,
+`session/set_model`, `session/prompt` and the `session/cancel` notification.
+Initialization reports protocol version 1, text/resource-link input, session loading and
+stdio/HTTP/SSE MCP transports. Unsupported prompt content is rejected before
+admission. Loading a session runs the existing authorized canonical resume
+preflight and replays conversation text and tool calls/results before its response.
+
+Prompts reuse the normal execution lease, CLI turn facade, durable settlement,
+and permission manager. Streaming text, reasoning and tool status are emitted
+as `session/update`. A `session/prompt` response is sent only after settlement
+and release of the active-turn guard; persistence uncertainty remains a JSON-RPC
+error carrying the existing `committed`, `commitUnknown` and repair facts.
+Cancellation never authorizes a pending tool.
+
+Tools request approval through `session/request_permission`. The client may
+select **Allow once** or **Deny**; invalid/error/cancelled replies deny execution.
+Approval defaults to prompt mode. Explicit `astra -y serve acp` uses Astra's
+existing auto mode and retains its hard safety denials.
+The transport does not implement the native `ask_user` questionnaire interface.
+
+Client-supplied MCP definitions are held in memory and connected through the
+existing MCP owner during a turn. They replace ambient MCP configuration for that
+ACP session and are never written to project/user `mcp.json`. Connection failures
+stop that turn without disclosing environment variables, headers or URLs in the
+ACP error. Pipe closure cancels active turns, denies pending approvals and bounds
+shutdown. Existing `astra serve stdio` retains its app-server protocol.
+
+The transport design follows the same boundary as
+[Grok Build's native ACP surface](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/src/agent/mvp_agent/acp_agent.rs)
+and the [Codex ACP adapter's per-thread projection](https://github.com/zed-industries/codex-acp/blob/main/src/thread.rs).
+The [ACP v1 schema](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/schema/v1/schema.json)
+owns wire shapes; Astra's existing runtime owns execution and persistence.
+
 ## Turn summary
 
 The completion line shows elapsed time, time to first token (`ttft`), primary

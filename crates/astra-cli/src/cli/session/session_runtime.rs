@@ -802,9 +802,15 @@ pub(crate) fn model_selection_for_name_from_catalog(
     models
         .iter()
         .filter(|entry| model_list_entry_is_active(entry))
-        .find(|entry| {
-            model_list_entry_name(entry)
-                .is_some_and(|name| name.eq_ignore_ascii_case(registry_model))
+        .find(|entry| entry.offering_id == registry_model)
+        .or_else(|| {
+            models
+                .iter()
+                .filter(|entry| model_list_entry_is_active(entry))
+                .find(|entry| {
+                    model_list_entry_name(entry)
+                        .is_some_and(|name| name.eq_ignore_ascii_case(registry_model))
+                })
         })
         .and_then(model_selection_from_list_entry)
 }

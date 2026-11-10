@@ -24,8 +24,47 @@ use crate::cli::session::session_runtime;
 use crate::cli::stream::streaming_types::StreamResult;
 use crate::{ExplainMode, cli::chat_stream::BasicCliChatContext};
 
-#[derive(Clone, Debug, Default)]
-struct JsonWriter;
+pub(crate) mod acp;
+
+#[derive(Clone, Debug)]
+struct JsonWriter(
+    tokio::sync::mpsc::Sender<(String, oneshot::Sender<Result<(), String>>)>,
+    Option<Arc<std::sync::Mutex<acp::TurnProjection>>>,
+);
+
+impl Default for JsonWriter {
+    fn default() -> Self {
+        Self::start(
+            |line| match crate::cli::stream::output_sink::write_stdout_line(line) {
+                Ok(crate::cli::stream::output_sink::OutputWriteStatus::Written) => Ok(()),
+                Ok(crate::cli::stream::output_sink::OutputWriteStatus::Closed) => {
+                    Err("stdout output transport closed by its consumer".into())
+                }
+                Err(error) => Err(format!("stdout write failed: {error}")),
+            },
+        )
+    }
+}
+
+impl JsonWriter {
+    fn start(mut write: impl FnMut(&str) -> Result<(), String> + Send + 'static) -> Self {
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<(String, oneshot::Sender<Result<(), String>>)>(1);
+        std::thread::Builder::new()
+            .name("astra-app-server-output".into())
+            .spawn(move || {
+                while let Some((line, reply)) = rx.blocking_recv() {
+                    // A timed-out queued request must not appear after its
+                    // caller has already handled delivery failure.
+                    if !reply.is_closed() {
+                        let _ = reply.send(write(&line));
+                    }
+                }
+            })
+            .expect("start app-server output thread");
+        Self(tx, None)
+    }
+}
 
 #[derive(Clone)]
 struct ServerContext {
@@ -161,6 +200,9 @@ struct TurnRequest {
     developer_instructions: Option<String>,
     permission_mode: PermissionMode,
     cancel: Arc<CancellationToken>,
+    /// Client-scoped MCP bindings; None preserves the app-server's existing startup.
+    mcp_servers: Option<Vec<astra_mcp::McpServerConfig>>,
+    offering_id: Option<String>,
 }
 
 pub(crate) async fn run_stdio_app_server(
@@ -186,7 +228,7 @@ pub(crate) async fn run_stdio_app_server(
         auto_approve,
     };
     let state = Arc::new(Mutex::new(AppState::default()));
-    let writer = JsonWriter;
+    let writer = JsonWriter::default();
     let stdin = std::io::stdin();
     let lines = stdin.lock().lines();
     run_app_server_lines(lines, ctx, state, writer, SESSION_BIND_TIMEOUT).await
@@ -381,6 +423,8 @@ async fn run_app_server_lines(
                         developer_instructions: turn_developer_instructions,
                         permission_mode,
                         cancel,
+                        mcp_servers: None,
+                        offering_id: None,
                     },
                 ));
             }
@@ -541,6 +585,8 @@ async fn run_turn(
         developer_instructions,
         permission_mode,
         cancel,
+        mcp_servers,
+        offering_id,
     } = request;
 
     let execution_lease =
@@ -570,8 +616,44 @@ async fn run_turn(
     // materialization before asking the Server to admit a turn, as one-shot
     // chat does.
     let (token, auth_owner) = prepare_turn_auth(&ctx, &cancel).await?;
+    let pipeline = if let Some(servers) = mcp_servers.as_ref() {
+        // ACP supplies the complete external MCP surface for this session.
+        // Do not load ambient MCP processes or persist the client's secrets.
+        let pipeline = session_runtime::create_tui_pipeline_modules(
+            &ctx.api,
+            ctx.auth_profile.as_deref(),
+            None,
+        )
+        .await;
+        for config in servers {
+            let connect = crate::mcp_client::connect_and_discover_skills(
+                &pipeline.mcp_manager,
+                config.clone(),
+                &pipeline.unified_skill_registry,
+            );
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(AppServerFailure::turn_failed("MCP setup cancelled")),
+                result = tokio::time::timeout(Duration::from_secs(20), connect) => {
+                    if !matches!(result, Ok(Ok(_))) {
+                        return Err(AppServerFailure::turn_failed("Client MCP setup failed or timed out; connection details omitted"));
+                    }
+                }
+            }
+        }
+        pipeline
+    } else {
+        session_runtime::create_pipeline_modules_quiet(&ctx.api, ctx.auth_profile.as_deref()).await
+    };
     let mut cli_context = crate::cli::cli_config::cli_context::CliContext::default();
     cli_context.select_model(params.get("model").and_then(Value::as_str));
+    if let Some(id) = offering_id.as_ref() {
+        cli_context.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::OfferingId {
+                offering_id: id.clone(),
+            },
+        });
+    }
     let model = params
         .get("model")
         .and_then(Value::as_str)
@@ -631,8 +713,6 @@ async fn run_turn(
         }
     });
 
-    let _pipeline =
-        session_runtime::create_pipeline_modules_quiet(&ctx.api, ctx.auth_profile.as_deref()).await;
     let mut pm = PermissionManager::with_load_policy(
         permission_mode,
         &std::env::current_dir().unwrap_or_default(),
@@ -640,13 +720,17 @@ async fn run_turn(
     );
 
     let explain_mode = explain_mode_from_params(&params)?;
-    let unified_skill_registry = astra_runtime::skills::default_unified_registry();
+    let unified_skill_registry = if mcp_servers.is_some() {
+        &pipeline.unified_skill_registry
+    } else {
+        astra_runtime::skills::default_unified_registry()
+    };
     let chat_ctx = BasicCliChatContext {
-        mcp_manager: None,
+        mcp_manager: mcp_servers.is_some().then(|| pipeline.mcp_manager.clone()),
         api: &ctx.api,
         auth_owner,
         message: &message,
-        offering_id: None,
+        offering_id: offering_id.as_deref(),
         model: model.as_deref(),
         provider: None,
         explain: explain_mode,
@@ -1225,12 +1309,16 @@ fn stream_event_notification(event: &StreamEvent) -> Option<(&'static str, Value
             serde_json::json!({"runtimeFeedback": frame}),
         )),
         StreamEvent::ToolStarted {
-            name, description, ..
+            name,
+            description,
+            tool_use_id,
+            ..
         } => Some((
             "item/started",
             serde_json::json!({
                 "item": {
                     "type": "dynamicToolCall",
+                    "id": tool_use_id,
                     "tool": name,
                     "name": name,
                     "arguments": {"description": description},
@@ -1238,11 +1326,17 @@ fn stream_event_notification(event: &StreamEvent) -> Option<(&'static str, Value
                 }
             }),
         )),
-        StreamEvent::AgentControlStarted { action, label, .. } => Some((
+        StreamEvent::AgentControlStarted {
+            action,
+            label,
+            tool_use_id,
+            ..
+        } => Some((
             "item/started",
             serde_json::json!({
                 "item": {
                     "type": "dynamicToolCall",
+                    "id": tool_use_id,
                     "tool": action,
                     "name": action,
                     "arguments": {"description": label},
@@ -1251,17 +1345,28 @@ fn stream_event_notification(event: &StreamEvent) -> Option<(&'static str, Value
             }),
         )),
         StreamEvent::ToolCompleted {
-            name, duration_ms, ..
+            name,
+            duration_ms,
+            tool_use_id,
+            status,
+            output,
+            ..
         }
         | StreamEvent::AgentControlCompleted {
             action: name,
             duration_ms,
+            tool_use_id,
+            status,
+            output,
             ..
         } => Some((
             "item/completed",
             serde_json::json!({
                 "item": {
                     "type": "dynamicToolCall",
+                    "id": tool_use_id,
+                    "status": status,
+                    "output": output,
                     "tool": name,
                     "name": name,
                     "durationMs": duration_ms,
@@ -1413,16 +1518,35 @@ async fn write_notification(
 }
 
 async fn write_json_line(writer: &JsonWriter, value: Value) -> Result<(), String> {
-    let _ = writer;
-    let line = serde_json::to_string(&value).map_err(|e| e.to_string())?;
-    match crate::cli::stream::output_sink::write_stdout_line(&line)
-        .map_err(|error| format!("stdout write failed: {error}"))?
-    {
-        crate::cli::stream::output_sink::OutputWriteStatus::Written => Ok(()),
-        crate::cli::stream::output_sink::OutputWriteStatus::Closed => {
-            Err("stdout output transport closed by its consumer".to_string())
-        }
+    let values = if let Some(projection) = writer.1.as_ref() {
+        projection
+            .lock()
+            .map_err(|_| "ACP output state poisoned")?
+            .project(value)
+    } else {
+        vec![value]
+    };
+    for value in values {
+        write_raw_json_line(writer, value).await?;
     }
+    Ok(())
+}
+
+async fn write_raw_json_line(writer: &JsonWriter, value: Value) -> Result<(), String> {
+    let line = serde_json::to_string(&value).map_err(|e| e.to_string())?;
+    let (reply, result) = oneshot::channel();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        writer
+            .0
+            .send((line, reply))
+            .await
+            .map_err(|_| "stdout writer stopped".to_string())?;
+        result
+            .await
+            .map_err(|_| "stdout writer stopped before reporting delivery".to_string())?
+    })
+    .await
+    .map_err(|_| "stdout delivery timed out; the write may still complete".to_string())?
 }
 
 #[cfg(test)]
@@ -1926,7 +2050,7 @@ mod tests {
             lines,
             ctx,
             state.clone(),
-            JsonWriter,
+            JsonWriter::default(),
             Duration::from_secs(1),
         )
         .await
@@ -1995,7 +2119,7 @@ mod tests {
             lines,
             ctx,
             state.clone(),
-            JsonWriter,
+            JsonWriter::default(),
             Duration::from_secs(1),
         )
         .await
@@ -2249,7 +2373,7 @@ mod tests {
                 system_prompt: None,
                 auto_approve: false,
             },
-            JsonWriter,
+            JsonWriter::default(),
             TurnRequest {
                 state: state.clone(),
                 thread_id: session_id.clone(),
@@ -2259,6 +2383,8 @@ mod tests {
                 developer_instructions: None,
                 permission_mode: PermissionMode::Auto,
                 cancel: cancel.clone(),
+                mcp_servers: None,
+                offering_id: None,
             },
         ));
         tokio::time::timeout(Duration::from_secs(5), request_seen.notified())
