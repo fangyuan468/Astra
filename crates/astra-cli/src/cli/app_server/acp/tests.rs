@@ -46,6 +46,15 @@ fn install_session(server: &mut AcpServer, id: &str) -> Arc<Mutex<AppState>> {
             state: state.clone(),
             model: None,
             models: std::collections::HashSet::from(["test-offering".into()]),
+            model_options: vec![
+                json!({"value":"agent-default","name":"Default"}),
+                json!({"value":"test-offering","name":"Test"}),
+            ],
+            model_efforts: HashMap::from([(
+                "test-offering".into(),
+                vec!["low".into(), "high".into(), "max".into()],
+            )]),
+            effort: None,
             offering_id: None,
             mcp_servers: vec![],
         },
@@ -261,6 +270,103 @@ async fn model_changes_are_validated_and_rejected_while_busy() {
     );
 }
 
+#[tokio::test]
+async fn config_options_set_and_validate_per_model_reasoning() {
+    let (mut server, _) = server();
+    initialize(&mut server).await;
+    let state = install_session(&mut server, "session");
+    let selected = server
+        .dispatch(
+            "session/set_config_option",
+            &json!({
+                "sessionId":"session", "configId":"model", "value":"test-offering"
+            }),
+            Some(json!(1)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        selected["configOptions"][0]["currentValue"],
+        "test-offering"
+    );
+    assert_eq!(selected["configOptions"][1]["options"][3]["value"], "max");
+    let changed = server
+        .dispatch(
+            "session/set_config_option",
+            &json!({
+                "sessionId":"session", "configId":"effort", "value":"max"
+            }),
+            Some(json!(2)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(changed["configOptions"][1]["currentValue"], "max");
+    assert_eq!(
+        server.sessions["session"].model_selector().as_deref(),
+        Some("test-offering(thinking:max)")
+    );
+    let unchanged = server
+        .dispatch(
+            "session/set_config_option",
+            &json!({
+                "sessionId":"session", "configId":"model", "value":"test-offering"
+            }),
+            Some(json!(20)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged["configOptions"][1]["currentValue"], "max");
+    assert!(
+        server
+            .dispatch(
+                "session/set_config_option",
+                &json!({
+                    "sessionId":"session", "configId":"effort", "value":"medium"
+                }),
+                Some(json!(3))
+            )
+            .await
+            .is_err()
+    );
+    begin_turn(
+        &mut *state.lock().await,
+        None,
+        "turn",
+        Arc::new(CancellationToken::new()),
+        None,
+    )
+    .unwrap();
+    assert!(
+        server
+            .dispatch(
+                "session/set_config_option",
+                &json!({
+                    "sessionId":"session", "configId":"effort", "value":"low"
+                }),
+                Some(json!(4))
+            )
+            .await
+            .is_err()
+    );
+    state.lock().await.active_turn = None;
+    let changed = server
+        .dispatch(
+            "session/set_config_option",
+            &json!({
+                "sessionId":"session", "configId":"model", "value":"agent-default"
+            }),
+            Some(json!(5)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(changed["configOptions"].as_array().unwrap().len(), 1);
+    assert!(server.sessions["session"].effort.is_none());
+}
+
 #[test]
 fn output_deduplicates_final_text_and_finishes_after_settlement() {
     let mut output = TurnProjection::new("session");
@@ -378,9 +484,11 @@ async fn new_session_uses_server_identity_and_authoritative_model_catalog() {
             description: None,
             max_completion_tokens: None,
             architecture: None,
-            thinking_capability: None,
+            thinking_capability: (id == "offer-two")
+                .then_some(astra_services::models::ThinkingCapability::EffortOnly),
             pricing: None,
-            thinking_protocol: None,
+            thinking_protocol: (id == "offer-two")
+                .then_some(astra_core::model_wire::thinking::ThinkingProtocol::ReasoningEffort),
         })
         .collect();
     Mock::given(method("POST"))
@@ -400,6 +508,7 @@ async fn new_session_uses_server_identity_and_authoritative_model_catalog() {
     let (mut server, output) = server();
     server.ctx.api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
     server.ctx.auth_profile = Some("default".into());
+    server.ctx.default_model = Some("offer-two(thinking:max)".into());
     initialize(&mut server).await;
     server.receive(&json!({"jsonrpc":"2.0","id":"new","method":"session/new","params":{"cwd":server.cwd,"mcpServers":[]}}).to_string()).await.unwrap();
     assert!(server.sessions.contains_key(&id));
@@ -407,6 +516,10 @@ async fn new_session_uses_server_identity_and_authoritative_model_catalog() {
     assert_eq!(
         output.lock().unwrap()[1]["result"]["models"]["currentModelId"],
         "agent-default"
+    );
+    assert_eq!(
+        output.lock().unwrap()[1]["result"]["configOptions"][1]["currentValue"],
+        "max"
     );
     assert!(
         server.tasks.is_empty(),
@@ -433,6 +546,18 @@ async fn new_session_uses_server_identity_and_authoritative_model_catalog() {
     )
     .unwrap();
     assert_eq!(selected.offering_id, "offer-two");
+    let options = server.sessions[&id].config_options();
+    assert_eq!(options[1]["options"][3]["value"], "max");
+    let selected = server
+        .dispatch(
+            "session/set_config_option",
+            &json!({"sessionId":id,"configId":"effort","value":"max"}),
+            Some(json!(30)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected["configOptions"][1]["currentValue"], "max");
     server
         .dispatch(
             "session/set_model",
@@ -441,8 +566,25 @@ async fn new_session_uses_server_identity_and_authoritative_model_catalog() {
         )
         .await
         .unwrap();
-    assert!(server.sessions[&id].model.is_none());
+    assert_eq!(
+        server.sessions[&id].model_selector().as_deref(),
+        Some("offer-two(thinking:max)")
+    );
     assert!(server.sessions[&id].offering_id.is_none());
+    let selected = server
+        .dispatch(
+            "session/set_config_option",
+            &json!({"sessionId":id,"configId":"effort","value":"default"}),
+            Some(json!(40)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected["configOptions"][1]["currentValue"], "default");
+    assert_eq!(
+        server.sessions[&id].model_selector().as_deref(),
+        Some("offer-two")
+    );
     mock.verify().await;
 }
 
@@ -545,5 +687,118 @@ async fn public_prompt_stays_pending_and_cancel_releases_runtime_lease() {
     }
     assert!(state.lock().await.active_turn.is_none());
     assert!(astra_services::session_journal::SessionExecutionLease::try_acquire(&id).is_ok());
+    mock.verify().await;
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn selected_reasoning_effort_reaches_chat_admission() {
+    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
+    let _home = crate::test_utils::HomeGuard::temp();
+    let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+    let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
+    let _credentials = crate::tests::isolate_credentials();
+    let mut creds = CredentialsFile::default();
+    creds.profiles.insert(
+        "default".into(),
+        Profile {
+            account_id: Some("test-owner".into()),
+            access_token: Some("test-token".into()),
+            ..Default::default()
+        },
+    );
+    save_credentials(&creds).unwrap();
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/agents/edge"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok":true})))
+        .mount(&mock)
+        .await;
+    let catalog = vec![astra_services::ModelListItemResponse {
+        offering_id: "test-offering".into(),
+        name: "kimi-k3".into(),
+        provider: "openai".into(),
+        access_id: "genesis".into(),
+        access_kind: astra_services::models::ModelAccessKind::AstraCloud,
+        access_label: "Genesis".into(),
+        execution_placement: astra_services::models::ModelExecutionPlacement::Server,
+        is_active: true,
+        context_window: 128000,
+        description: None,
+        max_completion_tokens: None,
+        architecture: None,
+        thinking_capability: Some(astra_services::models::ThinkingCapability::EffortOnly),
+        pricing: None,
+        thinking_protocol: Some(
+            astra_core::model_wire::thinking::ThinkingProtocol::ReasoningEffort,
+        ),
+    }];
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"items":catalog,"limit":200,"total":1,"catalog_revision":"test","next_cursor":null}),
+        ))
+        .mount(&mock)
+        .await;
+    let seen = Arc::new(tokio::sync::Notify::new());
+    let request_seen = seen.clone();
+    let body = Arc::new(std::sync::Mutex::new(None::<Value>));
+    let captured = body.clone();
+    Mock::given(method("POST"))
+        .and(path("/chat/stream"))
+        .respond_with(move |request: &wiremock::Request| {
+            *captured.lock().unwrap() = Some(serde_json::from_slice(&request.body).unwrap());
+            request_seen.notify_one();
+            ResponseTemplate::new(200).set_delay(Duration::from_secs(10))
+        })
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let (mut server, output) = server();
+    server.ctx.api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+    initialize(&mut server).await;
+    let id = format!("acp-effort-{}", uuid::Uuid::new_v4());
+    install_session(&mut server, &id);
+    for (config, value) in [("model", "test-offering"), ("effort", "max")] {
+        server
+            .dispatch(
+                "session/set_config_option",
+                &json!({"sessionId":id,"configId":config,"value":value}),
+                Some(json!(2)),
+            )
+            .await
+            .unwrap();
+    }
+    server.receive(&json!({"jsonrpc":"2.0","id":"prompt","method":"session/prompt","params":{"sessionId":id,"prompt":[{"type":"text","text":"hello"}]}}).to_string()).await.unwrap();
+    if tokio::time::timeout(Duration::from_secs(10), seen.notified())
+        .await
+        .is_err()
+    {
+        let paths: Vec<_> = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| request.url.path().to_owned())
+            .collect();
+        panic!(
+            "selected effort did not reach chat admission; paths: {paths:?}; output: {:?}",
+            output.lock().unwrap()
+        );
+    }
+    let payload = body.lock().unwrap().clone().unwrap();
+    assert_eq!(payload["model_selection"]["offering_id"], "test-offering");
+    assert_eq!(
+        payload["context"]["thinking"],
+        json!({"mode":"adaptive","effort":"max"})
+    );
+    server
+        .receive(
+            &json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":id}})
+                .to_string(),
+        )
+        .await
+        .unwrap();
+    server.shutdown().await;
     mock.verify().await;
 }

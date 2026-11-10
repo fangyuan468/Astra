@@ -14,8 +14,62 @@ struct Session {
     state: Arc<Mutex<AppState>>,
     model: Option<String>,
     models: std::collections::HashSet<String>,
+    model_options: Vec<Value>,
+    model_efforts: HashMap<String, Vec<String>>,
+    effort: Option<String>,
     offering_id: Option<String>,
     mcp_servers: Vec<astra_mcp::McpServerConfig>,
+}
+
+impl Session {
+    fn configured_effort(model: Option<&str>, available: Option<&Vec<String>>) -> Option<String> {
+        let (_, config) = astra_turn_core::thinking_config::resolve_model_thinking_request(model?);
+        match config {
+            astra_turn_core::thinking_config::ThinkingConfig::Adaptive { effort }
+                if available
+                    .is_some_and(|levels| levels.iter().any(|value| value == effort.as_str())) =>
+            {
+                Some(effort.as_str().to_string())
+            }
+            _ => None,
+        }
+    }
+
+    fn current_model_id(&self) -> &str {
+        self.offering_id.as_deref().unwrap_or("agent-default")
+    }
+
+    fn config_options(&self) -> Vec<Value> {
+        let mut options = vec![json!({
+            "id":"model", "name":"Model", "category":"model", "type":"select",
+            "currentValue":self.current_model_id(), "options":self.model_options
+        })];
+        if let Some(efforts) = self.model_efforts.get(self.current_model_id())
+            && !efforts.is_empty()
+        {
+            let mut values = vec![json!({"value":"default", "name":"Model default"})];
+            values.extend(
+                efforts
+                    .iter()
+                    .map(|effort| json!({"value":effort,"name":effort})),
+            );
+            options.push(json!({
+                "id":"effort", "name":"Reasoning effort", "category":"thought_level", "type":"select",
+                "currentValue":self.effort.as_deref().unwrap_or("default"), "options":values
+            }));
+        }
+        options
+    }
+
+    fn model_selector(&self) -> Option<String> {
+        self.model.as_ref().map(|model| match &self.effort {
+            Some(effort) => {
+                let base = astra_turn_core::thinking_config::resolve_model_thinking(model).0;
+                format!("{base}(thinking:{effort})")
+            }
+            None => model.clone(),
+        })
+    }
 }
 
 struct AcpServer {
@@ -205,7 +259,7 @@ impl AcpServer {
                     thread_id,
                     turn_id: turn_id.clone(),
                     message,
-                    params: json!({"model":session.model}),
+                    params: json!({"model":session.model_selector()}),
                     developer_instructions,
                     permission_mode: if self.ctx.auto_approve {
                         PermissionMode::Auto
@@ -240,9 +294,18 @@ impl AcpServer {
                 cancel_session(&session.state).await;
                 Ok(Some(json!({})))
             }
-            "session/set_model" => {
+            "session/set_model" | "session/set_config_option" => {
                 let session_id = required_string(params, "sessionId")?;
-                let model = required_string(params, "modelId")?;
+                let config_id = if method == "session/set_model" {
+                    "model"
+                } else {
+                    required_string(params, "configId")?
+                };
+                let value = if method == "session/set_model" {
+                    required_string(params, "modelId")?
+                } else {
+                    required_string(params, "value")?
+                };
                 let session = self
                     .sessions
                     .get_mut(session_id)
@@ -250,22 +313,61 @@ impl AcpServer {
                 if session.state.lock().await.active_turn.is_some() {
                     return Err(error(-32000, "Session is busy"));
                 }
-                if model != "agent-default" && !session.models.contains(model) {
-                    return Err(error(
-                        -32602,
-                        "Model is not in this session's advertised catalog",
-                    ));
+                match config_id {
+                    "model" => {
+                        if value != "agent-default" && !session.models.contains(value) {
+                            return Err(error(
+                                -32602,
+                                "Model is not in this session's advertised catalog",
+                            ));
+                        }
+                        let model_changed = value != session.current_model_id();
+                        if model_changed {
+                            if value == "agent-default" {
+                                session.model = self.ctx.default_model.clone();
+                                session.offering_id = None;
+                                session.effort = Session::configured_effort(
+                                    session.model.as_deref(),
+                                    session.model_efforts.get("agent-default"),
+                                );
+                            } else {
+                                session.model = Some(value.to_owned());
+                                session.offering_id = Some(value.to_owned());
+                                session.effort = None;
+                            }
+                        }
+                    }
+                    "effort" => {
+                        let available = session
+                            .model_efforts
+                            .get(session.current_model_id())
+                            .filter(|levels| !levels.is_empty())
+                            .ok_or_else(|| {
+                                error(-32602, "Reasoning effort is unavailable for this model")
+                            })?;
+                        if value != "default" && !available.iter().any(|level| level == value) {
+                            return Err(error(
+                                -32602,
+                                "Reasoning effort is not available for this model",
+                            ));
+                        }
+                        if value == "default"
+                            && let Some(model) = session.model.as_mut()
+                        {
+                            *model =
+                                astra_turn_core::thinking_config::resolve_model_thinking(model)
+                                    .0
+                                    .to_owned();
+                        }
+                        session.effort = (value != "default").then(|| value.to_owned());
+                    }
+                    _ => return Err(error(-32602, "Unknown configuration option")),
                 }
-                if model == "agent-default" {
-                    session.model = self.ctx.default_model.clone();
-                    session.offering_id = None;
+                Ok(Some(if method == "session/set_model" {
+                    json!({})
                 } else {
-                    // The shared catalog resolver accepts canonical Offering IDs.
-                    // A display name can be ambiguous across providers.
-                    session.model = Some(model.to_owned());
-                    session.offering_id = Some(model.to_owned());
-                }
-                Ok(Some(json!({})))
+                    json!({"configOptions":session.config_options()})
+                }))
             }
             _ => Err(error(-32601, "Method not found")),
         }
@@ -325,10 +427,36 @@ impl AcpServer {
         })?;
         let mut models =
             vec![json!({"modelId":"agent-default", "name":"Astra configured default"})];
+        let mut model_options =
+            vec![json!({"value":"agent-default", "name":"Astra configured default"})];
+        let mut model_efforts = HashMap::new();
         let mut model_ids = std::collections::HashSet::new();
         for entry in catalog {
             if model_ids.insert(entry.offering_id.clone()) {
                 models.push(json!({"modelId":entry.offering_id,"name":entry.name, "description":entry.description}));
+                model_options.push(json!({"value":entry.offering_id,"name":entry.name, "description":entry.description}));
+                let efforts = astra_turn_core::thinking_config::thinking_options(
+                    Some(&entry.provider),
+                    entry
+                        .thinking_capability
+                        .map(|capability| capability.as_str()),
+                    entry.thinking_protocol.unwrap_or_default(),
+                )
+                .into_iter()
+                .filter_map(|option| match option.config {
+                    astra_turn_core::thinking_config::ThinkingConfig::Adaptive { effort } => {
+                        Some(effort.as_str().to_string())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+                if self.ctx.default_model.as_deref().is_some_and(|model| {
+                    let base = astra_turn_core::thinking_config::resolve_model_thinking(model).0;
+                    base == entry.offering_id || base.eq_ignore_ascii_case(&entry.name)
+                }) {
+                    model_efforts.insert("agent-default".into(), efforts.clone());
+                }
+                model_efforts.insert(entry.offering_id, efforts);
             }
         }
         if method == "session/load" {
@@ -340,18 +468,26 @@ impl AcpServer {
                     .map_err(|_| error(-32603, "Session replay transport failed"))?;
             }
         }
+        let effort = Session::configured_effort(
+            self.ctx.default_model.as_deref(),
+            model_efforts.get("agent-default"),
+        );
         self.sessions.insert(
             session_id.clone(),
             Session {
                 state,
                 model: self.ctx.default_model.clone(),
                 models: model_ids,
+                model_options,
+                model_efforts,
+                effort,
                 offering_id: None,
                 mcp_servers,
             },
         );
         Ok(
-            json!({"sessionId":session_id,"models":{"currentModelId":"agent-default","availableModels":models}}),
+            json!({"sessionId":session_id,"models":{"currentModelId":"agent-default","availableModels":models},
+            "configOptions":self.sessions[&session_id].config_options()}),
         )
     }
 

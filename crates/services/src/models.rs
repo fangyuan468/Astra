@@ -924,6 +924,8 @@ pub struct AdmittedModelExecution {
     /// capability fact rather than model-name heuristics when selecting a
     /// bounded auxiliary reasoning policy.
     pub thinking_capability: Option<ThinkingCapability>,
+    /// Exact effort values declared by the execution owner, when available.
+    pub reasoning_efforts: Option<Vec<String>>,
     /// Mode-independent fixed temperature carried from Offering admission.
     pub fixed_temperature: Option<f64>,
     pub thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
@@ -976,6 +978,7 @@ impl AdmittedModelExecution {
             provider: offering.model.provider,
             cache_capability: offering.model.prompt_cache_capability,
             thinking_capability: offering.model.thinking_capability,
+            reasoning_efforts: None,
             fixed_temperature: offering.model.fixed_temperature,
             thinking_protocol: offering.model.thinking_protocol,
             request_body_overrides: offering.model.request_body_overrides,
@@ -1009,6 +1012,7 @@ impl AdmittedModelExecution {
             provider,
             cache_capability: None,
             thinking_capability: None,
+            reasoning_efforts: None,
             fixed_temperature: None,
             thinking_protocol: None,
             request_body_overrides: None,
@@ -2097,6 +2101,7 @@ fn admitted_user_model_from_row(
         })?,
         cache_capability: None,
         thinking_capability,
+        reasoning_efforts: None,
         fixed_temperature: None,
         thinking_protocol: Some(protocol),
         request_body_overrides: None,

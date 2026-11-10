@@ -311,6 +311,7 @@ mod tests {
                     provider: provider.into(),
                     cache_capability: None,
                     thinking_capability: None,
+                    reasoning_efforts: None,
                     fixed_temperature: None,
                     thinking_protocol: None,
                     request_body_overrides: None,

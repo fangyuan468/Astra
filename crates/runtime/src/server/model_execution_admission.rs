@@ -287,7 +287,13 @@ pub(crate) fn validate_reasoning_control(
         capability.map(|capability| capability.as_str()),
         protocol,
     );
-    if supported {
+    let effort_supported = match (thinking, &execution.reasoning_efforts) {
+        (astra_turn_core::thinking_config::ThinkingConfig::Adaptive { effort }, Some(allowed)) => {
+            allowed.iter().any(|level| level == effort.as_str())
+        }
+        _ => true,
+    };
+    if supported && effort_supported {
         Ok(())
     } else {
         Err(format!(
@@ -524,6 +530,37 @@ mod tests {
             execution.thinking_capability = capability;
             assert!(validate_reasoning_control(&execution, &ThinkingConfig::Off).is_err());
         }
+    }
+
+    #[test]
+    fn declared_reasoning_levels_limit_explicit_effort() {
+        use astra_core::model_wire::thinking::ThinkingProtocol;
+        use astra_services::models::ThinkingCapability;
+        use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+        let mut execution = super::inheritance_test_support::genesis_execution();
+        execution.thinking_capability = Some(ThinkingCapability::EffortOnly);
+        execution.thinking_protocol = Some(ThinkingProtocol::ReasoningEffort);
+        execution.reasoning_efforts = Some(vec!["low".into(), "high".into(), "max".into()]);
+        for effort in [
+            ThinkingEffort::Low,
+            ThinkingEffort::High,
+            ThinkingEffort::Max,
+        ] {
+            assert!(
+                validate_reasoning_control(&execution, &ThinkingConfig::Adaptive { effort })
+                    .is_ok()
+            );
+        }
+        assert!(
+            validate_reasoning_control(
+                &execution,
+                &ThinkingConfig::Adaptive {
+                    effort: ThinkingEffort::Medium
+                }
+            )
+            .is_err()
+        );
+        assert!(validate_reasoning_control(&execution, &ThinkingConfig::ModelDefault).is_ok());
     }
 
     #[async_trait]

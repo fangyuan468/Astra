@@ -46,6 +46,8 @@ struct GenesisModel {
     context_window: i32,
     #[serde(default)]
     max_output_tokens: i32,
+    #[serde(default)]
+    reasoning_efforts: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -57,6 +59,7 @@ struct GenesisPage {
 pub(super) struct GenesisCatalog {
     pub items: Vec<ModelListItem>,
     pub default_offering_id: Option<String>,
+    reasoning_efforts: HashMap<String, Vec<String>>,
     api_key: String,
 }
 
@@ -212,6 +215,7 @@ impl DatabaseModelService {
         let mut seen = BTreeSet::new();
         let mut ids = BTreeSet::new();
         let mut items = Vec::new();
+        let mut reasoning_efforts = HashMap::new();
         // Genesis owns visibility and status; use its existing user-PAT API,
         // including pagination, rather than a second local model allowlist.
         for _ in 0..100 {
@@ -260,9 +264,21 @@ impl DatabaseModelService {
                 {
                     return Err(unavailable());
                 }
+                // Genesis exposes these levels for its Chat Completions
+                // reasoning_effort field. The existing picker offers low/high/max
+                // together, so advertise it only when all three are declared.
+                let efforts = model.reasoning_efforts.filter(|efforts| {
+                    ["low", "high", "max"]
+                        .iter()
+                        .all(|level| efforts.iter().any(|value| value == level))
+                });
+                let id = offering_id(&provider.settings.issuer, subject, &model.id);
+                if let Some(efforts) = &efforts {
+                    reasoning_efforts.insert(id.clone(), efforts.clone());
+                }
                 items.push(ModelListItem {
-                    thinking_protocol: None,
-                    offering_id: offering_id(&provider.settings.issuer, subject, &model.id),
+                    thinking_protocol: efforts.as_ref().map(|_| ThinkingProtocol::ReasoningEffort),
+                    offering_id: id,
                     access_id: "genesis".into(),
                     access_kind: ModelAccessKind::AstraCloud,
                     access_label: "Genesis".into(),
@@ -275,7 +291,7 @@ impl DatabaseModelService {
                     max_completion_tokens: (model.max_output_tokens > 0)
                         .then_some(model.max_output_tokens),
                     architecture: None,
-                    thinking_capability: None,
+                    thinking_capability: efforts.as_ref().map(|_| ThinkingCapability::EffortOnly),
                     pricing: None,
                 });
             }
@@ -288,6 +304,7 @@ impl DatabaseModelService {
                 return Ok(GenesisCatalog {
                     items,
                     default_offering_id,
+                    reasoning_efforts,
                     api_key: pat.api_key,
                 });
             }
@@ -338,9 +355,10 @@ impl DatabaseModelService {
             base_url: format!("{}/v1", provider.settings.genesis_url),
             provider: "openai".into(),
             cache_capability: None,
-            thinking_capability: None,
+            thinking_capability: item.thinking_capability,
+            reasoning_efforts: catalog.reasoning_efforts.get(&item.offering_id).cloned(),
             fixed_temperature: None,
-            thinking_protocol: None,
+            thinking_protocol: item.thinking_protocol,
             request_body_overrides: None,
             context_window: Some(item.context_window as u32),
             max_completion_tokens: item.max_completion_tokens.map(|v| v as u32),
@@ -375,6 +393,7 @@ mod tests {
         delay: Arc<Mutex<std::time::Duration>>,
         preparation_delay: Arc<Mutex<std::time::Duration>>,
         catalog_status: Arc<Mutex<StatusCode>>,
+        reasoning_efforts: Arc<Mutex<Option<serde_json::Value>>>,
     }
 
     struct Server(tokio::task::JoinHandle<()>);
@@ -425,7 +444,10 @@ mod tests {
                 }
                 let first = query.get("page_token").unwrap().is_empty();
                 let (id, cursor) = if first { ("model-1", "next") } else { ("model-2", "") };
-                let item = serde_json::json!({"id":id,"name":format!("genesis-{id}"),"type": if first {"chat_text"} else {"chat_multimodal"}, "status":if failure == Some("disabled") {"disabled"} else {"enabled"}, "context_window":if failure == Some("context") || (first && failure == Some("first_context")) {0} else {32000}, "max_output_tokens":4096});
+                let mut item = serde_json::json!({"id":id,"name":format!("genesis-{id}"),"type": if first {"chat_text"} else {"chat_multimodal"}, "status":if failure == Some("disabled") {"disabled"} else {"enabled"}, "context_window":if failure == Some("context") || (first && failure == Some("first_context")) {0} else {32000}, "max_output_tokens":4096});
+                if let Some(efforts) = state.reasoning_efforts.lock().unwrap().clone() {
+                    item["reasoning_efforts"] = efforts;
+                }
                 let items = if failure == Some("removed") { vec![] } else { vec![item] };
                 (StatusCode::OK, Json(serde_json::json!({"items":items, "next_page_token": if failure == Some("cycle") { "next" } else { cursor }})))
             })).with_state(state.clone());
@@ -449,6 +471,46 @@ mod tests {
         )
         .with_uc_native(Some(provider));
         (service, state, server)
+    }
+
+    #[tokio::test]
+    async fn genesis_reasoning_capability_requires_declared_levels() {
+        let (service, state, _server) = fixture().await;
+        let missing = service.genesis_catalog("account-A").await.unwrap();
+        assert!(
+            missing
+                .items
+                .iter()
+                .all(|item| item.thinking_capability.is_none())
+        );
+        *state.reasoning_efforts.lock().unwrap() = Some(serde_json::json!(["low", "high"]));
+        let partial = service.genesis_catalog("account-A").await.unwrap();
+        assert!(
+            partial
+                .items
+                .iter()
+                .all(|item| item.thinking_capability.is_none())
+        );
+        *state.reasoning_efforts.lock().unwrap() = Some(serde_json::json!(["low", "high", "max"]));
+        let catalog = service.genesis_catalog("account-A").await.unwrap();
+        let item = &catalog.items[0];
+        assert_eq!(
+            item.thinking_capability,
+            Some(ThinkingCapability::EffortOnly)
+        );
+        assert_eq!(
+            item.thinking_protocol,
+            Some(ThinkingProtocol::ReasoningEffort)
+        );
+        let execution = service
+            .admit_genesis_from_catalog(&catalog, &item.offering_id)
+            .unwrap();
+        assert_eq!(
+            execution.reasoning_efforts,
+            Some(vec!["low".into(), "high".into(), "max".into()])
+        );
+        assert_eq!(execution.thinking_capability, item.thinking_capability);
+        assert_eq!(execution.thinking_protocol, item.thinking_protocol);
     }
 
     #[tokio::test]
