@@ -5,6 +5,7 @@ use crate::auth::uc::UcNativeProvider;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
 const GENESIS_CATALOG_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+const GENESIS_PUBLIC_CATALOG_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn catalog_timeout() -> (StatusCode, Json<ErrorResponse>) {
     error_response_coded(
@@ -46,8 +47,6 @@ struct GenesisModel {
     context_window: i32,
     #[serde(default)]
     max_output_tokens: i32,
-    #[serde(default)]
-    reasoning_efforts: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -56,9 +55,27 @@ struct GenesisPage {
     next_page_token: String,
 }
 
+#[derive(Deserialize)]
+struct GenesisPublicModel {
+    id: String,
+    name: String,
+    #[serde(rename = "type")]
+    model_type: String,
+    #[serde(default)]
+    reasoning_efforts: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct GenesisPublicPage {
+    items: Vec<GenesisPublicModel>,
+    #[serde(default)]
+    next_page_token: String,
+}
+
 pub(super) struct GenesisCatalog {
     pub items: Vec<ModelListItem>,
     pub default_offering_id: Option<String>,
+    source_models: HashMap<String, (String, String)>,
     reasoning_efforts: HashMap<String, Vec<String>>,
     api_key: String,
 }
@@ -135,7 +152,51 @@ impl DatabaseModelService {
     ) -> Result<GenesisCatalog, (StatusCode, Json<ErrorResponse>)> {
         // One budget covers PAT, product policy and all catalog pages. Do not
         // multiply the allowed wait by the number of pages or retry stale grants.
-        tokio::time::timeout(GENESIS_CATALOG_BUDGET, self.genesis_catalog_inner(subject))
+        let lookup = async {
+            // Public metadata is optional and must not grant model access or
+            // make an ordinary model-default request depend on another API.
+            let public = async {
+                Ok::<_, (StatusCode, Json<ErrorResponse>)>(
+                    tokio::time::timeout(
+                        GENESIS_PUBLIC_CATALOG_BUDGET,
+                        self.genesis_public_models(),
+                    )
+                    .await
+                    .ok()
+                    .flatten(),
+                )
+            };
+            let (mut catalog, public) =
+                tokio::try_join!(self.genesis_catalog_inner(subject), public)?;
+            if let Some(public) = public {
+                for item in &mut catalog.items {
+                    let Some((source_id, source_type)) =
+                        catalog.source_models.get(&item.offering_id)
+                    else {
+                        continue;
+                    };
+                    let Some(model) = public.get(source_id).filter(|model| {
+                        model.name == item.name && model.model_type == *source_type
+                    }) else {
+                        continue;
+                    };
+                    // The existing picker offers low/high/max together, so
+                    // advertise it only when all three are declared.
+                    if ["low", "high", "max"]
+                        .iter()
+                        .all(|level| model.reasoning_efforts.iter().any(|value| value == level))
+                    {
+                        item.thinking_capability = Some(ThinkingCapability::EffortOnly);
+                        item.thinking_protocol = Some(ThinkingProtocol::ReasoningEffort);
+                        catalog
+                            .reasoning_efforts
+                            .insert(item.offering_id.clone(), model.reasoning_efforts.clone());
+                    }
+                }
+            }
+            Ok(catalog)
+        };
+        tokio::time::timeout(GENESIS_CATALOG_BUDGET, lookup)
             .await
             .map_err(|_| {
                 tracing::warn!(
@@ -146,6 +207,41 @@ impl DatabaseModelService {
                 );
                 catalog_timeout()
             })?
+    }
+
+    async fn genesis_public_models(&self) -> Option<HashMap<String, GenesisPublicModel>> {
+        let provider = self.uc_provider.as_ref()?;
+        let mut cursor = String::new();
+        let mut seen = BTreeSet::new();
+        let mut models = HashMap::new();
+        for _ in 0..100 {
+            let response = provider
+                .client
+                .get(format!(
+                    "{}/api/v1/taas/public/models",
+                    provider.settings.genesis_url
+                ))
+                .query(&[("page_size", "100"), ("page_token", cursor.as_str())])
+                .send()
+                .await
+                .ok()?;
+            let page: GenesisPublicPage = UcNativeProvider::json_bounded(response, 1024 * 1024)
+                .await
+                .ok()?;
+            for model in page.items {
+                if model.id.is_empty() || models.insert(model.id.clone(), model).is_some() {
+                    return None;
+                }
+            }
+            if page.next_page_token.is_empty() {
+                return Some(models);
+            }
+            if !seen.insert(page.next_page_token.clone()) {
+                return None;
+            }
+            cursor = page.next_page_token;
+        }
+        None
     }
 
     async fn genesis_catalog_inner(
@@ -215,7 +311,7 @@ impl DatabaseModelService {
         let mut seen = BTreeSet::new();
         let mut ids = BTreeSet::new();
         let mut items = Vec::new();
-        let mut reasoning_efforts = HashMap::new();
+        let mut source_models = HashMap::new();
         // Genesis owns visibility and status; use its existing user-PAT API,
         // including pagination, rather than a second local model allowlist.
         for _ in 0..100 {
@@ -264,20 +360,10 @@ impl DatabaseModelService {
                 {
                     return Err(unavailable());
                 }
-                // Genesis exposes these levels for its Chat Completions
-                // reasoning_effort field. The existing picker offers low/high/max
-                // together, so advertise it only when all three are declared.
-                let efforts = model.reasoning_efforts.filter(|efforts| {
-                    ["low", "high", "max"]
-                        .iter()
-                        .all(|level| efforts.iter().any(|value| value == level))
-                });
                 let id = offering_id(&provider.settings.issuer, subject, &model.id);
-                if let Some(efforts) = &efforts {
-                    reasoning_efforts.insert(id.clone(), efforts.clone());
-                }
+                source_models.insert(id.clone(), (model.id, model.model_type));
                 items.push(ModelListItem {
-                    thinking_protocol: efforts.as_ref().map(|_| ThinkingProtocol::ReasoningEffort),
+                    thinking_protocol: None,
                     offering_id: id,
                     access_id: "genesis".into(),
                     access_kind: ModelAccessKind::AstraCloud,
@@ -291,7 +377,7 @@ impl DatabaseModelService {
                     max_completion_tokens: (model.max_output_tokens > 0)
                         .then_some(model.max_output_tokens),
                     architecture: None,
-                    thinking_capability: efforts.as_ref().map(|_| ThinkingCapability::EffortOnly),
+                    thinking_capability: None,
                     pricing: None,
                 });
             }
@@ -304,7 +390,8 @@ impl DatabaseModelService {
                 return Ok(GenesisCatalog {
                     items,
                     default_offering_id,
-                    reasoning_efforts,
+                    source_models,
+                    reasoning_efforts: HashMap::new(),
                     api_key: pat.api_key,
                 });
             }
@@ -394,6 +481,7 @@ mod tests {
         preparation_delay: Arc<Mutex<std::time::Duration>>,
         catalog_status: Arc<Mutex<StatusCode>>,
         reasoning_efforts: Arc<Mutex<Option<serde_json::Value>>>,
+        public_failure: Arc<Mutex<Option<&'static str>>>,
     }
 
     struct Server(tokio::task::JoinHandle<()>);
@@ -444,12 +532,31 @@ mod tests {
                 }
                 let first = query.get("page_token").unwrap().is_empty();
                 let (id, cursor) = if first { ("model-1", "next") } else { ("model-2", "") };
-                let mut item = serde_json::json!({"id":id,"name":format!("genesis-{id}"),"type": if first {"chat_text"} else {"chat_multimodal"}, "status":if failure == Some("disabled") {"disabled"} else {"enabled"}, "context_window":if failure == Some("context") || (first && failure == Some("first_context")) {0} else {32000}, "max_output_tokens":4096});
+                let item = serde_json::json!({"id":id,"name":format!("genesis-{id}"),"type": if first {"chat_text"} else {"chat_multimodal"}, "status":if failure == Some("disabled") {"disabled"} else {"enabled"}, "context_window":if failure == Some("context") || (first && failure == Some("first_context")) {0} else {32000}, "max_output_tokens":4096});
+                let items = if failure == Some("removed") { vec![] } else { vec![item] };
+                (StatusCode::OK, Json(serde_json::json!({"items":items, "next_page_token": if failure == Some("cycle") { "next" } else { cursor }})))
+            }))
+            .route("/api/v1/taas/public/models", get(|State(state): State<Fixture>, headers: HeaderMap, Query(query): Query<HashMap<String,String>>| async move {
+                assert!(!headers.contains_key("authorization"));
+                assert!(!headers.contains_key("x-api-key"));
+                let failure = *state.public_failure.lock().unwrap();
+                if failure == Some("slow") {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
+                if failure == Some("unavailable") {
+                    return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({})));
+                }
+                let first = query.get("page_token").unwrap().is_empty();
+                let (id, cursor) = if first { ("model-1", "next") } else { ("model-2", "") };
+                let id = if !first && failure == Some("duplicate") { "model-1" } else { id };
+                let name = if first && failure == Some("mismatch") { "different-model".to_owned() } else { format!("genesis-{id}") };
+                let model_type = if first && failure == Some("type") { "embedding_text" } else if first { "chat_text" } else { "chat_multimodal" };
+                let mut item = serde_json::json!({"id":id,"name":name,"type":model_type});
                 if let Some(efforts) = state.reasoning_efforts.lock().unwrap().clone() {
                     item["reasoning_efforts"] = efforts;
                 }
-                let items = if failure == Some("removed") { vec![] } else { vec![item] };
-                (StatusCode::OK, Json(serde_json::json!({"items":items, "next_page_token": if failure == Some("cycle") { "next" } else { cursor }})))
+                let items = if first && failure == Some("missing") { vec![] } else { vec![item] };
+                (StatusCode::OK, Json(serde_json::json!({"items":items, "next_page_token":cursor})))
             })).with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -511,6 +618,44 @@ mod tests {
         );
         assert_eq!(execution.thinking_capability, item.thinking_capability);
         assert_eq!(execution.thinking_protocol, item.thinking_protocol);
+    }
+
+    #[tokio::test]
+    async fn public_reasoning_metadata_cannot_expand_entitlements_and_is_optional() {
+        let (service, state, _server) = fixture().await;
+        *state.reasoning_efforts.lock().unwrap() = Some(serde_json::json!(["low", "high", "max"]));
+        *state.policy.lock().unwrap() = serde_json::json!({
+            "code": "OK",
+            "data": {"default_model": "genesis-model-1", "models": ["genesis-model-1"]}
+        });
+        let catalog = service.genesis_catalog("account-A").await.unwrap();
+        assert_eq!(catalog.items.len(), 1);
+        assert_eq!(catalog.items[0].name, "genesis-model-1");
+        assert_eq!(
+            catalog.items[0].thinking_capability,
+            Some(ThinkingCapability::EffortOnly)
+        );
+
+        for failure in ["mismatch", "type", "missing", "duplicate", "unavailable"] {
+            *state.public_failure.lock().unwrap() = Some(failure);
+            let catalog = service.genesis_catalog("account-A").await.unwrap();
+            assert_eq!(catalog.items.len(), 1);
+            assert_eq!(catalog.items[0].name, "genesis-model-1");
+            assert!(catalog.items[0].thinking_capability.is_none());
+            assert!(catalog.reasoning_efforts.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_public_reasoning_metadata_does_not_block_the_account_catalog() {
+        let (service, state, _server) = fixture().await;
+        *state.public_failure.lock().unwrap() = Some("slow");
+        *state.reasoning_efforts.lock().unwrap() = Some(serde_json::json!(["low", "high", "max"]));
+        let started = std::time::Instant::now();
+        let catalog = service.genesis_catalog("account-A").await.unwrap();
+        assert_eq!(catalog.items.len(), 2);
+        assert!(catalog.reasoning_efforts.is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(8));
     }
 
     #[tokio::test]

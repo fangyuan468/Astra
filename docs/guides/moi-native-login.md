@@ -204,6 +204,14 @@ server-owned runtime PAT in `X-API-Key`. This authenticated, read-only product
 configuration endpoint requires neither a workspace nor an administrator role;
 it is not a grant to workspace resources or model inference.
 
+For models already admitted by that account catalog and product policy, Astra
+also reads reasoning levels from `/api/v1/taas/public/models`, matching the
+model's stable ID, name, and type. The public catalog cannot add an Offering or
+override account access. If public metadata is unavailable, incomplete, or does
+not contain a model (including a private model), its explicit reasoning levels
+are not advertised; model-default inference remains available. The public
+lookup runs alongside account authorization with a separate two-second limit.
+
 The allowed names and explicit default are managed only through MOI's existing
 AI Studio model-selection administration. `ASTRA_GENESIS_DEFAULT_MODEL` has been
 removed; there is no Astra-specific model allowlist or default override. The
