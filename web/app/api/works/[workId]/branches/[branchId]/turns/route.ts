@@ -148,6 +148,7 @@ export async function POST(
     const backend = await runtime.fetchResponse(path, {
       method: "POST",
       auth: "required",
+      retryUnauthorized: true,
       body: JSON.stringify(input),
       signal: request.signal,
       headers: {

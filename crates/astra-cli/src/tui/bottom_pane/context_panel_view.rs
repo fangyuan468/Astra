@@ -683,16 +683,17 @@ mod tests {
     fn tab_jumps_to_first_non_empty_section_then_cycles() {
         let mut v = ContextPanelView::new(big_breakdown());
         assert_eq!(v.focus, None);
-        v.handle_key(press(KeyCode::Tab));
-        assert!(v.focus.is_some(), "Tab must enter focus mode");
-        let start = v.focus.unwrap();
-        // big_breakdown has 3 non-empty sections (System, Tools,
-        // Memory); Skills and History are empty and must be
-        // skipped.  Three more Tabs should complete the cycle.
-        for _ in 0..3 {
+        // Missing admission history remains an explicit status section.
+        for expected in [
+            Section::SystemPrompt,
+            Section::Tools,
+            Section::Memory,
+            Section::History,
+            Section::SystemPrompt,
+        ] {
             v.handle_key(press(KeyCode::Tab));
+            assert_eq!(v.focus, Some(expected));
         }
-        assert_eq!(v.focus, Some(start), "cycle did not return to start");
     }
 
     #[test]
@@ -714,7 +715,7 @@ mod tests {
     #[test]
     fn tab_ignores_empty_sections() {
         // big_breakdown has tools + system prompt but no memory /
-        // skills / history. Cycle through all sections — the focus
+        // skills. History reports unavailable input. Cycle through all sections — the focus
         // must never land on empty ones.
         let mut v = ContextPanelView::new(big_breakdown());
         let mut visited = Vec::new();

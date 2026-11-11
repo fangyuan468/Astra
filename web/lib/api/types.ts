@@ -135,6 +135,10 @@ export type ChatMessage = {
   id: string;
   role: MessageRole;
   content: string;
+  /** Durable Run identity for a cold transcript projection. */
+  runId?: string;
+  /** Terminal Context receipt; null means unconfirmed after cancellation. */
+  contextNotSaved?: boolean | null;
   activeSkills?: string[];
   activeTools?: string[];
   reasoning?: string;
@@ -254,6 +258,7 @@ export type QueueRunInputResponse = {
 };
 
 export type ActiveRunMutationResponse = {
+  contextNotSaved?: boolean | null;
   activeRun?: {
     runId: string;
     status: string;
@@ -339,4 +344,11 @@ export type SkillListResponse = {
   total: number;
   limit: number;
   nextCursor: RuntimeSkillListCursor | null;
+};
+
+/** Explicit target of a Stop request; null assistant is a runtime-only binding. */
+export type StopRunRequest = {
+  sessionId: string;
+  runId: string;
+  assistantMessageId: string | null;
 };

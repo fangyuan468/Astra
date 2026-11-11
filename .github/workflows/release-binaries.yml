@@ -98,6 +98,23 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: |
           set -euo pipefail
+          # Refresh the canonical source declaration for this candidate build.
+          # Ordinary Cargo builds intentionally cannot claim clean identity.
+          source_sha="$(git rev-parse --verify 'HEAD^{commit}')"
+          if [ "$source_sha" != "$RELEASE_SOURCE_SHA" ]; then
+            echo "Release checkout does not match the selected source" >&2
+            exit 1
+          fi
+          source_status="$(GIT_OPTIONAL_LOCKS=0 git status --porcelain=v1 --untracked-files=no)"
+          if [ -n "$source_status" ]; then
+            echo "Release checkout has tracked source changes" >&2
+            exit 1
+          fi
+          export ASTRA_BUILD_SOURCE_GIT_SHA="$source_sha"
+          export ASTRA_BUILD_SOURCE_GIT_DIRTY=false
+          # Keep the same declaration for subsequent Cargo tests in this job.
+          printf 'ASTRA_BUILD_SOURCE_GIT_SHA=%s\nASTRA_BUILD_SOURCE_GIT_DIRTY=false\n' \
+            "$source_sha" >> "$GITHUB_ENV"
           set --
           if [ -n "${RELEASE_FEATURES}" ]; then
             set -- --features "${RELEASE_FEATURES}"

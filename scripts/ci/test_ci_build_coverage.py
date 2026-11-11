@@ -2,6 +2,8 @@
 """Guard workspace shard coverage and Docker's vendored path dependency inputs."""
 
 from pathlib import Path
+from itertools import product
+import json
 import os
 import re
 import shlex
@@ -18,12 +20,142 @@ from test_release_build_shells import workflow_run_script
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def rust_setup_disk_guard():
+    action = (ROOT / ".github/actions/rust-setup/action.yml").read_text()
+    section = action.split("    - name: Guard workspace disk space\n", 1)[1].split("\n    - name:", 1)[0]
+    return textwrap.dedent(section.split("      run: |\n", 1)[1])
+
+
 class BuildCoverageTests(unittest.TestCase):
-    def test_rust_setup_disk_guard_uses_workspace_free_space_without_real_cleanup(self):
+    def test_self_hosted_build_survives_checkout_cleanup_and_rechecks_source(self):
         action = (ROOT / ".github/actions/rust-setup/action.yml").read_text()
-        section = action.split("\n    - name: Guard workspace disk space\n", 1)[1]
-        run_block = section.split("\n    - name:", 1)[0]
-        script = textwrap.dedent(run_block.split("\n      run: |\n", 1)[1])
+        self.assertIn("${{ runner.workspace }}/.astra-ci-target", action)
+        cache = action.split("    - uses: Swatinem/rust-cache@", 1)[1]
+        self.assertIn("runner.environment != 'self-hosted'", cache)
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            repo = workspace / "checkout"
+            source = repo / "dep/src/lib.rs"
+            source.parent.mkdir(parents=True)
+            (repo / "Cargo.toml").write_text('[package]\nname="cache-fixture"\nversion="0.1.0"\nedition="2021"\n[dependencies]\ncache-dep={path="dep"}\n[features]\nalternate=["cache-dep/alternate"]\n')
+            (repo / "dep/Cargo.toml").write_text('[package]\nname="cache-dep"\nversion="0.1.0"\nedition="2021"\n[features]\nalternate=[]\n')
+            (repo / "src").mkdir()
+            (repo / "src/main.rs").write_text('fn main() { println!("{}", cache_dep::value()); }')
+            source.write_text('pub fn value() -> u8 { if cfg!(feature="alternate") { 9 } else { 1 } }')
+            for args in (("init", "-q"), ("add", "."), ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture")):
+                subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+            github_env = workspace / "env"
+            environment = {**os.environ, "GITHUB_ENV": str(github_env),
+                           "GITHUB_WORKSPACE": str(repo), "ASTRA_CI_RUNNER_ENVIRONMENT": "self-hosted",
+                           "ASTRA_CI_TARGET_DIR": str(workspace / ".astra-ci-target"),
+                           "RUSTC_WRAPPER": "", "CARGO_INCREMENTAL": "0"}
+            script = "df() { printf 'Filesystem Blocks Used Available Capacity Mount\\nfixture 100000000 0 100000000 0%% /\\n'; }\n" + rust_setup_disk_guard()
+            subprocess.run(["bash", "-eu", "-c", script], env=environment, check=True, capture_output=True)
+            environment.update(line.split("=", 1) for line in github_env.read_text().splitlines())
+            for attempt in range(6):
+                if attempt == 1:
+                    stale = repo / "stale-untracked"
+                    stale.touch()
+                    subprocess.run(["git", "clean", "-ffdx"], cwd=repo, check=True, capture_output=True)
+                    self.assertFalse(stale.exists())
+                elif attempt == 4:
+                    source.write_text("pub fn value() -> u8 { 2 }")
+                elif attempt == 5:
+                    subprocess.run(["git", "checkout", "--", "dep/src/lib.rs"], cwd=repo, check=True)
+                args = ["cargo", "build", "--offline", "--message-format=json"]
+                if attempt == 2:
+                    args += ["--features", "alternate"]
+                build = subprocess.run(args, cwd=repo, env=environment, capture_output=True, text=True)
+                self.assertEqual(build.returncode, 0, build.stderr)
+                artifacts = [json.loads(line) for line in build.stdout.splitlines()]
+                dependency = next(a for a in artifacts if a.get("reason") == "compiler-artifact" and a["target"]["name"] == "cache_dep")
+                self.assertEqual(dependency["fresh"], attempt in (1, 3))
+                binary = Path(environment["CARGO_TARGET_DIR"]) / "debug/cache-fixture"
+                result = subprocess.run([str(binary)], capture_output=True, text=True, check=True)
+                self.assertEqual(result.stdout.strip(), "9" if attempt == 2 else "2" if attempt == 4 else "1")
+
+    def test_rust_toolchain_bootstraps_missing_rust_and_reuses_cargo_bin(self):
+        action = (ROOT / ".github/actions/rust-toolchain/action.yml").read_text()
+        script = textwrap.dedent(action.split("      run: |\n", 1)[1])
+        for installed, install_failure in ((False, False), (True, False), (False, True)):
+            with self.subTest(installed=installed, failure=install_failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                mock_bin = root / "mock-bin"
+                cargo_home = root / "cargo home"
+                mock_bin.mkdir()
+                (cargo_home / "bin").mkdir(parents=True)
+                calls = root / "calls"
+                github_path = root / "github-path"
+                github_env = root / "github-env"
+                outside = root / "outside-workspace"
+                outside.mkdir()
+                installer = root / "installer"
+                installer.write_text("""#!/bin/sh
+set -eu
+printf 'installer %s\\n' "$*" >> "$MOCK_CALLS"
+cp "$MOCK_BIN/rustup-source" "$CARGO_HOME/bin/rustup"
+cp "$MOCK_BIN/rustc-source" "$CARGO_HOME/bin/rustc"
+""")
+                programs = {
+                    "curl": 'printf "curl\\n" >> "$MOCK_CALLS"; if [ "$MOCK_FAILURE" = 1 ]; then exit 22; fi; cat "$MOCK_INSTALLER"',
+                    "rustup-source": 'printf "rustup %s\\n" "$*" >> "$MOCK_CALLS"; if [ "$1" = show ]; then test -f "$CARGO_HOME/ready"; printf "1.97.0-fixture (overridden by repository)\\n"; else touch "$CARGO_HOME/ready"; fi',
+                    "rustc-source": 'test -f "$CARGO_HOME/ready"; if [ "${RUSTUP_TOOLCHAIN:-}" != 1.97.0-fixture ] && [ "$PWD" != "$MOCK_WORKSPACE" ]; then exit 42; fi; printf "rustc pinned-fixture\\n"',
+                    "sccache": 'compiler="$1"; shift; cd "$MOCK_OUTSIDE"; "$compiler" "$@"',
+                }
+                for name, body in programs.items():
+                    path = mock_bin / name
+                    path.write_text("#!/bin/sh\nset -eu\n" + body + "\n")
+                    path.chmod(0o755)
+                if installed:
+                    for name in ("rustup", "rustc"):
+                        target = cargo_home / "bin" / name
+                        target.write_bytes((mock_bin / (name + "-source")).read_bytes())
+                        target.chmod(0o755)
+                    (cargo_home / "ready").touch()
+                environment = {**os.environ, "PATH": str(mock_bin) + ":/usr/bin:/bin",
+                         "CARGO_HOME": str(cargo_home), "GITHUB_PATH": str(github_path),
+                         "GITHUB_ENV": str(github_env), "MOCK_WORKSPACE": str(ROOT),
+                         "MOCK_OUTSIDE": str(outside), "SCCACHE_PATH": str(mock_bin / "sccache"),
+                         "MOCK_BIN": str(mock_bin), "MOCK_CALLS": str(calls),
+                         "MOCK_INSTALLER": str(installer), "MOCK_FAILURE": str(int(install_failure))}
+                result = subprocess.run(
+                    ["/bin/bash", "-e", "-c", script], cwd=ROOT, capture_output=True, text=True,
+                    env=environment,
+                )
+                invocations = calls.read_text().splitlines()
+                if install_failure:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("rustc pinned-fixture", result.stdout)
+                    continue
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("rustc pinned-fixture", result.stdout)
+                self.assertEqual(github_path.read_text().strip(), str(cargo_home / "bin"))
+                self.assertEqual("curl" in invocations, not installed)
+                self.assertEqual("rustup toolchain install" in invocations, not installed)
+                selected = dict(line.split("=", 1) for line in github_env.read_text().splitlines())
+                self.assertEqual(selected["RUSTUP_TOOLCHAIN"], "1.97.0-fixture")
+                next_environment = {**environment, **selected,
+                                    "PATH": str(cargo_home / "bin") + ":" + environment["PATH"]}
+                probe = subprocess.run(["bash", str(ROOT / "scripts/ci/configure-sccache.sh")],
+                    cwd=ROOT, env=next_environment, capture_output=True, text=True)
+                self.assertEqual(probe.returncode, 0, probe.stderr)
+                self.assertIn("RUSTC_WRAPPER=" + str(mock_bin / "sccache"), github_env.read_text())
+                # Without the exported selection, the same proxy fails only
+                # when sccache invokes it outside the repository. The compiler
+                # itself still works in ROOT, reproducing the old fail-open path.
+                negative_env = root / "negative-env"
+                next_environment.pop("RUSTUP_TOOLCHAIN")
+                next_environment["GITHUB_ENV"] = str(negative_env)
+                probe = subprocess.run(["bash", str(ROOT / "scripts/ci/configure-sccache.sh")],
+                    cwd=ROOT, env=next_environment, capture_output=True, text=True)
+                self.assertEqual(probe.returncode, 0, probe.stderr)
+                self.assertIn("Rust cache disabled", probe.stderr)
+                self.assertTrue(negative_env.read_text().endswith("RUSTC_WRAPPER=\n"))
+        for path in (".github/actions/rust-setup/action.yml", ".github/workflows/test.yml"):
+            self.assertIn("uses: ./.github/actions/rust-toolchain", (ROOT / path).read_text())
+
+    def test_rust_setup_disk_guard_uses_workspace_free_space_without_real_cleanup(self):
+        script = rust_setup_disk_guard()
         threshold_kib = 30 * 1024 * 1024
         cleanup = [
             "rm -rf /usr/share/dotnet",
@@ -33,14 +165,14 @@ class BuildCoverageTests(unittest.TestCase):
             "docker image prune -af",
         ]
 
-        for mode, available_kib, should_skip in (
+        for (mode, available_kib, should_skip), runner_environment in product((
             ("above", threshold_kib + 1, True),
             ("equal", threshold_kib, True),
             ("below", threshold_kib - 1, False),
             ("invalid", "not-a-number", False),
             ("failure", None, False),
-        ):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+        ), ("github-hosted", "self-hosted")):
+            with self.subTest(mode=mode, runner=runner_environment), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 mock_bin = root / "mock-bin"
                 mock_bin.mkdir()
@@ -80,6 +212,9 @@ printf '%s\\n' "$*" >> "${MOCK_SUDO_LOG}"
                 environment = {
                     **os.environ,
                     "GITHUB_WORKSPACE": str(workspace),
+                    "GITHUB_ENV": str(root / "github-env"),
+                    "ASTRA_CI_TARGET_DIR": str(root / ".astra-ci-target"),
+                    "ASTRA_CI_RUNNER_ENVIRONMENT": runner_environment,
                     "MOCK_DF_MODE": mode,
                     "MOCK_DF_AVAILABLE_KIB": str(available_kib or ""),
                     "MOCK_SUDO_LOG": str(sudo_log),
@@ -91,9 +226,11 @@ printf '%s\\n' "$*" >> "${MOCK_SUDO_LOG}"
                     capture_output=True,
                     text=True,
                 )
-                self.assertEqual(result.returncode, 0, result.stderr)
+                self_hosted_failure = runner_environment == "self-hosted" and not should_skip
+                self.assertEqual(result.returncode, 1 if self_hosted_failure else 0, result.stderr)
                 output = result.stdout + result.stderr
-                decision = "skip cleanup" if should_skip else "run cleanup"
+                decision = ("skip cleanup" if should_skip else
+                            "fail self-hosted" if self_hosted_failure else "run cleanup")
                 self.assertIn(f"Disk guard decision: {decision}", output)
                 self.assertIn(
                     f"threshold={threshold_kib} KiB (30 GiB)",
@@ -101,7 +238,67 @@ printf '%s\\n' "$*" >> "${MOCK_SUDO_LOG}"
                 )
 
                 invocations = sudo_log.read_text().splitlines() if sudo_log.exists() else []
-                self.assertEqual(invocations, [] if should_skip else cleanup)
+                self.assertEqual(invocations, [] if should_skip or self_hosted_failure else cleanup)
+
+    def test_self_hosted_target_reclamation_preserves_neighbors_and_rechecks_disk(self):
+        limit_kib = 64 * 1024 * 1024
+        scenarios = (
+            ("warm", limit_kib - 1, False, False, 0),
+            ("at-limit", limit_kib, False, False, 0),
+            ("oversized", limit_kib + 1, False, True, 0),
+            ("low-disk", 1024, True, True, 0),
+            ("still-low", 1024, True, True, 1),
+            ("failed-recheck", 1024, True, True, 1),
+            ("failed-cleanup", 1024, True, False, 7),
+            ("bad-size", "invalid", False, False, 1),
+            ("symlink", 0, True, True, 0),
+        )
+        for name, size_kib, low_disk, reclaimed, status in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                target = root / ".astra-ci-target"
+                target.mkdir()
+                (target / "old-artifact").touch()
+                neighbor = root / "unrelated"
+                neighbor.mkdir()
+                (neighbor / "keep").touch()
+                if name == "symlink":
+                    (target / "old-artifact").unlink()
+                    target.rmdir()
+                    target.symlink_to(neighbor, target_is_directory=True)
+                github_env = root / "github-env"
+                environment = {**os.environ, "GITHUB_WORKSPACE": str(root),
+                               "ASTRA_CI_RUNNER_ENVIRONMENT": "self-hosted",
+                               "ASTRA_CI_TARGET_DIR": str(target), "GITHUB_ENV": str(github_env),
+                               "MOCK_TARGET_SIZE": str(size_kib), "MOCK_LOW_DISK": str(int(low_disk)),
+                               "MOCK_SCENARIO": name}
+                # Real rm acts only on the disposable fixture. Disk and size
+                # readings simulate thresholds without filling the test host.
+                stubs = '''
+df() {
+  if [[ "${MOCK_SCENARIO}" == failed-recheck && ! -e "${ASTRA_CI_TARGET_DIR}" ]]; then return 2; fi
+  local available=100000000
+  if [[ "${MOCK_SCENARIO}" == still-low ]] ||
+     [[ "${MOCK_LOW_DISK}" == 1 && ( -e "${ASTRA_CI_TARGET_DIR}" || -L "${ASTRA_CI_TARGET_DIR}" ) ]]; then
+    available=10000000
+  fi
+  printf 'Filesystem Blocks Used Available Capacity Mount\\nfixture 100000000 0 %s 0%% /\\n' "$available"
+}
+du() { printf '%s\\t%s\\n' "$MOCK_TARGET_SIZE" "$ASTRA_CI_TARGET_DIR"; }
+rm() {
+  if [[ "${MOCK_SCENARIO}" == failed-cleanup ]]; then return 7; fi
+  command rm "$@"
+}
+'''
+                result = subprocess.run(["bash", "-c", stubs + rust_setup_disk_guard()],
+                                        env=environment, capture_output=True, text=True)
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(not target.exists() and not target.is_symlink(), reclaimed)
+                self.assertTrue((neighbor / "keep").exists())
+                if status == 0:
+                    self.assertEqual(github_env.read_text().strip(), f"CARGO_TARGET_DIR={target}")
+                else:
+                    self.assertFalse(github_env.exists(), "Failed setup must not select retained artifacts")
 
     def test_make_lint_preserves_restored_artifacts_and_checks_all_targets(self):
         result = subprocess.run(
@@ -146,58 +343,64 @@ printf '%s\\n' "$*" >> "${MOCK_SUDO_LOG}"
         self.assertIn("cargo build --locked -p astra-cli --bin mock_mcp_server", producer)
         test_command = re.search(r"run: (cargo nextest run[^\n]+)", producer).group(1)
         args = shlex.split(test_command)
-        self.assertEqual(args[args.index("-p") + 1], "astra-cli")
-        self.assertTrue({"--locked", "--lib", "--bins"}.issubset(args))
-        self.assertNotIn("-E", args, "Run the complete CLI inventory")
-        self.assertNotIn("--partition", args)
-        self.assertEqual(args[args.index("--profile") + 1], "ci")
+        self.assertEqual(
+            args,
+            shlex.split(
+                "cargo nextest run --locked -p astra-cli --lib --bins "
+                "--test cli_pipe --test process_supervisor "
+                "--test shell_execution_boundaries --test cli_mcp_setup --profile ci"
+            ),
+            "Preserve the complete selected offline CLI inventory without test filters",
+        )
         self.assertLess(producer.index("Prebuild mock MCP server"), producer.index(test_command))
 
     def test_vendored_terminal_units_are_locked_and_pty_tests_run_both_readers(self):
         workflow = (ROOT / ".github/workflows/test.yml").read_text()
-        section = workflow.split("\n  vendored-terminal:\n", 1)[1].split("\n  terminal-pty:", 1)[0]
-        self.assertIn("os: [ubuntu-latest, macos-15]", section)
+        lanes = (ROOT / "scripts/ci/run-macos-lanes.sh").read_text()
+        self.assertIn("run-macos-lanes.sh vendored", workflow)
         for features in ("event-stream", "event-stream,use-dev-tty"):
-            self.assertIn(f"cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib --features {features}\n", section)
+            self.assertIn(f"cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib --features {features}\n", lanes)
         lock = tomllib.loads((ROOT / "vendor/crossterm/Cargo.lock").read_text())
         self.assertTrue(any(p["name"] == "crossterm" for p in lock["package"]))
         self.assertNotIn("/Cargo.lock", (ROOT / "vendor/crossterm/.gitignore").read_text().splitlines())
-        pty = workflow.split("\n  terminal-pty:\n", 1)[1].split("\n  macos-workspace-coordination:", 1)[0]
-        self.assertIn("os: [ubuntu-latest, macos-15]", pty)
-        self.assertIn("segment: [default-reader, dev-tty-reader, reflow]", pty)
-        for segment, step, features in (
-            ("default-reader", "Test default terminal reader through PTYs", ""),
-            ("dev-tty-reader", "Test dev-tty terminal reader through PTYs", "--features crossterm/use-dev-tty "),
-        ):
-            with self.subTest(segment=segment):
-                commands = workflow_run_script(".github/workflows/test.yml", step).strip()
-                self.assertEqual(commands,
-                    f"cargo test --locked -p astra-cli --lib {features}tui::terminal_startup -- --test-threads=2")
-                block = pty.split(f"      - name: {step}\n", 1)[1].split("      - ", 1)[0]
-                self.assertIn(f"if: matrix.segment == '{segment}'", block)
+        self.assertEqual(workflow.count("segment: [default-reader, dev-tty-reader, reflow]"), 2)
+        for features in ("", "--features crossterm/use-dev-tty "):
+            self.assertIn(f"cargo test --locked -p astra-cli --lib {features}tui::terminal_startup -- --test-threads=2", lanes)
+
+    def test_mac_native_bundle_removes_extra_graphs_and_node_setup(self):
+        workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        hosted = workflow.split("\n  macos-hosted:\n", 1)[1].split("\n  vendored-terminal-macos:", 1)[0]
+        worker = (ROOT / ".github/workflows/macos-mini.yml").read_text()
+        self.assertIn("timeout-minutes: 65", hosted)
+        for job in (hosted, worker):
+            self.assertNotIn("actions/setup-node", job)
+            self.assertIn("run-macos-lanes.sh all", job)
+        commands = (ROOT / "scripts/ci/run-macos-lanes.sh").read_text()
+        native = commands.split('if [[ "$(uname -s)" == Darwin ]]; then', 1)[1].split("    fi", 1)[0]
+        for lane in ("default-reader", "coordination", "native-mio"):
+            self.assertIn(f'bash "$0" {lane}', native)
+        for lane in ("reflow", "dev-tty-reader", "vendored"):
+            self.assertNotIn(f'bash "$0" {lane}\n', native)
 
     def test_terminal_reflow_uses_real_binary_and_locked_emulator(self):
-        commands = workflow_run_script(".github/workflows/test.yml", "Test inline terminal resize with xterm reflow")
+        commands = (ROOT / "scripts/ci/run-macos-lanes.sh").read_text()
         self.assertIn("cargo build --locked -p astra-cli --bin astra", commands)
         self.assertIn("npm ci --ignore-scripts --prefix scripts/tui-reflow", commands)
-        self.assertIn('ASTRA_TEST_BINARY="$PWD/target/debug/astra" npm test --prefix scripts/tui-reflow', commands)
+        self.assertIn('ASTRA_TEST_BINARY="${CARGO_TARGET_DIR:-$PWD/target}/debug/astra" npm test', commands)
 
     def test_macos_cli_bash_reuses_default_reader_without_losing_coordination_contracts(self):
-        workflow = (ROOT / ".github/workflows/test.yml").read_text()
-        terminal = workflow.split("\n  terminal-pty-shards:\n", 1)[1].split("\n  macos-workspace-coordination:\n", 1)[0]
-        self.assertEqual(workflow.count("- name: Test macOS CLI Bash execution"), 1)
-        bash = terminal.split("      - name: Test macOS CLI Bash execution\n", 1)[1].split("      - ", 1)[0]
-        self.assertIn("if: matrix.os == 'macos-15' && matrix.segment == 'default-reader'", bash)
-        self.assertIn("--lib edge_tools::shell::tests::bash_echo_returns_output -- --exact", bash)
-        self.assertLess(terminal.index("Test default terminal reader through PTYs"), terminal.index("Initialize system Git for macOS CLI observation"))
-        self.assertLess(terminal.index("Initialize system Git for macOS CLI observation"), terminal.index("Test macOS CLI Bash execution"))
-        contracts = workflow.split("\n  macos-workspace-coordination-tests:\n", 1)[1].split("\n  test-online-core:", 1)[0]
-        self.assertIn('install-nextest: "false"', contracts)
-        self.assertIn("-p astra-tools", contracts)
-        self.assertIn("--all-targets -- -D warnings", contracts)
+        commands = (ROOT / "scripts/ci/run-macos-lanes.sh").read_text()
+        reader = commands.split("  default-reader)\n", 1)[1].split("    ;;", 1)[0]
+        self.assertLess(reader.index("tui::terminal_startup"), reader.index("observe_git"))
+        self.assertLess(reader.index("observe_git"), reader.index("bash_echo_returns_output"))
+        self.assertEqual(reader.count("cargo test"), 2)
+        contracts = commands.split("  coordination)\n", 1)[1].split("    ;;", 1)[0]
+        self.assertIn("cargo clippy --locked --manifest-path Cargo.toml -p astra-tools --all-targets -- -D warnings", contracts)
         self.assertIn("workspace_observation::tests:: -- --test-threads=1", contracts)
-        self.assertIn("/usr/bin/git", contracts)
-        self.assertNotIn("-p astra-cli", contracts, "Do not compile the same CLI test executable twice on macOS")
+        self.assertIn("observe_git", contracts)
+        self.assertNotIn("-p astra-cli", contracts)
+        self.assertIn('"/usr/bin/git"', commands)
+        self.assertIn("timeout=60", commands)
 
     def test_ci_resolves_the_actual_builder_base_not_only_the_planner(self):
         dockerfile = (ROOT / "Dockerfile").read_text()

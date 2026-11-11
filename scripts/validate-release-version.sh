@@ -76,6 +76,9 @@ if syntax_only:
     print(f"release version syntax is valid: {expected}")
     raise SystemExit(0)
 
+if not (root / "docs/reference/capabilities.md").is_file():
+    raise SystemExit("selected release source has no capability reference: docs/reference/capabilities.md")
+
 with (root / "Cargo.toml").open("rb") as manifest:
     document = tomllib.load(manifest)
 

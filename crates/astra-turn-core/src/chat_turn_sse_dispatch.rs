@@ -286,6 +286,9 @@ pub struct ChatTurnSseAccum {
     pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
     /// `true` only for run totals, never a logical-request retry increment.
     pub usage_is_run_total: bool,
+    /// Attempt count reported by the run-total usage event. Failed terminals
+    /// may have this accounting without a completed-loop execution summary.
+    pub run_total_tool_calls: Option<u32>,
     /// Usage for the most recent physical model request. This is distinct
     /// from aggregate logical-response usage: the latter is useful for
     /// accounting but cannot describe the active context window after a tool
@@ -363,6 +366,38 @@ pub struct StreamAppliedUserIntent {
 }
 
 impl ChatTurnSseAccum {
+    /// A classified failure accepted by the physical root terminal dispatcher.
+    /// This proves failure closure, never successful completion or tool authority.
+    pub fn has_authoritative_failed_terminal(&self) -> bool {
+        self.run_terminal.as_ref().is_some_and(|terminal| {
+            terminal.status == DurableRunTerminalStatus::Failed
+                && terminal.owner_generation.is_some()
+                && self.root_identity.run_id() == Some(terminal.run_id.as_str())
+                && (self.has_authoritative_interrupted_terminal()
+                    || terminal.error_kind.is_some_and(|kind| {
+                        kind != astra_core::ErrorKind::ContractViolation
+                            && self.error_kind.is_none_or(|observed| observed == kind)
+                    }))
+        })
+    }
+
+    /// A failed run can carry an honest partial result rather than a protocol
+    /// failure. Only the owner-stamped, validated terminal grants this closure.
+    pub fn has_authoritative_interrupted_terminal(&self) -> bool {
+        self.error_kind.is_none()
+            && self.run_terminal.as_ref().is_some_and(|terminal| {
+                terminal.status == DurableRunTerminalStatus::Failed
+                    && terminal.owner_generation.is_some()
+                    && self.root_identity.run_id() == Some(terminal.run_id.as_str())
+                    && terminal.error_kind.is_none()
+                    && terminal.interruption.is_some()
+            })
+    }
+
+    fn has_final_error(&self) -> bool {
+        self.error_message.is_some() && !self.pending_attempt_error
+    }
+
     /// Enforce terminal evidence for a Server-owned admission without losing
     /// observed execution facts or replacing an existing failure.
     pub fn require_server_terminal_evidence(&mut self) {
@@ -385,13 +420,14 @@ impl ChatTurnSseAccum {
                 "Server admission stream reported an error without an error message",
             ));
         }
-        let message = if !self.server_loop_terminal {
-            "Server admission stream ended without terminal execution evidence"
-        } else if self.has_tool_calls || !self.tool_calls.is_empty() {
-            "remote Server returned pending client continuation work"
-        } else {
-            return None;
-        };
+        let message =
+            if !self.server_loop_terminal && !self.has_authoritative_interrupted_terminal() {
+                "Server admission stream ended without terminal execution evidence"
+            } else if self.has_tool_calls || !self.tool_calls.is_empty() {
+                "remote Server returned pending client continuation work"
+            } else {
+                return None;
+            };
         Some(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::ContractViolation,
             message,
@@ -418,7 +454,8 @@ impl ChatTurnSseAccum {
     /// Missing coverage must not turn a snapshot into a qualified increment.
     pub fn accounted_usage(&self) -> Option<astra_turn_types::CanonicalTokenUsage> {
         let unbound_snapshot = self.usage_is_run_total
-            && (self.server_execution_summary.is_none()
+            && ((self.server_execution_summary.is_none()
+                && !self.has_authoritative_failed_terminal())
                 || self.run_id.as_deref().is_none_or(|id| id.trim().is_empty()));
         let missing_report = self.qualified_usage.is_none()
             && self
@@ -480,6 +517,8 @@ pub struct DurableRunTerminal {
     /// Missing kinds remain `None` so consumers can fail closed instead of
     /// guessing that every failed run was a provider overload.
     pub error_kind: Option<astra_core::ErrorKind>,
+    /// Validated user-facing partial outcome, never successful execution proof.
+    pub interruption: Option<crate::interruption::InterruptionRecord>,
 }
 
 /// Parse a durable run terminal without mutating stream state.  The SSE
@@ -505,13 +544,40 @@ pub fn durable_run_terminal_from_event(
     let status = DurableRunTerminalStatus::from_wire(status_text)
         .ok_or_else(|| format!("run_finished carried unknown status `{status_text}`"))?;
     let error_kind = match event.get("error_kind") {
-        None | Some(Value::Null) => None,
+        None | Some(Value::Null) => event
+            .get("error_code")
+            .and_then(Value::as_str)
+            .and_then(astra_core::ErrorKind::parse_tag),
         Some(Value::String(tag)) => Some(
             astra_core::ErrorKind::parse_tag(tag)
                 .ok_or_else(|| format!("run_finished carried unknown error_kind `{tag}`"))?,
         ),
         Some(_) => return Err("run_finished carried non-string error_kind".to_string()),
     };
+    let interruption = event
+        .get("interruption")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            serde_json::from_value::<crate::interruption::InterruptionRecord>(value.clone())
+                .map_err(|error| format!("invalid terminal interruption: {error}"))
+        })
+        .transpose()?;
+    if let Some(record) = interruption.as_ref()
+        && (status != DurableRunTerminalStatus::Failed
+            || event
+                .get("owner_generation")
+                .and_then(Value::as_u64)
+                .is_none()
+            || error_kind.is_some()
+            || astra_core::ErrorKind::parse_tag(record.kind.label()).is_some()
+            || event.get("error_code").and_then(Value::as_str) != Some(record.kind.label())
+            || record.user_message.trim().is_empty()
+            || event.get("error").and_then(Value::as_str) != Some(record.user_message.as_str())
+            || record.error_detail.is_some()
+            || record.stall_signal.is_some())
+    {
+        return Err("terminal interruption is inconsistent with the failed run".into());
+    }
     Ok(Some(DurableRunTerminal {
         run_id: run_id.to_string(),
         owner_generation: event.get("owner_generation").and_then(Value::as_u64),
@@ -521,6 +587,7 @@ pub fn durable_run_terminal_from_event(
             .and_then(Value::as_str)
             .map(ToString::to_string),
         error_kind,
+        interruption,
     }))
 }
 
@@ -545,19 +612,22 @@ pub struct ServerLoopExecutionSummary {
 
 impl ServerLoopExecutionSummary {
     /// Select Server-produced feedback for the accepted terminal boundary.
-    /// Clients consume this fact without reconstructing execution state.
+    /// The accepted run and its terminal receipt identify this fact. A local
+    /// replica's turn counter is independent, and a pre-admission Server read
+    /// cannot predict the turn allocated by a concurrent Server admission.
     pub fn runtime_feedback_for(
         &self,
         session_id: Option<&str>,
         run_id: Option<&str>,
         model_id: Option<&str>,
-        session_turn: u32,
     ) -> Option<&RuntimeFeedbackFrame> {
         self.runtime_feedback.as_ref().filter(|frame| {
-            session_id == Some(frame.identity.session_id.as_str())
+            frame.is_valid()
+                && frame.progress.session_turn > 0
+                && session_id == Some(frame.identity.session_id.as_str())
                 && run_id == Some(frame.identity.run_id.as_str())
                 && model_id == Some(frame.identity.model_id.as_str())
-                && frame.progress.session_turn == session_turn
+                && self.tool_ledger_receipt.run_id == frame.identity.run_id
                 // An interrupted summary may include a failed provider
                 // attempt after its last successfully ingested feedback.
                 && frame.progress.llm_rounds_completed <= self.llm_rounds
@@ -661,11 +731,16 @@ pub enum ChatTurnEdgePending {
     },
 }
 
-/// Hints for the CLI live renderer (no-op when the consumer sets `quiet`).
+/// Validated live presentation and control updates for stream consumers.
 #[derive(Debug)]
 pub enum SseRenderEffect {
     /// A visible advisory, independent of assistant output and terminal status.
     SystemWarning(String),
+    /// Exact root-scoped durable guidance disposition for the live client.
+    GuidanceDisposition {
+        intent: StreamAppliedUserIntent,
+        status: astra_turn_types::UserIntentStatus,
+    },
     StopThinkingSpinner,
     StartThinkingSpinner,
     /// Incremental reasoning chunk for a compact terminal preview (CLI).
@@ -908,6 +983,15 @@ fn apply_one_event(
             Some(_) => {}
         }
     }
+    if (accum.error_kind == Some(astra_core::ErrorKind::ContractViolation)
+        || accum.has_final_error())
+        && matches!(
+            etype,
+            "tool_request" | "approval_required" | "approval_batch_required"
+        )
+    {
+        return;
+    }
     match etype {
         "warning" => {
             if let Some(message) = event
@@ -1037,20 +1121,27 @@ fn apply_one_event(
                 accum.transcript_evidence.push(evidence);
             }
         }
-        "user_intent_applied" => {
+        "user_intent_applied" | "user_intent_returned" => {
             let event_run_id = event.get("run_id").and_then(Value::as_str);
             // Descendant control facts may share the physical stream. They
             // must not alter the root conversation reconstructed by the thin
             // client.
-            if event_run_id != accum.root_identity.run_id() {
+            if event_run_id.is_none() || event_run_id != accum.root_identity.run_id() {
                 return;
             }
+            let returned =
+                event.get("type").and_then(Value::as_str) == Some("user_intent_returned");
             let parsed = (|| {
                 let status: astra_turn_types::UserIntentStatus =
                     serde_json::from_value(event.get("status").cloned().ok_or("missing status")?)
                         .map_err(|_| "invalid status")?;
-                if status != astra_turn_types::UserIntentStatus::Applied {
-                    return Err("status was not applied");
+                let expected = if returned {
+                    astra_turn_types::UserIntentStatus::Returned
+                } else {
+                    astra_turn_types::UserIntentStatus::Applied
+                };
+                if status != expected {
+                    return Err("status disagrees with disposition type");
                 }
                 let intent_id = event
                     .get("intent_id")
@@ -1081,6 +1172,12 @@ fn apply_one_event(
                 })
             })();
             match parsed {
+                Ok(intent) if returned => {
+                    effects.push(SseRenderEffect::GuidanceDisposition {
+                        intent,
+                        status: astra_turn_types::UserIntentStatus::Returned,
+                    });
+                }
                 Ok(intent) => {
                     if let Some(existing) = accum
                         .applied_user_intents
@@ -1095,6 +1192,10 @@ fn apply_one_event(
                             ));
                         }
                     } else {
+                        effects.push(SseRenderEffect::GuidanceDisposition {
+                            intent: intent.clone(),
+                            status: astra_turn_types::UserIntentStatus::Applied,
+                        });
                         accum.applied_user_intents.push(intent);
                     }
                 }
@@ -1475,7 +1576,9 @@ fn apply_one_event(
                                     | DurableRunTerminalStatus::Paused
                             )
                         });
-                    if !accum.pending_attempt_error || receipt_supersedes_attempt_error {
+                    if !accum.has_final_error()
+                        && (!accum.pending_attempt_error || receipt_supersedes_attempt_error)
+                    {
                         accum.error_kind = None;
                         accum.error_message = None;
                     }
@@ -1577,6 +1680,13 @@ fn apply_one_event(
                     Some(validated)
                 };
             accum.usage_is_run_total = usage_scope == Some("run_total");
+            if accum.usage_is_run_total {
+                accum.run_total_tool_calls = event
+                    .get("tool_call_count")
+                    .or_else(|| nested.and_then(|usage| usage.get("tool_call_count")))
+                    .and_then(Value::as_u64)
+                    .and_then(|count| u32::try_from(count).ok());
+            }
             if matches!(usage_scope, Some("run_total" | "logical_request_total")) {
                 // `/chat/stream` carries the final physical exchange inside
                 // its terminal accounting event.  The run endpoint expands
@@ -1652,6 +1762,55 @@ fn apply_one_event(
                 .and_then(Value::as_u64)
                 .filter(|tokens| i64::try_from(*tokens).is_ok());
         }
+        "run_error" => {
+            // Fanout descendants cannot fail the root observation stream.
+            if accum
+                .root_identity
+                .run_id()
+                .is_some_and(|root| event.get("run_id").and_then(Value::as_str) != Some(root))
+            {
+                return;
+            }
+            if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation) {
+                return;
+            }
+            let provisional_interruption = event
+                .get("error_code")
+                .and_then(Value::as_str)
+                .and_then(crate::interruption::InterruptionKind::from_label)
+                .is_some_and(|kind| astra_core::ErrorKind::parse_tag(kind.label()).is_none())
+                && matches!(event.get("error_kind"), None | Some(Value::Null));
+            if provisional_interruption
+                && (accum.error_kind.is_some() || accum.pending_attempt_error)
+            {
+                return;
+            }
+            accum.error_message = Some(
+                event
+                    .get("error")
+                    .or_else(|| event.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Run failed")
+                    .to_owned(),
+            );
+            accum.error_code = event
+                .get("error_code")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            accum.error_kind = event
+                .get("error_kind")
+                .or_else(|| event.get("error_code"))
+                .and_then(Value::as_str)
+                .and_then(astra_core::ErrorKind::parse_tag)
+                .or_else(|| {
+                    (!provisional_interruption).then_some(astra_core::ErrorKind::ContractViolation)
+                });
+            // Root failure is final, unlike a recoverable provider-attempt error.
+            accum.pending_attempt_error = false;
+            accum.attempt_error_supersession_eligible = false;
+            accum.explain_analyze_degraded = true;
+            edge_pending.clear();
+        }
         "error" => {
             // Indexed errors are durable historical events. An error without
             // a replay index is a transport/connection failure and may have
@@ -1662,7 +1821,9 @@ fn apply_one_event(
             // Identity and protocol violations describe the stream itself,
             // not one provider attempt. They are sticky and must never be
             // downgraded by a later attempt-shaped error.
-            if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation) {
+            if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation)
+                || accum.has_final_error()
+            {
                 accum.attempt_error_supersession_eligible = false;
                 return;
             }
@@ -1795,6 +1956,34 @@ fn apply_one_event(
                 }
                 match durable_run_terminal_from_event(event) {
                     Ok(Some(terminal)) => {
+                        if accum.run_terminal.is_none()
+                            && event.get("context_not_saved").and_then(Value::as_bool) == Some(true)
+                        {
+                            effects.push(SseRenderEffect::SystemWarning(
+                                "This turn's conversation history could not be saved. Check tool results and current state before continuing.".into(),
+                            ));
+                        }
+                        if let Some(interruption) = terminal.interruption.as_ref() {
+                            let coherent = accum.error_kind.is_none()
+                                && !accum.pending_attempt_error
+                                && accum.error_message.as_ref().is_none_or(|message| {
+                                    message == &interruption.user_message
+                                        && accum.error_code.as_deref()
+                                            == Some(interruption.kind.label())
+                                })
+                                && accum.server_interruption.as_ref().is_none_or(|previous| {
+                                    serde_json::from_value::<
+                                            crate::interruption::InterruptionRecord,
+                                        >(previous.clone())
+                                        .is_ok_and(|previous| previous == *interruption)
+                                });
+                            if !coherent {
+                                accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
+                                accum.error_message =
+                                    Some("Conflicting failed interruption terminal".into());
+                                return;
+                            }
+                        }
                         let evaluation = event
                             .get("turn_evaluation")
                             .filter(|value| !value.is_null())
@@ -1834,6 +2023,23 @@ fn apply_one_event(
                             accum.error_message =
                                 Some("Conflicting root terminal evaluation".into());
                             return;
+                        }
+                        if accum.has_final_error()
+                            && accum.error_kind != Some(astra_core::ErrorKind::ContractViolation)
+                            && (terminal.status != DurableRunTerminalStatus::Failed
+                                || terminal
+                                    .error_kind
+                                    .is_some_and(|kind| Some(kind) != accum.error_kind))
+                        {
+                            accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
+                            accum.error_message =
+                                Some("Root failure contradicted by terminal outcome".into());
+                            return;
+                        }
+                        if let Some(interruption) = terminal.interruption.as_ref() {
+                            accum.server_interruption = Some(interruption.to_json());
+                            accum.error_message = Some(interruption.user_message.clone());
+                            accum.error_code = Some(interruption.kind.label().into());
                         }
                         accum.turn_evaluation = evaluation;
                         accum.attempt_error_supersession_eligible = accum.pending_attempt_error
@@ -2020,9 +2226,50 @@ fn remote_tool_receipt_failure(
     None
 }
 
-/// Parse one SSE event `block` (may contain multiple `data:` lines), update `accum`, append edge work.
+/// Parse one SSE event, update `accum`, and append edge work.
 pub fn dispatch_chat_turn_sse_event_block(
     block: &str,
+    accum: &mut ChatTurnSseAccum,
+    edge_pending: &mut Vec<ChatTurnEdgePending>,
+) -> Vec<SseRenderEffect> {
+    let mut frames = SseBlankLineUtf8Buf::new();
+    let mut input = block.as_bytes();
+    let mut effects = Vec::new();
+    while !input.is_empty() && !accum.stream_complete {
+        match frames.next_frame(&mut input, None) {
+            Ok(Some(frame)) => effects.extend(dispatch_one_sse_event(&frame, accum, edge_pending)),
+            Ok(None) => break,
+            Err(_) => unreachable!("a Rust string has valid UTF-8"),
+        }
+    }
+    if !accum.stream_complete {
+        let tail = frames.take_buf().expect("a Rust string has valid UTF-8");
+        if !tail.is_empty() {
+            effects.extend(dispatch_one_sse_event(&tail, accum, edge_pending));
+        }
+    }
+    effects
+}
+
+fn dispatch_one_sse_event(
+    block: &str,
+    accum: &mut ChatTurnSseAccum,
+    edge_pending: &mut Vec<ChatTurnEdgePending>,
+) -> Vec<SseRenderEffect> {
+    match crate::sse::data_lines::validated_sse_event(block) {
+        Ok(event) => dispatch_decoded_sse_event(&event, accum, edge_pending),
+        Err(_) => {
+            accum.thinking_active = false;
+            if accum.error_message.is_none() {
+                accum.error_message = Some("Error: invalid JSON in SSE data".to_string());
+            }
+            vec![SseRenderEffect::StopThinkingSpinner]
+        }
+    }
+}
+
+pub(crate) fn dispatch_decoded_sse_event(
+    parsed: &crate::sse::data_lines::SseJsonDrain,
     accum: &mut ChatTurnSseAccum,
     edge_pending: &mut Vec<ChatTurnEdgePending>,
 ) -> Vec<SseRenderEffect> {
@@ -2030,31 +2277,18 @@ pub fn dispatch_chat_turn_sse_event_block(
         return Vec::new();
     }
     let mut effects = Vec::new();
-    for line in block.lines() {
-        let Some(data) = line.strip_prefix("data: ") else {
-            continue;
-        };
-        if data == "[DONE]" {
-            if accum.thinking_active {
-                accum.thinking_active = false;
-                effects.push(SseRenderEffect::StopThinkingSpinner);
-            }
-            accum.stream_complete = true;
-            break;
-        }
-        let Ok(event) = serde_json::from_str::<Value>(data) else {
-            // Synthetic error: protocol parse error should be visible, not silently ignored.
-            accum.thinking_active = false;
-            effects.push(SseRenderEffect::StopThinkingSpinner);
-            if accum.error_message.is_none() {
-                accum.error_message = Some("Error: invalid JSON in SSE data".to_string());
-            }
-            continue;
-        };
-        apply_one_event(&event, accum, edge_pending, &mut effects);
+    for event in &parsed.events {
+        apply_one_event(event, accum, edge_pending, &mut effects);
         if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation) {
             accum.turn_evaluation = None;
         }
+    }
+    if parsed.stream_finished {
+        if accum.thinking_active {
+            accum.thinking_active = false;
+            effects.push(SseRenderEffect::StopThinkingSpinner);
+        }
+        accum.stream_complete = true;
     }
     effects
 }
@@ -2107,10 +2341,28 @@ impl ChatTurnSseFramer {
         Ok(blocks)
     }
 
-    /// Move an unfinished SSE event to the Edge read-ahead lane. HTTP chunks
-    /// can split a UTF-8 character, so this handoff must preserve raw bytes.
-    pub(crate) fn take_pending_bytes(&mut self) -> Vec<u8> {
-        self.sse.take_pending_bytes()
+    pub(crate) fn next_frame(
+        &mut self,
+        input: &mut &[u8],
+    ) -> Result<Option<String>, astra_core::sse_blocks::SseFrameError> {
+        let block = self.sse.next_frame(input, Some(16 * 1024 * 1024))?;
+        if let Some(block) = &block {
+            self.note_ttft_from_raw_event_text(block);
+        }
+        Ok(block)
+    }
+
+    /// Move the parser, including CRLF and UTF-8 boundary state, between the
+    /// main reader and the Edge read-ahead lane.
+    pub(crate) fn take_framing(&mut self) -> SseBlankLineUtf8Buf {
+        let mut replacement = SseBlankLineUtf8Buf::new();
+        replacement.mark_stream_started();
+        std::mem::replace(&mut self.sse, replacement)
+    }
+
+    pub(crate) fn restore_framing(&mut self, framing: SseBlankLineUtf8Buf) {
+        debug_assert_eq!(self.sse.buffered_bytes(), 0);
+        self.sse = framing;
     }
 
     /// After the byte stream ends: run TTFT detection on any trailing bytes, then take the buffer
@@ -2264,11 +2516,11 @@ mod tests {
                     "expected_result": "One verified result"
                 },
                 "entries": [{
-                    "signal": "read_coverage_overlap",
+                    "signal": "search_fanout",
                     "stage": "observe",
                     "observed_at_round": 2,
                     "evidence_count": 3,
-                    "recommendation": "review_read_coverage"
+                    "recommendation": "narrow_evidence_search"
                 }]
             }
         }))
@@ -2295,66 +2547,67 @@ mod tests {
     }
 
     #[test]
-    fn remote_server_feedback_is_exact_and_bound_to_terminal_progress() {
+    fn remote_server_feedback_uses_accepted_run_identity_and_server_progress() {
         let frame = server_feedback_frame();
         let summary = ServerLoopExecutionSummary {
-            tool_calls_count: 0,
-            observation_tool_calls_count: 0,
-            tools_used: Vec::new(),
             llm_rounds: 3,
             tool_ledger_receipt: server_summary_tool_receipt(0),
-            token_usage_coverage: None,
             runtime_feedback: Some(frame.clone()),
+            ..Default::default()
         };
-        assert_eq!(
+        let select = |summary: &ServerLoopExecutionSummary| {
             summary
-                .runtime_feedback_for(
-                    Some("session-1"),
-                    Some("run-1"),
-                    Some("deepseek-v4-flash"),
-                    4,
-                )
-                .cloned(),
-            Some(frame.clone())
-        );
-
-        let mut terminal_includes_failed_attempt = summary.clone();
-        terminal_includes_failed_attempt.llm_rounds = 4;
-        assert_eq!(
-            terminal_includes_failed_attempt
-                .runtime_feedback_for(
-                    Some("session-1"),
-                    Some("run-1"),
-                    Some("deepseek-v4-flash"),
-                    4,
-                )
-                .cloned(),
-            Some(frame.clone())
-        );
-        let mut impossible_future_feedback = summary.clone();
-        impossible_future_feedback.llm_rounds = 2;
-        assert!(
-            impossible_future_feedback
-                .runtime_feedback_for(
-                    Some("session-1"),
-                    Some("run-1"),
-                    Some("deepseek-v4-flash"),
-                    4,
-                )
+                .runtime_feedback_for(Some("session-1"), Some("run-1"), Some("deepseek-v4-flash"))
                 .cloned()
-                .is_none()
-        );
-        assert!(
-            summary
-                .runtime_feedback_for(
-                    Some("session-1"),
-                    Some("run-1"),
-                    Some("deepseek-v4-flash"),
-                    5,
-                )
-                .cloned()
-                .is_none()
-        );
+        };
+        // Server admission may advance after a restore read. Neither the
+        // replica's counter nor that earlier read can fence this run's turn.
+        for server_turn in [1, 4, 21] {
+            let mut accepted = summary.clone();
+            accepted
+                .runtime_feedback
+                .as_mut()
+                .unwrap()
+                .progress
+                .session_turn = server_turn;
+            assert_eq!(
+                select(&accepted).unwrap().progress.session_turn,
+                server_turn
+            );
+        }
+        let mut interrupted = summary.clone();
+        interrupted.llm_rounds = 4;
+        assert_eq!(select(&interrupted), Some(frame.clone()));
+        let mut future = summary.clone();
+        future.llm_rounds = 2;
+        assert!(select(&future).is_none());
+        let mut foreign_receipt = summary.clone();
+        foreign_receipt.tool_ledger_receipt.run_id = "foreign-run".into();
+        assert!(select(&foreign_receipt).is_none());
+        let mut invalid = summary.clone();
+        invalid
+            .runtime_feedback
+            .as_mut()
+            .unwrap()
+            .progress
+            .session_turn = 0;
+        assert!(select(&invalid).is_none());
+        for (session, run, model) in [
+            (None, Some("run-1"), Some("deepseek-v4-flash")),
+            (
+                Some("foreign-session"),
+                Some("run-1"),
+                Some("deepseek-v4-flash"),
+            ),
+            (
+                Some("session-1"),
+                Some("foreign-run"),
+                Some("deepseek-v4-flash"),
+            ),
+            (Some("session-1"), Some("run-1"), Some("foreign-model")),
+        ] {
+            assert!(summary.runtime_feedback_for(session, run, model).is_none());
+        }
     }
 
     fn dispatch_evaluation_event(accum: &mut ChatTurnSseAccum, event: &Value) {
@@ -2730,7 +2983,12 @@ mod tests {
                 ",\"tool_call\":{\"id\":\"tc-1\",\"type\":\"function\",\"function\":{\"name\":\"noop\",\"arguments\":\"{}\"}}"
             ),
         );
-        dispatch_chat_turn_sse_event_block(&stream, &mut accum, &mut vec![]);
+        for block in ChatTurnSseFramer::new()
+            .push_bytes(stream.as_bytes())
+            .unwrap()
+        {
+            dispatch_chat_turn_sse_event_block(&block, &mut accum, &mut vec![]);
+        }
 
         assert_eq!(accum.reasoning_signature, "sig_realish_base64");
 
@@ -2842,6 +3100,99 @@ mod tests {
         assert!(a.has_usage);
         assert_eq!(a.prompt_tokens, 100);
         assert_eq!(a.completion_tokens, 50);
+    }
+
+    #[test]
+    fn root_persistence_error_is_sticky_and_preserves_partial_answer() {
+        let mut accum = ChatTurnSseAccum::default();
+        let mut pending = vec![];
+        dispatch_chat_turn_sse_event_block(
+            &sse("run_started", ",\"run_id\":\"root\""),
+            &mut accum,
+            &mut pending,
+        );
+        dispatch_chat_turn_sse_event_block(
+            &sse("text_delta", ",\"content\":\"partial answer\""),
+            &mut accum,
+            &mut pending,
+        );
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "run_error",
+                ",\"run_id\":\"child\",\"error\":\"child only\"",
+            ),
+            &mut accum,
+            &mut pending,
+        );
+        assert!(accum.error_message.is_none());
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "run_error",
+                ",\"run_id\":\"root\",\"error\":\"Completion could not be saved.\",\"error_code\":\"canonical_persistence_failed\"",
+            ),
+            &mut accum,
+            &mut pending,
+        );
+        assert_eq!(
+            accum.error_message.as_deref(),
+            Some("Completion could not be saved.")
+        );
+        assert_eq!(
+            accum.error_code.as_deref(),
+            Some("canonical_persistence_failed")
+        );
+        assert_eq!(
+            accum.error_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
+        );
+        assert!(!accum.server_loop_terminal);
+        assert!(!accum.attempt_error_supersession_eligible);
+        assert_eq!(accum.full_text, "partial answer");
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "approval_required",
+                ",\"request_id\":\"late\",\"tool\":\"bash\"",
+            ),
+            &mut accum,
+            &mut pending,
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn root_failure_cannot_be_superseded_by_attempt_error_or_success() {
+        let mut accum = ChatTurnSseAccum::default();
+        let mut pending = vec![];
+        for event in [
+            serde_json::json!({"type":"run_started","run_id":"root"}),
+            serde_json::json!({"type":"run_error","run_id":"root","error":"stream failed","error_code":"stream_transport"}),
+            serde_json::json!({"type":"error","message":"later attempt","error_kind":"rate_limit"}),
+        ] {
+            dispatch_chat_turn_sse_event_block(
+                &format!("data: {event}\n\n"),
+                &mut accum,
+                &mut pending,
+            );
+        }
+        assert_eq!(
+            accum.error_kind,
+            Some(astra_core::ErrorKind::StreamTransport)
+        );
+        assert_eq!(accum.error_message.as_deref(), Some("stream failed"));
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "run_finished",
+                ",\"run_id\":\"root\",\"owner_generation\":4,\"status\":\"completed\"",
+            ),
+            &mut accum,
+            &mut pending,
+        );
+        assert_eq!(
+            accum.error_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
+        );
+        assert!(!accum.has_authoritative_failed_terminal());
+        assert!(accum.run_terminal.is_none());
     }
 
     #[test]
@@ -3698,6 +4049,136 @@ mod tests {
         let terminal = a.run_terminal.expect("root terminal must be retained");
         assert_eq!(terminal.run_id, "root-run");
         assert_eq!(terminal.status, DurableRunTerminalStatus::Cancelled);
+    }
+
+    #[test]
+    fn token_budget_interruption_survives_live_and_terminal_only_streams() {
+        use crate::interruption::{
+            InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
+        };
+
+        let record = InterruptionRecord::new(
+            InterruptionKind::TokenBudgetExceeded,
+            ResumeAction::ContinueImmediately,
+            InterruptionStateSummary::default(),
+        );
+        let failure = serde_json::json!({"type":"run_error", "run_id":"root",
+            "error_code":record.kind.label(), "error":record.user_message});
+        let terminal = serde_json::json!({"type":"run_finished", "run_id":"root", "owner_generation":1,
+            "status":"failed", "error_code":record.kind.label(), "error":record.user_message,
+            "interruption":record.to_json()});
+        for include_failure in [true, false] {
+            let mut accum = ChatTurnSseAccum::default();
+            let mut pending = vec![];
+            dispatch_chat_turn_sse_event_block(
+                &sse("session_info", ",\"run_id\":\"root\""),
+                &mut accum,
+                &mut pending,
+            );
+            if include_failure {
+                dispatch_chat_turn_sse_event_block(
+                    &format!("data: {failure}\n\n"),
+                    &mut accum,
+                    &mut pending,
+                );
+            }
+            dispatch_chat_turn_sse_event_block(
+                &format!("data: {terminal}\n\n"),
+                &mut accum,
+                &mut pending,
+            );
+            assert!(accum.has_authoritative_interrupted_terminal(), "{accum:?}");
+            assert_eq!(accum.error_code.as_deref(), Some("token_budget_exceeded"));
+            assert_eq!(accum.server_interruption, Some(record.to_json()));
+        }
+    }
+
+    #[test]
+    fn typed_incomplete_terminal_rejects_conflicting_or_diagnostic_payloads() {
+        let record = crate::interruption::InterruptionRecord::new(
+            crate::interruption::InterruptionKind::ExecutionIncomplete,
+            crate::interruption::ResumeAction::ContinueImmediately,
+            crate::interruption::InterruptionStateSummary::default(),
+        );
+        let terminal = serde_json::json!({"type":"run_finished", "run_id":"root", "owner_generation":1,
+            "status":"failed", "error_code":"execution_incomplete", "error_kind":null,
+            "error":record.user_message, "interruption":record.to_json()});
+        assert!(
+            durable_run_terminal_from_event(&terminal)
+                .unwrap()
+                .unwrap()
+                .interruption
+                .is_some()
+        );
+        for (pointer, value) in [
+            ("/status", serde_json::json!("completed")),
+            ("/owner_generation", Value::Null),
+            ("/error_kind", serde_json::json!("server_error")),
+            ("/error_kind", serde_json::json!("unknown_kind")),
+            ("/error_code", serde_json::json!("budget_exhausted")),
+            ("/interruption/kind", serde_json::json!("budget_exhausted")),
+            (
+                "/interruption/error_detail",
+                serde_json::json!("internal diagnostic"),
+            ),
+            ("/error", serde_json::json!("internal diagnostic")),
+        ] {
+            let mut invalid = terminal.clone();
+            *invalid.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                durable_run_terminal_from_event(&invalid).is_err(),
+                "{pointer}: {invalid}"
+            );
+        }
+        let mut invalid_evaluation = terminal.clone();
+        invalid_evaluation["turn_evaluation"] = serde_json::json!({});
+        let mut invalid_accum = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse("session_info", ",\"run_id\":\"root\""),
+            &mut invalid_accum,
+            &mut vec![],
+        );
+        dispatch_chat_turn_sse_event_block(
+            &format!("data: {invalid_evaluation}\n\n"),
+            &mut invalid_accum,
+            &mut vec![],
+        );
+        assert_eq!(
+            invalid_accum.error_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
+        );
+        assert!(invalid_accum.server_interruption.is_none());
+        assert!(invalid_accum.run_terminal.is_none());
+        let mut accum = ChatTurnSseAccum::default();
+        let mut pending = vec![];
+        dispatch_chat_turn_sse_event_block(
+            &sse("session_info", ",\"run_id\":\"root\""),
+            &mut accum,
+            &mut pending,
+        );
+        let mut child = terminal.clone();
+        child["run_id"] = serde_json::json!("child");
+        dispatch_chat_turn_sse_event_block(&format!("data: {child}\n\n"), &mut accum, &mut pending);
+        assert!(accum.run_terminal.is_none());
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "run_error",
+                ",\"run_id\":\"root\",\"error_kind\":\"contract_violation\",\"error\":\"actual protocol failure\"",
+            ),
+            &mut accum,
+            &mut pending,
+        );
+        dispatch_chat_turn_sse_event_block(
+            &format!("data: {terminal}\n\n"),
+            &mut accum,
+            &mut pending,
+        );
+        assert_eq!(
+            accum.error_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
+        );
+        assert!(!accum.has_authoritative_interrupted_terminal());
+        assert!(accum.server_interruption.is_none());
     }
 
     #[test]
@@ -5492,7 +5973,8 @@ mod tests {
     fn done_marker_stops_current_and_later_event_blocks() {
         let mut a = ChatTurnSseAccum::default();
         let mut pending = Vec::new();
-        let block = "data: [DONE]\ndata: {\"type\":\"text_delta\",\"content\":\"after-done\"}\n\n";
+        let block =
+            "data: [DONE]\n\ndata: {\"type\":\"text_delta\",\"content\":\"after-done\"}\n\n";
         dispatch_chat_turn_sse_event_block(block, &mut a, &mut pending);
         dispatch_chat_turn_sse_event_block(
             "data: {\"type\":\"tool_request\",\"request_id\":\"after-done\",\"tool\":\"bash\",\"args\":{}}\n\n",
@@ -5679,7 +6161,17 @@ mod context_manifest_trace_sse_tests {
             "data: {\"type\":\"user_intent_applied\",\"run_id\":\"child-run\",\"intent_id\":\"child-intent\",\"delivery\":\"guide_current_run\",\"status\":\"applied\",\"event_index\":9,\"content\":\"child\"}\n\n"
         );
 
-        dispatch_chat_turn_sse_event_block(stream, &mut accum, &mut pending);
+        let mut effects = Vec::new();
+        for block in ChatTurnSseFramer::new()
+            .push_bytes(stream.as_bytes())
+            .unwrap()
+        {
+            effects.extend(dispatch_chat_turn_sse_event_block(
+                &block,
+                &mut accum,
+                &mut pending,
+            ));
+        }
 
         assert_eq!(
             accum.applied_user_intents,
@@ -5691,6 +6183,37 @@ mod context_manifest_trace_sse_tests {
             }]
         );
         assert!(accum.error_kind.is_none());
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, SseRenderEffect::GuidanceDisposition { .. }))
+                .count(),
+            1,
+            "a replay or a child must not cause a second live disposition"
+        );
+    }
+
+    #[test]
+    fn guidance_dispositions_require_bound_root_and_matching_status() {
+        let mut accum = ChatTurnSseAccum::default();
+        let mut pending = Vec::new();
+        let applied = r#"data: {"type":"user_intent_applied","intent_id":"x","delivery":"guide_current_run","status":"applied","event_index":1,"content":"hi"}
+
+"#;
+        assert!(dispatch_chat_turn_sse_event_block(applied, &mut accum, &mut pending).is_empty());
+        assert!(accum.applied_user_intents.is_empty());
+        let returned = concat!(
+            "data: {\"type\":\"run_started\",\"run_id\":\"root\"}\n\n",
+            "data: {\"type\":\"user_intent_returned\",\"run_id\":\"root\",\"intent_id\":\"x\",\"delivery\":\"guide_current_run\",\"status\":\"returned\",\"event_index\":1,\"content\":\"hi\"}\n\n",
+        );
+        let effects = dispatch_chat_turn_sse_event_block(returned, &mut accum, &mut pending);
+        assert!(
+            matches!(effects.as_slice(), [SseRenderEffect::GuidanceDisposition { intent, status: astra_turn_types::UserIntentStatus::Returned }] if intent.intent_id == "x")
+        );
+        assert!(accum.applied_user_intents.is_empty());
+        let malformed = "data: {\"type\":\"user_intent_applied\",\"run_id\":\"root\",\"intent_id\":\"x\",\"delivery\":\"guide_current_run\",\"status\":\"returned\",\"event_index\":1,\"content\":\"hi\"}\n\n";
+        assert!(dispatch_chat_turn_sse_event_block(malformed, &mut accum, &mut pending).is_empty());
+        assert!(accum.error_kind.is_some());
     }
 
     #[test]

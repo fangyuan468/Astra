@@ -61,18 +61,30 @@ pub async fn build_server_state(
         auth_service,
         uc_provider,
     );
-    let state = core::install_turn_persistence_services(state, &settings, &shared_pool);
+    let memoria_port = runtime::build_memoria_port(&settings, &state);
+    let state = core::install_turn_persistence_services(
+        state,
+        &settings,
+        &shared_pool,
+        memoria_port.clone(),
+    );
     let state =
         core::install_admin_services(state, &settings, &shared_pool, control_pool.as_ref())?;
-    let state = core::install_execution_services(state, &shared_pool)
+    let state = core::install_execution_services(state, &shared_pool)?
         .with_memoria_config(
             settings.memoria.base_url.clone(),
             settings.memoria.master_key.clone(),
         )
         .with_self_hosted_memoria_fallback(settings.memoria.allows_self_hosted_master_fallback());
 
-    let wiring =
-        runtime::build_runtime_wiring(&settings, &shared_pool, &shared_encryptor, &state).await?;
+    let wiring = runtime::build_runtime_wiring(
+        &settings,
+        &shared_pool,
+        &shared_encryptor,
+        &state,
+        memoria_port,
+    )
+    .await?;
     let matrix_rt = Arc::clone(&wiring.matrix_rt);
 
     let artifact_signing_secret =

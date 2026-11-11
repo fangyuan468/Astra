@@ -3,6 +3,7 @@ mod common;
 use astra_services::{DatabaseSessionService, SessionCreateRequestData, SessionService};
 use axum::http::StatusCode;
 use serial_test::serial;
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -15,8 +16,19 @@ async fn provider_session_creation_is_idempotent_across_service_instances() {
         ProviderSessionCreationIdentity,
     };
     let (pool, settings) = common::setup_pool_and_settings().await;
-    let first = DatabaseSessionService::new(settings.clone()).with_pool(pool.clone());
-    let second = DatabaseSessionService::new(settings).with_pool(pool.clone());
+    astra_services::resource_governor::DatabaseResourceGovernor::new(pool.clone())
+        .ensure_tables()
+        .await
+        .unwrap();
+    let scope_key = Arc::new(
+        astra_services::FernetTokenEncryptor::new("provider-session-scope-test-key").unwrap(),
+    );
+    let first = DatabaseSessionService::new(settings.clone())
+        .with_pool(pool.clone())
+        .with_scope_encryptor(scope_key.clone());
+    let second = DatabaseSessionService::new(settings)
+        .with_pool(pool.clone())
+        .with_scope_encryptor(scope_key);
     let user_id = format!("creation-{}", Uuid::new_v4().simple());
     let principal = AuthPrincipal {
         user: AuthUserRecord {
@@ -54,6 +66,47 @@ async fn provider_session_creation_is_idempotent_across_service_instances() {
     assert_ne!(a.created, b.created, "exactly one call creates the session");
     assert_eq!(a.admission_facts.active_plan_id, None);
     assert_eq!(b.admission_facts.active_plan_id, None);
+    let proof_key = "__astra_provider_scope_proof_v1";
+    let proof = a
+        .session
+        .metadata
+        .get(proof_key)
+        .cloned()
+        .expect("server scope proof");
+    let replacement = first
+        .update_session(
+            a.session.session_id.clone(),
+            user_id.clone(),
+            astra_services::SessionUpdateRequestData {
+                title: None,
+                metadata: Some(serde_json::Map::from_iter([(
+                    "user_key".into(),
+                    serde_json::json!("value"),
+                )])),
+                metadata_patch: None,
+                status: None,
+            },
+        )
+        .await
+        .expect("ordinary metadata replacement");
+    assert_eq!(replacement.metadata.get(proof_key), Some(&proof));
+    let forged = first
+        .update_session(
+            a.session.session_id.clone(),
+            user_id.clone(),
+            astra_services::SessionUpdateRequestData {
+                title: None,
+                metadata: None,
+                metadata_patch: Some(serde_json::Map::from_iter([(
+                    proof_key.into(),
+                    serde_json::Value::Null,
+                )])),
+                status: None,
+            },
+        )
+        .await
+        .expect_err("client must not remove server scope proof");
+    assert_eq!(forged.0, StatusCode::BAD_REQUEST);
     let active_plan_id = Uuid::new_v4().to_string();
     sqlx::query(
         "UPDATE agent_sessions SET active_plan_id = ? WHERE user_id = ? AND session_id = ?",
@@ -93,9 +146,14 @@ async fn provider_session_creation_is_idempotent_across_service_instances() {
         StatusCode::TOO_MANY_REQUESTS
     );
     first
-        .delete_session(a.session.session_id, user_id)
+        .delete_session(a.session.session_id, user_id.clone())
         .await
         .expect("delete test session");
+    sqlx::query("DELETE FROM resource_usage WHERE user_id = ?")
+        .bind(&user_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

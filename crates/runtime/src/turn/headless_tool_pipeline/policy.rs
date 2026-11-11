@@ -7,14 +7,14 @@ use super::*;
 use astra_turn_core::headless_tool_assembly::{
     READ_ONLY_TOOLS, headless_idempotency_hit_openai_pair,
     headless_openai_duplicate_within_turn_pair, openai_tool_roundtrip_values,
-    unknown_local_tool_error_message,
+    openai_tool_roundtrip_values_with_result_fields, unknown_local_tool_error_message,
 };
 use astra_turn_core::headless_tool_body_preview::emit_headless_tool_body_preview;
 use astra_turn_core::headless_tool_journal::{
     journal_record_blocked_tool, journal_record_cancelled_tool,
     journal_record_duplicate_within_turn, journal_record_invocation_replay_with_evidence,
     journal_record_suppressed_tool_retry, journal_record_tool_not_admitted,
-    journal_record_unknown_tool,
+    journal_record_unknown_tool, journal_record_with_documents,
 };
 use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_cache_hit_line, headless_stderr_unknown_tool_detail,
@@ -26,7 +26,7 @@ use astra_turn_core::tool::deferred_activation::{
 };
 use astra_turn_core::tool_result_semantics::tool_dedup_signature;
 
-use super::record::safe_args_preview;
+use super::record::{safe_args_preview, safe_tool_arguments_for_record};
 
 const OUTCOME_MEMORY_FAILURE_BLOCK_WINDOW: usize = 2;
 const OUTCOME_MEMORY_FAILURE_BLOCK_MAX_AGE_SECS: u64 = 60 * 60;
@@ -104,20 +104,29 @@ pub(super) fn emit_blocked_tool_result(
     if !quiet && let Some(status_line) = blocked.status_line {
         term.emit_line(HeadlessStderrStyle::Yellow, status_line);
     }
-    let (tool_msg, err_tr) = openai_tool_roundtrip_values(
+    let unavailable = matches!(
+        blocked.journal_kind,
+        HeadlessShortCircuitJournalKind::Unavailable
+    )
+    .then(crate::server::tool_plan_gate::plan_mode_unavailable_tool_result);
+    let (tool_msg, err_tr) = openai_tool_roundtrip_values_with_result_fields(
         blocked.id,
         blocked.name,
         &blocked.err_msg,
+        unavailable
+            .as_ref()
+            .and_then(|result| result.metadata.as_ref()),
         astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
     );
     messages.push(tool_msg);
     tool_results.push(err_tr);
+    let (arguments, preview, _) = safe_tool_arguments_for_record(blocked.name, blocked.args);
     let record = match blocked.journal_kind {
         HeadlessShortCircuitJournalKind::HardBlocked => journal_record_blocked_tool(
             blocked.id.to_string(),
             blocked.name.to_string(),
             blocked.journal_reason,
-            safe_args_preview(blocked.name, blocked.args),
+            preview,
             blocked.early_exit_ms,
         ),
         HeadlessShortCircuitJournalKind::SuppressedRetry => journal_record_suppressed_tool_retry(
@@ -125,19 +134,35 @@ pub(super) fn emit_blocked_tool_result(
             blocked.name.to_string(),
             blocked.reason_code,
             blocked.journal_reason,
-            safe_args_preview(blocked.name, blocked.args),
+            preview,
             blocked.early_exit_ms,
         ),
         HeadlessShortCircuitJournalKind::Cancelled { error_kind } => journal_record_cancelled_tool(
             blocked.id.to_string(),
             blocked.name.to_string(),
             &blocked.journal_reason,
-            safe_args_preview(blocked.name, blocked.args),
+            preview,
             blocked.early_exit_ms,
             error_kind,
         ),
+        HeadlessShortCircuitJournalKind::Unavailable => {
+            let mut record = journal_record_tool_not_admitted(
+                blocked.id.to_string(),
+                blocked.name.to_string(),
+                preview,
+                &blocked.journal_reason,
+                blocked.early_exit_ms,
+            );
+            record.error = Some(blocked.reason_code.to_string());
+            record.result_preview = Some(blocked.journal_reason.chars().take(500).collect());
+            record
+        }
     };
-    tool_call_records.push(record);
+    tool_call_records.push(journal_record_with_documents(
+        record,
+        arguments,
+        &blocked.err_msg,
+    ));
 }
 
 /// Decide which denial body to emit for a name the validator rejected.
@@ -231,13 +256,14 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
              new request.",
             max_tools_per_turn = self.ctx.max_tools_per_turn,
         );
+        let (arguments, preview, _) = safe_tool_arguments_for_record(&slot.name, &slot.args);
         trace_short_circuit_tool_skip(
             self.ctx.step_recorder,
             &slot.id,
             &slot.name,
             "turn_budget_exhausted",
             None,
-            safe_args_preview(&slot.name, &slot.args).as_deref(),
+            preview.as_deref(),
             Some(&body),
             false,
         );
@@ -247,18 +273,19 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             &body,
             astra_turn_core::tool_result_semantics::ToolResultStatus::Skipped,
         );
+        let response = tool_msg["content"].as_str().expect("tool response is text");
+        let record = journal_record_suppressed_tool_retry(
+            slot.id.clone(),
+            slot.name.clone(),
+            "turn_budget_exhausted",
+            body,
+            preview,
+            0,
+        );
+        let record = journal_record_with_documents(record, arguments, response);
         self.ctx.messages.push(tool_msg);
         self.ctx.tool_results.push(tr);
-        self.ctx
-            .tool_call_records
-            .push(journal_record_suppressed_tool_retry(
-                slot.id.clone(),
-                slot.name.clone(),
-                "turn_budget_exhausted",
-                body,
-                safe_args_preview(&slot.name, &slot.args),
-                0,
-            ));
+        self.ctx.tool_call_records.push(record);
     }
 
     pub(super) fn handle_empty_tool_name(
@@ -295,23 +322,23 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             err_msg.as_str(),
             astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
         );
+        let (arguments, preview, _) = safe_tool_arguments_for_record(&slot.name, &slot.args);
         trace_short_circuit_tool_skip(
             self.ctx.step_recorder,
             &slot.id,
             &slot.name,
             "unknown_tool",
             None,
-            safe_args_preview(&slot.name, &slot.args).as_deref(),
+            preview.as_deref(),
             Some(&err_msg),
             false,
         );
         self.ctx.messages.push(tool_msg);
         self.ctx.tool_results.push(err_tr);
-        self.ctx.tool_call_records.push(journal_record_unknown_tool(
-            slot.id.clone(),
-            slot.name.clone(),
-            0,
-        ));
+        let record = journal_record_unknown_tool(slot.id.clone(), slot.name.clone(), 0);
+        self.ctx
+            .tool_call_records
+            .push(journal_record_with_documents(record, arguments, &err_msg));
         // Unknown local tool names are catalog misses, not runtime failures.
         // Keeping them out of ToolHealth prevents removed or hallucinated
         // tools from being carried forward as "available but broken" hints.
@@ -390,8 +417,13 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             *count
         };
         if !has_exact_edge_result && count > self.ctx.max_identical_calls {
-            let args_preview = safe_args_preview(&slot.name, &slot.args);
+            let (arguments, args_preview, _) =
+                safe_tool_arguments_for_record(&slot.name, &slot.args);
             let (tool_msg, tr) = headless_openai_duplicate_within_turn_pair(&slot.id, &slot.name);
+            let response = tool_msg["content"]
+                .as_str()
+                .expect("tool response is text")
+                .to_owned();
             self.ctx.messages.push(tool_msg);
             self.ctx.tool_results.push(tr);
             trace_short_circuit_tool_skip(
@@ -404,13 +436,14 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 None,
                 false,
             );
+            let record = journal_record_duplicate_within_turn(
+                slot.id.clone(),
+                slot.name.clone(),
+                args_preview,
+            );
             self.ctx
                 .tool_call_records
-                .push(journal_record_duplicate_within_turn(
-                    slot.id.clone(),
-                    slot.name.clone(),
-                    args_preview,
-                ));
+                .push(journal_record_with_documents(record, arguments, &response));
             agent_warn!(
                 "dedup",
                 "Hard cap: tool '{}' (id={}) call #{} (limit: {})",
@@ -608,7 +641,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     }
                 }
             };
-            let args_preview = safe_args_preview(&execution.name, &execution.args);
+            let (arguments, args_preview, _) =
+                safe_tool_arguments_for_record(&execution.name, &execution.args);
             if !self.ctx.quiet {
                 self.ctx.term.emit_line(
                     HeadlessStderrStyle::Red,
@@ -637,22 +671,24 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             );
             self.ctx.messages.push(tool_msg);
             self.ctx.tool_results.push(err_tr);
-            if is_prompt_deferred {
-                let record = journal_record_tool_not_admitted(
+            let record = if is_prompt_deferred {
+                journal_record_tool_not_admitted(
                     execution.id.clone(),
                     execution.name.clone(),
-                    args_preview.clone(),
+                    args_preview,
                     &err_msg,
                     execution.early_exit_ms,
-                );
-                self.ctx.tool_call_records.push(record);
+                )
             } else {
-                self.ctx.tool_call_records.push(journal_record_unknown_tool(
+                journal_record_unknown_tool(
                     execution.id.clone(),
                     execution.name.clone(),
                     execution.early_exit_ms,
-                ));
-            }
+                )
+            };
+            self.ctx
+                .tool_call_records
+                .push(journal_record_with_documents(record, arguments, &err_msg));
             // Catalog misses and not-yet-activated deferred names are caller
             // protocol issues, not runtime failures. Do not persist them into
             // ToolHealth/avoidance_advised state; otherwise removed or deferred
@@ -723,7 +759,10 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         execution: &HeadlessResolvedExecution,
         idem_key: Option<&IdempotencyKey>,
     ) -> bool {
-        if execution.is_edge_tool || !READ_ONLY_TOOLS.contains(&execution.name.as_str()) {
+        if self.ctx.runtime_tool_executor.is_some()
+            || execution.is_edge_tool
+            || !READ_ONLY_TOOLS.contains(&execution.name.as_str())
+        {
             return false;
         }
         let Some(idem_key) = idem_key else {
@@ -767,7 +806,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             if catalog_replay {
                 return false;
             }
-            cached.output = modified;
+            cached.output =
+                astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(&modified).content;
         }
         if !self.ctx.quiet {
             self.ctx.term.emit_line(
@@ -954,7 +994,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             let args_str = serde_json::to_string(&execution.args).ok();
             let permission_context = self.ctx.permission_context;
             let effective_permission_timeout = self.ctx.effective_permission_timeout;
-            let plan_mode_active = self.ctx.plan_mode_active;
+            let mut plan_mode_active = self.ctx.plan_mode_active;
             let provider_lookup = self.ctx.runtime_tool_executor.map_or(
                 crate::server::runtime_tool_executor::ProviderPolicyLookup::NotProvider,
                 |executor| executor.provider_policy_lookup(&execution.name),
@@ -965,6 +1005,62 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 }
                 _ => None,
             };
+            // A failed lookup is retried only for an invocation that would be
+            // blocked by plan mode. Reads and plan-control tools never wait on
+            // the database, and explicit Plan permission remains authoritative.
+            if plan_mode_active
+                && crate::turn::permission_gate::plan_mode_blocks(
+                    &execution.name,
+                    &astra_turn_core::tool_argument_hints::normalize_llm_function_arguments(
+                        &execution.args,
+                    ),
+                    provider_policy,
+                )
+                && let Some(executor) = self.ctx.runtime_tool_executor
+            {
+                let explicit_plan = match permission_context {
+                    Some(context) => {
+                        context.read().await.mode() == astra_turn_types::PermissionMode::Plan
+                    }
+                    None => true,
+                };
+                if !explicit_plan {
+                    match executor.plan_mode_for_write().await {
+                        Some(active) => plan_mode_active = active,
+                        None => {
+                            let result =
+                                crate::server::tool_plan_gate::plan_mode_unavailable_tool_result();
+                            emit_blocked_tool_result(
+                                HeadlessBlockedTool {
+                                    id: &execution.id,
+                                    name: &execution.name,
+                                    args: &execution.args,
+                                    reason_code: "tool_unavailable",
+                                    journal_kind: HeadlessShortCircuitJournalKind::Unavailable,
+                                    journal_reason: result.output.clone(),
+                                    err_msg: result.output,
+                                    early_exit_ms: execution.early_exit_ms,
+                                    status_line: Some(format!(
+                                        "  ⚠ Tool temporarily unavailable: {}",
+                                        execution.name
+                                    )),
+                                },
+                                self.ctx.step_recorder,
+                                self.ctx.quiet,
+                                self.ctx.term,
+                                self.ctx.messages,
+                                self.ctx.tool_results,
+                                self.ctx.tool_call_records,
+                            );
+                            return HeadlessPipelineStage::ShortCircuit;
+                        }
+                    }
+                }
+            }
+            let source_discovery_tool = self
+                .ctx
+                .runtime_tool_executor
+                .and_then(|executor| executor.source_selection_discovery_tool(&execution.name));
             resolved_provider_policy = provider_policy.cloned();
             let permission_result = match &provider_lookup {
                 crate::server::runtime_tool_executor::ProviderPolicyLookup::MissingPolicy {
@@ -991,6 +1087,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         effective_permission_timeout,
                         plan_mode_active,
                         provider_policy,
+                        source_discovery_tool.as_deref(),
                     )
                     .await
                 }

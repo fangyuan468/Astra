@@ -309,12 +309,44 @@ pub(crate) enum ModelCatalogError {
     NotAuthenticated,
     #[error(transparent)]
     Request(#[from] astra_thin_client::ThinClientError),
-    #[error("invalid model catalog JSON: {0}")]
-    InvalidJson(#[from] serde_json::Error),
+    #[error("Model catalog response is not valid JSON. Check the model service and try again.")]
+    InvalidJson(#[source] serde_json::Error),
+    #[error(
+        "Model catalog response does not match this client's supported schema. Run `astra update`, or ask the server administrator to restore a supported client/server combination."
+    )]
+    UnsupportedSchema(#[source] serde_json::Error),
     #[error("invalid model catalog protocol: {0}")]
     Protocol(String),
     #[error("Model catalog request timed out")]
     TimedOut,
+}
+
+impl From<serde_json::Error> for ModelCatalogError {
+    fn from(error: serde_json::Error) -> Self {
+        if error.is_data() {
+            Self::UnsupportedSchema(error)
+        } else {
+            Self::InvalidJson(error)
+        }
+    }
+}
+
+impl ModelCatalogError {
+    fn into_classified(self) -> astra_core::ClassifiedError {
+        match self {
+            Self::InvalidJson(error) | Self::UnsupportedSchema(error) => {
+                model_catalog_decode_error(error)
+            }
+            Self::Request(astra_thin_client::ThinClientError::Api { status, .. }) => {
+                model_catalog_http_error(status)
+            }
+            Self::NotAuthenticated => astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Auth,
+                "Sign in before reading the model catalog.",
+            ),
+            other => astra_core::ClassifiedError::from(other.to_string()),
+        }
+    }
 }
 
 /// Fetch the exact public model catalog. Only active Offerings reach the
@@ -342,28 +374,68 @@ pub(crate) async fn fetch_owner_model_catalog(
     api: &astra_thin_client::ThinClient,
     owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
 ) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
-    // The exact owner supplies every bearer. An inherited transport provider
-    // must not replace it with another binding at request dispatch.
     let api = api.clone().without_bearer_provider();
     tokio::time::timeout(astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT, async {
+        // An already committed action may finish with its captured binding
+        // after the user selects a different profile. The binding itself
+        // still rejects logout, re-login, and credential replacement.
         let token = owner_access_token(&api, owner, None)
             .await
             .ok_or(ModelCatalogError::NotAuthenticated)?;
-        match fetch_model_catalog(&api, Some(&token)).await {
-            Err(ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
-                status,
-                ..
-            })) if status == reqwest::StatusCode::UNAUTHORIZED => {
-                let refreshed = owner_access_token(&api, owner, Some(&token))
-                    .await
-                    .ok_or(ModelCatalogError::NotAuthenticated)?;
-                fetch_model_catalog(&api, Some(&refreshed)).await
-            }
-            result => result,
-        }
+        fetch_model_catalog_with_retry(
+            &api,
+            &token,
+            owner_access_token(&api, owner, Some(&token)),
+            true,
+        )
+        .await
     })
     .await
     .map_err(|_| ModelCatalogError::TimedOut)?
+}
+
+pub(crate) async fn fetch_admitted_model_catalog(
+    api: &astra_thin_client::ThinClient,
+    auth: &AdmittedAuth,
+) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
+    let api = api.clone().without_bearer_provider();
+    let token = auth
+        .access_token(&api, None)
+        .await
+        .ok_or(ModelCatalogError::NotAuthenticated)?;
+    fetch_model_catalog_with_retry(
+        &api,
+        &token,
+        auth.access_token(&api, Some(&token)),
+        matches!(auth, AdmittedAuth::Owner(_)),
+    )
+    .await
+}
+
+async fn fetch_model_catalog_with_retry(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    refresh: impl std::future::Future<Output = Option<String>>,
+    owner_bound: bool,
+) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
+    match fetch_model_catalog(api, Some(token)).await {
+        Err(
+            error @ ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::UNAUTHORIZED,
+                ..
+            }),
+        ) => {
+            let Some(refreshed) = refresh.await else {
+                return Err(if owner_bound {
+                    ModelCatalogError::NotAuthenticated
+                } else {
+                    error
+                });
+            };
+            fetch_model_catalog(api, Some(&refreshed)).await
+        }
+        result => result,
+    }
 }
 
 /// Lookup a model entry by canonical Offering ID or display name.
@@ -371,10 +443,15 @@ pub(crate) fn find_model_entry_by_name<'a>(
     models: &'a [ModelListItemResponse],
     name: &str,
 ) -> Option<&'a ModelListItemResponse> {
-    models.iter().find(|entry| {
-        entry.offering_id == name
-            || model_list_entry_name(entry).is_some_and(|value| value.eq_ignore_ascii_case(name))
-    })
+    if let Some(entry) = models.iter().find(|entry| entry.offering_id == name) {
+        return Some(entry);
+    }
+    let mut matches = models.iter().filter(|entry| {
+        model_list_entry_is_active(entry)
+            && model_list_entry_name(entry).is_some_and(|value| value.eq_ignore_ascii_case(name))
+    });
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 
 pub(crate) fn model_list_entry_is_active(entry: &ModelListItemResponse) -> bool {
@@ -551,6 +628,22 @@ fn model_catalog_contract_error(message: impl Into<String>) -> astra_core::Class
     astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
 }
 
+fn model_catalog_decode_error(error: serde_json::Error) -> astra_core::ClassifiedError {
+    let schema_mismatch = error.is_data();
+    let message = ModelCatalogError::from(error).to_string();
+    astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
+        .with_details_json(
+            serde_json::json!({
+                "reason": if schema_mismatch {
+                    "model_catalog_schema_mismatch"
+                } else {
+                    "model_catalog_json_invalid"
+                }
+            })
+            .to_string(),
+        )
+}
+
 /// Keep the catalog owner and HTTP status through the string-based turn boundary.
 /// Auth also covers forbidden access and provider credentials; only a catalog
 /// session 401 can authorize the existing session refresh retry.
@@ -634,8 +727,8 @@ async fn load_server_model_access(
         if !response.status().is_success() {
             return Err(model_catalog_http_error(response.status()));
         }
-        let page: ModelAccessProjectionResponse = response
-            .json()
+        let bytes = response
+            .bytes()
             .await
             .map_err(|error| {
                 tracing::warn!(
@@ -645,13 +738,13 @@ async fn load_server_model_access(
                 );
                 let (kind, message) = if error.is_timeout() {
                     (astra_core::ErrorKind::Network, "Model catalog response timed out. Try again.")
-                } else if error.is_decode() {
-                    (astra_core::ErrorKind::ContractViolation, "Model catalog response was not valid JSON. Check the model service and try again.")
                 } else {
                     (astra_core::ErrorKind::Network, "Model catalog response could not be read. Check your connection and try again.")
                 };
                 astra_core::ClassifiedError::new(kind, message)
             })?;
+        let page: ModelAccessProjectionResponse =
+            serde_json::from_slice(&bytes).map_err(model_catalog_decode_error)?;
         if page.limit == 0 || page.limit > 200 {
             return Err(model_catalog_contract_error(
                 "Model Access projection returned an invalid page limit",
@@ -799,19 +892,8 @@ pub(crate) fn model_selection_for_name_from_catalog(
     model: &str,
 ) -> Option<ServerModelSelection> {
     let registry_model = astra_turn_core::thinking_config::resolve_model_thinking(model).0;
-    models
-        .iter()
+    find_model_entry_by_name(models, &registry_model)
         .filter(|entry| model_list_entry_is_active(entry))
-        .find(|entry| entry.offering_id == registry_model)
-        .or_else(|| {
-            models
-                .iter()
-                .filter(|entry| model_list_entry_is_active(entry))
-                .find(|entry| {
-                    model_list_entry_name(entry)
-                        .is_some_and(|name| name.eq_ignore_ascii_case(registry_model))
-                })
-        })
         .and_then(model_selection_from_list_entry)
 }
 
@@ -823,12 +905,7 @@ pub(crate) async fn resolve_server_model_selection(
 ) -> Result<ServerModelSelection, astra_core::ClassifiedError> {
     let (catalog, _) = fetch_server_model_catalog(api, Some(token), purpose)
         .await
-        .map_err(|error| match error {
-            ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
-                status, ..
-            }) => model_catalog_http_error(status),
-            other => astra_core::ClassifiedError::from(other.to_string()),
-        })?;
+        .map_err(ModelCatalogError::into_classified)?;
     resolve_server_model_selection_from_catalog(model, &catalog).map_err(|error| {
         astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, error)
     })
@@ -1274,6 +1351,10 @@ fn active_env_access_token(now_epoch: i64) -> Option<String> {
     Some(token)
 }
 
+pub(crate) fn has_environment_access_token() -> bool {
+    active_env_access_token(chrono::Utc::now().timestamp()).is_some()
+}
+
 /// Whether the token selected for a turn came from the environment bearer.
 /// Keep this decision next to `fresh_access_token` so delivery code does not
 /// reimplement expiry or precedence rules and accidentally replace it with a
@@ -1341,6 +1422,70 @@ pub(crate) async fn capture_admitted_auth_owner(
         return None;
     }
     Some(owner)
+}
+
+/// Verified refresh authority or the immutable bearer that entered the turn.
+#[derive(Clone)]
+pub(crate) enum AdmittedAuth {
+    Owner(crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot),
+    Static(std::sync::Arc<str>),
+}
+
+impl AdmittedAuth {
+    pub(crate) fn new(
+        bearer: &str,
+        owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
+    ) -> Self {
+        match owner {
+            Some(owner) => Self::Owner(owner),
+            None => Self::Static(bearer.into()),
+        }
+    }
+
+    pub(crate) async fn access_token(
+        &self,
+        api: &astra_thin_client::ThinClient,
+        rejected: Option<&str>,
+    ) -> Option<String> {
+        match self {
+            Self::Owner(owner) if owner.is_current() => {
+                let token = owner_access_token(api, owner, rejected).await;
+                owner.is_current().then_some(token).flatten()
+            }
+            Self::Owner(_) => None,
+            Self::Static(bearer) if rejected != Some(bearer.as_ref()) => Some(bearer.to_string()),
+            Self::Static(_) => None,
+        }
+    }
+}
+
+/// Capture the source selected for a user action before any asynchronous wait.
+/// The bearer itself or verified owner remains fixed even if ambient state changes.
+pub(crate) fn capture_presented_auth(
+    profile: Option<&str>,
+    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+) -> Option<AdmittedAuth> {
+    if !owner.is_current() {
+        return None;
+    }
+    if owner.native_binding.is_none()
+        && let Some(token) = active_env_access_token(chrono::Utc::now().timestamp())
+    {
+        return Some(AdmittedAuth::new(&token, None));
+    }
+    if profile.is_some_and(|name| owner.profile_name.as_deref() != Some(name)) {
+        return None;
+    }
+    if owner.native_binding.is_some() {
+        return Some(AdmittedAuth::Owner(owner.clone()));
+    }
+    owner.legacy_binding.as_ref()?;
+    Some(AdmittedAuth::Owner(owner.clone()))
+}
+
+pub(crate) fn can_manage_personal_models(auth: &AdmittedAuth) -> bool {
+    matches!(auth, AdmittedAuth::Owner(owner)
+        if owner.server_account_id.is_some() && owner.native_binding.is_none())
 }
 
 pub(crate) async fn fresh_access_token(
@@ -1466,53 +1611,6 @@ pub(crate) async fn presented_access_token(
     fresh_access_token(api, profile)
         .await
         .ok_or(AccessMiss::NotLoggedIn)
-}
-
-/// Accounting and other best-effort reads must not start a refresh. A short
-/// deadline cancelling that refresh can persist `refresh_pending` without a
-/// settled result.
-pub(crate) async fn access_token_without_refresh(profile: Option<&str>) -> Option<String> {
-    if let Some(binding) = crate::cli::native_auth::active() {
-        // File locking stays on the blocking pool. A still-valid token is
-        // usable for this read even inside the refresh skew; do not rotate it.
-        let session = binding.snapshot_off_runtime().await.ok()?;
-        if session.refresh_pending {
-            return None;
-        }
-        let now = astra_credentials::native::unix_now().ok()?;
-        if session.expires_at <= now {
-            return None;
-        }
-        return Some(session.access_token);
-    }
-    let profile = profile.map(str::to_owned);
-    tokio::task::spawn_blocking(move || {
-        let now = chrono::Utc::now().timestamp();
-        if let Some(token) = active_env_access_token_if_unexpired(now) {
-            return Some(token);
-        }
-        let creds = load_credentials();
-        let name = profile_name(profile.as_deref(), &creds);
-        let token = creds.profiles.get(&name)?.access_token.clone()?;
-        access_token_unexpired(&token, now).then_some(token)
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-fn access_token_unexpired(token: &str, now_epoch: i64) -> bool {
-    jwt_expiry_epoch(token)
-        .map(|exp| exp > now_epoch)
-        .unwrap_or(true)
-}
-
-fn active_env_access_token_if_unexpired(now_epoch: i64) -> Option<String> {
-    let token = std::env::var("ASTRA_ACCESS_TOKEN").ok()?;
-    if token.is_empty() || !access_token_unexpired(&token, now_epoch) {
-        return None;
-    }
-    Some(token)
 }
 
 pub(crate) fn initialize_session_state(
@@ -2565,11 +2663,10 @@ mod tests {
     }
 
     use super::{
-        ACCESS_TOKEN_REFRESH_SKEW_SECS, BannerTextStyle, ModelCatalogError, RestoredSessionState,
-        ServerDefaultModel, SilentRefreshError, access_token_needs_refresh,
-        applied_user_intents_from_turn_metadata, banner_session_display, banner_welcome_text,
-        create_pipeline_modules, current_access_token, current_git_root,
-        default_model_selection_from_access, ensure_state_default_model,
+        ACCESS_TOKEN_REFRESH_SKEW_SECS, BannerTextStyle, RestoredSessionState, ServerDefaultModel,
+        SilentRefreshError, access_token_needs_refresh, applied_user_intents_from_turn_metadata,
+        banner_session_display, banner_welcome_text, create_pipeline_modules, current_access_token,
+        current_git_root, default_model_selection_from_access, ensure_state_default_model,
         fetch_server_model_catalog, fresh_access_token, git_root_from, initialize_session_state,
         load_server_model_access, model_default_invalid_reason_message,
         model_selection_for_name_from_catalog, pending_recovery_status_line,
@@ -2619,32 +2716,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn accounting_read_keeps_a_token_inside_the_refresh_skew() {
-        let now = chrono::Utc::now().timestamp();
-        let soon = jwt_with_exp(now + 30);
-        let expired = jwt_with_exp(now - 5);
-        assert!(
-            super::access_token_unexpired(&soon, now),
-            "a token inside the 60s refresh skew is still valid"
-        );
-        assert!(
-            super::access_token_needs_refresh(&soon, now),
-            "the skew still decides when a refresh should start"
-        );
-        assert!(!super::access_token_unexpired(&expired, now));
-        if crate::cli::native_auth::active().is_none() {
-            let _g = isolate_credentials();
-            let _soon = EnvGuard::set("ASTRA_ACCESS_TOKEN", &soon);
-            assert_eq!(
-                super::access_token_without_refresh(None).await.as_deref(),
-                Some(soon.as_str())
-            );
-            let _expired = EnvGuard::set("ASTRA_ACCESS_TOKEN", &expired);
-            assert_eq!(super::access_token_without_refresh(None).await, None);
-        }
-    }
-
     fn jwt_with_exp(exp: i64) -> String {
         use base64::Engine;
 
@@ -2662,6 +2733,7 @@ mod tests {
         context_window: i32,
     ) -> ModelListItemResponse {
         ModelListItemResponse {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: offering_id.to_string(),
             access_id: "self-hosted".to_string(),
@@ -2759,8 +2831,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_catalog_fetch_rejects_non_catalog_json_at_the_shared_boundary() {
-        for body in ["not-json", r#"{"models":[]}"#, "[]"] {
+    async fn model_catalog_fetch_distinguishes_json_syntax_from_unsupported_schema() {
+        for (body, expected_reason) in [
+            ("not-json", "model_catalog_json_invalid"),
+            (r#"{"models":[]}"#, "model_catalog_schema_mismatch"),
+            ("[]", "model_catalog_schema_mismatch"),
+        ] {
             let mock = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/models"))
@@ -2776,9 +2852,45 @@ mod tests {
             )
             .await
             .expect_err("obsolete or malformed catalog shapes must fail at the shared boundary");
+            let classified = error.into_classified();
+            assert_eq!(classified.kind, astra_core::ErrorKind::ContractViolation);
+            let details: serde_json::Value =
+                serde_json::from_str(classified.details_json.as_deref().unwrap()).unwrap();
+            assert_eq!(details["reason"], expected_reason);
+            if expected_reason == "model_catalog_schema_mismatch" {
+                assert!(classified.message.contains("astra update"));
+                assert!(!classified.message.contains("not valid JSON"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn model_access_decode_errors_preserve_safe_machine_classification() {
+        for (body, expected_reason) in [
+            ("{", "model_catalog_json_invalid"),
+            (
+                r#"{"private":"synthetic-response-must-not-be-displayed"}"#,
+                "model_catalog_schema_mismatch",
+            ),
+        ] {
+            let mock = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/model-access"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&mock)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+            let error = super::load_server_model_access(&api, "token")
+                .await
+                .expect_err("malformed or unsupported projections cannot select a model");
+            assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+            let details: serde_json::Value =
+                serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+            assert_eq!(details["reason"], expected_reason);
             assert!(
-                matches!(error, ModelCatalogError::InvalidJson(_)),
-                "{error}"
+                !error
+                    .message
+                    .contains("synthetic-response-must-not-be-displayed")
             );
         }
     }
@@ -5013,5 +5125,42 @@ mod admitted_owner_tests {
             server.received_requests().await.unwrap().is_empty(),
             "capture cannot rotate a token or probe another identity"
         );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn presented_environment_bearer_stays_static_and_never_borrows_profile() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        unsafe {
+            std::env::set_var("ASTRA_ACCESS_TOKEN", "gateway-token");
+        }
+        let _identity =
+            cli_utils::install_cli_profile_identity_for_test("default", Some("owner")).unwrap();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".into(),
+            Profile {
+                account_id: Some("owner".into()),
+                access_token: Some("profile-token".into()),
+                refresh_token: Some("profile-refresh".into()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+        let server = wiremock::MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let owner = cli_utils::cli_owner_auth_snapshot();
+        let auth = super::capture_presented_auth(Some("default"), &owner).unwrap();
+        assert_eq!(
+            auth.access_token(&api, None).await.as_deref(),
+            Some("gateway-token")
+        );
+        assert!(
+            auth.access_token(&api, Some("gateway-token"))
+                .await
+                .is_none()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 }

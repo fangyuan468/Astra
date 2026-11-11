@@ -69,6 +69,9 @@ Children use the existing same-session run tree and execution owner. Built-in
 profiles may narrow tools, skills, read-only access and budgets; they cannot
 grant capabilities the parent or provider lacks. Explicit model requirements
 remain authoritative; omitted child model selection inherits the parent binding.
+When a child cannot access needed evidence, its parent can provide concise,
+attributed observations. These remain supplied facts, not child verification or
+additional execution authority.
 
 Skills do not introduce reviewer, execution-model or reasoning requirements.
 Independent review follows the user's or configured workflow's requirements;
@@ -390,9 +393,16 @@ configuration cannot repair it. Physical attempts remain separately accounted.
   the complete canonical group. An early slot query does not require another
   query after all group results have been observed at the completion barrier.
   Failed or unobserved terminal results still block completion. When the
-  parent has no independent work, it proposes a final answer; the existing
-  completion barrier waits for direct children and resumes synthesis with
-  their results, without shell sleeps, polling, or an extra database read.
+  parent has no independent work, it can call the resident `agent.wait` action
+  for new messages or results, without schema discovery, shell sleeps or polling.
+  Pending questions are answered with their correlation ID before waiting. The
+  existing completion barrier remains the finalization guard; the model does
+  not need to propose an artificial final answer to request a wait.
+  Terminal notifications inline complete child output when the existing aggregate
+  delivery budget permits, including JSON escaping and envelope overhead. The
+  small diagnostic/status preview is not the delivery payload. Output exceeding
+  that budget retains its exact producer-owned result and uses the existing
+  explicit read/artifact reference; a reference is not proof of complete adoption.
   Observation timeouts do not cancel children. Completion waiting uses the
   host's authorized execution deadline, if present, rather than inventing a
   deadline; cancellation and user guidance remain active while parked.

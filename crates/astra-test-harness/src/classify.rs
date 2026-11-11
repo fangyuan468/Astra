@@ -81,6 +81,11 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
     if outcome.exit_code < 0 {
         return FailureClass::Unknown;
     }
+    if outcome.is_pre_execution_failure()
+        && outcome.error_kind.as_deref() == Some("tool_unavailable")
+    {
+        return FailureClass::ToolUnavailable;
+    }
     // Exit 124 only proves that the outer deadline fired. If typed execution
     // evidence already proves model/tool progress, calling it an infrastructure
     // outage hides the product's pacing failure and tells reviewers to paper it
@@ -96,7 +101,9 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
 
     let stderr = &outcome.stderr;
 
-    if stderr.contains("Could not validate credentials") {
+    if outcome.error_kind.as_deref() == Some("auth")
+        || stderr.contains("Could not validate credentials")
+    {
         return FailureClass::InfraAuth;
     }
 
@@ -137,11 +144,7 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
     // failures also exit 3; classify those above and keep remaining
     // no-evidence process failures honest instead of telling users to log in.
     if outcome.exit_code == 3 && outcome.text.is_empty() {
-        if stderr_lower.contains("auth")
-            || stderr_lower.contains("credential")
-            || stderr_lower.contains("api key")
-            || stderr_lower.contains("login")
-        {
+        if astra_core::classify_tool_output(stderr) == astra_core::ErrorKind::Auth {
             return FailureClass::InfraAuth;
         }
         return FailureClass::Unknown;
@@ -161,15 +164,17 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
     let judger_unavailable = criteria_results.iter().any(|r| {
         !r.passed
             && matches!(r.criterion, Criterion::HardJudger { .. })
-            && (r.detail.contains("required judger unavailable")
+            && (crate::judger::assessment_summary(r).0 == "unavailable"
+                || r.detail.contains("required judger unavailable")
                 || r.detail.starts_with("judger call failed:"))
     });
     if judger_unavailable {
         return FailureClass::InfraVerificationUnavailable;
     }
-    if criteria_results.iter().any(|result| {
-        !result.passed && crate::criteria::execution_verification_unavailable(result, outcome)
-    }) {
+    if criteria_results
+        .iter()
+        .any(|result| !result.passed && crate::criteria::execution_verification_unavailable(result))
+    {
         return FailureClass::InfraVerificationUnavailable;
     }
     if criteria_results.iter().any(|result| {
@@ -270,7 +275,7 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
     if tools_count_failed {
         let exceeded_max = criteria_results.iter().any(|r| {
             if let Criterion::ToolsCountBetween { max, .. } = &r.criterion {
-                !r.passed && outcome.total_tool_calls.max(outcome.tool_calls_count) > *max
+                !r.passed && outcome.observed_tool_calls() > *max
             } else {
                 false
             }
@@ -665,6 +670,24 @@ mod tests {
     }
 
     #[test]
+    fn empty_completion_is_not_auth_recovery_prose() {
+        let mut outcome = make_outcome().with_exit_code(3).with_stderr(
+            "Choose another authorized model, or explicitly retry after the provider recovers.",
+        );
+        assert_eq!(classify(&outcome, &[]), FailureClass::Unknown);
+        outcome.model = "provider/model".into();
+        outcome.error_kind = Some("api_error".into());
+        outcome.error_code = Some("empty_completion".into());
+        // Empty completion does not identify whether the provider or adapter
+        // lost the response; retain that uncertainty instead of guessing auth.
+        assert_eq!(classify(&outcome, &[]), FailureClass::Unknown);
+        outcome.error_code = None;
+        outcome.error_kind = Some("auth".into());
+        outcome.stderr.clear();
+        assert_eq!(classify(&outcome, &[]), FailureClass::InfraAuth);
+    }
+
+    #[test]
     fn durable_ledger_timeout_is_runtime_infrastructure_not_auth() {
         let outcome = make_outcome().with_exit_code(3).with_stderr(
             "Error: [database_error] durable inference ledger timed out during logical_invocation_admission",
@@ -750,6 +773,53 @@ mod tests {
             classify(&make_outcome(), &[result]),
             FailureClass::InfraVerificationUnavailable
         );
+    }
+
+    #[tokio::test]
+    async fn step_judger_unavailable_is_not_a_negative_quality_verdict() {
+        use crate::judger::{Judger, JudgerAssessment, JudgerResult, SemanticJudgerEvidence};
+
+        struct Judge(bool);
+        #[async_trait::async_trait]
+        impl Judger for Judge {
+            async fn judge(
+                &self,
+                _: &Criterion,
+                _: &RunOutcome,
+                _: Option<&SemanticJudgerEvidence>,
+            ) -> Result<JudgerResult, astra_core::ClassifiedError> {
+                if self.0 {
+                    Err(astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::Unknown,
+                        "uncertain judgment answer",
+                    ))
+                } else {
+                    Ok(JudgerResult {
+                        assessment: JudgerAssessment::Acceptance(false),
+                        rationale: "rejected".into(),
+                        full_rationale: "rejected".into(),
+                        votes: Vec::new(),
+                    })
+                }
+            }
+        }
+        let criterion = Criterion::HardJudger {
+            question: "was the work complete?".into(),
+            threshold: 0.7,
+            model: None,
+        };
+        let outcome = make_outcome();
+        for (unavailable, expected) in [
+            (true, FailureClass::InfraVerificationUnavailable),
+            (false, FailureClass::ModelQualityLow),
+        ] {
+            let mut result =
+                crate::judger::evaluate_judger(&Judge(unavailable), &criterion, &outcome, None)
+                    .await
+                    .unwrap();
+            result.detail = format!("step 1: {}", result.detail);
+            assert_eq!(classify(&outcome, &[result]), expected);
+        }
     }
 
     #[test]

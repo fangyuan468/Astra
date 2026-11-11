@@ -4,6 +4,16 @@ Authentication owns identity, session issuance and credential binding. Request-a
 
 External provider catalog and runtime-context requests carry the verified `provider_scope_id` and `external_subject` from the authorized principal. The adapter exposes request authorization and these scope-based operations. Current provider-request HMAC and Edge-token admission use local verification; Edge registration also checks revocation. Login, refresh and logout use Astra's canonical authenticated-session services; the retired password/session-handle adapter interfaces and their source-level exports are removed.
 
+## ChatGPT model credentials
+
+Sign in with ChatGPT is a separate, explicitly linked inference credential.
+Existing Astra authentication supplies the owner for every connection route;
+OpenAI subject/email never creates an Astra session, changes account roles, or
+replaces Astra refresh tokens. Server holds encrypted renewable credentials
+only after user browser consent. OAuth state, PKCE and OIDC validation belong
+to the connection service; local browser handling belongs to the CLI. See
+[model-access ownership](model-access-and-inference.md#implemented-chatgpt-subscription-connection-boundary).
+
 ## Identity and provenance
 
 External principals are identified by issuer/provider and subject, never subject or email alone. Memoria's provider ID is `memoria:` followed by the SHA-256 of its normalized issuer URL. The issuer defaults to the configured API base URL; an explicitly stable `MEMORIA_ISSUER` lets administrators move the transport without changing the identity authority.
@@ -40,6 +50,60 @@ must not be presented as a reason to enable fallback. Authentication middleware
 can reject invalid or revoked sessions earlier with 401. Older servers without
 these codes retain generic CLI permission hints; detail text is not parsed to
 infer an authorization category.
+
+## Ordinary request authentication cache
+
+The authentication service verifies each local access JWT's signature, type,
+subject, session, origin and expiry before consulting its process-local cache.
+A miss reads account activity, refresh-session expiry and issuer binding in one
+SQL snapshot. A successful observation can be reused for at most 30 seconds,
+bounded further by token/session expiry and the Memoria access-token lifetime.
+Hits do not extend freshness. Ordinary local authentication therefore uses one
+cold statement and no SQL on a cache hit; Memoria misses additionally resolve
+the current connection credential. No bearer, password hash or memory credential
+is retained in the cache.
+
+The cache is shared by service clones and bounded to 1,024 entries, 4 MiB of
+accounted storage and 16 KiB per entry. Reconfiguring a service's pool, issuer or
+encryptor starts a new namespace. Logout invalidates only its session's local
+observations and fences matching in-flight fills; account-wide changes still
+invalidate all observations, including on uncertain commits. Session fences are
+bounded within the cache; overflow conservatively fences older in-flight fills.
+Other processes and out-of-band account/session mutations can take up
+to 30 seconds to affect ordinary request admission. Expired observations require
+a successful fresh lookup; database errors do not enable stale fallback.
+
+A successful database snapshot authenticates a request overlapping logout;
+cache invalidation prevents retaining that observation and does not reject an
+unrelated principal. Absolute token, observed Session and Memoria access expiry
+are checked again after awaited validation. A request starting after a local
+logout cannot reuse an invalidated observation.
+
+Refresh and logout serialize on the account lock. Refresh atomically replaces
+the active token hash in its existing session row; the consumed hash cannot
+refresh again. Logout uses a signed, strictly unexpired refresh token's user and
+session claims to revoke that session, even after the old hash is replaced or
+cleaned up. A valid proof with no remaining session is an idempotent success;
+it cannot revoke another session. This relies on unique session IDs and trusted
+JWT signing keys: removing an old hash alone no longer revokes its logout proof.
+Expired or revoked rows remain eligible for the existing bounded cleanup.
+Do not mix this version with older servers: an old server may report logout
+success after a new server has already replaced the hash, leaving the session
+active. For upgrade or rollback, stop admission to all API replicas, drain or
+terminate their in-flight requests, and wait until every old process has exited
+before starting any replica of the other version. This cutover interrupts
+service; ordinary rolling updates and session affinity do not provide the
+required ordering. Keep all API replicas on the same side of the cutover.
+After rollback, an older server cannot use a token already consumed by the
+newer version to revoke its successor; it rejects that logout. Draining
+requests does not restore replaced hashes, so clients must use their current
+refresh tokens or the affected sessions must be revoked separately.
+
+This cache observes identity, not operation permissions. Memory operations
+continue resolving scoped credentials through the canonical credential resolver;
+provider-request replay checks, sensitive reauthentication and execution-handoff
+reauthorization retain their own fresh authority checks. Already admitted work
+continues under its existing execution/cancellation authority.
 
 ## Atomic binding and sessions
 
@@ -162,6 +226,20 @@ unchanged when no native identity is bound.
 
 Browser login URLs require HTTPS except for explicit loopback development addresses. Windows passes the URL as child-process environment data, not shell source.
 
+Terminal and workbench login share an asynchronous browser-opening boundary.
+On WSL, command-local `WSLENV` forwards the URL unchanged to one PowerShell
+invocation; the URL never becomes script source. Its completion is observed
+for up to five seconds, with one second for local cleanup. Failure or timeout
+produces a sanitized warning while the displayed manual URL and callback stay
+usable. There is no alternate automatic launcher. Failed or cancelled attempts
+signal their POSIX process group and collect the direct child. Owner destruction
+synchronously signals that group, even during runtime shutdown when asynchronous
+collection cannot run. This does not prove Windows-process termination or revoke
+a browser request already in flight.
+Successful handoffs and native desktop browsers retain their own lifetime.
+Workbench cancellation still vetoes credential exchange through `LoginControl`.
+Observers do not wait for processes, and opening results do not authorize login.
+
 ### Browser-delivered local authorization codes
 
 The CLI binds its existing listener to `127.0.0.1:0`, generates a fresh state
@@ -273,6 +351,49 @@ make test-memoria-auth-online-contract
 
 The test issues and revokes upstream keys; never point it at a production service.
 
+## MOI device authorization
+
+`astra login --device-code` is an explicit native UC alternative for terminals
+without a browser. It shares discovery/environment validation, nonce-verified
+ID tokens, product preparation, atomic login publication, refresh and logout
+with the existing UC browser login. It has no new local credential schema.
+Discovery's device endpoint is optional; its absence leaves browser login
+unchanged and rejects only the explicit device command.
+
+UC admits the fixed `astra-cli` scope set and S256 PKCE request. The CLI prints
+the manual verification URI and user code, never the grant secret or a complete
+verification URI. Keycloak owns grant state and the final consent. UC's typed
+identity continuation must return to the original Keycloak device session,
+without opening a fresh authorization-code flow. The UC implementation and
+rollout are tracked in [Matrixflow #17972](https://github.com/matrixorigin/matrixflow/issues/17972).
+
+Polling obeys the issuer interval, increases it permanently for `slow_down`,
+backs off proven connection failures, and
+stops at a bounded wait of `min(expires_in, 600)` seconds. Longer server lifetimes remain valid;
+the local wait limit is reported separately from server grant expiry. No final
+poll bypasses the issuer interval or retry delay. Authorization creation errors
+distinguish HTTP 429, HTTP 5xx and rejection without rendering upstream bodies.
+A token request with an unconfirmed outcome is terminal and is not replayed,
+including ambiguous transport failures, HTTP 429/5xx, and
+`temporarily_unavailable` responses. New credentials are
+published only after existing MOI and Astra preparation succeeds. No implicit
+browser/manual fallback is introduced.
+
+An in-flight token request gets an independent bounded settlement period after
+the local deadline or cancellation. An unconfirmed response is reported as such,
+rather than claiming the grant expired. The shared native credential owner
+arbitrates cancellation against rename admission, polls contended publication locks for up
+to ten seconds, and distinguishes pre-rename failure from visible publication
+whose directory durability is unconfirmed. Callers join the writer after
+cancellation, revoke new credentials only on definite pre-commit failure, and
+attempt old-session revocation for both durable and visible-but-unconfirmed
+publication. Filesystem operations themselves cannot be forcibly interrupted;
+no caller timeout may leave a detached writer behind. This publication contract
+is shared by browser and device login; there is no device-only auth.json writer.
+Optional workspace selection uses the same bounded publication owner after login.
+Refresh sends the one-time token only after its pending intent is durably synced;
+a visible replacement with unconfirmed directory durability is never revoked.
+
 ## CLI in-flight credential ownership
 
 A CLI turn captures its admitted credential owner once, including when
@@ -300,3 +421,136 @@ Only `execution_settled: true` confirms execution settlement; a terminal status
 alone does not release an uncertain local execution lease. Internal transport
 detach retains the existing server recovery semantics and is not user cancel
 authority.
+
+
+## Web browser credential delivery
+
+Web uses one HttpOnly `astra_session` selector. A browser login imports a matching
+access/refresh pair through `POST /auth/browser-sessions`, consumes that refresh
+JWT, and stores a stable `bs3.<runtime-root>.<user-id>.<session-id>.<random-proof>` handle in the cookie.
+The runtime root, user and session hints, and 256-bit random proof are bound together.
+The runtime verifies the handle's user and session IDs against the signed refresh token
+before adoption, preventing a logged-out handle from being rebound to a different
+session. An ordinary
+request never sends this proof to a separately configured runtime URL.
+
+`auth_refresh_tokens` owns session identity, revocation and the encrypted browser
+credential pair in the same row. The handle hash is checked against the session primary key; raw proofs
+are never stored. `/auth/refresh` accepts either a direct single-use JWT or the
+independent browser proof. A consumed direct JWT cannot recover a successor. A
+browser proof returns the current access JWT while usable; refreshing atomically
+replaces the canonical hash and encrypted pair under the existing account lock.
+A loser reads the committed winner. Provider verification happens before locking,
+and its identity/credential binding is checked again under lock.
+
+The ordinary browser resolution uses the random session ID as the canonical row
+primary key, stored only as `session_id`, and verifies the full handle hash in one authority snapshot. Direct
+refresh and principal checks use the same primary key. Refresh also compares the
+signed refresh token hash on that row; the hash is not a separate index. When the
+current access token is usable, ordinary browser resolution does not write or call
+the provider; rotation writes and revalidates the provider when applicable. React
+request caching deduplicates Server Component configuration reads. Chat,
+project and sidebar handlers and hydrated pages pass their admitted client through
+the request; there is no cross-user or process-local token authority. A late Stop
+acknowledgement resolves authority again before reconciliation. The existing SDK owns later 401
+retries, cancellation, REST and streaming admission. An initial owner/provider/DB
+outage is reported as unavailable. A later SDK refresh failure retains the SDK's
+existing original-401 behavior; it never clears the proof or reports success.
+
+RSC rendering, sidebar, ordinary API calls and refresh never write authentication
+cookies. Handle logout revokes the captured session and deletes its owner in one
+transaction, but leaves the now-inert cookie: a delayed logout response must not
+erase a newer login. Revocation uses the exact handle hash and canonical session
+identity, without decrypting credentials, calling a provider or requiring an active
+account. Expiry, deleted old accounts and replaced encryption keys cannot trap the
+browser in a session it cannot sign out of or replace. Other replicas reject
+subsequent owner resolutions. Ordinary principal checks can retain an already
+admitted access JWT for the existing maximum 30-second cache interval. The
+existing admin authorizer checks JWT and role independently of session revocation;
+an already issued admin access JWT can remain usable until its expiry. Signing
+in creates an independent session;
+runtime configuration changes only the browser selection. Neither operation
+implicitly revokes a previously selected session. If the response is lost, the
+browser can continue using its old selection. A copied old browser handle may be
+refreshed until its one-year absolute limit unless explicitly revoked. Sign out
+before switching when immediate revocation is required: signing out afterwards
+revokes only the currently selected session. An unreceived new session expires
+through the normal retention path. Static bearer tokens must be revoked at their
+issuer and can outlive the Web cookie.
+
+Runtime settings are full replacements, encoded as `cfg1` in the same selector:
+explicit static bearer, no authentication, demo, or deployment default. The deployment API URL may supply a default destination; `ASTRA_ACCESS_TOKEN`
+is never a browser identity. Anonymous/default selections cannot inherit a server
+credential. Each browser must sign in or explicitly supply its own static token. Refresh-pair import through `POST /api/runtime-config` requires `browserProof`: a
+caller-generated independent 32-byte CSPRNG secret encoded as unpadded base64url
+(for example, `crypto.randomBytes(32).toString("base64url")` in Node.js). Generate
+it before importing, retain the same proof, token pair and runtime URL across uncertain retries
+against any Web replica, and discard caller storage after confirming cookie delivery.
+Treat the proof as a bearer secret; never derive it from tokens or log it. Missing
+or malformed proof is rejected before consuming credentials. This also supports
+passwordless external accounts; interactive password login obtains a fresh pair
+on each retry. Raw refresh JWTs are never stored in cookies. Demo configuration disables live access; it does not authenticate a workspace.
+The public landing remains available and live workspace pages require sign-in.
+Demo combined with credentials is rejected as ambiguous; logout exits demo. Missing/malformed/revoked
+browser credentials do not fall back to environment authentication. Static logout
+selects explicit no-auth mode; settings DELETE restores the deployment destination (without credentials) without revoking the previously selected session. Explicit logout remains the way to request revocation. These settings changes, static logout
+and login/import explicitly write the selector. Two concurrent explicit changes
+can arrive in reverse response order: HTTP cookies do not support compare-and-set.
+This limitation does not affect delayed ordinary refresh or handle-logout responses.
+
+The encrypted payload has an immutable one-year absolute cap. Browser rotation
+caps the canonical refresh-row expiry to it, so bearer admission and handle
+resolution respect the same ceiling. No separate browser expiry or sweep exists.
+Refresh retention treats the configured seven days as a minimum period after
+expiry. Logout and provider disconnect shorten expiry to the earlier of its current value
+and database time, and clear browser ciphertext in the same update. Repeated
+revocation cannot postpone cleanup. Revoked rows remain for the retention period
+plus any cleanup backlog. Other
+ciphertext remains until expiry, the retention period and any cleanup backlog.
+
+Refresh maintenance captures a conservative UTC cutoff, binds it as a concrete
+DATETIME to the expiry index, and rechecks each candidate and the cutoff in a
+primary-key batch delete. The bound candidate cutoff avoids the observed MatrixOne 4.2.5 dynamic time range
+error during candidate selection. The DELETE retains a database-clock condition
+and rechecks the base row; its index completeness and physical I/O remain engine-dependent. The delete checks the current database
+clock and the retention period again, so a concurrent renewal or backward clock
+change cannot cause premature deletion. Correct expiry selection still depends
+on MatrixOne's index returning complete results. Candidate anomalies and stalled
+batches are logged and retried; the maintenance worker uses bounded batches and
+periodic retries without persistent coordination. Each catch-up round keeps a
+fixed cutoff and a normal six-hour sweep performs one follow-up check even if
+its first batch was empty. Replica conflicts can delay progress, and clock
+synchronization remains a deployment requirement. An admin cleanup error may
+follow already committed batches or other table deletions; retrying is safe.
+JWT signing and `ASTRA_TOKEN_ENCRYPTION_KEY` must match across runtime replicas.
+Missing keys, key mismatch and corrupt ciphertext fail closed. Changing either key
+requires sign-in again; it is not transparent key rotation.
+Web page errors offer retry and an explicit sign-in link, including when a saved
+session cannot be decrypted. The standard Next error boundary displays no backend
+error details and never grants an anonymous identity or changes the selector.
+Authentication APIs retain their original error status. The live Work browser
+harness enrolls through `POST /api/runtime-config` using its own credential and
+the browser's shared cookie jar; it does not construct authentication cookies.
+
+### Fresh-schema deployment
+
+This change advances the strict core schema contract to `2026-10-29-v116`. It does
+not migrate, alter, drop or recreate an existing database. Provision a **separate
+fresh database**, preserving the old database and its data. Existing data does not
+appear in the fresh database without a separately designed migration. Drain old
+Web/runtime replicas before cutting over both tiers and require new sign-in; legacy
+token cookies are not converted. Do not mix old cookie writers with new handle
+readers. Rollback also requires a drain and the original code/database; older
+runtimes cannot consume new browser handles.
+
+Validation: Web unit/public-route tests; `browser_sessions_db_it` for real DB
+concurrency, rollback, provider replacement/disconnect and isolation;
+`browser_session_next_db_it` for two real Next servers and two independent runtime
+auth services sharing an isolated DB. Build the current Web source before running
+the latter (`npm --prefix packages/sdk run build && npm --prefix web run build`),
+use the Node version pinned in `.nvmrc`, install the lockfile-matched Playwright
+Chromium headless shell (`cd web && npm exec -- playwright install --with-deps chromium --only-shell`),
+and explicitly set `ASTRA_TEST_DB_IT=1` and `ASTRA_TEST_DATABASE`. The test also
+corrupts disposable owners and drives the real browser recovery links, including
+fresh document retry and sign-in across the two Web replicas.
+No live provider or LLM credentials are needed.

@@ -185,7 +185,7 @@ NEXTEST_ONLINE_FLAGS  := --profile $(NEXTEST_ONLINE_PROFILE)
 # Operational pressure probes have dedicated runners and data-size controls.
 # Keep them out of the generic ignored-test lane, whose per-case timeout is a
 # correctness budget rather than a load-test budget.
-NEXTEST_CLEANUP_PRESSURE_EXCLUSION := not test(/(db_cleanup_expired|db_truncate_gc|prompt_retention)_pressure_probe/)
+NEXTEST_CLEANUP_PRESSURE_EXCLUSION := not test(/db_cleanup_expired_pressure_probe/)
 # Phase-0 production baselines require hermetic binary/model inputs and the
 # ASTRA_PHASE0_BASELINE_EXCLUSIVE guard. They are owned by
 # scripts/phase0-production-baseline.sh, not the generic ignored-test lane.
@@ -1236,8 +1236,8 @@ test-runtime-e2e-hooks: sweep
 # This helper owns the astra-runtime / astra-plan integration binaries.
 # astra-services integration binaries run in test-online's core lane, beside
 # the astra-services ignored lib tests, so their test-binary linking and live-DB
-# time are charged to core. CI splits core into isolated core-runtime,
-# core-turn-core, and core-services jobs. `make test-online` remains the complete
+# time are charged to core. CI splits core into isolated core-runtime
+# and core-services jobs. `make test-online` remains the complete
 # online suite; ASTRA_ONLINE_LANE=core retains the combined core lane.
 #
 # Optional serial mode: ASTRA_TEST_DB_IT_TEST_THREADS=1 -> -j 1
@@ -1315,11 +1315,11 @@ test-online:
 	case "$$ONLINE_LANE" in \
 		all) DB_NAMES="$$RUNTIME_IGNORED_DB $$INTEGRATION_DB" ;; \
 		core) DB_NAMES="$$RUNTIME_IGNORED_DB" ;; \
-		core-runtime|core-turn-core|core-services) \
+		core-runtime|core-services) \
 			RUNTIME_IGNORED_DB="$${TEST_DB_BASE}_$$(printf '%s' "$$ONLINE_LANE" | tr '-' '_')"; \
 			DB_NAMES="$$RUNTIME_IGNORED_DB" ;; \
 		integration) DB_NAMES="$$INTEGRATION_DB" ;; \
-		*) echo "❌ invalid ASTRA_ONLINE_LANE=$$ONLINE_LANE (expected all, core, core-runtime, core-turn-core, core-services, or integration)"; exit 2 ;; \
+		*) echo "❌ invalid ASTRA_ONLINE_LANE=$$ONLINE_LANE (expected all, core, core-runtime, core-services, or integration)"; exit 2 ;; \
 	esac; \
 	echo "Running online lane=$$ONLINE_LANE; recreating test databases: $$DB_NAMES ..."; \
 	for DB_NAME in $$DB_NAMES; do \
@@ -1338,23 +1338,13 @@ test-online:
 				-E 'not test(/durable_run_event_pressure_probe/) and $(NEXTEST_CLEANUP_PRESSURE_EXCLUSION)' \
 				|| FAILED="$$FAILED astra-runtime-ignored"; \
 	fi; \
-	if [ "$$ONLINE_LANE" = "all" ] || [ "$$ONLINE_LANE" = "core" ] || [ "$$ONLINE_LANE" = "core-turn-core" ]; then \
-		echo "Running astra-turn-core db-store ignored tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
-		RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
-			ASTRA_TEST_DB_IT=1 \
-			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} \
-			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-turn-core \
-				--features db-store --lib --run-ignored only $(NEXTEST_ONLINE_FLAGS) $$ONLINE_JOBS_FLAG \
-				-E '$(NEXTEST_CLEANUP_PRESSURE_EXCLUSION)' \
-				|| FAILED="$$FAILED astra-turn-core-db-store"; \
-	fi; \
 	if [ "$$ONLINE_LANE" = "all" ] || [ "$$ONLINE_LANE" = "core" ] || [ "$$ONLINE_LANE" = "core-services" ]; then \
 		echo "Running astra-services ignored lib/integration tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
 		RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 			ASTRA_TEST_DATABASE=$$RUNTIME_IGNORED_DB \
 			ASTRA_TEST_DB_IT=1 \
 			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} \
-			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services \
+			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services --features e2e-hooks \
 				--lib --tests --run-ignored only $(NEXTEST_ONLINE_FLAGS) $$ONLINE_JOBS_FLAG \
 				-E '$(NEXTEST_CLEANUP_PRESSURE_EXCLUSION)' \
 				|| FAILED="$$FAILED astra-services-online"; \
@@ -1739,7 +1729,9 @@ format-check:
 .PHONY: audit
 audit:
 	@command -v cargo-audit >/dev/null 2>&1 || { echo "cargo-audit not found; install with: cargo install cargo-audit"; exit 1; }
-	@cargo audit --no-fetch
+	@# Only ignore the rmcp advisory after verifying its vulnerable backends are disabled.
+	@python3 scripts/ci/check_rmcp_audit.py
+	@cargo audit --no-fetch --ignore RUSTSEC-2026-0462
 
 .PHONY: type-check
 type-check: sweep

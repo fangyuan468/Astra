@@ -10,7 +10,7 @@ This document defines how Astra documentation is organized so design stays usefu
 - Design guides implementation; implementation does not define design by accident.
 - One design domain has one owning document.
 - Related documents may reference an invariant, but should not restate it differently.
-- Implementation status belongs in plans, PR descriptions, or release notes, not canonical design docs.
+- Current implementation status belongs in the [capability reference](../reference/capabilities.md); PRs and release notes carry revision-specific run evidence. Canonical design docs retain target contracts.
 - If a historical document contains durable ideas, migrate the ideas into the owning design doc and delete the diary.
 
 ## Document classes

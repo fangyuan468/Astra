@@ -10,6 +10,10 @@ operators, and kernel contributors to the level of detail they need.
 > ahead of the implementation on a given branch. Code, contract tests, and
 > runtime-profile tests remain authoritative for current behavior.
 
+Start with the [current capability status](reference/capabilities.md) to distinguish
+implemented paths and limits from target contracts. Release notes link the exact
+source snapshot used for that version.
+
 ## Choose your path
 
 | Goal | Start here | Next |
@@ -41,7 +45,6 @@ operators, and kernel contributors to the level of detail they need.
 | [Deployment guide](guides/deployment.md) | Recommended operational path and health verification |
 | [Configuration reference](reference/configuration.md) | Server, database, authentication, model, Runner, and observability settings |
 | [Troubleshooting](guides/troubleshooting.md) | First diagnostics for dependencies, server startup, and tests |
-| [Run projection repair](guides/run-projection-repair.md) | Repair procedure when a derived run view is stale |
 
 ## Develop and contribute
 
@@ -50,7 +53,6 @@ operators, and kernel contributors to the level of detail they need.
 | [Developer setup](quickstart/development.md) | Prerequisites, repository layout, local loop, and code conventions |
 | [Development workflow](guides/development-workflow.md) | Server-only, Server + User Runner, and Docker development profiles |
 | [Testing guide](guides/testing.md) | Offline, contract, online, and system test lanes |
-| [Offline router workflow](guides/model-router-offline.md) | Approved trace datasets, isolated paired evidence, and offline candidate training |
 | [Makefile reference](reference/makefile-commands.md) | Build, validation, test, and development targets |
 | [Dependencies](reference/dependencies.md) | Required and optional development tools |
 | [Repository automation](guides/repository-automation.md) | Maintainer contract for Mergify, branch protection, and external-fork delivery |

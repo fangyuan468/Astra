@@ -9,18 +9,40 @@ use crate::cli::session::session_startup;
 use crate::cli::session::session_state::SessionState;
 use astra_services::session_journal;
 
+pub(crate) fn turn_failure_diagnostic(failure: &crate::TurnFailure) -> String {
+    let mut message = match failure.partial.error_code.as_deref() {
+        Some(code) if failure.partial.server_admission_not_dispatched => {
+            format!("[{code}] {}", failure.error)
+        }
+        _ => failure.error.clone(),
+    };
+    append_cancelled_context_notice(&mut message, failure.partial.cancel_context_not_saved);
+    message
+}
+
+pub(crate) fn append_cancelled_context_notice(
+    message: &mut String,
+    observation: Option<Option<bool>>,
+) {
+    if let Some(observation) = observation
+        && let Some(notice) = super::turn_cancellation::cancelled_context_notice(observation)
+        && !message.contains(notice)
+    {
+        message.push_str("; ");
+        message.push_str(notice);
+    }
+}
+
 pub(crate) async fn reconcile_and_report_turn_failure(
     state: &mut SessionState,
-    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     line: &str,
     failure: &mut crate::TurnFailure,
     turn_start: Instant,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
 ) {
-    // A closed primary SSE fanout is not permission to lose a server-applied
-    // user intent. The dedicated control-tail observer owns that fact until
-    // either success or failure settlement consumes it.
+    // A closed primary stream can still have a server-applied user intent.
+    // Wait for any one-shot reconciliation before committing the failure.
     let active_run_control =
         astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control)
             .as_ref()
@@ -34,19 +56,12 @@ pub(crate) async fn reconcile_and_report_turn_failure(
                 "Turn failed before durable guidance disposition reconciliation completed; canonical server history remains authoritative.",
             );
         }
-        for intent in run_control.take_remotely_applied_user_intents() {
-            if !failure
-                .partial
-                .applied_user_intents
-                .iter()
-                .any(|existing| existing.intent_id == intent.intent_id)
-            {
-                failure.partial.applied_user_intents.push(intent);
-            }
-        }
+        crate::cli::stream::streaming_types::merge_applied_user_intents(
+            &mut failure.partial.applied_user_intents,
+            run_control.take_remotely_applied_user_intents(),
+        );
     }
 
-    reconcile_failure_accounting(api, profile, &mut failure.partial).await;
     report_turn_failure(state, profile, line, failure, turn_start, ui);
 }
 
@@ -63,8 +78,22 @@ pub(crate) fn report_admission_rejection(
 ) {
     let draft_restored =
         !line.trim().is_empty() && ui.restore_input(line, state.session_id.as_deref());
+    if failure.partial.error_code.as_deref() == Some("session_unavailable") {
+        let mut message = String::from("Session is unavailable\n");
+        if draft_restored {
+            message.push_str("  Your message was not sent; the draft is back in the composer.\n");
+        }
+        message.push_str(
+            "  Choose an available session, then send your message again.\n  No model or tool ran.",
+        );
+        ui.show_error(&message);
+        return;
+    }
     let metadata = failure.partial.error_metadata.as_ref();
-    if failure.partial.error_code.as_deref() == Some("session_writer_conflict") {
+    if matches!(
+        failure.partial.error_code.as_deref(),
+        Some("session_writer_conflict" | "session_execution_slot_occupied")
+    ) {
         let session_id = metadata
             .and_then(|value| value.get("session_id"))
             .and_then(serde_json::Value::as_str)
@@ -116,107 +145,6 @@ fn admission_rejection_message(draft_restored: bool) -> String {
     message
 }
 
-async fn reconcile_failure_accounting(
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    partial: &mut crate::PartialTurnData,
-) {
-    let Some(run_id) = partial
-        .run_id
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-    else {
-        return;
-    };
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    // Do not call fresh_access_token here. Its refresh writes auth.json and
-    // outlives this 5s deadline only when settlement is detached; starting it
-    // from a best-effort read is unnecessary and used to cancel mid-rotation.
-    let Some(token) = await_failure_reconciliation_before_deadline(
-        deadline,
-        crate::cli::session::session_runtime::access_token_without_refresh(profile),
-    )
-    .await
-    .flatten() else {
-        tracing::warn!(
-            run_id,
-            "durable failure accounting could not acquire authentication before the bounded reconciliation deadline"
-        );
-        return;
-    };
-    let mut backoff = std::time::Duration::from_millis(50);
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            tracing::warn!(
-                run_id,
-                "durable failure accounting did not settle before the bounded reconciliation deadline"
-            );
-            return;
-        }
-        let request_timeout = remaining.min(std::time::Duration::from_secs(1));
-        if let Ok(Ok(run)) = tokio::time::timeout(
-            request_timeout,
-            api.get_run_with_presented_bearer(&token, &run_id),
-        )
-        .await
-            && run
-                .get("accounting")
-                .is_some_and(|accounting| apply_durable_run_accounting(partial, accounting))
-        {
-            return;
-        }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            continue;
-        }
-        tokio::time::sleep(backoff.min(remaining)).await;
-        backoff = (backoff * 2).min(std::time::Duration::from_millis(500));
-    }
-}
-
-async fn await_failure_reconciliation_before_deadline<F>(
-    deadline: tokio::time::Instant,
-    future: F,
-) -> Option<F::Output>
-where
-    F: std::future::Future,
-{
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    if remaining.is_zero() {
-        return None;
-    }
-    tokio::time::timeout(remaining, future).await.ok()
-}
-
-fn apply_durable_run_accounting(
-    partial: &mut crate::PartialTurnData,
-    accounting: &serde_json::Value,
-) -> bool {
-    let read = |key: &str| accounting.get(key).and_then(serde_json::Value::as_u64);
-    let (Some(prompt), Some(completion), Some(cache_read), Some(cache_creation)) = (
-        read("prompt_tokens"),
-        read("completion_tokens"),
-        read("cache_read_tokens"),
-        read("cache_creation_tokens"),
-    ) else {
-        return false;
-    };
-    partial.prompt_tokens = prompt;
-    partial.completion_tokens = completion;
-    partial.cache_read_tokens = cache_read;
-    partial.cache_creation_tokens = cache_creation;
-    if let Some(count) = read("tool_call_count").and_then(|value| u32::try_from(value).ok()) {
-        partial.tool_calls_count = count;
-    }
-    partial.tool_outcomes = accounting
-        .get("tool_outcomes")
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok());
-    true
-}
-
 pub(crate) fn report_turn_failure(
     state: &mut SessionState,
     profile: Option<&str>,
@@ -235,6 +163,11 @@ pub(crate) fn report_turn_failure(
             crate::cli::theme::icon_err(),
             failure.error
         ));
+    }
+    if let Some(observation) = failure.partial.cancel_context_not_saved
+        && let Some(notice) = super::turn_cancellation::cancelled_context_notice(observation)
+    {
+        ui.show_warning(notice);
     }
 
     // A failed turn can still be a real, resumable session. Publish the
@@ -287,7 +220,10 @@ pub(crate) fn report_turn_failure(
         &failure.partial,
     );
     {
-        let error_kind = astra_core::ClassifiedError::from(failure.error.clone()).kind;
+        let error_kind = failure
+            .partial
+            .failure_kind
+            .unwrap_or_else(|| astra_core::ClassifiedError::from(failure.error.clone()).kind);
         err_event.metadata = Some(serde_json::json!({
             "error_kind": error_kind.as_str(),
             "retryable": error_kind.is_retryable(),
@@ -381,51 +317,11 @@ pub(crate) fn report_turn_failure(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        admission_rejection_message, apply_durable_run_accounting,
-        await_failure_reconciliation_before_deadline, reconcile_and_report_turn_failure,
-        reconcile_failure_accounting, report_admission_rejection, report_turn_failure,
-    };
+    use super::{admission_rejection_message, report_admission_rejection, report_turn_failure};
     use crate::cli::session::session_state::SessionState;
     use crate::tests::heavy_checkpoint_with_runtime_state;
     use astra_services::session_journal;
-    use std::time::{Duration, Instant};
-
-    #[tokio::test]
-    async fn failure_reconciliation_bounds_a_never_returning_token_refresh() {
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(25);
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            await_failure_reconciliation_before_deadline(
-                deadline,
-                std::future::pending::<Option<String>>(),
-            ),
-        )
-        .await
-        .expect("the shared failure deadline must bound token refresh");
-        assert_eq!(result, None);
-    }
-
-    fn tool_call_record(
-        name: &str,
-        ok: bool,
-        result_preview: Option<&str>,
-    ) -> session_journal::ToolCallRecord {
-        session_journal::ToolCallRecord {
-            name: name.into(),
-            ok,
-            ms: 0,
-            error: None,
-            input_bytes: None,
-            output_bytes: None,
-            args_preview: None,
-            result_preview: result_preview.map(str::to_string),
-            file_path: None,
-            surgically_removed: None,
-            original_tool_name: None,
-            ..Default::default()
-        }
-    }
+    use std::time::Instant;
 
     #[test]
     fn line_surface_does_not_claim_a_composer_restore() {
@@ -463,23 +359,77 @@ mod tests {
         };
         *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) =
             Some(control);
+        let _credentials = crate::tests::isolate_credentials();
+        let mut credentials = crate::cli::cli_config::cli_utils::CredentialsFile::default();
+        credentials.profiles.insert(
+            "default".into(),
+            crate::cli::cli_config::cli_utils::Profile {
+                access_token: Some("synthetic-observed-token".into()),
+                ..Default::default()
+            },
+        );
+        crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
+        let server = wiremock::MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let usage =
+            astra_turn_types::CanonicalTokenUsage::new(Some(17), None, None, Some(3)).unwrap();
         let mut failure = crate::TurnFailure {
             error: "callback failed".into(),
-            partial: crate::PartialTurnData::default(),
+            partial: crate::PartialTurnData {
+                run_id: Some("closed-failure".into()),
+                prompt_tokens: 17,
+                completion_tokens: 3,
+                qualified_usage: Some(usage),
+                applied_user_intents: vec![
+                    crate::cli::stream::streaming_types::AppliedStreamUserIntent {
+                        intent_id: "intent-newer".into(),
+                        delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                        status: astra_turn_types::UserIntentStatus::Applied,
+                        event_index: 30,
+                        content: "newer instruction".into(),
+                    },
+                ],
+                ..Default::default()
+            },
         };
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let ctx = crate::cli::turn::turn_entry::TurnContext {
+            api: &api,
+            profile: None,
+            post_commit_tx: None,
+            admission: None,
+            explain_analyze_terminal_degraded: None,
+        };
         let mut ui = crate::tests::TestUi::default();
-
-        reconcile_and_report_turn_failure(
+        let bound_session = state.session_id.clone().unwrap();
+        let mut dispatch = crate::cli::turn::turn_settlement::TurnDispatch {
+            ctx: &ctx,
+            line: "original",
+            effective_line: "original",
+            user_intent: "original",
+            input_runtime_required_texts: &[],
+            input_runtime_volatile_texts: &[],
+            token: "synthetic-observed-token",
+            session_id: &bound_session,
+            admitted_server_turn: None,
+            semantic_query_override: None,
+            turn_start: Instant::now(),
+            ui: &mut ui,
+            turn_usage_sink: None,
+            auth_owner: None,
+        };
+        crate::cli::turn::turn_settlement::settle_failed_turn(
             &mut state,
-            &api,
-            None,
-            "original",
+            &mut dispatch,
             &mut failure,
-            Instant::now(),
-            &mut ui,
         )
         .await;
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "failure reporting must not query accounting or refresh tokens"
+        );
+        assert_eq!(failure.partial.qualified_usage, Some(usage));
+        assert_eq!(failure.partial.prompt_tokens, 17);
+        assert_eq!(failure.partial.completion_tokens, 3);
 
         let intents = state
             .last_turn_event
@@ -490,6 +440,7 @@ mod tests {
             .expect("durable applied guidance");
         assert_eq!(intents[0]["intent_id"], "intent-failed-tail");
         assert_eq!(intents[0]["content"], "stop old work");
+        assert_eq!(intents[1]["intent_id"], "intent-newer");
         assert_eq!(
             state.history,
             vec![
@@ -501,208 +452,133 @@ mod tests {
                     "stop old work".to_string(),
                     "[Previous turn failed: callback failed]".to_string()
                 ),
+                (
+                    "newer instruction".to_string(),
+                    "[Previous turn failed: callback failed]".to_string()
+                ),
             ],
             "the online continuation must retain the same original+guidance facts as restart"
         );
     }
 
     #[test]
-    fn durable_run_accounting_replaces_latest_frame_lower_bound() {
-        let mut partial = crate::PartialTurnData {
-            prompt_tokens: 7_603,
-            completion_tokens: 315,
-            cache_read_tokens: 34_688,
-            tool_calls_count: 3,
-            ..Default::default()
-        };
-        let accounting = serde_json::json!({
-            "prompt_tokens": 47_955,
-            "cache_read_tokens": 35_000,
-            "cache_creation_tokens": 0,
-            "completion_tokens": 650,
-            "tool_call_count": 4,
-            "tool_outcomes": {
-                "requested": 4,
-                "executed": 3,
-                "succeeded": 2,
-                "failed": 1,
-                "rejected": 1,
-                "reused": 0,
-                "suppressed": 0,
-                "deferred": 0
-            }
-        });
-        assert!(apply_durable_run_accounting(&mut partial, &accounting));
-        assert_eq!(partial.prompt_tokens, 47_955);
-        assert_eq!(partial.cache_read_tokens, 35_000);
-        assert_eq!(partial.completion_tokens, 650);
-        assert_eq!(partial.tool_calls_count, 4);
-        let outcomes = partial.tool_outcomes.expect("typed tool outcomes");
-        assert_eq!(outcomes.requested, 4);
-        assert_eq!(outcomes.executed, 3);
-        assert_eq!(outcomes.rejected, 1);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn failure_accounting_uses_presented_native_token_without_refresh() {
-        use astra_credentials::native::{Environment, NativeSession, NativeStore, unix_now};
-        use std::os::unix::fs::PermissionsExt;
-        use wiremock::matchers::{header, method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        let origin = server.uri();
-        let issuer = format!("{origin}/realms/moi");
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let store = NativeStore::with_directory(directory.path().to_path_buf());
-        let saved = store.clone();
-        let session = NativeSession {
-            environment: Environment {
-                issuer: issuer.clone(),
-                astra_url: origin.clone(),
-                moi_url: origin.clone(),
-                authorization_endpoint: format!("{origin}/api/v1/uc/oauth2/authorize"),
-                token_endpoint: format!("{issuer}/protocol/openid-connect/token"),
-                revocation_endpoint: format!("{issuer}/protocol/openid-connect/revoke"),
-                jwks_uri: format!("{issuer}/protocol/openid-connect/certs"),
-            },
-            generation: "replaced-on-publish".into(),
-            subject: "subject-a".into(),
-            session_id: "sid-a".into(),
-            astra_user_id: "astra-a".into(),
-            moi_principal_id: "moi-a".into(),
-            catalog_user_id: "catalog-a".into(),
-            access_token: "presented-access-token".into(),
-            refresh_token: "refresh-must-not-be-sent".into(),
-            expires_at: unix_now().unwrap() + 30,
-            workspace_id: None,
-            role_id: None,
-            refresh_pending: false,
-        };
-        let (published, _) = store.publish(session).unwrap();
-        let binding = crate::cli::native_auth::binding_for_test(store, published);
-        let _active = crate::cli::native_auth::install_active_for_test(binding.clone());
-        Mock::given(method("POST"))
-            .and(path("/realms/moi/protocol/openid-connect/token"))
-            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
-            .expect(0)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/chat/runs/run-accounting"))
-            .and(header("authorization", "Bearer presented-access-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "accounting": {
-                    "prompt_tokens": 11,
-                    "completion_tokens": 4,
-                    "cache_read_tokens": 2,
-                    "cache_creation_tokens": 1
-                }
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let api = astra_thin_client::ThinClient::new(&origin, None)
-            .unwrap()
-            .with_bearer_provider(binding);
-        let mut partial = crate::PartialTurnData {
-            run_id: Some("run-accounting".into()),
-            ..Default::default()
-        };
-        reconcile_failure_accounting(&api, None, &mut partial).await;
-        assert_eq!(partial.prompt_tokens, 11);
-        assert_eq!(partial.completion_tokens, 4);
-        let current = saved.current().unwrap();
-        assert!(!current.refresh_pending);
-        assert_eq!(current.refresh_token, "refresh-must-not-be-sent");
-        assert_eq!(current.access_token, "presented-access-token");
-    }
-
-    #[test]
     fn report_turn_failure_persists_filtered_partial_metrics() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let sid = format!("test-turn-failure-{}", uuid::Uuid::new_v4());
-        let mut state = SessionState {
-            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
-            session_id: Some(sid.clone()),
-            model: Some("gpt-5".into()),
+        let qualified = session_journal::ToolOutcomeSummary {
+            requested: 2,
+            executed: 1,
+            succeeded: 1,
+            suppressed: 1,
             ..Default::default()
         };
-        let failure = crate::TurnFailure {
-            error: "model overloaded".into(),
-            partial: crate::PartialTurnData {
-                tool_call_records: vec![
-                    tool_call_record(
-                        "bash",
-                        false,
-                        Some("Skipped: the skill already completed this work."),
-                    ),
-                    tool_call_record("read_file", true, Some("contents")),
-                ],
-                tools_used: vec!["read_file".into()],
-                run_id: Some("run-failure-1".into()),
-                prompt_tokens: 13,
-                completion_tokens: 7,
-                tool_calls_count: 1,
-                partial_text: "Partial analysis".into(),
-                ..Default::default()
-            },
+        let mismatched = session_journal::ToolOutcomeSummary {
+            requested: 3,
+            executed: 1,
+            succeeded: 1,
+            suppressed: 2,
+            ..Default::default()
         };
+        // Two retained records do not prove complete run accounting. Only
+        // the qualified aggregate may supply the journal's executed count.
+        for (tool_outcomes, expected_count, expected_outcomes) in [
+            (Some(qualified.clone()), Some(1), Some(qualified)),
+            (None, None, None),
+            (Some(mismatched), None, None),
+        ] {
+            let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+            let sid = format!("test-turn-failure-{}", uuid::Uuid::new_v4());
+            let mut state = SessionState {
+                journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+                session_id: Some(sid.clone()),
+                model: Some("gpt-5".into()),
+                ..Default::default()
+            };
+            let failure = crate::TurnFailure {
+                error: "model overloaded".into(),
+                partial: crate::PartialTurnData {
+                    tool_call_records: vec![
+                        session_journal::ToolCallRecord {
+                            name: "bash".into(),
+                            disposition: Some(session_journal::ToolCallDisposition::Suppressed),
+                            skill_reentry_count: Some(1),
+                            result_preview: Some(
+                                "Skipped: the skill already completed this work.".into(),
+                            ),
+                            ..Default::default()
+                        },
+                        session_journal::ToolCallRecord {
+                            name: "read_file".into(),
+                            ok: true,
+                            disposition: Some(session_journal::ToolCallDisposition::Executed),
+                            result_preview: Some("contents".into()),
+                            ..Default::default()
+                        },
+                    ],
+                    tools_used: vec!["read_file".into()],
+                    run_id: Some("run-failure-1".into()),
+                    prompt_tokens: 13,
+                    completion_tokens: 7,
+                    tool_calls_count: 2,
+                    tool_outcomes,
+                    partial_text: "Partial analysis".into(),
+                    ..Default::default()
+                },
+            };
 
-        report_turn_failure(
-            &mut state,
-            None,
-            "show session metrics",
-            &failure,
-            Instant::now(),
-            &mut crate::cli::ui_adapter::LineUiAdapter,
-        );
+            report_turn_failure(
+                &mut state,
+                None,
+                "show session metrics",
+                &failure,
+                Instant::now(),
+                &mut crate::cli::ui_adapter::LineUiAdapter,
+            );
 
-        let event = state.last_turn_event.as_ref().expect("turn_error event");
-        assert_eq!(event.tool_count, Some(1));
-        assert_eq!(event.turn, Some(1));
-        assert_eq!(event.tools_used, Some(vec!["read_file".into()]));
-        assert_eq!(event.tokens_in, Some(13));
-        assert_eq!(event.tokens_out, Some(7));
-        assert_eq!(event.tool_calls.as_ref().map(Vec::len), Some(2));
-        assert_eq!(
-            state.turn, 1,
-            "failed turn settlement must advance the local turn cursor"
-        );
-        assert_eq!(state.history.len(), 1);
-        assert_eq!(
-            state.history[0],
-            (
-                "show session metrics".to_string(),
-                "[Previous turn failed: model overloaded]".to_string()
-            ),
-            "live continuation must use the same canonical TurnError projection as restart"
-        );
-        assert_eq!(
-            state.history,
-            crate::cli::session::session_runtime::turn_error_history_pairs(event),
-            "online and restart projections must remain byte-for-byte identical"
-        );
-        assert_eq!(state.last_response.as_deref(), Some("Partial analysis"));
+            let event = state.last_turn_event.as_ref().expect("turn_error event");
+            assert_eq!(event.tool_count, expected_count);
+            assert_eq!(event.tool_outcomes, expected_outcomes);
+            assert_eq!(event.turn, Some(1));
+            assert_eq!(event.tools_used, Some(vec!["read_file".into()]));
+            assert_eq!(event.tokens_in, Some(13));
+            assert_eq!(event.tokens_out, Some(7));
+            assert_eq!(event.tool_calls.as_ref().map(Vec::len), Some(2));
+            assert_eq!(
+                state.turn, 1,
+                "failed turn settlement must advance the local turn cursor"
+            );
+            assert_eq!(state.history.len(), 1);
+            assert_eq!(
+                state.history[0],
+                (
+                    "show session metrics".to_string(),
+                    "[Previous turn failed: model overloaded]".to_string()
+                ),
+                "live continuation must use the same canonical TurnError projection as restart"
+            );
+            assert_eq!(
+                state.history,
+                crate::cli::session::session_runtime::turn_error_history_pairs(event),
+                "online and restart projections must remain byte-for-byte identical"
+            );
+            assert_eq!(state.last_response.as_deref(), Some("Partial analysis"));
 
-        let events = session_journal::read_journal(&sid).unwrap();
-        let persisted = events.last().expect("persisted turn_error");
-        assert_eq!(persisted.tool_count, Some(1));
-        assert_eq!(persisted.tools_used, Some(vec!["read_file".into()]));
-        assert_eq!(persisted.tool_calls.as_ref().map(Vec::len), Some(2));
-        assert_eq!(
-            persisted.metadata.as_ref().unwrap()["run_id"],
-            "run-failure-1"
-        );
-        let scope = persisted
-            .producer_scope
-            .as_ref()
-            .expect("exact root producer");
-        assert_eq!(scope.run_id, "run-failure-1");
-        assert_eq!(scope.agent_id.as_deref(), Some("root"));
-        assert!(scope.parent_run_id.is_none());
+            let events = session_journal::read_journal(&sid).unwrap();
+            let persisted = events.last().expect("persisted turn_error");
+            assert_eq!(persisted.tool_count, expected_count);
+            assert_eq!(persisted.tool_outcomes, expected_outcomes);
+            assert_eq!(persisted.tools_used, Some(vec!["read_file".into()]));
+            assert_eq!(persisted.tool_calls.as_ref().map(Vec::len), Some(2));
+            assert_eq!(
+                persisted.metadata.as_ref().unwrap()["run_id"],
+                "run-failure-1"
+            );
+            let scope = persisted
+                .producer_scope
+                .as_ref()
+                .expect("exact root producer");
+            assert_eq!(scope.run_id, "run-failure-1");
+            assert_eq!(scope.agent_id.as_deref(), Some("root"));
+            assert!(scope.parent_run_id.is_none());
+        }
     }
 
     #[test]
@@ -954,6 +830,57 @@ mod tests {
         assert!(shown.contains("do not cancel"));
         assert!(!shown.contains("astra session cancel"));
         assert!(!shown.contains("astra --resume"));
+    }
+
+    #[test]
+    fn unavailable_session_rejection_restores_the_draft_with_appropriate_recovery() {
+        let mut state = SessionState {
+            session_id: Some("unavailable-session".into()),
+            ..Default::default()
+        };
+        let failure = crate::TurnFailure {
+            error: "Session unavailable".into(),
+            partial: crate::PartialTurnData {
+                error_code: Some("session_unavailable".into()),
+                admission_rejected: true,
+                ..Default::default()
+            },
+        };
+        let mut ui = crate::tests::TestUi::default();
+        report_admission_rejection(&mut state, "my unsent message", &failure, &mut ui);
+        assert_eq!(ui.restored_inputs, vec!["my unsent message"]);
+        assert_eq!(state.session_id.as_deref(), Some("unavailable-session"));
+        let shown = ui.errors.join("\n");
+        assert!(shown.contains("Session is unavailable"));
+        assert!(shown.contains("Choose an available session"));
+        assert!(shown.contains("No model or tool ran"));
+        assert!(
+            !shown.contains("busy") && !shown.contains("session cancel"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn occupied_execution_has_the_same_explicit_recovery_as_writer_conflict() {
+        let mut state = SessionState {
+            session_id: Some("session-blocked".into()),
+            ..Default::default()
+        };
+        let failure = crate::TurnFailure {
+            error: "conflict".into(),
+            partial: crate::PartialTurnData {
+                error_code: Some("session_execution_slot_occupied".into()),
+                admission_rejected: true,
+                ..Default::default()
+            },
+        };
+        let mut ui = crate::tests::TestUi::default();
+        report_admission_rejection(&mut state, "synthetic request", &failure, &mut ui);
+        assert_eq!(ui.restored_inputs, vec!["synthetic request"]);
+        let shown = ui.errors.join("\n");
+        assert!(shown.contains("Another run still owns this session"));
+        assert!(shown.contains("astra session cancel session-blocked"));
+        assert!(shown.contains("astra --resume session-blocked"));
     }
 
     #[test]

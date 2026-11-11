@@ -7,10 +7,9 @@ use super::{
     WorkBranchRecord, WorkBranchRecordParts, WorkBranchRevision, WorkBranchSubject,
     WorkBranchSubjectChange, WorkChangeReason, WorkChangeRef, WorkCriteriaChange, WorkDomainError,
     WorkEventPage, WorkEventQuery, WorkGoal, WorkId, WorkItemRevisionRef, WorkObservationQuery,
-    WorkObservationReport, WorkOwnerId, WorkPatchArtifact, WorkPatchArtifactBasisResource,
-    WorkPatchArtifactId, WorkPlanContext, WorkPlanProposalAcceptance, WorkProposalStatus,
-    WorkRecord, WorkRecordParts, WorkRevision, WorkSessionPlanBinding, WorkTaskExecutionSnapshot,
-    WorkTaskGraphPage, WorkTaskGraphQuery,
+    WorkObservationReport, WorkOwnerId, WorkPlanContext, WorkPlanProposalAcceptance,
+    WorkProposalStatus, WorkRecord, WorkRecordParts, WorkRevision, WorkSessionPlanBinding,
+    WorkTaskExecutionSnapshot, WorkTaskGraphPage, WorkTaskGraphQuery,
 };
 use astra_core::SharedPool;
 use async_trait::async_trait;
@@ -33,10 +32,8 @@ pub enum WorkConflictResource {
     CriterionSetRevision,
     GraphRevision,
     CriterionIdentity,
-    CriterionRevision,
     WorkItemIdentity,
     WorkItemRevision,
-    WorkItemEdge,
     CheckRunIdentity,
     AcceptanceDecisionIdentity,
     WorkEventSequence,
@@ -62,10 +59,6 @@ pub enum WorkRecoveryPointBlocker {
         "the branch plan basis is behind the current Work plan; refresh before saving progress"
     )]
     BranchBasisChanged,
-    #[error("the Work Session execution slot has no canonical Run")]
-    DanglingRunSlot,
-    #[error("the Work Session Run is missing its status")]
-    RunStatusMissing,
     #[error("the Work Run is still active; finish or pause it before saving progress")]
     ActiveRun,
     #[error("the Work Session still has an active turn reservation")]
@@ -159,10 +152,6 @@ pub enum WorkRepositoryError {
         operation: &'static str,
         #[source]
         source: sqlx::Error,
-    },
-    #[error("Work patch artifact conflict: {resource:?}")]
-    PatchArtifactConflict {
-        resource: WorkPatchArtifactBasisResource,
     },
     #[error("failed to encode canonical {entity}: {source}")]
     ManifestEncoding {
@@ -484,31 +473,6 @@ pub trait WorkRepository: Send + Sync {
         work_id: &WorkId,
         branch_id: &WorkBranchId,
     ) -> Result<Option<WorkBranchSubject>, WorkRepositoryError>;
-
-    async fn record_patch_artifact(
-        &self,
-        artifact: super::NewWorkPatchArtifact,
-    ) -> Result<WorkPatchArtifact, WorkRepositoryError>;
-
-    async fn load_patch_artifact(
-        &self,
-        owner_id: &WorkOwnerId,
-        work_id: &WorkId,
-        patch_artifact_id: &WorkPatchArtifactId,
-    ) -> Result<Option<WorkPatchArtifact>, WorkRepositoryError>;
-
-    async fn load_patch_artifact_content(
-        &self,
-        owner_id: &WorkOwnerId,
-        work_id: &WorkId,
-        branch_id: &WorkBranchId,
-        patch_artifact_id: &WorkPatchArtifactId,
-    ) -> Result<Option<super::WorkPatchArtifactContent>, WorkRepositoryError>;
-
-    async fn list_patch_artifacts(
-        &self,
-        query: super::WorkPatchArtifactQuery,
-    ) -> Result<super::WorkPatchArtifactPage, WorkRepositoryError>;
 
     async fn propose_plan(
         &self,
@@ -855,25 +819,8 @@ async fn insert_new_criteria(
         return Ok(());
     }
 
-    let mut identities =
-        QueryBuilder::<MySql>::new("INSERT INTO work_criteria (owner_id, work_id, criterion_id) ");
-    identities.push_values(criteria, |mut row, encoded| {
-        row.push_bind(owner_id.as_str())
-            .push_bind(work_id.as_str())
-            .push_bind(encoded.criterion.criterion_id.as_str());
-    });
-    identities
-        .build()
-        .execute(&mut **transaction)
-        .await
-        .map_err(|source| {
-            WorkRepositoryError::insert(
-                "insert criterion identities",
-                WorkConflictResource::CriterionIdentity,
-                source,
-            )
-        })?;
-
+    // Every identity starts at revision 1 and is retained for the Work lifetime.
+    // Its primary key is also the final identity fence if proposal admission races.
     let mut revisions = QueryBuilder::<MySql>::new(
         "INSERT INTO work_criterion_revisions
          (owner_id, work_id, criterion_id, revision, criterion_kind,
@@ -897,7 +844,7 @@ async fn insert_new_criteria(
         .map_err(|source| {
             WorkRepositoryError::insert(
                 "insert criterion revisions",
-                WorkConflictResource::CriterionRevision,
+                WorkConflictResource::CriterionIdentity,
                 source,
             )
         })?;
@@ -1613,27 +1560,34 @@ async fn lock_bindable_existing_session(
         return Err(WorkRepositoryError::SessionNotBindable);
     }
 
-    let active_run: Option<String> = query(
-        "SELECT run_id
-         FROM agent_session_execution_slots
-         WHERE user_id = ? AND session_id = ?
-         LIMIT 1
-         FOR UPDATE",
+    if !crate::storage::session_execution_activity(
+        transaction,
+        genesis.owner_id.as_str(),
+        genesis.session_id.as_str(),
+        expected_active_run_id,
     )
-    .bind(genesis.owner_id.as_str())
-    .bind(genesis.session_id.as_str())
-    .fetch_optional(&mut **transaction)
     .await
-    .map_err(|source| {
-        WorkRepositoryError::persistence("check existing session execution slot", source)
-    })?
-    .map(|row| row.try_get("run_id"))
-    .transpose()
-    .map_err(|source| WorkRepositoryError::corrupt("existing session execution slot", source))?;
-    match (active_run.as_deref(), expected_active_run_id) {
-        (None, None) => {}
-        (Some(actual), Some(expected)) if actual == expected => {}
-        _ => return Err(WorkRepositoryError::SessionBusy),
+    .map_err(|source| WorkRepositoryError::persistence("check existing session execution", source))?
+    .is_idle()
+    {
+        return Err(WorkRepositoryError::SessionBusy);
+    }
+    if let Some(expected) = expected_active_run_id {
+        let owned_coordinator: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ?
+             AND status = 'running' AND parent_run_id IS NULL AND retry_of IS NULL
+             AND delegation_id IS NULL AND agent_id IS NULL
+             AND owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6) LIMIT 1 FOR UPDATE",
+        )
+        .bind(genesis.owner_id.as_str())
+        .bind(genesis.session_id.as_str())
+        .bind(expected)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|source| WorkRepositoryError::persistence("lock Work coordinator", source))?;
+        if owned_coordinator.is_none() {
+            return Err(WorkRepositoryError::SessionBusy);
+        }
     }
 
     let session_project = session
@@ -1653,7 +1607,7 @@ async fn lock_bindable_existing_session(
     Ok(())
 }
 
-/// Bind the exact slot-owning coordinator run to the Work it just created.
+/// Bind the exact admitted coordinator Run to the Work it just created.
 ///
 /// The run is deliberately not assigned to the root WorkItem: establishing
 /// and coordinating a plan is not evidence that the user's root outcome was
@@ -1685,7 +1639,7 @@ async fn bind_running_session_run(
         WorkRepositoryError::persistence("bind running session run to Work genesis", source)
     })?;
     if result.rows_affected() != 1 {
-        // The execution slot establishes which run has authority. Requiring
+        // Admission establishes the exact live coordinator. Requiring
         // its exact unbound durable row prevents a Work that subsequent child
         // runs cannot inherit and prevents rebinding an existing run lineage.
         return Err(WorkRepositoryError::SessionBusy);
@@ -1850,52 +1804,6 @@ impl WorkRepository for DatabaseWorkRepository {
         branch_id: &WorkBranchId,
     ) -> Result<Option<WorkBranchSubject>, WorkRepositoryError> {
         super::subject_repository::load_branch_subject(self, owner_id, work_id, branch_id).await
-    }
-
-    async fn record_patch_artifact(
-        &self,
-        artifact: super::NewWorkPatchArtifact,
-    ) -> Result<WorkPatchArtifact, WorkRepositoryError> {
-        super::patch_artifact_repository::record_patch_artifact(self, artifact).await
-    }
-
-    async fn load_patch_artifact(
-        &self,
-        owner_id: &WorkOwnerId,
-        work_id: &WorkId,
-        patch_artifact_id: &WorkPatchArtifactId,
-    ) -> Result<Option<WorkPatchArtifact>, WorkRepositoryError> {
-        super::patch_artifact_repository::load_patch_artifact(
-            self,
-            owner_id,
-            work_id,
-            patch_artifact_id,
-        )
-        .await
-    }
-
-    async fn load_patch_artifact_content(
-        &self,
-        owner_id: &WorkOwnerId,
-        work_id: &WorkId,
-        branch_id: &WorkBranchId,
-        patch_artifact_id: &WorkPatchArtifactId,
-    ) -> Result<Option<super::WorkPatchArtifactContent>, WorkRepositoryError> {
-        super::patch_artifact_repository::load_patch_artifact_content(
-            self,
-            owner_id,
-            work_id,
-            branch_id,
-            patch_artifact_id,
-        )
-        .await
-    }
-
-    async fn list_patch_artifacts(
-        &self,
-        query: super::WorkPatchArtifactQuery,
-    ) -> Result<super::WorkPatchArtifactPage, WorkRepositoryError> {
-        super::patch_artifact_repository::list_patch_artifacts(self, query).await
     }
 
     async fn propose_plan(

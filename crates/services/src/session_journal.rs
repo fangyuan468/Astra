@@ -921,6 +921,14 @@ pub enum RuntimeWorkEstablishmentReceipt {
 /// Per-tool-call audit record, embedded in turn events for granular tracking.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ToolCallRecord {
+    /// Producer-frozen invocation equality, never execution or storage authority.
+    /// Invalid optional identity must not discard the surrounding audit record.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_observed_invocation_identity"
+    )]
+    pub invocation_identity: Option<astra_turn_types::ToolInvocationIdentity>,
     /// Producer-owned causality frozen before dispatch; never execution authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_attribution: Option<crate::runs::WorkInvocationAttribution>,
@@ -931,6 +939,10 @@ pub struct ToolCallRecord {
     /// Runtime-authored presentation guidance, never appended to result_full.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_advisories: Vec<String>,
+    /// Source-authored cause and recovery facts, retained when result bodies
+    /// are compacted. This is diagnostic evidence, never retry authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_evidence: Option<astra_core::ToolFailureEvidence>,
     /// Full guidance authority when runtime_advisories carries its bounded preview.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_advisory_artifact: Option<ToolResultArtifactDescriptor>,
@@ -940,9 +952,13 @@ pub struct ToolCallRecord {
     pub tool_call_id: Option<String>,
     /// Tool name.
     pub name: String,
-    /// Whether the observed outcome is successful. For execution accounting,
-    /// consult `disposition`: reused/deferred/suppressed calls did not execute.
+    /// Whether the observed result was successfully delivered and accepted.
+    /// For execution accounting, consult `disposition` as well.
     pub ok: bool,
+    /// Execution outcome when it differs from result delivery. This prevents
+    /// a delivery failure from hiding a completed side effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_ok: Option<bool>,
     /// Execution time in milliseconds.
     pub ms: u64,
     /// Error message if the call failed (first 500 chars).
@@ -1078,11 +1094,6 @@ pub struct ToolCallRecord {
     pub workspace_mutation_partial: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_mutation_partial_paths: Option<Vec<String>>,
-    /// Validated executor-authored fact that a best-effort inferred source was
-    /// modified or deleted.  This is advisory recovery state, not proof that
-    /// the tool failed and not authority to roll the change back implicitly.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_preimage_recovery: Option<serde_json::Value>,
     /// Source-authored error classification. This remains typed across
     /// runtime, journal, ingestion, and reflection boundaries so downstream
     /// systems never need to infer control semantics from error prose.
@@ -1096,6 +1107,16 @@ pub struct ToolCallRecord {
     /// cannot establish that dispatch did not happen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_dispatch_rejection: Option<ToolPreDispatchRejection>,
+}
+
+fn deserialize_observed_invocation_identity<'de, D>(
+    deserializer: D,
+) -> Result<Option<astra_turn_types::ToolInvocationIdentity>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 impl fmt::Debug for ToolCallRecord {
@@ -1134,6 +1155,10 @@ pub enum ToolCallDisposition {
 #[serde(rename_all = "snake_case")]
 pub enum ToolPreDispatchRejection {
     ProviderSchemaValidation,
+    /// The executor explicitly reported an unavailable capability without
+    /// starting execution or leaving possible side effects. This is retry
+    /// evidence only, never a successful execution or observation.
+    CapabilityUnavailable,
 }
 
 impl ToolCallDisposition {
@@ -1245,6 +1270,20 @@ impl ToolCallRecord {
 
     pub fn was_executed(&self) -> bool {
         self.effective_disposition() == ToolCallDisposition::Executed
+    }
+
+    /// Explicit outcome uncertainty outranks process exit/result facts. It
+    /// remains evidence, not permission to retry or a separate run lifecycle.
+    pub fn outcome_is_unknown(&self) -> bool {
+        self.error_kind == Some(astra_core::ErrorKind::ToolOutcomeUnknown)
+            || self.recovery_evidence.as_ref().is_some_and(|evidence| {
+                evidence.cause == astra_core::ToolFailureCause::OutcomeUnknown
+            })
+    }
+
+    /// A result can fail delivery after the underlying operation succeeded.
+    pub fn execution_succeeded(&self) -> bool {
+        self.was_executed() && self.execution_ok.unwrap_or(self.ok)
     }
 
     /// Canonical terminal lifecycle event for this record.
@@ -1894,9 +1933,16 @@ pub struct SessionExecutionLease {
 
 impl SessionExecutionLease {
     pub fn try_acquire(session_id: &str) -> Result<Self, SessionExecutionLeaseError> {
-        let owner_scope = OwnerScope::local_user();
+        Self::try_acquire_for_owner(&OwnerScope::local_user(), session_id)
+    }
+
+    /// Acquire the same execution fence for an already captured local owner.
+    pub fn try_acquire_for_owner(
+        owner_scope: &OwnerScope,
+        session_id: &str,
+    ) -> Result<Self, SessionExecutionLeaseError> {
         let journal_path =
-            journal_file_path_for_owner(&owner_scope, session_id).map_err(|source| {
+            journal_file_path_for_owner(owner_scope, session_id).map_err(|source| {
                 SessionExecutionLeaseError::Io {
                     session_id: session_id.to_string(),
                     source,
@@ -1907,7 +1953,7 @@ impl SessionExecutionLease {
         // macOS relies on the stable owner-local file fence and returns unit.
         #[allow(clippy::let_unit_value)]
         let _kernel_authority =
-            acquire_execution_kernel_authority(&owner_scope, &journal_path, session_id)?;
+            acquire_execution_kernel_authority(owner_scope, &journal_path, session_id)?;
         let created_parent_dirs = journal_path
             .parent()
             .map(missing_directories_before_create)
@@ -11462,6 +11508,51 @@ mod turn_event_buffer_tests {
     }
 
     #[test]
+    fn tool_call_identity_is_optional_validated_observation() {
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "owner", "session", "run", "chain", "call",
+        )
+        .unwrap();
+        let record = ToolCallRecord {
+            name: "bash".into(),
+            ok: false,
+            tool_call_id: Some("call".into()),
+            invocation_identity: Some(identity.clone()),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&record).unwrap();
+        let restored: ToolCallRecord = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(restored.invocation_identity, Some(identity));
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!("bad"),
+            serde_json::json!({"user_id":"owner", "session_id":"session",
+                "run_id":"run", "turn_chain_id":" ", "invocation_id":"call"}),
+        ] {
+            let mut raw = encoded.clone();
+            raw["invocation_identity"] = invalid;
+            let retained: ToolCallRecord = serde_json::from_value(raw).unwrap();
+            assert!(retained.invocation_identity.is_none());
+            assert!(retained.was_executed());
+            assert_eq!(retained.name, "bash");
+        }
+        let mut absent = encoded;
+        absent
+            .as_object_mut()
+            .unwrap()
+            .remove("invocation_identity");
+        let retained: ToolCallRecord = serde_json::from_value(absent).unwrap();
+        assert!(retained.invocation_identity.is_none());
+        assert!(
+            serde_json::to_value(retained)
+                .unwrap()
+                .get("invocation_identity")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn tool_call_record_keeps_live_authority_out_of_durable_json() {
         let raw = r#"{"command":"tool --token secret-token-value"}"#;
         let safe = r#"{"command":"tool --token [REDACTED:TOKEN_ARGUMENT]"}"#;
@@ -11967,6 +12058,26 @@ mod turn_event_buffer_tests {
             classify_canonical_commit_presence(&[event], 0, 1, &commit),
             CanonicalCommitPresence::Exact
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn explicit_owner_execution_lease_uses_the_existing_owner_local_fence() {
+        let root = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(root.path());
+        let sid = "execution-lease-explicit-owner";
+        let current = OwnerScope::local_user();
+        let captured = SessionExecutionLease::try_acquire_for_owner(&current, sid).unwrap();
+        assert!(matches!(
+            SessionExecutionLease::try_acquire(sid),
+            Err(SessionExecutionLeaseError::Conflict { .. })
+        ));
+        let other = OwnerScope::user("independent-explicit-lease-owner").unwrap();
+        assert_ne!(current, other);
+        let independent = SessionExecutionLease::try_acquire_for_owner(&other, sid).unwrap();
+        drop(captured);
+        assert!(SessionExecutionLease::try_acquire(sid).is_ok());
+        drop(independent);
     }
 
     #[test]

@@ -740,6 +740,7 @@ async fn handle_chat_message(
             &conn.principal.origin,
             astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(_)
         ),
+        Some(&conn.principal),
     )
     .await
     {
@@ -814,6 +815,9 @@ async fn handle_attach_run(
     run_id: &str,
     last_index: u32,
 ) {
+    if !authorize_ws_run(socket, state, conn, run_id).await {
+        return;
+    }
     let record = match state
         .execution
         .run_lifecycle_service
@@ -851,6 +855,22 @@ async fn handle_attach_run(
     conn.active_run_id = None;
 }
 
+async fn authorize_ws_run(
+    socket: &mut WebSocket,
+    state: &AppState,
+    conn: &WsConnection,
+    run_id: &str,
+) -> bool {
+    match super::run::handlers::authorize_provider_run_session(state, &conn.principal, run_id).await
+    {
+        Ok(()) => true,
+        Err((status, error)) => {
+            send_msg(socket, &ws_error_from_status(status, error.0.detail)).await;
+            false
+        }
+    }
+}
+
 async fn inject_ws_effective_runtime_context(
     state: &AppState,
     conn: &WsConnection,
@@ -866,6 +886,9 @@ async fn handle_cancel_run(
     conn: &WsConnection,
     run_id: &str,
 ) {
+    if !authorize_ws_run(socket, state, conn, run_id).await {
+        return;
+    }
     match state
         .execution
         .run_lifecycle_service
@@ -888,6 +911,9 @@ async fn handle_pause_run(
     run_id: &str,
     emit_ack: bool,
 ) {
+    if !authorize_ws_run(socket, state, conn, run_id).await {
+        return;
+    }
     match state
         .execution
         .run_lifecycle_service
@@ -918,6 +944,9 @@ async fn handle_resume_run(
     run_id: &str,
     emit_ack: bool,
 ) {
+    if !authorize_ws_run(socket, state, conn, run_id).await {
+        return;
+    }
     match state
         .execution
         .run_lifecycle_service
@@ -1302,7 +1331,7 @@ fn build_ws_chat_request(message: WsChatMessage) -> astra_services::runs::ChatRe
         execution_budget,
         execution_time_budget: None,
         admitted_execution_deadline: None,
-        conversation_authority: None,
+
         execution_policy: Default::default(),
         explain,
         interaction_mode,
@@ -2399,6 +2428,7 @@ mod tests {
             run_id: "run-1".into(),
             status: STATUS_CANCELLED.into(),
             execution_settled: true,
+            context_not_saved: None,
         };
 
         match cancel_run_outcome_message(&record) {
@@ -2413,6 +2443,7 @@ mod tests {
             run_id: "run-1".into(),
             status: STATUS_COMPLETED.into(),
             execution_settled: true,
+            context_not_saved: None,
         };
 
         match cancel_run_outcome_message(&record) {
@@ -2435,6 +2466,7 @@ mod tests {
             run_id: "run-1".into(),
             status: "cancellation_requested".into(),
             execution_settled: false,
+            context_not_saved: None,
         };
 
         match cancel_run_outcome_message(&record) {

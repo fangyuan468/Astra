@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use astra_core::SharedPool;
 use astra_services::{SessionArtifactJsonRecord, SessionArtifactJsonStore, SessionArtifactStore};
 use serde_json::{Value, json};
 
@@ -37,34 +36,26 @@ fn sanitize_component(raw: &str) -> String {
 pub(crate) fn session_full_llm_capture_enabled(
     metadata: Option<&serde_json::Map<String, Value>>,
 ) -> bool {
+    session_full_llm_capture_override_enabled(session_capture_override(metadata))
+}
+
+pub(crate) fn session_full_llm_capture_override_enabled(capture: Option<bool>) -> bool {
     resolve_full_llm_capture_enabled(
-        metadata,
+        capture,
         astra_config::runtime_config::RuntimeConfig::cached()
             .trace
             .category_enabled(astra_config::runtime_config::TraceCategory::LlmExchanges),
     )
 }
 
-fn resolve_full_llm_capture_enabled(
-    metadata: Option<&serde_json::Map<String, Value>>,
-    default_enabled: bool,
-) -> bool {
+fn resolve_full_llm_capture_enabled(capture: Option<bool>, default_enabled: bool) -> bool {
+    capture.unwrap_or(default_enabled)
+}
+
+fn session_capture_override(metadata: Option<&serde_json::Map<String, Value>>) -> Option<bool> {
     metadata
         .and_then(|metadata| metadata.get(FULL_LLM_CAPTURE_METADATA_KEY))
         .and_then(Value::as_bool)
-        .unwrap_or(default_enabled)
-}
-
-fn prompt_request_delta_persistence_enabled_for_trace(
-    trace: &astra_config::runtime_config::SessionTraceConfig,
-) -> bool {
-    trace.category_enabled(astra_config::runtime_config::TraceCategory::PromptAssembly)
-}
-
-fn prompt_request_delta_persistence_enabled() -> bool {
-    prompt_request_delta_persistence_enabled_for_trace(
-        &astra_config::runtime_config::RuntimeConfig::cached().trace,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -73,6 +64,10 @@ pub(crate) fn build_capture_request_json(
     tools: &[Value],
     max_output_tokens: Option<usize>,
 ) -> Value {
+    let messages: Vec<_> = messages
+        .iter()
+        .map(astra_core::model_wire::responses::without_continuation)
+        .collect();
     json!({
         "message_count": messages.len(),
         "tool_count": tools.len(),
@@ -332,33 +327,6 @@ pub(crate) async fn persist_configured_capture_or_log(
     }
 }
 
-pub(crate) async fn persist_prompt_request_plan_or_log(
-    context: &'static str,
-    shared_pool: Option<SharedPool>,
-    input: astra_services::PromptRequestPersistInput,
-    plan: astra_services::PromptRequestPlan,
-) {
-    if !prompt_request_delta_persistence_enabled() {
-        return;
-    }
-    let Some(shared_pool) = shared_pool else {
-        return;
-    };
-    if let Err(error) = astra_services::persist_prompt_request(&shared_pool, &input, &plan).await {
-        let pool_stats = shared_pool.stats();
-        tracing::error!(
-            target: "astra_runtime::prompt_delta",
-            %context,
-            request_id = %plan.request_id,
-            db_pool_max = pool_stats.max_connections,
-            db_pool_size = pool_stats.size,
-            db_pool_idle = pool_stats.num_idle,
-            error = %error,
-            "failed to persist prompt request delta"
-        );
-    }
-}
-
 fn capture_file_path(
     session_id: &str,
     user_id: &str,
@@ -508,10 +476,22 @@ pub(crate) fn persist_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_config::runtime_config::{SessionTraceConfig, TraceCategory, TraceProfile};
     use astra_services::{StoredSessionArtifact, session_journal::JournalDirGuard};
     use async_trait::async_trait;
     use tempfile::tempdir;
+
+    #[test]
+    fn capture_does_not_export_private_continuation() {
+        let messages = vec![
+            json!({"role":"assistant", "content":"working", "_astra_responses":{
+                "items":[{"type":"reasoning", "content":[{"type":"reasoning_text", "text":"private"}]}]
+            }}),
+        ];
+        let capture = build_capture_request_json(&messages, &[], None);
+        assert_eq!(capture["messages"][0]["content"], "working");
+        assert!(!capture.to_string().contains("reasoning_text"));
+        assert!(messages[0].get("_astra_responses").is_some());
+    }
 
     #[derive(Default)]
     struct RecordingArtifactStore {
@@ -545,8 +525,6 @@ mod tests {
                 retention_policy: Some("default".into()),
                 retention_until: None,
                 status: Some("active".into()),
-                referenced_by_manifest_count: 0,
-                referenced_by_state_items_count: 0,
                 referenced_by_citation_count: 0,
                 referenced_by_durable_count: 0,
                 created_at: None,
@@ -597,29 +575,6 @@ mod tests {
                 next_cursor: None,
             })
         }
-    }
-
-    #[test]
-    fn prompt_request_delta_db_persistence_follows_prompt_assembly_trace_category() {
-        let production = SessionTraceConfig::default();
-        assert!(
-            !prompt_request_delta_persistence_enabled_for_trace(&production),
-            "production/default trace profile must not write prompt delta diagnostics"
-        );
-
-        let dev = SessionTraceConfig::default().apply_profile(TraceProfile::Dev);
-        assert!(
-            prompt_request_delta_persistence_enabled_for_trace(&dev),
-            "dev trace profile enables all diagnostic persistence categories"
-        );
-
-        let custom = SessionTraceConfig {
-            profile: TraceProfile::Custom,
-            enabled_categories: vec![TraceCategory::PromptAssembly],
-            ..SessionTraceConfig::default()
-        }
-        .normalize();
-        assert!(prompt_request_delta_persistence_enabled_for_trace(&custom));
     }
 
     #[test]
@@ -674,9 +629,12 @@ mod tests {
             json!("true"),
         )]);
 
-        assert!(resolve_full_llm_capture_enabled(Some(&enabled), false));
-        assert!(!resolve_full_llm_capture_enabled(Some(&disabled), true));
-        assert!(!resolve_full_llm_capture_enabled(Some(&wrong_type), false));
+        assert_eq!(session_capture_override(Some(&enabled)), Some(true));
+        assert_eq!(session_capture_override(Some(&disabled)), Some(false));
+        assert_eq!(session_capture_override(Some(&wrong_type)), None);
+        assert_eq!(session_capture_override(None), None);
+        assert!(resolve_full_llm_capture_enabled(Some(true), false));
+        assert!(!resolve_full_llm_capture_enabled(Some(false), true));
         assert!(!resolve_full_llm_capture_enabled(None, false));
         assert!(resolve_full_llm_capture_enabled(None, true));
     }

@@ -11,9 +11,9 @@ use tower::util::ServiceExt;
 
 use super::harness::{
     MATRIX_E2E_EDGE_WORKSPACE_ROOT, MatrixE2eCtx, cleanup_edge_registry, cleanup_session_data,
-    delete_no_content, get_json, maybe_tool_result_payload_from_sse, parse_sse_events, post_empty,
-    post_json, post_json_with_headers, put_json, row_get_opt_i64, row_get_opt_str, row_get_str,
-    seed_pending_approval, seeded_model_selection, tool_result_payload, wait_for_agent_event_types,
+    get_json, maybe_tool_result_payload_from_sse, parse_sse_events, post_empty, post_json,
+    post_json_with_headers, put_json, seed_pending_approval, seeded_model_selection,
+    tool_result_payload, wait_for_agent_event_types,
 };
 
 async fn run_tool_backed_chat_turn(
@@ -107,7 +107,7 @@ async fn run_tool_backed_chat_turn(
         if !posted_result
             && let Some(payload) = maybe_tool_result_payload_from_sse(
                 s.as_ref(),
-                "ctx-trace-tool-1",
+                &json!({"path":"README.md"}),
                 &ctx.edge_agent_id,
                 "completed",
                 "# README\nfrom tool-backed matrix e2e\n",
@@ -217,6 +217,10 @@ pub async fn run_product_matrix_full_journey(
         "snapshot.health.status: {plat}"
     );
     assert!(plat["timestamp"].is_string(), "snapshot.timestamp: {plat}");
+    assert!(
+        plat.get("agents").is_none(),
+        "retired catalog must not appear in the platform snapshot: {plat}"
+    );
 
     let (st_au_sum, au_sum) = get_json(
         app,
@@ -290,105 +294,22 @@ pub async fn run_product_matrix_full_journey(
     .await;
     assert_eq!(st_mkt, StatusCode::OK, "marketplace installed: {mkt_j}");
 
-    // Per-run skill name so parallel E2E processes do not contend on global marketplace stats rows.
-    let mkt_probe_skill = format!("e2e_matrix_mkt_{suffix}");
-    let (st_qr, qr_j) = post_json(
+    for path in ["/marketplace/search", "/marketplace/stats/example"] {
+        let (status, _) = get_json(app, path, Some(auth_header), &[]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "retired route: {path}");
+    }
+    let (status, _) = post_json(
         app,
         "/marketplace/quality-report",
         Some(auth_header),
-        json!({
-            "skill_name": mkt_probe_skill.as_str(),
-            "skill_version": "1.0.0",
-            "runtime_version": "matrix-e2e",
-            "success_rate": 0.95,
-            "avg_tokens": 120.0,
-            "invocation_count": 3
-        }),
+        json!({}),
     )
     .await;
-    assert_eq!(
-        st_qr,
-        StatusCode::NO_CONTENT,
-        "marketplace quality report: {qr_j}"
-    );
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
-    let (st_mst, mst_j) = get_json(
-        app,
-        &format!("/marketplace/stats/{mkt_probe_skill}"),
-        None,
-        &[],
-    )
-    .await;
-    assert_eq!(st_mst, StatusCode::OK, "marketplace skill stats: {mst_j}");
-    assert_eq!(mst_j["skill_name"].as_str(), Some(mkt_probe_skill.as_str()));
-
-    let (st_msearch, ms_j) = get_json(app, "/marketplace/search?limit=10", None, &[]).await;
-    assert_eq!(st_msearch, StatusCode::OK, "marketplace search: {ms_j}");
-    assert!(ms_j["results"].is_array(), "search results: {ms_j}");
-
-    let (st_agent, agent_j) = post_json(
-        app,
-        "/agents",
-        Some(auth_header),
-        json!({
-            "name": "matrix-crud-agent",
-            "agent_config": { "suite": "matrix" },
-            "data_source": { "type": "matrixone", "database": ctx.matrixone_database.clone() }
-        }),
-    )
-    .await;
-    assert_eq!(st_agent, StatusCode::CREATED, "create agent: {agent_j}");
-    let agent_id = agent_j["agent_id"].as_str().expect("agent_id").to_string();
-
-    let agent_db =
-        sqlx::query("SELECT agent_name, owner_user_id FROM agent_agents WHERE agent_id = ?")
-            .bind(&agent_id)
-            .fetch_optional(pool)
-            .await
-            .expect("agent_agents select");
-    let agent_db = agent_db.expect("agent row");
-    assert_eq!(
-        agent_db.try_get::<String, _>("agent_name").ok().as_deref(),
-        Some("matrix-crud-agent")
-    );
-    assert_eq!(
-        agent_db
-            .try_get::<String, _>("owner_user_id")
-            .ok()
-            .as_deref(),
-        Some(user_id.as_str())
-    );
-
-    let (st_get_ag, got_ag) =
-        get_json(app, &format!("/agents/{agent_id}"), Some(auth_header), &[]).await;
-    assert_eq!(st_get_ag, StatusCode::OK, "get agent: {got_ag}");
-    assert_eq!(got_ag["name"].as_str(), Some("matrix-crud-agent"));
-
-    let (st_put_ag, put_ag) = put_json(
-        app,
-        &format!("/agents/{agent_id}"),
-        Some(auth_header),
-        json!({ "name": "matrix-crud-agent-renamed" }),
-    )
-    .await;
-    assert_eq!(st_put_ag, StatusCode::OK, "put agent: {put_ag}");
-    assert_eq!(
-        put_ag["name"].as_str(),
-        Some("matrix-crud-agent-renamed"),
-        "agent update response: {put_ag}"
-    );
-    let agent_renamed = sqlx::query("SELECT agent_name FROM agent_agents WHERE agent_id = ?")
-        .bind(&agent_id)
-        .fetch_one(pool)
-        .await
-        .expect("agent_agents after rename");
-    assert_eq!(
-        agent_renamed
-            .try_get::<String, _>("agent_name")
-            .ok()
-            .as_deref(),
-        Some("matrix-crud-agent-renamed")
-    );
+    let (status, _) = post_json(app, "/agents", Some(auth_header), json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let agent_id = edge_agent_id.clone();
 
     let (st_ev, ev_j) = post_json(
         app,
@@ -461,147 +382,6 @@ pub async fn run_product_matrix_full_journey(
                 .any(|e| e["event_id"].as_str() == Some(manual_event_id.as_str()))
         }),
         "manual event missing in list: {ev_sess}"
-    );
-
-    let (st_dv_chain, dv_chain) = get_json(
-        app,
-        &format!("/data-versioning/lineage/{manual_event_id}/chain"),
-        Some(auth_header),
-        &[],
-    )
-    .await;
-    assert_eq!(
-        st_dv_chain,
-        StatusCode::OK,
-        "data-versioning lineage chain: {dv_chain}"
-    );
-    assert!(
-        dv_chain.as_array().is_some_and(|a| !a.is_empty()),
-        "expected non-empty lineage for manual event: {dv_chain}"
-    );
-
-    let (st_dv_up, dv_up) = get_json(
-        app,
-        &format!("/data-versioning/lineage/{manual_event_id}/upstream"),
-        Some(auth_header),
-        &[],
-    )
-    .await;
-    assert_eq!(
-        st_dv_up,
-        StatusCode::OK,
-        "data-versioning upstream lineage: {dv_up}"
-    );
-
-    let (st_ctx, ctx_j) = post_json(
-        app,
-        "/context",
-        Some(auth_header),
-        json!({
-            "session_id": session_id,
-            "event_id": manual_event_id,
-            "context_data": { "window": "matrix", "tokens": 42 }
-        }),
-    )
-    .await;
-    assert_eq!(st_ctx, StatusCode::CREATED, "context snapshot: {ctx_j}");
-    let context_capture_id = ctx_j["context_capture_id"]
-        .as_str()
-        .expect("context_capture_id")
-        .to_string();
-
-    let snap_row =
-        sqlx::query("SELECT session_id, event_id FROM ctx_snapshots WHERE context_capture_id = ?")
-            .bind(&context_capture_id)
-            .fetch_optional(pool)
-            .await
-            .expect("ctx_snapshots");
-    let snap_row = snap_row.expect("ctx_snapshots row");
-    assert_eq!(
-        snap_row.try_get::<String, _>("session_id").ok().as_deref(),
-        Some(session_id.as_str())
-    );
-    assert_eq!(
-        snap_row.try_get::<String, _>("event_id").ok().as_deref(),
-        Some(manual_event_id.as_str())
-    );
-
-    let (st_get_ctx, got_ctx) = get_json(
-        app,
-        &format!("/context/{context_capture_id}"),
-        Some(auth_header),
-        &[],
-    )
-    .await;
-    assert_eq!(st_get_ctx, StatusCode::OK, "get snapshot: {got_ctx}");
-
-    let (st_dec, dec_j) = post_json(
-        app,
-        "/decisions",
-        Some(auth_header),
-        json!({
-            "session_id": session_id,
-            "event_id": manual_event_id,
-            "context_capture_id": context_capture_id,
-            "decision_type": "e2e_matrix_decision",
-            "decision_output": { "choice": "path_a" },
-            "model_params": { "temperature": 0.1 }
-        }),
-    )
-    .await;
-    assert_eq!(st_dec, StatusCode::CREATED, "record decision: {dec_j}");
-    let decision_id = dec_j["decision_id"]
-        .as_str()
-        .expect("decision_id")
-        .to_string();
-
-    let dec_row = sqlx::query(
-        "SELECT session_id, decision_type FROM ctx_decision_audits WHERE decision_id = ?",
-    )
-    .bind(&decision_id)
-    .fetch_optional(pool)
-    .await
-    .expect("ctx_decision_audits");
-    let dec_row = dec_row.expect("decision row");
-    assert_eq!(
-        dec_row.try_get::<String, _>("session_id").ok().as_deref(),
-        Some(session_id.as_str())
-    );
-    assert_eq!(
-        dec_row
-            .try_get::<String, _>("decision_type")
-            .ok()
-            .as_deref(),
-        Some("e2e_matrix_decision")
-    );
-
-    let (st_get_dec, got_dec) = get_json(
-        app,
-        &format!("/decisions/{decision_id}"),
-        Some(auth_header),
-        &[],
-    )
-    .await;
-    assert_eq!(st_get_dec, StatusCode::OK, "get decision: {got_dec}");
-
-    let (st_audit, audit) = get_json(
-        app,
-        &format!("/decisions/{decision_id}/audit"),
-        Some(auth_header),
-        &[],
-    )
-    .await;
-    assert_eq!(st_audit, StatusCode::OK, "decision audit: {audit}");
-
-    let list_dec_path = format!("/decisions?session_id={session_id}&limit=20&offset=0");
-    let (st_list_d, list_d) = get_json(app, &list_dec_path, Some(auth_header), &[]).await;
-    assert_eq!(st_list_d, StatusCode::OK, "list decisions: {list_d}");
-    assert!(
-        list_d["decisions"].as_array().is_some_and(|arr| {
-            arr.iter()
-                .any(|d| d["decision_id"].as_str() == Some(decision_id.as_str()))
-        }),
-        "decision not in list: {list_d}"
     );
 
     let (st_mem_s, mem_s) = post_json(
@@ -750,69 +530,38 @@ pub async fn run_product_matrix_full_journey(
     )
     .await;
     assert_eq!(st_appr, StatusCode::OK, "approval/respond: {appr_j}");
+    // Resolving approval does not finish the synthetic execution that owns it.
+    let approval_store = astra_services::runs::DatabaseRunStateStore::new(ctx.shared_pool.clone())
+        .with_owner_pod_id("system-matrix-approval-fixture");
+    use astra_services::runs::RunStateStore;
+    assert!(
+        approval_store
+            .update_run_status_with_events_if_current(
+                &ctx.user_id,
+                &ctx.session_id,
+                &approval_run_id,
+                &["running"],
+                Some(0),
+                "completed",
+                None,
+                None,
+                &[],
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        approval_store
+            .release_owner_lease(&ctx.user_id, &ctx.session_id, &approval_run_id, 0)
+            .await
+            .unwrap()
+    );
 
     let (st_runs, runs) = get_json(app, "/runs", Some(auth_header), &[]).await;
     assert_eq!(st_runs, StatusCode::OK, "list runs: {runs}");
 
-    let (st_cpl, cpl_j) =
-        get_json(app, "/data-versioning/checkpoints", Some(auth_header), &[]).await;
-    assert_eq!(
-        st_cpl,
-        StatusCode::OK,
-        "list checkpoints (read-only): {cpl_j}"
-    );
-    assert!(
-        cpl_j.is_array(),
-        "checkpoints list should be a JSON array: {cpl_j}"
-    );
-
-    let sb_name = format!("sb_{suffix}");
-    let (st_sb, sb_j) = post_json(
-        app,
-        "/sandbox",
-        Some(auth_header),
-        json!({ "name": sb_name, "description": "matrix e2e sandbox" }),
-    )
-    .await;
-    assert_eq!(st_sb, StatusCode::CREATED, "create sandbox: {sb_j}");
-
-    let sb_row =
-        sqlx::query("SELECT user_id, status FROM infra_sandbox_metadata WHERE sandbox_name = ?")
-            .bind(&sb_name)
-            .fetch_optional(pool)
-            .await
-            .expect("sandbox select");
-    let sb_row = sb_row.expect("infra_sandbox_metadata row");
-    assert_eq!(
-        sb_row.try_get::<String, _>("user_id").ok().as_deref(),
-        Some(user_id.as_str())
-    );
-
-    let (st_sbl, sbl) = get_json(app, "/sandbox", Some(auth_header), &[]).await;
-    assert_eq!(st_sbl, StatusCode::OK, "list sandboxes: {sbl}");
-    assert!(
-        sbl["sandboxes"].as_array().is_some_and(|a| {
-            a.iter()
-                .any(|s| s["sandbox_name"].as_str() == Some(sb_name.as_str()))
-        }),
-        "sandbox not listed: {sbl}"
-    );
-
-    let (st_sbg, sbg) = get_json(app, &format!("/sandbox/{sb_name}"), Some(auth_header), &[]).await;
-    assert_eq!(st_sbg, StatusCode::OK, "get sandbox: {sbg}");
-
-    let st_sbd = delete_no_content(app, &format!("/sandbox/{sb_name}"), Some(auth_header)).await;
-    assert_eq!(st_sbd, StatusCode::NO_CONTENT, "delete sandbox");
-
-    let sb_gone = sqlx::query("SELECT 1 FROM infra_sandbox_metadata WHERE sandbox_name = ?")
-        .bind(&sb_name)
-        .fetch_optional(pool)
-        .await
-        .expect("sandbox gone");
-    assert!(
-        sb_gone.is_none(),
-        "sandbox row should be removed after DELETE"
-    );
+    let (retired_status, _) = get_json(app, "/sandbox", Some(auth_header), &[]).await;
+    assert_eq!(retired_status, StatusCode::NOT_FOUND);
 
     let (st_sks, sks_j) = get_json(app, "/skills", Some(auth_header), &[]).await;
     assert_eq!(st_sks, StatusCode::OK, "list skills: {sks_j}");
@@ -824,33 +573,6 @@ pub async fn run_product_matrix_full_journey(
 
     let (st_intro, intro_j) = get_json(app, "/introspection/skills", Some(auth_header), &[]).await;
     assert_eq!(st_intro, StatusCode::OK, "introspection skills: {intro_j}");
-
-    let intro_ct = format!(
-        "/introspection/context/trend?session_id={session_id}&turns=8&context_window=128000"
-    );
-    let (st_ict, ict_j) = get_json(app, &intro_ct, Some(auth_header), &[]).await;
-    assert_eq!(
-        st_ict,
-        StatusCode::OK,
-        "introspection context trend: {ict_j}"
-    );
-
-    let intro_cs = format!("/introspection/context/snapshot?session_id={session_id}&detail=false");
-    let (st_ics, ics_j) = get_json(app, &intro_cs, Some(auth_header), &[]).await;
-    assert_eq!(
-        st_ics,
-        StatusCode::OK,
-        "introspection context snapshot: {ics_j}"
-    );
-
-    let intro_rq =
-        format!("/introspection/context/retrieval_quality?session_id={session_id}&turns=5");
-    let (st_irq, irq_j) = get_json(app, &intro_rq, Some(auth_header), &[]).await;
-    assert_eq!(
-        st_irq,
-        StatusCode::OK,
-        "introspection retrieval quality: {irq_j}"
-    );
 
     let (st_models, models_j) = get_json(app, "/models", Some(auth_header), &[]).await;
     assert_eq!(st_models, StatusCode::OK, "list models: {models_j}");
@@ -878,6 +600,7 @@ pub async fn run_product_matrix_full_journey(
         "agent_id": agent_id,
         "session_id": session_id,
         "message": "matrix journey ping",
+        "explain": true,
     "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "model_selection": seeded_model_selection(ctx),
         "context": {
@@ -922,80 +645,36 @@ pub async fn run_product_matrix_full_journey(
         pool,
         &user_id,
         &session_id,
-        &["user_query", "llm_response"],
+        &["trace_span"],
         std::time::Duration::from_secs(30),
     )
     .await;
 
-    let recs = sqlx::query(
-        "SELECT event_id, session_id, user_id, event_type, content, parent_event_id, \
-         causal_chain_id, token_input, token_output, token_total, llm_model_used, reasoning_content \
-         FROM agent_events WHERE session_id = ? AND user_id = ? ORDER BY created_at ASC",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .fetch_all(pool)
-    .await
-    .expect("select agent_events");
+    let transcript_rows = sqlx::query(
+        "SELECT role, content FROM session_transcript_items WHERE user_id = ? AND session_id = ? ORDER BY item_seq"
+    ).bind(&user_id).bind(&session_id).fetch_all(pool).await.unwrap();
+    for (role, text) in [("user", "matrix journey ping"), ("assistant", LLM_TEXT)] {
+        assert!(
+            transcript_rows
+                .iter()
+                .any(|row| row.get::<String, _>("role") == role
+                    && row.get::<String, _>("content") == text),
+            "canonical history must retain {role} content"
+        );
+    }
 
-    let user_q = recs
-        .iter()
-        .find(|r| {
-            row_get_str(r, "event_type") == "user_query"
-                && row_get_str(r, "content").contains("matrix journey ping")
-        })
-        .expect("user_query event from chat/stream");
-    assert_eq!(row_get_str(user_q, "session_id"), session_id);
-    assert_eq!(row_get_str(user_q, "user_id"), user_id);
-    assert!(!row_get_str(user_q, "event_id").is_empty());
-    let cc = row_get_opt_str(user_q, "causal_chain_id").unwrap_or_default();
-    assert!(
-        !cc.is_empty(),
-        "causal_chain_id should be set on user_query"
-    );
-
-    let llm = recs
-        .iter()
-        .find(|r| {
-            row_get_str(r, "event_type") == "llm_response"
-                && row_get_str(r, "content").contains(LLM_TEXT)
-        })
-        .expect("llm_response from chat/stream with expected assistant text");
-    assert_eq!(row_get_str(llm, "session_id"), session_id);
-    assert_eq!(row_get_str(llm, "user_id"), user_id);
-    let llm_content = row_get_str(llm, "content");
-    assert!(
-        llm_content.contains(LLM_TEXT),
-        "llm_response content: {llm_content}"
-    );
-    let uq_event_id = row_get_str(user_q, "event_id");
+    let run = sqlx::query(
+        "SELECT status, total_prompt_tokens, total_completion_tokens, total_tool_calls, resolved_model_name
+         FROM agent_runs WHERE user_id = ? AND session_id = ? AND parent_run_id IS NULL
+         ORDER BY created_at DESC LIMIT 1"
+    ).bind(&user_id).bind(&session_id).fetch_one(pool).await.unwrap();
+    assert_eq!(run.get::<String, _>("status"), "completed");
+    assert_eq!(run.get::<i64, _>("total_prompt_tokens"), 5);
+    assert_eq!(run.get::<i64, _>("total_completion_tokens"), 15);
+    assert_eq!(run.get::<i64, _>("total_tool_calls"), 0);
     assert_eq!(
-        row_get_opt_str(llm, "parent_event_id").as_deref(),
-        Some(uq_event_id.as_str()),
-        "llm_response should parent to user_query"
-    );
-
-    let llm_round = recs
-        .iter()
-        .find(|r| {
-            row_get_str(r, "event_type") == "llm_round_completed"
-                && row_get_str(r, "event_id").starts_with("trace:round_done:")
-        })
-        .expect("llm_round_completed event from server-owned stream");
-    assert_eq!(row_get_opt_i64(llm_round, "token_input"), Some(5));
-    assert_eq!(row_get_opt_i64(llm_round, "token_output"), Some(15));
-    assert_eq!(row_get_opt_i64(llm_round, "token_total"), Some(20));
-    assert!(
-        row_get_opt_str(llm_round, "llm_model_used")
-            .as_deref()
-            .is_some_and(|model| model.starts_with("mock-")),
-        "server-owned stream should persist the seeded mock model"
-    );
-    assert!(
-        row_get_opt_str(llm, "reasoning_content")
-            .map(|s| s.is_empty())
-            .unwrap_or(true),
-        "reasoning_content should be empty for mock round with reasoning: \"\""
+        run.get::<String, _>("resolved_model_name"),
+        format!("mock-{}", ctx.suffix)
     );
 
     // A session is resumable only after it has a durable conversation
@@ -1073,34 +752,26 @@ pub async fn run_product_matrix_full_journey(
         "agent_sessions.status after POST .../resume"
     );
 
-    let turn_cnt_row = sqlx::query(
-        "SELECT COUNT(*) AS c FROM agent_events \
-         WHERE session_id = ? AND user_id = ? AND event_type = 'user_query'",
+    let (status, turns) = get_json(
+        app,
+        &format!("/sessions/{session_id}/audit/turns?page=1&per_page=10"),
+        Some(auth_header),
+        &[],
     )
-    .bind(&session_id)
-    .bind(&user_id)
-    .fetch_one(pool)
-    .await
-    .expect("turn events count");
-    let n_turns: i64 = turn_cnt_row.try_get("c").unwrap_or(0);
+    .await;
+    assert_eq!(status, StatusCode::OK);
     assert!(
-        n_turns >= 1,
-        "expected >=1 session turn events after chat/stream for audit detail, got {n_turns}"
+        turns["turns"].as_array().unwrap().is_empty(),
+        "Server turns do not synthesize legacy audit roots"
     );
-    let last_turn_n = n_turns as u32;
-    let turn_detail_path = format!("/sessions/{session_id}/audit/turns/{last_turn_n}");
-    let (st_td, td_j) = get_json(app, &turn_detail_path, Some(auth_header), &[]).await;
-    assert_eq!(st_td, StatusCode::OK, "audit turn detail: {td_j}");
-    assert_eq!(
-        td_j["turn"].as_u64(),
-        Some(u64::from(last_turn_n)),
-        "turn detail index: {td_j}"
-    );
-    let ui = td_j["user_input"].as_str().unwrap_or("");
-    assert!(
-        ui.contains("matrix journey ping"),
-        "turn detail user_input should include user prompt: {td_j}"
-    );
+    let (status, _) = get_json(
+        app,
+        &format!("/sessions/{session_id}/audit/turns/1"),
+        Some(auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     let tool_turn_sse =
         run_tool_backed_chat_turn(app, ctx, auth_header, &session_id, &agent_id).await;
@@ -1108,91 +779,42 @@ pub async fn run_product_matrix_full_journey(
         tool_turn_sse.contains("\"type\":\"tool_request\""),
         "tool-backed chat should emit tool_request: {tool_turn_sse}"
     );
-    wait_for_agent_event_types(
-        pool,
-        &user_id,
-        &session_id,
-        &["context_trace_signal"],
-        std::time::Duration::from_secs(30),
-    )
-    .await;
-
-    let trace_row = {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            if let Some(row) = sqlx::query(
-                "SELECT \
-                     JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.turn_id')) AS turn_id, \
-                     JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_surface.visible_tools[0]')) AS selected_tool, \
-                     JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_surface.surface_scope')) AS surface_scope, \
-                     CAST(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_surface.tools_available')) AS SIGNED) AS tools_available \
-                 FROM agent_events \
-                 WHERE session_id = ? \
-                   AND user_id = ? \
-                   AND event_type = 'context_trace_signal' \
-                   AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_surface.visible_tools[0]')) IS NOT NULL \
-                 ORDER BY created_at DESC \
-                 LIMIT 1",
-            )
-            .bind(&session_id)
-            .bind(&user_id)
-            .fetch_optional(pool)
-            .await
-            .expect("latest tool-backed context_trace_signal event")
-            {
-                break row;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!(
-                    "timeout waiting for tool-backed context_trace_signal for session_id={session_id}"
-                );
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    };
+    // Check the selected and consumed tool at the provider boundary. The
+    // latest context display is a projection of the final request and need
+    // not retain an earlier request's tool catalog or its ordering.
+    let requests = ctx.native_provider_requests().await;
+    let tool_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request.body["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["role"] == "user" && message["content"] == "read README through a tool"
+                })
+            })
+        })
+        .collect();
     assert!(
-        trace_row
-            .try_get::<Option<String>, _>("turn_id")
-            .ok()
-            .flatten()
-            .is_some_and(|turn_id| turn_id.starts_with("turn-")),
-        "context trace event should carry turn_id"
-    );
-    assert_eq!(
-        trace_row
-            .try_get::<Option<String>, _>("selected_tool")
-            .ok()
-            .flatten()
-            .as_deref(),
-        Some("read_file"),
-        "context trace event should persist selected tool"
+        tool_requests.iter().any(
+            |request| request.body["tools"].as_array().is_some_and(|tools| tools
+                .iter()
+                .any(|tool| tool["function"]["name"] == "read_file"))
+        )
     );
     assert!(
-        trace_row
-            .try_get::<Option<String>, _>("surface_scope")
-            .ok()
-            .flatten()
-            .is_some_and(|surface_scope| !surface_scope.is_empty()),
-        "context trace event should persist tool surface scope"
-    );
-    assert!(
-        trace_row
-            .try_get::<Option<i64>, _>("tools_available")
-            .ok()
-            .flatten()
-            .is_some_and(|tools_available| tools_available >= 1),
-        "context trace event should persist available tool count"
+        tool_requests
+            .iter()
+            .any(|request| request.body["messages"]
+                .as_array()
+                .is_some_and(|messages| messages.iter().any(|message| {
+                    message["role"] == "tool"
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains("from tool-backed matrix e2e"))
+                })))
     );
 
     cleanup_session_data(&ctx.shared_pool, &user_id, &session_id).await;
     cleanup_edge_registry(pool, &user_id, &edge_agent_id).await;
-
-    let del_agent = delete_no_content(app, &format!("/agents/{agent_id}"), Some(auth_header)).await;
-    assert_eq!(
-        del_agent,
-        StatusCode::NO_CONTENT,
-        "delete agent should succeed"
-    );
 
     let (st_out, out_j) = post_json(
         app,

@@ -33,7 +33,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 
 // ─── Public types ────────────────────────────────────────────────────────
@@ -121,6 +121,8 @@ pub enum StoreError {
     },
     #[error("corrupt index row: {0}")]
     CorruptIndex(String),
+    #[error("corrupt config version blob: {0}")]
+    CorruptBlob(String),
 }
 
 // ─── Trait ───────────────────────────────────────────────────────────────
@@ -176,10 +178,10 @@ impl LocalFileStore {
         })
     }
 
-    fn append_index(&self, entry: &IndexEntry) -> Result<(), StoreError> {
+    fn lock_index(&self) -> Result<fs::File, StoreError> {
         self.ensure_root()?;
         let path = self.index_path();
-        let mut f = OpenOptions::new()
+        let f = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
@@ -192,10 +194,13 @@ impl LocalFileStore {
             source,
         })?;
 
-        // Hold an advisory file lock for the complete append. `write_all`
-        // may loop internally, so O_APPEND alone cannot guarantee a
-        // one-row-per-line record when multiple CLI processes save config
-        // versions at the same time.
+        Ok(f)
+    }
+
+    fn append_index(&self, mut f: fs::File, entry: &IndexEntry) -> Result<(), StoreError> {
+        let path = self.index_path();
+        // The caller holds the index lock across blob publication and append.
+        // `write_all` may loop internally, so O_APPEND alone is insufficient.
         let mut line =
             serde_json::to_string(entry).map_err(|e| StoreError::CorruptIndex(e.to_string()))?;
         line.push('\n');
@@ -248,21 +253,88 @@ impl ConfigVersionStore for LocalFileStore {
         //    round-trip is the bytes, not the struct.
         let toml_bytes = toml::to_string_pretty(config)?;
         let id = VersionId::from_toml_bytes(toml_bytes.as_bytes());
+        // Reuse the index lock to serialize publication and validation. This
+        // also protects the hard-link based no-clobber fallback used on some
+        // filesystems from another put observing its temporary second link.
+        let index = self.lock_index()?;
 
-        // 2. Write blob iff absent. `create_new` would race two
-        //    concurrent puts; we check-then-write on the assumption
-        //    that collisions on the same content are fine.
+        // 2. Publish a fully written private blob without following an existing
+        //    destination. Concurrent writers may produce the same version.
         let blob = self.blob_path(&id);
         if !blob.exists() {
-            let mut f = fs::File::create(&blob).map_err(|source| StoreError::Io {
-                path: blob.clone(),
-                source,
-            })?;
-            f.write_all(toml_bytes.as_bytes())
+            let mut staged =
+                tempfile::NamedTempFile::new_in(&self.root).map_err(|source| StoreError::Io {
+                    path: self.root.clone(),
+                    source,
+                })?;
+            staged
+                .write_all(toml_bytes.as_bytes())
                 .map_err(|source| StoreError::Io {
                     path: blob.clone(),
                     source,
                 })?;
+            if let Err(error) = staged.persist_noclobber(&blob)
+                && error.error.kind() != std::io::ErrorKind::AlreadyExists
+            {
+                return Err(StoreError::Io {
+                    path: blob.clone(),
+                    source: error.error,
+                });
+            }
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        #[cfg(not(unix))]
+        if fs::symlink_metadata(&blob).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(StoreError::Io {
+                path: blob.clone(),
+                source: std::io::Error::other("config version blob is a symlink"),
+            });
+        }
+        let mut existing = options.open(&blob).map_err(|source| StoreError::Io {
+            path: blob.clone(),
+            source,
+        })?;
+        let metadata = existing.metadata().map_err(|source| StoreError::Io {
+            path: blob.clone(),
+            source,
+        })?;
+        if !metadata.is_file() {
+            return Err(StoreError::CorruptBlob(
+                "version is not a regular file".into(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            if metadata.nlink() != 1 {
+                return Err(StoreError::CorruptBlob(
+                    "version has multiple hard links".into(),
+                ));
+            }
+            existing
+                .set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|source| StoreError::Io {
+                    path: blob.clone(),
+                    source,
+                })?;
+        }
+        let mut contents = String::new();
+        existing
+            .read_to_string(&mut contents)
+            .map_err(|source| StoreError::Io {
+                path: blob.clone(),
+                source,
+            })?;
+        if contents != toml_bytes {
+            return Err(StoreError::CorruptBlob(
+                "content does not match its version".into(),
+            ));
         }
 
         // 3. Append index row — always, even on duplicate put. The
@@ -274,7 +346,7 @@ impl ConfigVersionStore for LocalFileStore {
             source_session: meta.source_session,
             parent: meta.parent,
         };
-        self.append_index(&entry)?;
+        self.append_index(index, &entry)?;
 
         Ok(id)
     }

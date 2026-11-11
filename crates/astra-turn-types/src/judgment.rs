@@ -3,12 +3,10 @@
 //! Native Noul/Choice/Score answers retain their probability semantics.
 //! Ordinary chat models return explicit discrete outcomes instead; an
 //! unknown result is never represented by a fabricated probability.
-use serde::{
-    Deserialize, Serialize,
-    de::{self, MapAccess, SeqAccess, Visitor},
-};
+use crate::parse_unique_json;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::{collections::BTreeMap, fmt};
+use std::collections::BTreeMap;
 
 pub const JUDGMENT_SCHEMA_VERSION: u32 = 2;
 const DISTRIBUTION_TOLERANCE: f64 = 1e-6;
@@ -149,6 +147,14 @@ impl JudgmentRequest {
         .expect("judgment answer envelope serializes")
         .len()
         .saturating_add(32)
+    }
+
+    /// Total generation allowance, including provider reasoning before the answer.
+    /// The answer-envelope minimum remains separate for model admission. This
+    /// allowance is an upper bound; providers and execution deadlines still cap it.
+    #[must_use]
+    pub fn generation_token_budget(&self) -> usize {
+        self.output_token_budget().max(8_192)
     }
 
     /// Return whether an admitted model can emit the complete typed answer.
@@ -513,98 +519,6 @@ pub enum JudgmentCodecError {
     Invalid(&'static str),
 }
 
-/// Parse JSON while rejecting duplicate object keys at every nesting level.
-/// This must run on raw bytes before conversion to `serde_json::Value`.
-pub fn parse_unique_judgment_json(raw: &[u8]) -> Result<Value, serde_json::Error> {
-    struct StrictValue(Value);
-
-    impl<'de> Deserialize<'de> for StrictValue {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: serde::Deserializer<'de>,
-        {
-            struct StrictValueVisitor;
-            impl<'de> Visitor<'de> for StrictValueVisitor {
-                type Value = StrictValue;
-
-                fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                    formatter.write_str("JSON without duplicate object keys")
-                }
-
-                fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
-                    Ok(StrictValue(Value::Bool(value)))
-                }
-
-                fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
-                    Ok(StrictValue(Value::Number(value.into())))
-                }
-
-                fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
-                    Ok(StrictValue(Value::Number(value.into())))
-                }
-
-                fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-                where
-                    E: de::Error,
-                {
-                    serde_json::Number::from_f64(value)
-                        .map(|number| StrictValue(Value::Number(number)))
-                        .ok_or_else(|| E::custom("non-finite JSON number"))
-                }
-
-                fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
-                    Ok(StrictValue(Value::String(value.to_string())))
-                }
-
-                fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
-                    Ok(StrictValue(Value::String(value)))
-                }
-
-                fn visit_none<E>(self) -> Result<Self::Value, E> {
-                    Ok(StrictValue(Value::Null))
-                }
-
-                fn visit_unit<E>(self) -> Result<Self::Value, E> {
-                    Ok(StrictValue(Value::Null))
-                }
-
-                fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-                where
-                    A: SeqAccess<'de>,
-                {
-                    let mut values = Vec::new();
-                    while let Some(StrictValue(value)) = sequence.next_element()? {
-                        values.push(value);
-                    }
-                    Ok(StrictValue(Value::Array(values)))
-                }
-
-                fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
-                where
-                    A: MapAccess<'de>,
-                {
-                    let mut values = Map::new();
-                    while let Some(key) = access.next_key::<String>()? {
-                        if values.contains_key(&key) {
-                            return Err(de::Error::custom("duplicate JSON object key"));
-                        }
-                        let StrictValue(value) = access.next_value()?;
-                        values.insert(key, value);
-                    }
-                    Ok(StrictValue(Value::Object(values)))
-                }
-            }
-
-            deserializer.deserialize_any(StrictValueVisitor)
-        }
-    }
-
-    let mut deserializer = serde_json::Deserializer::from_slice(raw);
-    let StrictValue(value) = StrictValue::deserialize(&mut deserializer)?;
-    deserializer.end()?;
-    Ok(value)
-}
-
 /// Format one typed judgment request for an ordinary chat model. The result
 /// returns scalar values bound to request kinds and may explicitly abstain.
 #[must_use]
@@ -680,7 +594,7 @@ pub fn judgment_request_from_messages(
             .ok_or(JudgmentCodecError::Invalid(
                 "typed judgment user content must be JSON text",
             ))?;
-    let value = parse_unique_judgment_json(content.as_bytes())?;
+    let value = parse_unique_json(content.as_bytes())?;
     let request: JudgmentRequest = serde_json::from_value(value)?;
     request.validate().map_err(JudgmentCodecError::Invalid)?;
     Ok(request)
@@ -730,7 +644,7 @@ pub fn normalize_judgment_response(
     let provenance = provenance.ok_or(JudgmentCodecError::Invalid(
         "missing execution judgment provenance",
     ))?;
-    let mut value = parse_unique_judgment_json(raw.as_bytes())?;
+    let mut value = parse_unique_json(raw.as_bytes())?;
     let raw_answers = value
         .get_mut("answers")
         .and_then(Value::as_object_mut)
@@ -1166,7 +1080,7 @@ mod tests {
             r#"{"schema_version":2,"state":{},"questions":{"x":{"type":"noul","instructions":"a"},"x":{"type":"noul","instructions":"b"}}}"#,
             r#"{"answers":{"noul":"yes","route":"code","progress":1,"progress":2}}"#,
         ] {
-            assert!(parse_unique_judgment_json(raw.as_bytes()).is_err(), "{raw}");
+            assert!(parse_unique_json(raw.as_bytes()).is_err(), "{raw}");
         }
         let duplicate_distribution = r#"{"schema_version":2,"model":"m","answers":{"noul":{"type":"noul","noul":0.5},"route":{"type":"choice","choice":"code","probabilities":{"code":0.6,"code":0.6,"docs":0.4},"confidence":0.4},"progress":{"type":"score","score":1,"probabilities":{"0":0,"1":1,"2":0},"legend":{"0":"No new evidence","1":"Some","2":"Substantial"},"confidence":1}}}"#;
         assert!(
@@ -1206,6 +1120,8 @@ mod tests {
             },
         );
         assert!(with_choice.output_token_budget() > base.output_token_budget());
+        assert!(base.generation_token_budget() >= 8_192);
+        assert!(with_choice.generation_token_budget() >= with_choice.output_token_budget());
         let required = with_choice.output_token_budget();
         assert!(!with_choice.output_budget_fits_completion_cap(Some((required - 1) as u32)));
         assert!(with_choice.output_budget_fits_completion_cap(Some(required as u32)));

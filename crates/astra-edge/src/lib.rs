@@ -240,6 +240,9 @@ pub struct EdgeInvocation {
     pub execution_ceiling: Option<Box<astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>>,
     pub runtime_process_authorization:
         Option<Box<astra_server_types::edge_ws_protocol::RuntimeProcessAuthorizationContext>>,
+    /// W3C carrier for this invocation's task. Empty when the server sent none.
+    pub traceparent: Option<String>,
+    pub tracestate: Option<String>,
     /// Bounded semantic inputs addressed to this invocation. Ordinary tool
     /// executors may ignore the receiver; provider-stage adapters consume it.
     pub input_rx: mpsc::Receiver<EdgeInvocationInput>,
@@ -254,6 +257,26 @@ pub struct EdgeInvocationInput {
 }
 
 pub trait EdgeInvocationExecutor: Send + Sync {
+    /// Optional sealed live RPC facet. Hosts without an explicitly configured
+    /// local capacity provider reject the request before dispatch.
+    fn execute_capacity(
+        &self,
+        _provider_id: String,
+        _payload: astra_server_types::edge_ws_protocol::SealedCapacityPayload,
+        _timeout_secs: u64,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            astra_server_types::edge_ws_protocol::SealedCapacityPayload,
+            astra_server_types::edge_ws_protocol::CapacityRpcFailure,
+        >,
+    > {
+        Box::pin(async {
+            Err(astra_server_types::edge_ws_protocol::CapacityRpcFailure::Unsupported)
+        })
+    }
+
     fn execute(
         &self,
         invocation: EdgeInvocation,
@@ -355,12 +378,6 @@ struct CompletedEdgeInvocation {
     generation: u64,
     result: astra_tools::ToolResult,
     duration_ms: u64,
-}
-
-struct CompletedProviderStageInput {
-    request_id: String,
-    generation: u64,
-    ack: ProviderStageInputAck,
 }
 
 fn rejected_tool_message(
@@ -484,8 +501,8 @@ pub struct EdgeInvocationOwner {
     tasks: JoinSet<()>,
     completed_tx: mpsc::Sender<CompletedEdgeInvocation>,
     completed_rx: mpsc::Receiver<CompletedEdgeInvocation>,
-    input_ack_tx: mpsc::Sender<CompletedProviderStageInput>,
-    input_ack_rx: mpsc::Receiver<CompletedProviderStageInput>,
+    input_ack_tx: mpsc::Sender<EdgeClientMessage>,
+    input_ack_rx: mpsc::Receiver<EdgeClientMessage>,
     journal: EdgeInvocationJournal,
     journal_writable: bool,
 }
@@ -497,7 +514,7 @@ impl EdgeInvocationOwner {
     ) -> Result<Self, EdgeConnectionError> {
         let (completed_tx, completed_rx) = mpsc::channel::<CompletedEdgeInvocation>(1_024);
         let (input_ack_tx, input_ack_rx) =
-            mpsc::channel::<CompletedProviderStageInput>(MAX_PROVIDER_STAGE_INPUTS_PER_INVOCATION);
+            mpsc::channel::<EdgeClientMessage>(MAX_PROVIDER_STAGE_INPUTS_PER_INVOCATION);
         let journal = EdgeInvocationJournal::open(context.journal_path.clone()).await?;
         let journal_status = journal.status();
         tracing::info!(
@@ -706,6 +723,14 @@ async fn serve_connection_on_owner(
     let input_ack_rx = &mut owner.input_ack_rx;
     let journal = &mut owner.journal;
     let executor = owner.executor.clone();
+    let capacity_cancel = shutdown.child_token();
+    let capacity_slots = Arc::new(Semaphore::new(
+        astra_server_types::edge_ws_protocol::MAX_CAPACITY_RPC_INFLIGHT,
+    ));
+    let mut capacity_tasks = JoinSet::new();
+    let (capacity_completed_tx, mut capacity_completed_rx) = mpsc::channel::<EdgeClientMessage>(
+        astra_server_types::edge_ws_protocol::MAX_CAPACITY_RPC_INFLIGHT,
+    );
 
     // Results remain in the durable outbox until the server acknowledges the
     // exact delivery generation. Reconnect therefore starts by replaying them.
@@ -739,10 +764,11 @@ async fn serve_connection_on_owner(
         "Edge agent ready — waiting for tool calls"
     );
 
-    async {
+    let result = async {
         let mut draining = false;
         loop {
-        if draining && tasks.is_empty() && completed_rx.is_empty() && input_ack_rx.is_empty() {
+        if draining && tasks.is_empty() && completed_rx.is_empty() && input_ack_rx.is_empty()
+            && capacity_tasks.is_empty() && capacity_completed_rx.is_empty() {
             break;
         }
         tokio::select! {
@@ -759,6 +785,11 @@ async fn serve_connection_on_owner(
                 tracing::info!("Edge capability withdrawal started; draining admitted invocations");
             }
             joined = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(error)) = joined {
+                    return Err(Box::new(error) as EdgeConnectionError);
+                }
+            }
+            joined = capacity_tasks.join_next(), if !capacity_tasks.is_empty() => {
                 if let Some(Err(error)) = joined {
                     return Err(Box::new(error) as EdgeConnectionError);
                 }
@@ -784,6 +815,8 @@ async fn serve_connection_on_owner(
                                 execution_timeout_ms,
                                 command_timeout_cap_ms,
                                 execution_ceiling,
+                                traceparent,
+                                tracestate,
                             }) => {
                                 let execution_deadline = if timeout_secs.is_none() && execution_ceiling.is_none() {
                                     Err("An unbudgeted task requires an admitted execution grant")
@@ -927,6 +960,8 @@ async fn serve_connection_on_owner(
                                             execution_ceiling,
                                             runtime_process_authorization,
                                             input_rx,
+                                            traceparent,
+                                            tracestate,
                                         }, cancel.clone()).await
                                     };
                                     // The executor owns asynchronous subprocess cleanup.
@@ -975,6 +1010,7 @@ async fn serve_connection_on_owner(
                                 }
                                 let execution_generation = journal
                                     .running_execution_generation(&request_id, delivery_generation);
+                                let input_id = input.input_id().to_owned();
                                 let input = EdgeInvocationInput { input, ack: ack_tx };
                                 let sent = match execution_generation {
                                     Some(generation) => invocations.send_input(&request_id, generation, input),
@@ -997,19 +1033,49 @@ async fn serve_connection_on_owner(
                                 }
                                 let input_ack_tx = input_ack_tx.clone();
                                 tokio::spawn(async move {
-                                    // A dropped adapter acknowledgement is a
-                                    // transport failure. Do not invent a
-                                    // third business disposition; the pool's
-                                    // bounded wait will retry the same input
-                                    // identity on the next opportunity.
-                                    if let Ok(ack) = ack_rx.await {
-                                        let _ = input_ack_tx
-                                            .send(CompletedProviderStageInput {
-                                                request_id,
-                                                generation: delivery_generation,
-                                                ack,
-                                            })
-                                            .await;
+                                    let message = match ack_rx.await {
+                                        Ok(ack) => EdgeClientMessage::ToolInputAck {
+                                            request_id, delivery_generation, ack,
+                                        },
+                                        Err(_) => EdgeClientMessage::ToolInputUnconfirmed {
+                                            request_id, delivery_generation, input_id,
+                                        },
+                                    };
+                                    let _ = input_ack_tx.send(message).await;
+                                });
+                            }
+                            Ok(EdgeServerMessage::CapacityRequest {
+                                request_id, connection_generation, provider_id, payload, timeout_secs,
+                            }) => {
+                                use astra_server_types::edge_ws_protocol::{CapacityRpcFailure, valid_capacity_identity};
+                                if !valid_capacity_identity(&request_id) || connection_generation == 0 {
+                                    continue;
+                                }
+                                let permit = capacity_slots.clone().try_acquire_owned();
+                                let rejection = if draining {
+                                    Some(CapacityRpcFailure::Offline)
+                                } else if permit.is_err() {
+                                    Some(CapacityRpcFailure::Busy)
+                                } else { None };
+                                if let Some(error) = rejection {
+                                    let message = EdgeClientMessage::CapacityResult {
+                                        request_id, connection_generation, result: Err(error),
+                                    };
+                                    send_connection_frame(&mut write, Message::Text(serde_json::to_string(&message)?.into()), &shutdown).await?;
+                                    continue;
+                                }
+                                let completed = capacity_completed_tx.clone();
+                                let cancel = capacity_cancel.child_token();
+                                let executor = executor.clone();
+                                capacity_tasks.spawn(async move {
+                                    let _permit = permit.expect("capacity permit checked before dispatch");
+                                    let result = executor.execute_capacity(provider_id, payload, timeout_secs, cancel.clone()).await;
+                                    // Live-only frames never enter the tool journal or replay outbox.
+                                    tokio::select! {
+                                        _ = cancel.cancelled() => {},
+                                        _ = completed.send(EdgeClientMessage::CapacityResult {
+                                            request_id, connection_generation, result,
+                                        }) => {},
                                     }
                                 });
                             }
@@ -1063,6 +1129,9 @@ async fn serve_connection_on_owner(
                     _ => {}
                 }
             }
+            Some(completed) = capacity_completed_rx.recv() => {
+                send_connection_frame(&mut write, Message::Text(serde_json::to_string(&completed)?.into()), &shutdown).await?;
+            }
             Some(completed) = completed_rx.recv() => {
                 if !invocations.finish_if_current(&completed.request_id, completed.generation) {
                     tracing::warn!(
@@ -1080,12 +1149,7 @@ async fn serve_connection_on_owner(
                 );
                 send_connection_frame(&mut write, Message::Text(serde_json::to_string(&result_msg)?.into()), &shutdown).await?;
             }
-            Some(completed) = input_ack_rx.recv() => {
-                let message = EdgeClientMessage::ToolInputAck {
-                    request_id: completed.request_id,
-                    delivery_generation: completed.generation,
-                    ack: completed.ack,
-                };
+            Some(message) = input_ack_rx.recv() => {
                 send_connection_frame(&mut write, Message::Text(serde_json::to_string(&message)?.into()), &shutdown).await?;
             }
             _ = heartbeat.tick() => {
@@ -1103,7 +1167,14 @@ async fn serve_connection_on_owner(
         }
 
         Ok(())
-    }.await
+    }.await;
+    capacity_cancel.cancel();
+    while let Some(joined) = capacity_tasks.join_next().await {
+        if let Err(error) = joined {
+            return Err(Box::new(error) as EdgeConnectionError);
+        }
+    }
+    result
 }
 
 async fn persist_completion(
@@ -1219,6 +1290,134 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn sealed_capacity_uses_shared_owner_and_never_replays_after_disconnect() {
+        use astra_server_types::edge_ws_protocol::{CapacityRpcFailure, SealedCapacityPayload};
+
+        struct CapacityExecutor(mpsc::UnboundedSender<&'static str>);
+        impl EdgeInvocationExecutor for CapacityExecutor {
+            fn execute(
+                &self,
+                _: EdgeInvocation,
+                _: CancellationToken,
+            ) -> BoxFuture<'_, astra_tools::ToolResult> {
+                Box::pin(async { panic!("capacity RPC must not enter ordinary tool execution") })
+            }
+            fn execute_capacity(
+                &self,
+                provider_id: String,
+                payload: SealedCapacityPayload,
+                _: u64,
+                cancel: CancellationToken,
+            ) -> BoxFuture<'_, Result<SealedCapacityPayload, CapacityRpcFailure>> {
+                Box::pin(async move {
+                    if provider_id == "echo" {
+                        return Ok(payload);
+                    }
+                    self.0.send("started").unwrap();
+                    cancel.cancelled().await;
+                    self.0.send("cancelled").unwrap();
+                    Err(CapacityRpcFailure::OutcomeUnknown)
+                })
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().to_owned();
+        let journal_path = workspace.join("journal.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let context = || EdgeConnectionContext {
+                account_id: "user".into(),
+                edge_agent_id: "edge".into(),
+                workspace_dir: workspace.clone(),
+                journal_path: journal_path.clone(),
+                ready: None,
+            };
+            let mut owner =
+                EdgeInvocationOwner::open(&context(), Arc::new(CapacityExecutor(events_tx)))
+                    .await
+                    .unwrap();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let socket = tokio_tungstenite::accept_async(MaybeTlsStream::Plain(stream))
+                    .await
+                    .unwrap();
+                owner
+                    .serve_connection(socket, context(), CancellationToken::new(), None)
+                    .await
+                    .unwrap();
+                assert!(owner.journal.pending_results().unwrap().is_empty());
+                assert!(!owner.has_unsettled_work());
+            }
+        });
+        let request = |id: &str, provider: &str, generation| EdgeServerMessage::CapacityRequest {
+            request_id: id.into(),
+            connection_generation: generation,
+            provider_id: provider.into(),
+            payload: SealedCapacityPayload("c2VhbGVk".into()),
+            timeout_secs: 5,
+        };
+        for (id, generation) in [("first-echo", 7), ("second-echo", 8)] {
+            let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&request(id, "echo", generation))
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let Some(Ok(Message::Text(text))) = socket.next().await else {
+                        panic!("capacity transport closed");
+                    };
+                    if let EdgeClientMessage::CapacityResult {
+                        request_id,
+                        connection_generation,
+                        result,
+                    } = serde_json::from_str(&text).unwrap()
+                    {
+                        assert_eq!(request_id, id);
+                        assert_eq!(connection_generation, generation);
+                        assert_eq!(result.unwrap().0, "c2VhbGVk");
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            if generation == 7 {
+                socket
+                    .send(Message::Text(
+                        serde_json::to_string(&request("pending", "block", generation))
+                            .unwrap()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(events_rx.recv().await, Some("started"));
+                socket.close(None).await.unwrap();
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(3), events_rx.recv())
+                        .await
+                        .unwrap(),
+                    Some("cancelled")
+                );
+            } else {
+                socket.close(None).await.unwrap();
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     struct BlockingExecutor {
         started: std::sync::Mutex<Option<oneshot::Sender<()>>>,
         release: Arc<tokio::sync::Notify>,
@@ -1247,7 +1446,7 @@ mod tests {
         use futures_util::{SinkExt, StreamExt};
 
         struct ControlledExecutor {
-            started: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+            started: std::sync::Mutex<Option<oneshot::Sender<u64>>>,
             executions: std::sync::atomic::AtomicUsize,
             inputs: std::sync::atomic::AtomicUsize,
             cancellations: std::sync::atomic::AtomicUsize,
@@ -1262,7 +1461,8 @@ mod tests {
                     self.executions
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     if let Some(started) = self.started.lock().unwrap().take() {
-                        let _ = started.send(());
+                        let _ =
+                            started.send(invocation.args["fraction"].as_f64().unwrap().to_bits());
                     }
                     loop {
                         tokio::select! {
@@ -1338,7 +1538,7 @@ mod tests {
             identity: Box::new(identity),
             delivery_generation: 1,
             tool: "native_provider".into(),
-            args: serde_json::json!({}),
+            args: serde_json::json!({"fraction": 51.248178375505404_f64}),
             runtime_process_authorization: None,
             runtime_process_authorization_required: false,
             timeout_secs: Some(60),
@@ -1346,6 +1546,9 @@ mod tests {
             execution_timeout_ms: None,
             command_timeout_cap_ms: None,
             execution_ceiling: None,
+
+            traceparent: None,
+            tracestate: None,
         };
         first_socket
             .send(Message::Text(
@@ -1353,10 +1556,11 @@ mod tests {
             ))
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(3), started_rx)
+        let observed_bits = tokio::time::timeout(Duration::from_secs(3), started_rx)
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(observed_bits, 51.248178375505404_f64.to_bits());
         first_socket.close(None).await.unwrap();
         let (mut second_socket, _) = tokio::time::timeout(
             Duration::from_secs(3),
@@ -1475,6 +1679,9 @@ mod tests {
             execution_deadline_unix_ms: None,
             execution_timeout_ms: None,
             command_timeout_cap_ms: None,
+
+            traceparent: None,
+            tracestate: None,
         };
         client
             .send(Message::Text(
@@ -1502,6 +1709,9 @@ mod tests {
             execution_deadline_unix_ms: None,
             execution_timeout_ms: None,
             command_timeout_cap_ms: None,
+
+            traceparent: None,
+            tracestate: None,
         };
         client
             .send(Message::Text(

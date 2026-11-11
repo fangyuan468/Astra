@@ -396,19 +396,108 @@ pub fn evaluate_permission(
     args: &Value,
     ctx: &PermissionSyncContext,
 ) -> DecisionEnvelope {
-    evaluate_permission_with_provider_policy(tool_name, args, ctx, None)
+    evaluate_permission_with_provider_policy(tool_name, args, ctx, None, None)
 }
 
 /// Evaluate permission using the exact provider policy that was selected for
 /// this invocation. Static tools pass `None` and retain their args-aware
 /// registry behavior; dynamic tools must pass the descriptor-keyed policy used
-/// by batching and execution.
+/// by batching and execution. `source_discovery_tool` is supplied only for an
+/// exact materialized selection whose descriptor is indexed by the runtime;
+/// it grants the selection the discovery tool's allowlist scope, not its other
+/// permission rules or approval policy.
 #[must_use]
 pub fn evaluate_permission_with_provider_policy(
     tool_name: &str,
     args: &Value,
     ctx: &PermissionSyncContext,
     provider_policy: Option<&crate::provider_resolution::ResolvedInvocationPolicy>,
+    source_discovery_tool: Option<&str>,
+) -> DecisionEnvelope {
+    let outer =
+        evaluate_permission_once(tool_name, args, ctx, provider_policy, source_discovery_tool);
+    if provider_policy.is_some()
+        || tool_name != "agent"
+        || args.get("action").and_then(Value::as_str) != Some("run_chain")
+        || matches!(&outer.decision, HardDecision::Deny { .. })
+    {
+        return outer;
+    }
+    let Some(steps) = args.get("steps").and_then(Value::as_array) else {
+        return outer; // Argument validation owns malformed calls.
+    };
+    let reject = |reason: String| {
+        let mut result = outer.clone();
+        result.decision = HardDecision::Deny {
+            reason: reason.clone(),
+        };
+        result.source = DecisionSource::SafetyMiddleware {
+            reason: reason.clone(),
+        };
+        if let Some(step) = result
+            .trace
+            .iter_mut()
+            .find(|step| step.step == EvaluationStep::SafetyMiddleware)
+        {
+            step.outcome = TraceOutcome::Matched(result.decision.clone());
+            step.note = reason;
+        }
+        result.will_save = None;
+        result
+    };
+    if steps.len() > crate::tool_registry_chain::MAX_RUN_CHAIN_STEPS {
+        return reject("This chain has too many steps; split it into smaller calls.".into());
+    }
+    fn depends_on_previous_step(value: &Value) -> bool {
+        match value {
+            Value::String(value) => value.contains("$prev") || value.contains("$step."),
+            Value::Array(values) => values.iter().any(depends_on_previous_step),
+            Value::Object(values) => values.values().any(depends_on_previous_step),
+            _ => false,
+        }
+    }
+    let chain_context = crate::tool_registry_chain::ChainContext::new(
+        args.get("input")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+    );
+    for step in steps {
+        let Some(name) = step.get("tool").and_then(Value::as_str) else {
+            return reject("This chain contains an invalid step.".into());
+        };
+        let step_args = step.get("args").unwrap_or(&Value::Null);
+        if depends_on_previous_step(step_args) {
+            return reject("This chain depends on an earlier result; run its steps separately so each can be authorized.".into());
+        }
+        let resolved = crate::tool_registry_chain::resolve_args(step_args, &chain_context);
+        if name == "run_chain"
+            || (name == "agent"
+                && resolved.get("action").and_then(Value::as_str) == Some("run_chain"))
+        {
+            return reject("Nested chains are unavailable; run the steps separately.".into());
+        }
+        let child = evaluate_permission_once(name, &resolved, ctx, None, None);
+        match child.decision {
+            HardDecision::Allow => {}
+            HardDecision::Deny { reason } => {
+                return reject(format!("Chain step '{name}' was denied: {reason}"));
+            }
+            HardDecision::NeedExternal { .. } => {
+                return reject(format!(
+                    "Chain step '{name}' needs approval; run it separately so approval can be requested."
+                ));
+            }
+        }
+    }
+    outer
+}
+
+fn evaluate_permission_once(
+    tool_name: &str,
+    args: &Value,
+    ctx: &PermissionSyncContext,
+    provider_policy: Option<&crate::provider_resolution::ResolvedInvocationPolicy>,
+    source_discovery_tool: Option<&str>,
 ) -> DecisionEnvelope {
     let mut trace = Vec::with_capacity(EVALUATION_ORDER.len());
     let mut risk_tags = risk_tags_for_request(tool_name, args);
@@ -783,7 +872,11 @@ pub fn evaluate_permission_with_provider_policy(
     );
 
     if ctx.inherited.allowed_tools.is_some() {
-        if !ctx.inherited.is_tool_allowed_by_allowlist(tool_name) {
+        if !ctx.inherited.is_tool_allowed_by_allowlist(tool_name)
+            && !(provider_policy.is_some()
+                && source_discovery_tool
+                    .is_some_and(|source| ctx.inherited.is_tool_allowed_by_allowlist(source)))
+        {
             let decision = HardDecision::Deny {
                 reason: format!("Tool '{tool_name}' not in allowed tools list"),
             };
@@ -2287,6 +2380,66 @@ mod tests {
     }
 
     #[test]
+    fn chain_requests_individual_approval_for_worktree_in_prompt_mode() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Prompt,
+        );
+        let args = serde_json::json!({"action":"run_chain", "name":"example", "steps":[
+            {"tool":"worktree", "args":{"action":"exit", "exit_action":"remove", "discard_changes":true}}
+        ]});
+        let decision = evaluate_permission("agent", &args, &ctx);
+        assert!(
+            matches!(decision.decision, HardDecision::Deny { ref reason } if reason.contains("run it separately")),
+            "{decision:?}"
+        );
+    }
+
+    #[test]
+    fn chain_respects_child_denies_and_allowlist() {
+        use crate::permission::types::{PermissionMode, PermissionRule, PermissionSyncContext};
+        let args = serde_json::json!({"action":"run_chain", "steps":[
+            {"tool":"worktree", "args":{"action":"exit", "exit_action":"remove"}}
+        ]});
+        let mut denied = PermissionSyncContext::root(PermissionMode::Auto);
+        denied.inherited.add_deny(PermissionRule::tool("worktree"));
+        assert!(
+            matches!(evaluate_permission("agent", &args, &denied).decision,
+            HardDecision::Deny { ref reason } if reason.contains("worktree"))
+        );
+        let mut allowlisted = PermissionSyncContext::root(PermissionMode::Auto);
+        allowlisted.inherited.allowed_tools = Some(["agent".to_string()].into_iter().collect());
+        assert!(
+            matches!(evaluate_permission("agent", &args, &allowlisted).decision,
+            HardDecision::Deny { ref reason } if reason.contains("worktree"))
+        );
+        let unrestricted = PermissionSyncContext::root(PermissionMode::Auto);
+        assert!(matches!(
+            evaluate_permission("agent", &args, &unrestricted).decision,
+            HardDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn chain_checks_input_and_rejects_unresolved_step_arguments() {
+        use crate::permission::types::{PermissionMode, PermissionSyncContext};
+        let ctx = PermissionSyncContext::root(PermissionMode::Auto);
+        let dynamic = serde_json::json!({"action":"run_chain", "steps":[
+            {"tool":"bash", "args":{"command":"$prev"}}
+        ]});
+        assert!(
+            matches!(evaluate_permission("agent", &dynamic, &ctx).decision,
+            HardDecision::Deny { ref reason } if reason.contains("run its steps separately"))
+        );
+        let input = serde_json::json!({"action":"run_chain", "input":{"cmd":"rm -rf /"}, "steps":[
+            {"tool":"bash", "args":{"command":"$input.cmd"}}
+        ]});
+        assert!(matches!(
+            evaluate_permission("agent", &input, &ctx).decision,
+            HardDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
     fn ask_rule_precedes_internal_orchestration_short_circuit() {
         let ctx = crate::permission::types::PermissionSyncContext::new(
             crate::permission::types::InheritedPermissions {
@@ -2749,11 +2902,20 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_writing_hidden_home_app_state_requires_approval_in_auto_mode() {
+    fn evaluate_known_agent_state_requires_approval_but_hidden_projects_do_not() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
         );
-        let config_path = "~/.yyy/config.toml".to_string();
+        let ordinary = evaluate_permission(
+            "write_file",
+            &serde_json::json!({"path":"~/.codex/workspace/service.conf", "content":"workers=4"}),
+            &ctx,
+        );
+        assert!(
+            matches!(ordinary.decision, HardDecision::Allow),
+            "{ordinary:?}"
+        );
+        let config_path = "~/.astra/config.toml".to_string();
 
         let write_file = evaluate_permission(
             "write_file",
@@ -2762,7 +2924,7 @@ mod tests {
         );
         assert!(
             matches!(write_file.decision, HardDecision::NeedExternal { .. }),
-            "hidden home app state writes must remain gated: {write_file:?}"
+            "known agent state writes must remain gated: {write_file:?}"
         );
 
         let bash_rm = evaluate_permission(
@@ -2772,7 +2934,36 @@ mod tests {
         );
         assert!(
             matches!(bash_rm.decision, HardDecision::NeedExternal { .. }),
-            "destructive shell operations on hidden home app state must remain gated: {bash_rm:?}"
+            "destructive shell operations on known agent state must remain gated: {bash_rm:?}"
+        );
+    }
+
+    #[test]
+    fn auto_mode_reads_workspace_bash_output_without_weakening_astra_state_guard() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let command = "jq -r '.items[]' /sandbox/.moi/astra-bash-outputs/one.stdout";
+        assert!(!crate::cloud::approval_policy::bash_command_is_read_only(
+            command
+        ));
+        let workspace_output =
+            evaluate_permission("bash", &serde_json::json!({"command": command}), &ctx);
+        assert!(
+            matches!(workspace_output.decision, HardDecision::Allow),
+            "ordinary workspace output should follow existing Auto mode: {workspace_output:?}"
+        );
+
+        let private_state = evaluate_permission(
+            "bash",
+            &serde_json::json!({
+                "command": "jq -r '.items[]' /sandbox/.moi/.astra/bash-outputs/one.stdout"
+            }),
+            &ctx,
+        );
+        assert!(
+            matches!(private_state.decision, HardDecision::NeedExternal { .. }),
+            "Astra private state must remain protected: {private_state:?}"
         );
     }
 
@@ -3299,6 +3490,7 @@ mod tests {
             &serde_json::json!({}),
             &ctx,
             Some(&policy),
+            None,
         );
 
         assert_eq!(envelope.decision, HardDecision::Allow);
@@ -3336,6 +3528,7 @@ mod tests {
                 &serde_json::json!({}),
                 &ctx,
                 Some(&policy),
+                None,
             );
 
             assert!(matches!(
@@ -3374,6 +3567,7 @@ mod tests {
             &serde_json::json!({}),
             &ctx,
             Some(&policy),
+            None,
         );
 
         assert!(matches!(envelope.decision, HardDecision::Deny { .. }));
@@ -3399,6 +3593,7 @@ mod tests {
             &serde_json::json!({"task":"inspect"}),
             &child,
             Some(&collaborator),
+            None,
         );
         assert_eq!(admitted.decision, HardDecision::Allow);
         assert_eq!(admitted.source, DecisionSource::InternalOrchestration);
@@ -3413,6 +3608,7 @@ mod tests {
             &serde_json::json!({"task":"inspect"}),
             &child,
             Some(&ordinary_mutating),
+            None,
         );
         assert!(matches!(denied.decision, HardDecision::Deny { .. }));
 
@@ -3424,6 +3620,7 @@ mod tests {
             &serde_json::json!({"task":"inspect"}),
             &root,
             Some(&collaborator),
+            None,
         );
         assert!(matches!(
             root_decision.decision,
@@ -3438,6 +3635,7 @@ mod tests {
             &serde_json::json!({"task":"inspect"}),
             &plan,
             Some(&collaborator),
+            None,
         );
         assert_eq!(plan_decision.decision, HardDecision::Allow);
     }
@@ -3676,6 +3874,7 @@ mod tests {
                 &serde_json::json!({}),
                 &ctx,
                 Some(&dynamic_read),
+                None,
             )
             .decision,
             HardDecision::Allow
@@ -3691,6 +3890,7 @@ mod tests {
                 &serde_json::json!({"path": "x"}),
                 &ctx,
                 Some(&disguised_write),
+                None,
             )
             .decision,
             HardDecision::Deny { .. }

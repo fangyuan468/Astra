@@ -27,30 +27,58 @@ runs:
   using: "composite"
   steps:
     # Avoid paying for cleanup when the filesystem containing the workspace has
-    # enough room. Keep the cleanup fallback for low or unreadable disk space.
+    # enough room. Persistent runners reclaim only their disposable Cargo
+    # artifacts; only hosted images use the privileged cleanup fallback.
     - name: Guard workspace disk space
       shell: bash
+      env:
+        ASTRA_CI_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        ASTRA_CI_TARGET_DIR: ${{ runner.workspace }}/.astra-ci-target
       run: |
         set -euxo pipefail
         disk_guard_workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE must be set}"
         disk_guard_threshold_kib=$((30 * 1024 * 1024))
-        disk_guard_available_kib=""
-        disk_guard_measurement="invalid"
-
-        if disk_guard_available_kib="$(
-          df -Pk "${disk_guard_workspace}" |
-            awk 'NR == 2 { print $4; exit }'
-        )"; then
-          if [[ "${disk_guard_available_kib}" =~ ^[0-9]+$ ]]; then
-            disk_guard_measurement="valid"
+        measure_workspace_disk() {
+          disk_guard_available_kib=""
+          disk_guard_measurement="invalid"
+          if disk_guard_available_kib="$(
+            df -Pk "${disk_guard_workspace}" |
+              awk 'NR == 2 { print $4; exit }'
+          )"; then
+            if [[ "${disk_guard_available_kib}" =~ ^[0-9]+$ ]]; then
+              disk_guard_measurement="valid"
+            fi
+          else
+            disk_guard_measurement="failed"
           fi
-        else
-          disk_guard_measurement="failed"
+        }
+        measure_workspace_disk
+
+        if [[ "${ASTRA_CI_RUNNER_ENVIRONMENT:-}" == self-hosted &&
+              "${disk_guard_measurement}" == valid ]]; then
+          disk_guard_target="${ASTRA_CI_TARGET_DIR:?ASTRA_CI_TARGET_DIR must be set}"
+          disk_guard_target_limit_kib=$((64 * 1024 * 1024))
+          if [[ -e "${disk_guard_target}" || -L "${disk_guard_target}" ]]; then
+            if ! disk_guard_target_kib="$(du -sk "${disk_guard_target}" | awk 'NR == 1 { print $1; exit }')" ||
+               [[ ! "${disk_guard_target_kib}" =~ ^[0-9]+$ ]]; then
+              echo "::error::Cannot measure retained Cargo artifacts; refusing cleanup."
+              exit 1
+            fi
+            if (( disk_guard_target_kib > disk_guard_target_limit_kib ||
+                  disk_guard_available_kib < disk_guard_threshold_kib )); then
+              echo "Reclaiming disposable Cargo artifacts: size=${disk_guard_target_kib} KiB; limit=${disk_guard_target_limit_kib} KiB (64 GiB); free=${disk_guard_available_kib} KiB."
+              rm -rf -- "${disk_guard_target}"
+              measure_workspace_disk
+            fi
+          fi
         fi
 
         if [[ "${disk_guard_measurement}" == "valid" ]] &&
           (( disk_guard_available_kib >= disk_guard_threshold_kib )); then
           echo "Disk guard decision: skip cleanup; workspace filesystem free=${disk_guard_available_kib} KiB; threshold=${disk_guard_threshold_kib} KiB (30 GiB)."
+        elif [[ "${ASTRA_CI_RUNNER_ENVIRONMENT:-}" == self-hosted ]]; then
+          echo "::error::Disk guard decision: fail self-hosted; measurement=${disk_guard_measurement}; workspace filesystem free=${disk_guard_available_kib:-unavailable} KiB; threshold=${disk_guard_threshold_kib} KiB (30 GiB). Reclaim runner disk before retrying."
+          exit 1
         else
           echo "Disk guard decision: run cleanup; measurement=${disk_guard_measurement}; workspace filesystem free=${disk_guard_available_kib:-unavailable} KiB; threshold=${disk_guard_threshold_kib} KiB (30 GiB)."
           sudo rm -rf /usr/share/dotnet
@@ -61,11 +89,13 @@ runs:
         fi
 
         df -h "${disk_guard_workspace}"
+        if [[ "${ASTRA_CI_RUNNER_ENVIRONMENT:-}" == self-hosted ]]; then
+          # Survive checkout cleanup within this runner's isolated account.
+          echo "CARGO_TARGET_DIR=${ASTRA_CI_TARGET_DIR}" >> "$GITHUB_ENV"
+        fi
 
     - name: Install pinned Rust toolchain
-      # The repository toolchain also owns test-created Cargo fixtures.
-      shell: bash
-      run: rustc --version
+      uses: ./.github/actions/rust-toolchain
 
     - uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff # v2
       if: ${{ inputs.install-nextest == 'true' }}
@@ -109,6 +139,8 @@ runs:
     - name: Configure sccache
       if: ${{ inputs.use-sccache == 'true' && steps.install_sccache.outcome == 'success' }}
       shell: bash
+      env:
+        ASTRA_CI_RUNNER_ENVIRONMENT: ${{ runner.environment }}
       run: scripts/ci/configure-sccache.sh
 
     - name: Report sccache fallback
@@ -119,6 +151,7 @@ runs:
         echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
 
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      if: ${{ runner.environment != 'self-hosted' }}
       # Restoring build artifacts is also an optimization. Every caller runs a
       # compiler/test gate afterwards, so cache-service failures remain visible
       # as slower builds rather than false CI failures.

@@ -34,7 +34,11 @@ impl std::fmt::Debug for Model {
 impl Model {
     fn route(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
+            inference_protocol: None,
+            response_scope: None,
+            subscription: None,
             fixed_temperature: None,
+            supported_reasoning_efforts: None,
             thinking_protocol: Some(
                 astra_core::model_wire::thinking::canonical_thinking_protocol(
                     &self.provider,
@@ -98,7 +102,7 @@ impl MemoryInferencePort for Recorder<'_> {
                 cache_capability: None,
                 route: self.model.route(),
                 max_output_tokens: Some(r.max_output_tokens),
-                temperature: Some(r.temperature),
+                temperature: Some(r.preferred_temperature),
                 thinking: &ThinkingConfig::Off,
             },
             r.deadline,

@@ -1,16 +1,10 @@
 import {
   AstraClient,
-  PATH_AUTH_REFRESH,
   extractJwtSubject,
   headersInitToRecord,
-  joinApiPath,
   methodCanHaveJson,
 } from "@astra/sdk";
 import {
-  ACCESS_TOKEN_COOKIE,
-  API_URL_COOKIE,
-  DEFAULT_API_URL,
-  REFRESH_TOKEN_COOKIE,
   getRuntimeConfig,
   getWebConfigurationMessage,
   type RuntimeConfig,
@@ -21,6 +15,7 @@ export type RuntimeAuthMode = "required" | "optional" | "none";
 
 export type RuntimeRequestInit = Omit<RequestInit, "body"> & {
   auth?: RuntimeAuthMode;
+  retryUnauthorized?: boolean;
   json?: unknown;
   operation?: string;
   body?: BodyInit | null;
@@ -34,8 +29,6 @@ type RuntimeClientOptions = {
 export class WebRuntimeClient {
   readonly config: RuntimeConfig;
   readonly sdk: AstraClient;
-  private accessToken?: string;
-  private refreshToken?: string;
 
   constructor(config: RuntimeConfig) {
     if (config.mode !== "live" || !config.apiUrl) {
@@ -48,23 +41,11 @@ export class WebRuntimeClient {
     }
 
     this.config = config;
-    this.accessToken = config.accessToken;
-    this.refreshToken = config.refreshToken;
     this.sdk = new AstraClient({
-      baseUrl: config.apiUrl,
+      baseUrl: new URL("/", config.apiUrl).toString(),
       accessToken: config.accessToken,
       refreshToken: config.refreshToken,
-      headers: this.baseAuthHeaders("optional"),
-      onTokenRefresh: async (tokens) => {
-        this.accessToken = tokens.accessToken;
-        this.refreshToken = tokens.refreshToken;
-        await this.persistTokens(tokens.accessToken, tokens.refreshToken);
-      },
     });
-  }
-
-  get apiUrl(): string {
-    return this.config.apiUrl ?? DEFAULT_API_URL;
   }
 
   async get<T>(path: string, init?: RuntimeRequestInit): Promise<T> {
@@ -92,7 +73,7 @@ export class WebRuntimeClient {
   }
 
   async request<T>(path: string, init: RuntimeRequestInit = {}): Promise<T> {
-    const response = await this.fetchResponse(path, init);
+    const response = await this.fetchResponse(path, { ...init, retryUnauthorized: init.retryUnauthorized ?? true });
     if (!response.ok) {
       throw new RuntimeClientError({
         operation: init.operation ?? `${init.method ?? "GET"} ${path}`,
@@ -117,7 +98,7 @@ export class WebRuntimeClient {
       throw new RuntimeClientError({
         operation: init.operation ?? `${init.method ?? "GET"} ${path}`,
         path,
-        status: response.status,
+        status: 502,
         detail: `Runtime returned invalid JSON for ${path}.`,
         cause: error,
       });
@@ -130,24 +111,11 @@ export class WebRuntimeClient {
   ): Promise<Response> {
     const operation = init.operation ?? `${init.method ?? "GET"} ${path}`;
     const auth = init.auth ?? "optional";
-    const url = this.url(path);
-    const request = this.toRequestInit(init, auth, operation, path);
-
-    let response = await fetch(url, request);
-    if (response.status === 401 && auth !== "none" && this.refreshToken) {
-      const refreshed = await this.refreshTokens();
-      if (refreshed) {
-        response = await fetch(
-          url,
-          this.toRequestInit(init, auth, operation, path),
-        );
-      }
-    }
-    return response;
-  }
-
-  url(path: string): string {
-    return new URL(joinApiPath(undefined, path), this.apiUrl).toString();
+    return this.sdk.fetchResponse(
+      path,
+      this.toRequestInit(init, auth, operation, path),
+      { auth: auth === "none" ? "none" : "optional", retryUnauthorized: init.retryUnauthorized },
+    );
   }
 
   private toRequestInit(
@@ -167,7 +135,7 @@ export class WebRuntimeClient {
       init.headers,
     );
 
-    if (auth === "required" && !this.accessToken) {
+    if (auth === "required" && !this.sdk.getTokens().accessToken) {
       throw new RuntimeClientError({
         operation,
         path,
@@ -176,7 +144,7 @@ export class WebRuntimeClient {
       });
     }
 
-    const { auth: _auth, json: _json, operation: _operation, ...rest } = init;
+    const { auth: _auth, json: _json, operation: _operation, retryUnauthorized: _retryUnauthorized, ...rest } = init;
     return {
       ...rest,
       method,
@@ -194,9 +162,9 @@ export class WebRuntimeClient {
     if (request?.hasJsonBody && methodCanHaveJson(request.method)) {
       headers["Content-Type"] = "application/json";
     }
-    if (auth !== "none" && this.accessToken) {
-      headers.Authorization = `Bearer ${this.accessToken}`;
-      const userId = extractJwtSubject(this.accessToken);
+    const { accessToken } = this.sdk.getTokens();
+    if (auth !== "none" && accessToken) {
+      const userId = extractJwtSubject(accessToken);
       if (userId) {
         headers["X-User-Id"] = userId;
       }
@@ -204,56 +172,7 @@ export class WebRuntimeClient {
     return headers;
   }
 
-  private async refreshTokens(): Promise<boolean> {
-    if (!this.refreshToken) {
-      return false;
-    }
 
-    const response = await fetch(this.url(PATH_AUTH_REFRESH), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ refresh_token: this.refreshToken }),
-      cache: "no-store",
-    });
-    if (!response.ok) {
-      return false;
-    }
-
-    const payload = (await response.json()) as {
-      access_token?: unknown;
-      refresh_token?: unknown;
-    };
-    if (
-      typeof payload.access_token !== "string" ||
-      typeof payload.refresh_token !== "string"
-    ) {
-      return false;
-    }
-
-    this.accessToken = payload.access_token;
-    this.refreshToken = payload.refresh_token;
-    this.sdk.setTokens(payload.access_token, payload.refresh_token);
-    await this.persistTokens(payload.access_token, payload.refresh_token);
-    return true;
-  }
-
-  private async persistTokens(
-    accessToken: string,
-    refreshToken: string,
-  ): Promise<void> {
-    const { cookies } = await import("next/headers");
-    const cookieStore = await cookies();
-    cookieStore.set(ACCESS_TOKEN_COOKIE, accessToken, {
-      httpOnly: true,
-      sameSite: "lax",
-      path: "/",
-    });
-    cookieStore.set(REFRESH_TOKEN_COOKIE, refreshToken, {
-      httpOnly: true,
-      sameSite: "lax",
-      path: "/",
-    });
-  }
 }
 
 export async function getRuntimeClient(
@@ -291,40 +210,4 @@ export async function requireRuntimeClient(
     });
   }
   return new WebRuntimeClient(config);
-}
-
-export async function getRuntimeClientFromCookies(
-  options: RuntimeClientOptions = {},
-): Promise<WebRuntimeClient> {
-  const { cookies } = await import("next/headers");
-  const cookieStore = await cookies();
-  const apiUrl =
-    cookieStore.get(API_URL_COOKIE)?.value ??
-    process.env.ASTRA_API_URL ??
-    DEFAULT_API_URL;
-  const accessToken =
-    cookieStore.get(ACCESS_TOKEN_COOKIE)?.value ??
-    process.env.ASTRA_ACCESS_TOKEN;
-  const refreshToken = cookieStore.get(REFRESH_TOKEN_COOKIE)?.value;
-  if (options.auth === "required" && !accessToken) {
-    throw new RuntimeClientError({
-      operation: options.operation ?? "initialize runtime client",
-      path: "/",
-      status: 401,
-      detail: "Runtime authentication is missing.",
-    });
-  }
-  return new WebRuntimeClient({
-    mode: "live",
-    source: cookieStore.get(API_URL_COOKIE)?.value ? "cookie" : "env",
-    apiUrl,
-    accessToken,
-    refreshToken,
-    demoMode: false,
-    hasAccessToken: Boolean(accessToken),
-    hasRefreshToken: Boolean(refreshToken),
-    message: accessToken
-      ? `Connected to ${apiUrl} with authentication.`
-      : `Connected to ${apiUrl} without authentication. Login for full access.`,
-  });
 }

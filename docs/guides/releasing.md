@@ -330,3 +330,22 @@ Do not rewrite a tag or replace a completed release in place. Fix product or
 packaging defects through a normal pull request and publish a patch version. If
 an existing artifact is unsafe, mark the release as a prerelease and identify
 the replacement version prominently while preparing the patch.
+
+## Capability snapshot
+
+Release PRs must start with the same raw capability metadata line as all PRs,
+for example `Capability assessment: N/A: Version-only preparation changes no capability behavior.`
+For other changes, choose `Updated` or `Unchanged` and explain the reference
+updates or why its assessment remains accurate. See the [first-line contract](../reference/capabilities.md#keeping-claims-accurate).
+Release preparation does not generate a PR body.
+
+The [current capability reference](../reference/capabilities.md) is versioned with
+the source. Each new Release body links to that file at the selected immutable
+source SHA; generated release notes must preserve the link exactly once. Recovery
+reuses the owned draft byte-for-byte and verifies the same snapshot link.
+
+Release preflight requires the file in the selected source tree. Sources from
+before this reference existed are rejected explicitly by the current workflow;
+no new link is invented for an old release and no historical draft is migrated.
+Maintainers review the capability assessment before publication: structural CI
+checks are not evidence of live infrastructure or production maturity.

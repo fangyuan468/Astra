@@ -10,34 +10,38 @@ mod isolated_database;
 use astra_core::SharedPool;
 use astra_services::auth::session::{DatabaseSessionService, SessionService};
 use astra_services::runs::{
-    DatabaseRunStateStore, DurableRunRecord, RunControlReadKey, RunStateStore, ToolOutputBatchItem,
+    CanonicalRunTerminalReceipt, CanonicalRunTerminalRequest, CanonicalTerminalContext,
+    CanonicalTerminalOutcome, CanonicalTerminalTranscript, DatabaseRunStateStore, DurableRunRecord,
+    RunControlReadKey, RunStateStore,
 };
+use astra_turn_types::CanonicalTokenUsage;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use sqlx::{Connection, Row, mysql::MySqlConnection};
 use std::{sync::Arc, time::Duration};
 use tracing::instrument::WithSubscriber;
 use tracing_subscriber::prelude::*;
 
-/// Capture actual statements only within the instrumented store call.
-#[derive(Clone, Default)]
-struct Queries(Arc<std::sync::Mutex<Vec<String>>>);
-
-impl tracing::field::Visit for Queries {
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "db.statement" {
-            self.0.lock().unwrap().push(value.to_owned());
-        }
+/// Seed cold-body fixtures below the public codec, including corrupt bodies
+/// which metadata-only reads must never materialize or interpret.
+async fn seed_current_checkpoint_fixture(
+    pool: &SharedPool,
+    user: &str,
+    session: &str,
+    run: &str,
+    body: Option<&str>,
+) {
+    let identity = body.map(|_| format!("fixture-{}", uuid::Uuid::new_v4()));
+    if let (Some(id), Some(body)) = (&identity, body) {
+        sqlx::query("INSERT INTO run_checkpoints (checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind, checkpoint_version, idempotency_key, checkpoint_json) VALUES (?, ?, ?, ?, 0, 'phase', 'phase_checkpoint_v1', ?, ?)")
+            .bind(id).bind(run).bind(user).bind(session).bind(id).bind(body).execute(pool.get()).await.unwrap();
     }
-    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    let hash = body.map(|body| format!("{:x}", Sha256::digest(body.as_bytes())));
+    sqlx::query("UPDATE agent_runs SET current_checkpoint_id = ?, checkpoint_version = ?, current_checkpoint_hash = ? WHERE user_id = ? AND run_id = ?")
+        .bind(&identity).bind(body.map(|_| "phase_checkpoint_v1")).bind(hash).bind(user).bind(run).execute(pool.get()).await.unwrap();
 }
 
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Queries {
-    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-        if event.metadata().target() == "sqlx::query" {
-            event.record(&mut self.clone());
-        }
-    }
-}
+use common::SqlQueries as Queries;
 
 async fn setup() -> (SharedPool, Arc<DatabaseRunStateStore>) {
     let (pool, _settings) = common::setup_pool_and_settings().await;
@@ -64,6 +68,11 @@ fn make_idempotent_event(
 
 fn durable_run_record(run_id: String, user_id: String, session_id: String) -> DurableRunRecord {
     DurableRunRecord {
+        opening: Default::default(),
+        opening_hash: None,
+        context_admission_hash: None,
+        terminal_receipt_json: None,
+        terminal_at: None,
         run_id,
         user_id,
         session_id,
@@ -81,8 +90,8 @@ fn durable_run_record(run_id: String, user_id: String, session_id: String) -> Du
         owner_lease_expires_at: None,
         run_generation: 1,
         last_event_idx: -1,
-        checkpoint_version: None,
-        checkpoint_json: None,
+        last_guidance_event_idx: -1,
+        current_checkpoint: None,
         error_code: None,
         error_message: None,
 
@@ -144,6 +153,382 @@ async fn insert_run_fixture(
         .expect("insert active session fixture");
     }
     store.insert_run(record).await.expect("insert run fixture");
+}
+
+/// Complete through C0, the accounting/lifecycle owner, rather than inventing
+/// a second accounting-finalized event in the presentation log.
+async fn terminal_run_fixture(
+    pool: &SharedPool,
+    store: &DatabaseRunStateStore,
+    user: &str,
+    session: &str,
+    run: &str,
+    prompt: Option<u64>,
+    failure: Option<&str>,
+) {
+    let opened = store.load_run_admission(user, run).await.unwrap().unwrap();
+    let opened = opened.run();
+    let mut digest = Sha256::new();
+    digest.update(b"astra.run-terminal-transcript.v1\0");
+    digest.update(0_u64.to_be_bytes());
+    let receipt = CanonicalRunTerminalReceipt {
+        schema_version: 1,
+        user_id: user.into(),
+        session_id: session.into(),
+        run_id: run.into(),
+        generation: opened.run_generation,
+        opening_hash: opened.opening_hash.clone().unwrap(),
+        context_admission_hash: opened.context_admission_hash.clone(),
+        outcome: if failure.is_some() {
+            CanonicalTerminalOutcome::Failed
+        } else {
+            CanonicalTerminalOutcome::Completed
+        },
+        error_hash: CanonicalRunTerminalReceipt::error_hash(failure),
+        error_code: None,
+        error_kind: None,
+        error_metadata: None,
+        interruption: None,
+        context: CanonicalTerminalContext::Unowned,
+        transcript: CanonicalTerminalTranscript {
+            item_count: 0,
+            digest: format!("{:x}", digest.finalize()),
+            assistant_source_event_id: None,
+        },
+        usage: prompt
+            .map(|n| CanonicalTokenUsage::new(Some(n), Some(0), Some(0), Some(0)).unwrap()),
+        tool_ledger: None,
+    };
+    let mut tx = pool.get().begin().await.unwrap();
+    astra_services::storage::admit_session_execution_write(&mut tx, session, user)
+        .await
+        .unwrap();
+    store
+        .claim_canonical_terminal_in_transaction(
+            &mut tx,
+            CanonicalRunTerminalRequest {
+                user_id: user,
+                run_id: run,
+                expected_session_id: session,
+                expected_statuses: &["running"],
+                expected_owner_generation: opened.run_generation,
+                status: if failure.is_some() {
+                    "failed"
+                } else {
+                    "completed"
+                },
+                waiting_for: None,
+                error_message: failure,
+                error_code: None,
+                error_kind: None,
+                error_metadata: None,
+                interruption: None,
+                cancellation_origin: None,
+                prompt_tokens: prompt.unwrap_or(0),
+                completion_tokens: 0,
+                tool_calls: 0,
+            },
+            &receipt,
+        )
+        .await
+        .unwrap()
+        .expect("canonical terminal claim");
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn audit_error_events_project_receipts_without_double_counting_status() {
+    use astra_services::session_audit::{
+        AuditSessionListParams, CrossSessionStatsParams, DatabaseSessionAuditService,
+        SessionAuditService,
+    };
+    let (pool, settings) = common::setup_pool_and_settings().await;
+    let store = DatabaseRunStateStore::new(pool.clone());
+    let user = uuid::Uuid::new_v4().to_string();
+    let session = uuid::Uuid::new_v4().to_string();
+    let runs: Vec<_> = (0..3).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+    for run in &runs {
+        let mut record = durable_run_record(run.clone(), user.clone(), session.clone());
+        record.events = vec![make_event("run_started", json!({}))];
+        insert_run_fixture(&pool, &store, record).await;
+    }
+    terminal_run_fixture(
+        &pool,
+        &store,
+        &user,
+        &session,
+        &runs[0],
+        None,
+        Some("receipt failure"),
+    )
+    .await;
+    let physical = make_event("run_error", json!({"error":"crash recovery"}));
+    store
+        .update_run_status_with_events_if_current(
+            &user,
+            &session,
+            &runs[1],
+            &["running"],
+            None,
+            "failed",
+            None,
+            Some("crash recovery"),
+            &[physical],
+        )
+        .await
+        .unwrap();
+    store
+        .update_run_status_with_events_if_current(
+            &user,
+            &session,
+            &runs[2],
+            &["running"],
+            None,
+            "failed",
+            None,
+            Some("status only"),
+            &[],
+        )
+        .await
+        .unwrap();
+    let audit = DatabaseSessionAuditService::new(settings).with_pool(pool.clone());
+    let initial = audit.list_errors(&user, &session).await.unwrap();
+    assert_eq!(
+        initial.total, 2,
+        "receipt and crash recovery each own one event; status alone owns none"
+    );
+    let receipt = initial
+        .errors
+        .iter()
+        .find(|error| error.event_id.starts_with("receipt:"))
+        .unwrap()
+        .clone();
+    assert_eq!(receipt.event_type, "run_error");
+    assert!(receipt.content.contains("receipt failure"));
+    let stored: String = sqlx::query_scalar("SELECT CAST(terminal_receipt_json AS CHAR) FROM agent_runs WHERE user_id = ? AND run_id = ?")
+        .bind(&user).bind(&runs[0]).fetch_one(pool.get()).await.unwrap();
+    let index = receipt.metadata["event_idx"].as_i64().unwrap();
+    let physical_id = initial
+        .errors
+        .iter()
+        .find(|error| !error.event_id.starts_with("receipt:"))
+        .unwrap()
+        .event_id
+        .clone();
+    // Cross-source ID equality is not proof of a duplicate event.
+    sqlx::query("INSERT INTO agent_events (event_id,user_id,session_id,event_type,content,metadata,payload_hash,ingestion_write_id,created_at) VALUES (?, ?, ?, 'error','independent journal failure',CAST('{}' AS JSON),?,?,'2026-10-01 00:00:59')")
+        .bind(&physical_id).bind(&user).bind(&session).bind("a".repeat(64)).bind(uuid::Uuid::new_v4().to_string()).execute(pool.get()).await.unwrap();
+    store
+        .append_events_batch(
+            &user,
+            &session,
+            &runs[0],
+            &[make_event(
+                "run_error",
+                json!({"error":"independent later failure"}),
+            )],
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_runs SET created_at = '2026-10-01 00:00:00', terminal_at = '2026-10-01 00:01:01' WHERE user_id = ?").bind(&user).execute(pool.get()).await.unwrap();
+    sqlx::query("UPDATE agent_run_events SET created_at = '2026-10-01 00:00:59' WHERE user_id = ?")
+        .bind(&user)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_run_openings SET opening_events_json = '{invalid' WHERE user_id = ?")
+        .bind(&user)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    let listed = audit.list_errors(&user, &session).await.unwrap();
+    assert_eq!(listed.total, 4);
+    let later = listed
+        .errors
+        .iter()
+        .find(|error| error.event_id == receipt.event_id)
+        .unwrap();
+    assert_eq!(later.metadata["event_idx"], index);
+    assert_eq!(
+        audit
+            .get_summary(&user, &session)
+            .await
+            .unwrap()
+            .error_count,
+        4
+    );
+    let sessions = audit
+        .list_sessions(
+            &user,
+            &serde_json::from_value::<AuditSessionListParams>(json!({})).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sessions.sessions[0].error_count, 4);
+    let all = CrossSessionStatsParams {
+        since: None,
+        until: None,
+    };
+    assert_eq!(
+        audit
+            .get_cross_session_stats(&user, &all)
+            .await
+            .unwrap()
+            .total_errors,
+        4
+    );
+    for (since, until, expected) in [
+        (None, Some("2026-10-01 00:01:00".into()), 3),
+        (Some("2026-10-01 00:01:00".into()), None, 1),
+    ] {
+        assert_eq!(
+            audit
+                .get_cross_session_stats(&user, &CrossSessionStatsParams { since, until })
+                .await
+                .unwrap()
+                .total_errors,
+            expected
+        );
+    }
+    assert!(audit.list_errors("foreign-owner", &session).await.is_err());
+    let mut mismatch: serde_json::Value = serde_json::from_str(&stored).unwrap();
+    mismatch["receipt"]["run_id"] = "wrong-run".into();
+    for invalid in ["{invalid".to_string(), mismatch.to_string()] {
+        sqlx::query(
+            "UPDATE agent_runs SET terminal_receipt_json = ? WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(invalid)
+        .bind(&user)
+        .bind(&runs[0])
+        .execute(pool.get())
+        .await
+        .unwrap();
+        assert!(audit.list_errors(&user, &session).await.is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT 1")
+                .fetch_one(pool.get())
+                .await
+                .unwrap(),
+            1
+        );
+    }
+    for table in [
+        "agent_run_events",
+        "agent_run_openings",
+        "agent_runs",
+        "agent_events",
+        "agent_sessions",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_id = ?"
+        )))
+        .bind(&user)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn load_run_does_not_mix_metadata_with_later_committed_events() {
+    // Pause after SQLx has received the metadata row, but before load_run
+    // reads its events. The independent writer can then commit a later event
+    // deterministically, without sleeps or production test hooks.
+    struct MetadataReadBarrier {
+        ready: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MetadataReadBarrier {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "sqlx::query" {
+                return;
+            }
+            let mut queries = Queries::default();
+            event.record(&mut queries);
+            if !queries.0.lock().unwrap().iter().any(|sql| {
+                sql.contains("FROM agent_runs LEFT JOIN agent_run_openings")
+                    && sql.contains("WHERE user_id = ? AND run_id = ?")
+            }) {
+                return;
+            }
+            if let Some(ready) = self.ready.lock().unwrap().take() {
+                ready.send(()).expect("notify metadata reader barrier");
+                // The synchronous SQLx callback must hand off its Tokio
+                // worker so the notified writer and database I/O can advance.
+                tokio::task::block_in_place(|| {
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("release metadata reader after concurrent commit");
+                });
+            }
+        }
+    }
+
+    let (pool, store) = setup().await;
+    let user_id = common::id("run-read-user");
+    let session_id = common::id("run-read-session");
+    let run_id = common::id("run-read-run");
+    insert_run_fixture(
+        &pool,
+        store.as_ref(),
+        durable_run_record(run_id.clone(), user_id.clone(), session_id.clone()),
+    )
+    .await;
+    let before = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let subscriber = tracing_subscriber::registry().with(MetadataReadBarrier {
+        ready: std::sync::Mutex::new(Some(ready_tx)),
+        release: std::sync::Mutex::new(release_rx),
+    });
+    let reader = {
+        let store = Arc::clone(&store);
+        let user_id = user_id.clone();
+        let run_id = run_id.clone();
+        tokio::spawn(async move {
+            store
+                .load_run(&user_id, &run_id)
+                .with_subscriber(subscriber)
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), ready_rx)
+        .await
+        .expect("reader reaches metadata boundary")
+        .expect("metadata boundary remains observable");
+    let later_event = make_event("tool_result", json!({"output": "committed after metadata"}));
+    let append = tokio::time::timeout(
+        Duration::from_secs(5),
+        store.append_event(&user_id, &session_id, &run_id, later_event.clone()),
+    )
+    .await;
+    release_tx.send(()).expect("release paused reader");
+    append
+        .expect("independent writer can commit while reader is paused")
+        .expect("append concurrent event");
+    let snapshot = reader.await.unwrap().unwrap().unwrap();
+    assert_eq!(snapshot.last_event_idx, before.last_event_idx);
+    assert_eq!(
+        snapshot.events, before.events,
+        "events must belong to the metadata frontier, not a later commit"
+    );
+    let current = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+    assert!(current.last_event_idx > snapshot.last_event_idx);
+    assert_eq!(current.events.last().unwrap()["id"], later_event["id"]);
+    assert_eq!(
+        current.events.last().unwrap()["index"],
+        current.last_event_idx
+    );
+    common::cleanup_work_owner(&pool, &user_id).await;
 }
 
 #[tokio::test]
@@ -217,6 +602,10 @@ async fn cancellation_intent_is_independent_from_a_locked_session_row() {
     for (sql, scoped_id) in [
         (
             "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+            &run_id,
+        ),
+        (
+            "DELETE FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
             &run_id,
         ),
         (
@@ -362,23 +751,24 @@ async fn batch_write_preserves_event_idx_ordering() {
     .await
     .unwrap();
 
-    assert_eq!(rows.len(), 5);
+    assert_eq!(rows.len(), 4);
 
     let types: Vec<String> = rows.iter().map(|r| r.get("event_type")).collect();
     assert_eq!(
         types,
-        vec![
-            "run_started",
-            "tool_call",
-            "tool_result",
-            "text_delta",
-            "run_finished"
-        ]
+        vec!["tool_call", "tool_result", "text_delta", "run_finished"]
     );
 
     let indices: Vec<i64> = rows.iter().map(|r| r.get("event_idx")).collect();
     for (i, idx) in indices.iter().enumerate() {
-        assert_eq!(*idx, i as i64, "event_idx should be sequential");
+        assert_eq!(*idx, i as i64 + 1, "event_idx should be sequential");
+    }
+
+    let loaded = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+    assert_eq!(loaded.events.len(), 5);
+    assert_eq!(loaded.events[0]["event_type"], "run_started");
+    for (index, event) in loaded.events.iter().enumerate() {
+        assert_eq!(event["index"], index as i64);
     }
 
     // Cleanup
@@ -585,10 +975,7 @@ async fn append_events_batch_isolates_idempotency_and_replay_by_owner() {
         .bind(&run_id)
         .execute(_pool.get())
         .await;
-    let _ = sqlx::query("DELETE FROM run_display_projections WHERE run_id = ?")
-        .bind(&run_id)
-        .execute(_pool.get())
-        .await;
+
     let _ = sqlx::query("DELETE FROM agent_runs WHERE run_id = ?")
         .bind(&run_id)
         .execute(_pool.get())
@@ -637,13 +1024,7 @@ async fn event_append_keeps_checkpoint_durable_without_reading_its_body() {
             json!({"version":"checkpoint_v1", "graceful":true, "payload":"x".repeat(bytes)})
                 .to_string()
         });
-        sqlx::query("UPDATE agent_runs SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?")
-            .bind(&body)
-            .bind(&user)
-            .bind(&run)
-            .execute(pool.get())
-            .await
-            .unwrap();
+        seed_current_checkpoint_fixture(&pool, &user, &session, &run, body.as_deref()).await;
         let event = make_idempotent_event(
             "agent_progress",
             &format!("body-{bytes}"),
@@ -664,7 +1045,7 @@ async fn event_append_keeps_checkpoint_durable_without_reading_its_body() {
                 .find(|sql| sql.contains("FROM agent_runs") && sql.contains("FOR UPDATE"))
                 .expect("actual run-lock statement");
             assert!(
-                locked_run.contains("CAST(NULL AS CHAR) AS checkpoint_json"),
+                !locked_run.contains("checkpoint_json") && !locked_run.contains("run_checkpoints"),
                 "append must omit recovery body: {locked_run}"
             );
             eprintln!(
@@ -674,7 +1055,7 @@ async fn event_append_keeps_checkpoint_durable_without_reading_its_body() {
             );
         }
         let retained: Option<String> = sqlx::query_scalar(
-            "SELECT checkpoint_json FROM agent_runs WHERE user_id = ? AND run_id = ?",
+            "SELECT c.checkpoint_json FROM agent_runs r LEFT JOIN run_checkpoints c ON c.user_id = r.user_id AND c.run_id = r.run_id AND c.checkpoint_id = r.current_checkpoint_id WHERE r.user_id = ? AND r.run_id = ?",
         )
         .bind(&user)
         .bind(&run)
@@ -716,15 +1097,13 @@ async fn event_append_keeps_checkpoint_durable_without_reading_its_body() {
     assert_eq!(index, baseline_index + 3);
     for table in [
         "agent_run_events",
-        "run_display_projections",
         "agent_runs",
-        "agent_session_execution_slots",
         "agent_session_lifecycle_fences",
         "agent_sessions",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE user_id = ? AND session_id IN (?, ?)"
-        ))
+        )))
         .bind(&user)
         .bind(&session)
         .bind(&other_session)
@@ -902,10 +1281,7 @@ async fn checkpoints_isolate_idempotency_and_latest_load_by_owner() {
         .bind(&run_id)
         .execute(_pool.get())
         .await;
-    let _ = sqlx::query("DELETE FROM run_display_projections WHERE run_id = ?")
-        .bind(&run_id)
-        .execute(_pool.get())
-        .await;
+
     let _ = sqlx::query("DELETE FROM agent_runs WHERE run_id = ?")
         .bind(&run_id)
         .execute(_pool.get())
@@ -921,6 +1297,7 @@ async fn recovery_claim_reads_canonical_resume_history_without_embedded_snapshot
     let user_id = format!("recovery-history-user-{}", uuid::Uuid::new_v4());
     let session_id = format!("recovery-history-session-{}", uuid::Uuid::new_v4());
     let run_id = format!("recovery-history-run-{}", uuid::Uuid::new_v4());
+    let oversized_run_id = format!("oversized-{}", uuid::Uuid::new_v4());
     let malformed_run_id = format!("recovery-history-malformed-{}", uuid::Uuid::new_v4());
     insert_run_fixture(
         &_pool,
@@ -928,15 +1305,23 @@ async fn recovery_claim_reads_canonical_resume_history_without_embedded_snapshot
         durable_run_record(run_id.clone(), user_id.clone(), session_id.clone()),
     )
     .await;
-    let mut malformed_record = durable_run_record(
+    let malformed_record = durable_run_record(
         malformed_run_id.clone(),
         user_id.clone(),
         session_id.clone(),
     );
-    malformed_record.checkpoint_version = Some("checkpoint_v1".into());
-    malformed_record.checkpoint_json =
-        Some(r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":7}"#.into());
     insert_run_fixture(&_pool, store.as_ref(), malformed_record).await;
+
+    insert_run_fixture(
+        &_pool,
+        store.as_ref(),
+        durable_run_record(
+            oversized_run_id.clone(),
+            user_id.clone(),
+            session_id.clone(),
+        ),
+    )
+    .await;
 
     let checkpoint_json =
         r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"canonical-only"}"#;
@@ -971,6 +1356,25 @@ async fn recovery_claim_reads_canonical_resume_history_without_embedded_snapshot
         .expect("insert recovery checkpoint fixture");
     }
 
+    // The newest oversized row is invalid even though an older valid row
+    // exists. Exercise the actual bounded SQL projection, not just the codec.
+    for (offset, body) in [
+        (0, checkpoint_json.to_owned()),
+        (
+            1,
+            json!({
+                "version":"checkpoint_v1", "graceful":true,
+                "last_batch_id":"oversized", "padding":"x".repeat(8 * 1024 * 1024)
+            })
+            .to_string(),
+        ),
+    ] {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO run_checkpoints (checkpoint_id,run_id,user_id,session_id,node_seq,checkpoint_kind,checkpoint_version,idempotency_key,checkpoint_json,created_at) VALUES (?,?,?,?,4,'resume','checkpoint_v1',?,?,DATE_ADD(NOW(6),INTERVAL ? SECOND))")
+            .bind(&id).bind(&oversized_run_id).bind(&user_id).bind(&session_id)
+            .bind(&id).bind(body).bind(offset).execute(_pool.get()).await.unwrap();
+    }
+
     let claims = store
         .claim_recoverable_active_runs(256)
         .await
@@ -980,8 +1384,7 @@ async fn recovery_claim_reads_canonical_resume_history_without_embedded_snapshot
         .find(|claim| claim.run.user_id == user_id && claim.run.run_id == run_id)
         .expect("canonical-only recovery run should be claimed");
     assert!(claim.has_graceful_resume_checkpoint);
-    assert!(claim.run.checkpoint_version.is_none());
-    assert!(claim.run.checkpoint_json.is_none());
+    assert!(claim.run.current_checkpoint.is_none());
 
     let malformed_claim = claims
         .iter()
@@ -989,10 +1392,22 @@ async fn recovery_claim_reads_canonical_resume_history_without_embedded_snapshot
         .expect("malformed canonical recovery run should be claimed");
     assert!(!malformed_claim.has_graceful_resume_checkpoint);
 
-    for run_id in [run_id.as_str(), malformed_run_id.as_str()] {
+    assert!(
+        !claims
+            .iter()
+            .find(|claim| claim.run.run_id == oversized_run_id)
+            .expect("oversized newest checkpoint still permits its existing owner claim")
+            .has_graceful_resume_checkpoint
+    );
+
+    for run_id in [
+        run_id.as_str(),
+        malformed_run_id.as_str(),
+        oversized_run_id.as_str(),
+    ] {
         for statement in [
             "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
-            "DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
             "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
         ] {
             let _ = sqlx::query(statement)
@@ -1002,337 +1417,6 @@ async fn recovery_claim_reads_canonical_resume_history_without_embedded_snapshot
                 .await;
         }
     }
-}
-
-/// Owner isolation: dirty tool output rows for another user/session with the
-/// same batch/output identity must not block or contaminate the owner batch.
-#[tokio::test]
-#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
-async fn tool_output_batches_isolate_identity_by_owner_session() {
-    let (_pool, store) = setup().await;
-    let owner_user_id = format!("tool-owner-{}", uuid::Uuid::new_v4());
-    let foreign_user_id = format!("tool-foreign-{}", uuid::Uuid::new_v4());
-    let owner_session_id = format!("tool-owner-session-{}", uuid::Uuid::new_v4());
-    let foreign_session_id = format!("tool-foreign-session-{}", uuid::Uuid::new_v4());
-    let run_id = format!("tool-run-{}", uuid::Uuid::new_v4());
-    let foreign_run_id = format!("tool-foreign-run-{}", uuid::Uuid::new_v4());
-    let batch_id = format!("batch-{}", uuid::Uuid::new_v4());
-    let output_id = format!("output-{}", uuid::Uuid::new_v4());
-    let missing_tool_name = format!("missing-tool-{}", uuid::Uuid::new_v4());
-
-    insert_run_fixture(
-        &_pool,
-        store.as_ref(),
-        durable_run_record(
-            run_id.clone(),
-            owner_user_id.clone(),
-            owner_session_id.clone(),
-        ),
-    )
-    .await;
-
-    sqlx::query(
-        "INSERT INTO session_tool_output_batches
-         (batch_id, session_id, run_id, user_id, output_count, payload_bytes, status, created_at)
-         VALUES (?, ?, ?, ?, 1, 17, 'committed', NOW(6))",
-    )
-    .bind(&batch_id)
-    .bind(&foreign_session_id)
-    .bind(&foreign_run_id)
-    .bind(&foreign_user_id)
-    .execute(_pool.get())
-    .await
-    .expect("insert foreign dirty batch");
-    sqlx::query(
-        "INSERT INTO session_tool_outputs
-         (output_id, batch_id, session_id, run_id, user_id, output_idx, parent_output_id,
-          tool_call_id, tool_name, output_json, payload_bytes, preview_text, preview_status,
-          artifact_ref, content_hash, normalize_version, created_at)
-         VALUES (?, ?, ?, ?, ?, 0, NULL, 'foreign-call', 'bash', ?, 17, 'foreign',
-                 'template', NULL, 'foreign-hash', 'raw_v1', NOW(6))",
-    )
-    .bind(&output_id)
-    .bind(&batch_id)
-    .bind(&foreign_session_id)
-    .bind(&foreign_run_id)
-    .bind(&foreign_user_id)
-    .bind(r#"{"source":"foreign_row"}"#)
-    .execute(_pool.get())
-    .await
-    .expect("insert foreign dirty output");
-
-    store
-        .insert_tool_output_batch(
-            &batch_id,
-            &owner_session_id,
-            &run_id,
-            &owner_user_id,
-            &[ToolOutputBatchItem {
-                output_id: output_id.clone(),
-                tool_call_id: Some("owner-call".into()),
-                tool_name: missing_tool_name.clone(),
-                result: astra_turn_types::ToolInvocationResultPayload::new(
-                    "owner_row",
-                    Default::default(),
-                    None,
-                )
-                .unwrap(),
-            }],
-        )
-        .await
-        .expect("owner tool output batch insert");
-
-    let same_batch_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM session_tool_output_batches WHERE batch_id = ?")
-            .bind(&batch_id)
-            .fetch_one(_pool.get())
-            .await
-            .unwrap();
-    assert_eq!(
-        same_batch_count, 2,
-        "batch identity must include owner/session"
-    );
-
-    let same_output_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM session_tool_outputs WHERE batch_id = ? AND output_idx = 0",
-    )
-    .bind(&batch_id)
-    .fetch_one(_pool.get())
-    .await
-    .unwrap();
-    assert_eq!(
-        same_output_count, 2,
-        "output batch ordering must include owner/session"
-    );
-
-    let owner_payload: String = sqlx::query_scalar(
-        "SELECT output_json FROM session_tool_outputs
-         WHERE user_id = ? AND session_id = ? AND output_id = ?",
-    )
-    .bind(&owner_user_id)
-    .bind(&owner_session_id)
-    .bind(&output_id)
-    .fetch_one(_pool.get())
-    .await
-    .unwrap();
-    assert!(
-        owner_payload.contains("owner_row"),
-        "owner output payload must not be overwritten by foreign row: {owner_payload}"
-    );
-
-    let owner_event_count: i64 = sqlx::query_scalar(
-        "SELECT event_count FROM agent_sessions WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(&owner_session_id)
-    .bind(&owner_user_id)
-    .fetch_one(_pool.get())
-    .await
-    .expect("load owner event_count");
-    assert_eq!(
-        owner_event_count, 0,
-        "fallback persistence must not change session event_count"
-    );
-
-    let missing_event_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events
-         WHERE session_id = ? AND user_id = ? AND event_type = 'preview_template_missing'
-           AND meta_tool_name = ?",
-    )
-    .bind(&owner_session_id)
-    .bind(&owner_user_id)
-    .bind(&missing_tool_name)
-    .fetch_one(_pool.get())
-    .await
-    .expect("count owner preview-template diagnostic events");
-    assert_eq!(missing_event_count, 0);
-
-    let _ = sqlx::query("DELETE FROM session_tool_outputs WHERE batch_id = ?")
-        .bind(&batch_id)
-        .execute(_pool.get())
-        .await;
-    let _ = sqlx::query("DELETE FROM session_tool_output_batches WHERE batch_id = ?")
-        .bind(&batch_id)
-        .execute(_pool.get())
-        .await;
-    let _ = sqlx::query(
-        "DELETE FROM agent_events
-         WHERE (session_id = ? AND user_id = ?)
-            OR (session_id = ? AND user_id = ?)",
-    )
-    .bind(&owner_session_id)
-    .bind(&owner_user_id)
-    .bind(&foreign_session_id)
-    .bind(&foreign_user_id)
-    .execute(_pool.get())
-    .await;
-    let _ = sqlx::query("DELETE FROM agent_runs WHERE run_id = ?")
-        .bind(&run_id)
-        .execute(_pool.get())
-        .await;
-    let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
-        .bind(&owner_session_id)
-        .bind(&owner_user_id)
-        .execute(_pool.get())
-        .await;
-}
-
-#[tokio::test]
-#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
-async fn tool_output_batches_fence_all_tools_without_session_diagnostic_mutations() {
-    let (pool, store) = setup().await;
-    let user_id = format!("preview-user-{}", uuid::Uuid::new_v4());
-    let session_id = format!("preview-session-{}", uuid::Uuid::new_v4());
-    sqlx::query(
-        "INSERT INTO agent_sessions
-         (user_id, session_id, status, event_count, last_event_id, created_at, updated_at, last_active_at)
-         VALUES (?, ?, 'active', 7, 'prior-event', '2026-01-01', '2026-01-01', '2026-01-01')",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .execute(pool.get()).await.unwrap();
-
-    for state in ["active", "deleting", "pending_delete", "deleted", "missing"] {
-        if state == "deleting" {
-            sqlx::query("UPDATE agent_sessions SET status = 'deleting' WHERE user_id = ? AND session_id = ?")
-                .bind(&user_id).bind(&session_id).execute(pool.get()).await.unwrap();
-        } else if state == "pending_delete" {
-            // An active root must still be rejected by the durable fence.
-            sqlx::query(
-                "UPDATE agent_sessions SET status = 'active' WHERE user_id = ? AND session_id = ?",
-            )
-            .bind(&user_id)
-            .bind(&session_id)
-            .execute(pool.get())
-            .await
-            .unwrap();
-            sqlx::query("UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6) WHERE user_id = ? AND session_id = ?")
-                .bind(&user_id).bind(&session_id).execute(pool.get()).await.unwrap();
-        } else if state == "deleted" {
-            sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
-                .bind(&user_id)
-                .bind(&session_id)
-                .execute(pool.get())
-                .await
-                .unwrap();
-            sqlx::query("UPDATE agent_session_lifecycle_fences SET database_deleted_at = NOW(6) WHERE user_id = ? AND session_id = ?")
-                .bind(&user_id).bind(&session_id).execute(pool.get()).await.unwrap();
-        } else if state == "missing" {
-            sqlx::query(
-                "DELETE FROM agent_session_lifecycle_fences WHERE user_id = ? AND session_id = ?",
-            )
-            .bind(&user_id)
-            .bind(&session_id)
-            .execute(pool.get())
-            .await
-            .unwrap();
-        }
-
-        for name in [
-            "read_file",
-            "ask_user",
-            "unknown_preview_tool",
-            "empty_batch",
-        ] {
-            let batch_id = uuid::Uuid::new_v4().to_string();
-            let items = if name == "empty_batch" {
-                vec![]
-            } else {
-                vec![ToolOutputBatchItem {
-                    output_id: uuid::Uuid::new_v4().to_string(),
-                    tool_call_id: None,
-                    tool_name: name.to_string(),
-                    result: astra_turn_types::ToolInvocationResultPayload::new(
-                        "bounded output",
-                        Default::default(),
-                        None,
-                    )
-                    .unwrap(),
-                }]
-            };
-            // Retrying must neither manufacture diagnostic events nor escape admission.
-            for _ in 0..2 {
-                let result = store
-                    .insert_tool_output_batch(
-                        &batch_id,
-                        &session_id,
-                        "preview-run",
-                        &user_id,
-                        &items,
-                    )
-                    .await;
-                if state == "active" {
-                    result.unwrap();
-                } else {
-                    assert!(
-                        matches!(
-                            result,
-                            Err(astra_services::runs::DatabaseRunStateStoreError::Database {
-                                operation: "admit_tool_output_batch",
-                                source: sqlx::Error::RowNotFound,
-                                ..
-                            })
-                        ),
-                        "{state}/{name}: {result:?}"
-                    );
-                }
-            }
-            for table in ["session_tool_output_batches", "session_tool_outputs"] {
-                let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ? AND batch_id = ?"))
-                    .bind(&user_id).bind(&session_id).bind(&batch_id).fetch_one(pool.get()).await.unwrap();
-                let expected = if state == "active"
-                    && (table == "session_tool_output_batches" || !items.is_empty())
-                {
-                    1
-                } else {
-                    0
-                };
-                assert_eq!(count, expected, "{state}/{name}/{table}");
-                sqlx::query(&format!(
-                    "DELETE FROM {table} WHERE user_id = ? AND session_id = ? AND batch_id = ?"
-                ))
-                .bind(&user_id)
-                .bind(&session_id)
-                .bind(&batch_id)
-                .execute(pool.get())
-                .await
-                .unwrap();
-            }
-        }
-        let events: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .fetch_one(pool.get())
-        .await
-        .unwrap();
-        assert_eq!(events, 0);
-        if state == "active" {
-            let unchanged: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND session_id = ?
-                 AND event_count = 7 AND last_event_id = 'prior-event'
-                 AND updated_at = '2026-01-01' AND last_active_at = '2026-01-01'",
-            )
-            .bind(&user_id)
-            .bind(&session_id)
-            .fetch_one(pool.get())
-            .await
-            .unwrap();
-            assert_eq!(
-                unchanged, 1,
-                "preview persistence cannot mutate session diagnostics or activity"
-            );
-        }
-    }
-    let roots: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND session_id = ?",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .fetch_one(pool.get())
-    .await
-    .unwrap();
-    assert_eq!(roots, 0, "output writes must not lazily recreate a session");
 }
 
 /// Batch write: single-event append_event uses batch path and works.
@@ -1580,8 +1664,7 @@ async fn concurrent_run_inserts_share_one_session_slot() {
     );
 
     let slot_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_session_execution_slots
-         WHERE user_id = ? AND session_id = ?",
+        "SELECT COUNT(*) FROM agent_runs WHERE user_id = ? AND session_id = ? AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL) OR (owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)))",
     )
     .bind(&user_id)
     .bind(&session_id)
@@ -1602,15 +1685,13 @@ async fn concurrent_run_inserts_share_one_session_slot() {
     assert_eq!(fence_count, 1, "the first admission must create one fence");
 
     for table in [
-        "run_display_projections",
         "agent_run_events",
-        "agent_session_execution_slots",
         "agent_runs",
         "agent_session_lifecycle_fences",
         "agent_sessions",
     ] {
         let statement = format!("DELETE FROM {table} WHERE user_id = ? AND session_id = ?");
-        sqlx::query(&statement)
+        sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(&user_id)
             .bind(&session_id)
             .execute(pool.get())
@@ -1713,13 +1794,9 @@ async fn session_deletion_competes_safely_with_run_admission() {
             "agent_run_events",
             "user_id = ? AND session_id = ? AND run_id = ?",
         ),
-        (
-            "run_display_projections",
-            "user_id = ? AND session_id = ? AND run_id = ?",
-        ),
     ] {
         let statement = format!("SELECT COUNT(*) FROM {table} WHERE {predicate}");
-        let count: i64 = sqlx::query_scalar(&statement)
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
             .bind(&user_id)
             .bind(&session_id)
             .bind(&run_id)
@@ -1738,18 +1815,104 @@ async fn session_deletion_competes_safely_with_run_admission() {
     .expect("count deleted session root");
     assert_eq!(session_count, 0, "session deletion must remove the root");
 
-    for table in [
-        "agent_session_execution_slots",
-        "agent_session_lifecycle_fences",
-    ] {
+    for table in ["agent_session_lifecycle_fences"] {
         let statement = format!("DELETE FROM {table} WHERE user_id = ? AND session_id = ?");
-        sqlx::query(&statement)
+        sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(&user_id)
             .bind(&session_id)
             .execute(pool.get())
             .await
             .unwrap_or_else(|error| panic!("cleanup {table}: {error}"));
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn control_batch_reads_guidance_watermarks_without_event_queries() {
+    let (pool, store) = setup().await;
+    let nonce = uuid::Uuid::new_v4();
+    let (user_a, user_b) = (format!("guide-a-{nonce}"), format!("guide-b-{nonce}"));
+    let (run_a, run_b) = (format!("run-a-{nonce}"), format!("run-b-{nonce}"));
+    let (session_a, session_b) = (format!("session-a-{nonce}"), format!("session-b-{nonce}"));
+    for (user, run, session) in [(&user_a, &run_a, &session_a), (&user_b, &run_b, &session_b)] {
+        insert_run_fixture(
+            &pool,
+            &store,
+            durable_run_record(run.clone(), user.clone(), session.clone()),
+        )
+        .await;
+    }
+    let initial_a = store
+        .load_run_control(&user_a, &run_a)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_event_idx;
+    let initial_b = store
+        .load_run_control(&user_b, &run_b)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_event_idx;
+    for kind in ["progress", "user_intent", "progress", "user_intent"] {
+        store
+            .append_event(&user_a, &session_a, &run_a, make_event(kind, json!({})))
+            .await
+            .unwrap();
+    }
+    store
+        .append_event(
+            &user_b,
+            &session_b,
+            &run_b,
+            make_event("user_intent", json!({})),
+        )
+        .await
+        .unwrap();
+    let key = |user: &str, run: &str| RunControlReadKey {
+        user_id: user.into(),
+        run_id: run.into(),
+    };
+    let keys = vec![
+        key(&user_a, &run_a),
+        key(&user_b, &run_b),
+        key(&user_a, &run_a),
+        key(&user_b, &run_a),
+    ];
+    let queries = Queries::default();
+    let results = store
+        .load_run_control_batch(&keys)
+        .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
+        .await
+        .unwrap()
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        results[0].as_ref().unwrap().last_guidance_event_idx,
+        initial_a + 4
+    );
+    assert_eq!(
+        results[1].as_ref().unwrap().last_guidance_event_idx,
+        initial_b + 1
+    );
+    assert_eq!(
+        results[2].as_ref().unwrap().last_guidance_event_idx,
+        initial_a + 4
+    );
+    assert!(
+        results[3].is_none(),
+        "a different owner cannot observe this run"
+    );
+    let sql = queries.0.lock().unwrap();
+    assert_eq!(
+        sql.iter().filter(|sql| sql.contains("agent_runs")).count(),
+        1
+    );
+    assert!(
+        sql.iter().all(|sql| !sql.contains("agent_run_events")),
+        "control reads must not query event history"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1770,11 +1933,22 @@ async fn control_batch_preserves_database_identity_positions_and_isolates_corrup
         )
         .await;
     }
+    // MatrixOne inputRows counts storage rows before filtering, including
+    // unrelated rows sharing a candidate block. Bound scans by the population
+    // before injecting history, rather than by the number of requested keys.
+    let candidate_population: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+    assert!(candidate_population >= 2);
+    // More history than the entire initial population ensures a missing
+    // candidate filter cannot pass the scan bound by reading that history.
+    let history_count = candidate_population + 256;
     // Historical runs must not become work for unrelated active observations.
     let mut history = sqlx::QueryBuilder::<sqlx::MySql>::new(
         "INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,ancestor_path,status) ",
     );
-    history.push_values(0..256, |mut row, i| {
+    history.push_values(0..history_count, |mut row, i| {
         let id = format!("control-history-{nonce}-{i}");
         row.push_bind(&other)
             .push_bind(format!("session-{bad}"))
@@ -1872,10 +2046,10 @@ async fn control_batch_preserves_database_identity_positions_and_isolates_corrup
                         .all(|b| b.is_ascii_alphanumeric() || b == b'-')
                 );
             }
-            sqlx::raw_sql(&format!(
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
                 "SET @control_u{ordinal}='{}',@control_r{ordinal}='{}'",
                 key.user_id, key.run_id
-            ))
+            )))
             .execute(&mut *connection)
             .await
             .unwrap();
@@ -1887,17 +2061,17 @@ async fn control_batch_preserves_database_identity_positions_and_isolates_corrup
         arguments.truncate(statements[0].matches('?').count());
         // Inspect the emitted production SELECT, not a test-owned query copy.
         // MatrixOne supports this prepared diagnostic but not JSON EXPLAIN.
-        sqlx::raw_sql(&format!(
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "PREPARE control_scan FROM '{}'",
             statements[0].replace('\'', "''")
-        ))
+        )))
         .execute(&mut *connection)
         .await
         .unwrap();
-        let rows = sqlx::raw_sql(&format!(
+        let rows = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "EXPLAIN ANALYZE FORCE EXECUTE control_scan USING {}",
             arguments.join(",")
-        ))
+        )))
         .fetch_all(&mut *connection)
         .await
         .unwrap();
@@ -1928,8 +2102,8 @@ async fn control_batch_preserves_database_identity_positions_and_isolates_corrup
         assert!(!scans.is_empty(), "missing base scan counters: {plan:?}");
         let scanned = scans.iter().sum::<u64>();
         assert!(
-            (1..=size as u64).contains(&scanned),
-            "{size} lookups scanned {scanned} rows including unrelated history: {plan:?}"
+            (1..=candidate_population as u64).contains(&scanned),
+            "{size} lookups scanned {scanned} rows, exceeding the pre-history population {candidate_population}: {plan:?}"
         );
         eprintln!("control_batch requests={size} base_scan_rows={scanned}");
     }
@@ -1963,17 +2137,19 @@ async fn control_batch_preserves_database_identity_positions_and_isolates_corrup
     assert!(results[1].as_ref().unwrap().is_none());
     for table in ["agent_runs", "agent_sessions"] {
         for owner in [&user, &other] {
-            sqlx::query(&format!("DELETE FROM {table} WHERE user_id=?"))
-                .bind(owner)
-                .execute(independent.get())
-                .await
-                .unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE user_id=?"
+            )))
+            .bind(owner)
+            .execute(independent.get())
+            .await
+            .unwrap();
         }
     }
     independent.close().await;
 }
 
-/// The status reader must stay independent of history size and checkpoint bytes.
+/// Status returns bounded facts without hydrating history or checkpoint bodies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
@@ -1986,10 +2162,6 @@ async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
         json!({"event_type":"run_started", "data":{"explain_analyze_requested":true,"transport":"edge"}}),
         json!({"event_type":"executor_bound", "data":{"executor":{"id":"original"}}}),
         json!({"event_type":"workspace_bound", "data":{"workspace":{"id":"original"},"transport":"ignored"}}),
-        json!({"event_type":"executor_bound", "data":{"executor":{"id":"replacement"}}}),
-        json!({"event_type":"workspace_bound", "data":{"workspace":{"id":"replacement"}}}),
-        json!({"event_type":"run_finished", "data":{"prompt_tokens":10}}),
-        json!({"event_type":"run_finished", "data":{"prompt_tokens":20}}),
     ];
     events.extend((0..256).map(
         |i| json!({"event_type":"agent_progress", "data":{"index":i,"text":"x".repeat(2048)}}),
@@ -2000,23 +2172,64 @@ async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
         durable_run_record_with_events(run.clone(), user.clone(), session.clone(), "agent", events),
     )
     .await;
-    let checkpoint = "x".repeat(256 * 1024);
-    sqlx::query("UPDATE agent_runs SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?")
-        .bind(&checkpoint)
-        .bind(&user)
-        .bind(&run)
-        .execute(pool.get())
+    // Opening facts are immutable; later presentation cannot replace them.
+    store
+        .append_events_batch(
+            &user,
+            &session,
+            &run,
+            &[
+                json!({"event_type":"executor_bound","data":{"executor":{"id":"replacement"}}}),
+                json!({"event_type":"workspace_bound","data":{"workspace":{"id":"replacement"}}}),
+            ],
+        )
         .await
         .unwrap();
+    terminal_run_fixture(&pool, &store, &user, &session, &run, Some(20), None).await;
+    let terminal_at: chrono::NaiveDateTime =
+        sqlx::query_scalar("SELECT terminal_at FROM agent_runs WHERE user_id = ? AND run_id = ?")
+            .bind(&user)
+            .bind(&run)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+    let terminal_tail = store
+        .load_run_control(&user, &run)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_event_idx;
+    let checkpoint = "x".repeat(256 * 1024);
+    seed_current_checkpoint_fixture(&pool, &user, &session, &run, Some(&checkpoint)).await;
     let (_, replica) = setup().await;
-    for (phase, expected_tokens) in [(0, 20), (1, 30)] {
+    for phase in 0..2 {
         if phase == 1 {
-            store.append_events_batch(&user, &session, &run, &[
-                json!({"event_type":"run_accounting_finalized","data":{"prompt_tokens":25}}),
-                json!({"event_type":"run_accounting_finalized","data":{"prompt_tokens":30}}),
-                json!({"event_type":"run_finished","data":{"prompt_tokens":99}}),
-            ]).await.unwrap();
+            store
+                .append_events_batch(
+                    &user,
+                    &session,
+                    &run,
+                    &[
+                        json!({"event_type":"agent_progress","data":{"index":257}}),
+                        json!({"event_type":"agent_progress","data":{"index":258}}),
+                        json!({"event_type":"agent_progress","data":{"index":259}}),
+                    ],
+                )
+                .await
+                .unwrap();
         }
+        let current_terminal_at: chrono::NaiveDateTime = sqlx::query_scalar(
+            "SELECT terminal_at FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user)
+        .bind(&run)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            current_terminal_at, terminal_at,
+            "post-terminal evidence cannot move completion time"
+        );
         let queries = Queries::default();
         let subscriber =
             tracing::Dispatch::new(tracing_subscriber::registry().with(queries.clone()));
@@ -2030,11 +2243,8 @@ async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
         assert_eq!(snapshot.workspace.unwrap()["id"], "original");
         assert_eq!(snapshot.executor.unwrap()["id"], "original");
         assert_eq!(snapshot.transport.as_deref(), Some("edge"));
-        assert_eq!(
-            snapshot.accounting.unwrap()["prompt_tokens"],
-            expected_tokens
-        );
-        assert_eq!(snapshot.last_event_idx, 262 + phase * 3);
+        assert_eq!(snapshot.accounting.unwrap()["prompt_tokens"], 20);
+        assert_eq!(snapshot.last_event_idx, terminal_tail + phase * 3);
         let queries = queries.0.lock().unwrap();
         let reads: Vec<_> = queries
             .iter()
@@ -2053,7 +2263,7 @@ async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
             "status reads cannot write"
         );
         assert!(
-            reads[0].contains("CAST(NULL AS CHAR) AS checkpoint_json"),
+            !reads[0].contains("checkpoint_json") && !reads[0].contains("run_checkpoints"),
             "status must not hydrate recovery bodies"
         );
     }
@@ -2082,7 +2292,7 @@ async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
         );
     }
     let retained: String = sqlx::query_scalar(
-        "SELECT checkpoint_json FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        "SELECT c.checkpoint_json FROM agent_runs r LEFT JOIN run_checkpoints c ON c.user_id = r.user_id AND c.run_id = r.run_id AND c.checkpoint_id = r.current_checkpoint_id WHERE r.user_id = ? AND r.run_id = ?",
     )
     .bind(&user)
     .bind(&run)
@@ -2106,7 +2316,13 @@ async fn status_snapshot_preserves_selected_fact_failure_semantics() {
     insert_run_fixture(
         &pool,
         &store,
-        durable_run_record(run.clone(), user.clone(), session.clone()),
+        durable_run_record_with_events(
+            run.clone(),
+            user.clone(),
+            session.clone(),
+            "agent",
+            vec![json!({"event_type":"run_started","data":{}})],
+        ),
     )
     .await;
     let empty = store
@@ -2121,13 +2337,11 @@ async fn status_snapshot_preserves_selected_fact_failure_semantics() {
             &user,
             &session,
             &run,
-            &[
-                json!({"event_type":"agent_progress","data":{}}),
-                json!({"event_type":"run_finished","data":{"prompt_tokens":19}}),
-            ],
+            &[json!({"event_type":"agent_progress","data":{}})],
         )
         .await
         .unwrap();
+    terminal_run_fixture(&pool, &store, &user, &session, &run, Some(19), None).await;
     // A bad unrelated payload cannot poison the bounded status read.
     sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_type = 'agent_progress'")
         .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
@@ -2137,35 +2351,15 @@ async fn status_snapshot_preserves_selected_fact_failure_semantics() {
         .unwrap()
         .unwrap();
     assert_eq!(finished.accounting.unwrap()["prompt_tokens"], 19);
-    sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_type = 'run_finished'")
-        .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+    sqlx::query(
+        "UPDATE agent_runs SET terminal_receipt_json = '{' WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user)
+    .bind(&run)
+    .execute(pool.get())
+    .await
+    .unwrap();
     assert!(store.load_run_status_snapshot(&user, &run).await.is_err());
-
-    // Presence, not a successfully decoded 'data', selects finalized accounting.
-    store
-        .append_events_batch(
-            &user,
-            &session,
-            &run,
-            &[json!({"event_type":"run_accounting_finalized"})],
-        )
-        .await
-        .unwrap();
-    assert!(
-        store
-            .load_run_status_snapshot(&user, &run)
-            .await
-            .unwrap()
-            .unwrap()
-            .accounting
-            .is_none()
-    );
-    sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_type = 'run_accounting_finalized'")
-        .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
-    assert!(
-        store.load_run_status_snapshot(&user, &run).await.is_err(),
-        "selected corruption must not become missing accounting"
-    );
 }
 
 #[tokio::test]
@@ -2173,11 +2367,7 @@ async fn status_snapshot_preserves_selected_fact_failure_semantics() {
 async fn status_snapshot_keeps_zero_positions_and_ignores_unselected_same_type_corruption() {
     let (pool, store) = setup().await;
     let user = common::id("status-zero");
-    for event in [
-        json!({"event_type":"run_finished","data":{"prompt_tokens":0}}),
-        json!({"event_type":"run_accounting_finalized","data":{"prompt_tokens":0}}),
-        json!({"event_type":"workspace_bound","data":{"workspace":{"id":"only-workspace"}}}),
-    ] {
+    for prompt in [None, Some(0)] {
         let run = common::id("status-run");
         let session = common::id("status-session");
         insert_run_fixture(
@@ -2188,41 +2378,62 @@ async fn status_snapshot_keeps_zero_positions_and_ignores_unselected_same_type_c
                 user.clone(),
                 session.clone(),
                 "agent",
-                vec![event.clone()],
+                vec![json!({"event_type":"run_started","data":{}})],
             ),
         )
         .await;
+        terminal_run_fixture(&pool, &store, &user, &session, &run, prompt, None).await;
         let snapshot = store
             .load_run_status_snapshot(&user, &run)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(snapshot.last_event_idx, 0);
-        if event["event_type"] == "workspace_bound" {
-            assert_eq!(snapshot.workspace.as_ref().unwrap()["id"], "only-workspace");
-            assert!(snapshot.executor.is_none() && snapshot.accounting.is_none());
-            store
-                .append_events_batch(
-                    &user,
-                    &session,
-                    &run,
-                    &[json!({"event_type":"workspace_bound","data":{"workspace":{"id":"later"}}})],
-                )
-                .await
-                .unwrap();
-            sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_idx = 1")
-                .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
-            let after = store
-                .load_run_status_snapshot(&user, &run)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(after.workspace, snapshot.workspace);
-        } else {
-            assert_eq!(snapshot.accounting.unwrap()["prompt_tokens"], 0);
-            assert!(snapshot.workspace.is_none() && snapshot.executor.is_none());
-        }
+        assert_eq!(snapshot.last_event_idx, 1);
+        let accounting = snapshot.accounting.unwrap();
+        assert_eq!(
+            accounting
+                .get("prompt_tokens")
+                .and_then(serde_json::Value::as_u64),
+            prompt
+        );
+        assert_eq!(accounting["qualified_usage"].is_null(), prompt.is_none());
+        assert!(snapshot.workspace.is_none() && snapshot.executor.is_none());
     }
+    let run = common::id("status-run");
+    let session = common::id("status-session");
+    insert_run_fixture(
+        &pool,
+        &store,
+        durable_run_record_with_events(run.clone(), user.clone(), session.clone(), "agent", vec![json!({"event_type":"workspace_bound","data":{"workspace":{"id":"only-workspace"}}})]),
+    )
+    .await;
+    let first_index: i64 = sqlx::query_scalar("SELECT event_idx FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_type = 'workspace_bound'")
+        .bind(&user).bind(&run).fetch_one(pool.get()).await.unwrap();
+    assert_eq!(first_index, 0, "generic store facts can occupy index zero");
+    store
+        .append_events_batch(
+            &user,
+            &session,
+            &run,
+            &[json!({"event_type":"workspace_bound","data":{"workspace":{"id":"later"}}})],
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_idx = 1")
+        .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+    let snapshot = store
+        .load_run_status_snapshot(&user, &run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.workspace.unwrap()["id"], "only-workspace");
+    assert!(snapshot.executor.is_none() && snapshot.accounting.is_none());
+    sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_idx = 0")
+        .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+    assert!(
+        store.load_run_status_snapshot(&user, &run).await.is_err(),
+        "selected index-zero corruption must fail"
+    );
 }
 
 /// Count real SQL rather than simulating the batching implementation.
@@ -2442,206 +2653,232 @@ async fn batched_probe_conflicts_collation_and_overlapping_writers_preserve_atom
     }
     for table in [
         "agent_run_events",
-        "run_display_projections",
-        "agent_session_execution_slots",
         "agent_runs",
         "agent_sessions",
         "agent_session_lifecycle_fences",
     ] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
-            .bind(&user)
-            .execute(pool.get())
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_id = ?"
+        )))
+        .bind(&user)
+        .execute(pool.get())
+        .await
+        .unwrap();
     }
 }
 
 /// Opt-in database capacity probe, not a claim about 1,000 running LLM loops.
 /// Compare one and four independent pool/store owners at the same total quota.
 #[cfg(feature = "capacity-probes")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated MatrixOne; opt in with --features capacity-probes"]
-async fn thousand_session_append_preserves_results_across_independent_pools() {
+async fn assert_thousand_session_append_preserves_results(replicas: usize) {
+    let total_started = std::time::Instant::now();
     use futures_util::{StreamExt, future::join_all, stream};
     let (bootstrap, mut settings) = common::setup_pool_and_settings().await;
     isolated_database::require_isolated_database(&settings.database);
-    for replicas in [1_usize, 4] {
-        let prefix = common::id("append-scale");
-        settings.db_pool_max_connections = 32 / replicas as u32;
-        settings.db_pool_min_connections = 0;
-        let mut pools = Vec::new();
-        let mut stores = Vec::new();
-        for replica in 0..replicas {
-            let pool = SharedPool::new(&settings).await.unwrap();
-            stores.push(
-                DatabaseRunStateStore::new(pool.clone())
-                    .with_owner_pod_id(format!("scale-{replica}")),
-            );
-            pools.push(pool);
-        }
-        let identities: Vec<_> = (0..1000)
-            .map(|n| {
-                (
-                    format!("{prefix}-u{}", n / 10),
-                    format!("{prefix}-s{n}"),
-                    format!("{prefix}-r{n}"),
-                )
-            })
-            .collect();
-        stream::iter(identities.iter().enumerate())
-            .for_each_concurrent(32, |(n, (user, session, run))| {
-                let pool = &pools[n % replicas];
-                let store = &stores[n % replicas];
-                async move {
-                    insert_run_fixture(
-                        pool,
-                        store,
-                        durable_run_record(run.clone(), user.clone(), session.clone()),
-                    )
-                    .await;
-                }
-            })
-            .await;
-        let batch: Vec<_> = (0..16)
-            .map(|n| make_idempotent_event("agent_progress", &format!("scale-{n}"), json!({"n":n})))
-            .collect();
-        for replay in [false, true] {
-            let barrier = Arc::new(tokio::sync::Barrier::new(1000));
-            let started = std::time::Instant::now();
-            let calls = identities
-                .iter()
-                .enumerate()
-                .map(|(n, (user, session, run))| {
-                    // Replay through a different replica, not an instance-local cache.
-                    let store = &stores[(n + usize::from(replay)) % replicas];
-                    let batch = &batch;
-                    let barrier = barrier.clone();
-                    async move {
-                        barrier.wait().await;
-                        let started = std::time::Instant::now();
-                        let result = store.append_events_batch(user, session, run, batch).await;
-                        (result, started.elapsed().as_micros())
-                    }
-                });
-            let results = tokio::time::timeout(Duration::from_secs(120), join_all(calls))
-                .await
-                .unwrap();
-            let mut latencies: Vec<_> = results
-                .into_iter()
-                .map(|(result, elapsed)| {
-                    result.unwrap();
-                    elapsed
-                })
-                .collect();
-            latencies.sort_unstable();
-            eprintln!(
-                "append_scale replicas={replicas} total_connections=32 sessions=1000 owners=100 replay={replay} wall_ms={} p50_us={} p95_us={} p99_us={}",
-                started.elapsed().as_millis(),
-                latencies[499],
-                latencies[949],
-                latencies[989]
-            );
-            let bad: i64 = sqlx::query_scalar(
-                "SELECT CAST(COUNT(*) AS SIGNED) FROM (
-                   SELECT runs.run_id FROM agent_runs runs
-                   LEFT JOIN agent_run_events events
-                     ON events.user_id = runs.user_id AND events.run_id = runs.run_id
-                   WHERE runs.user_id LIKE ? GROUP BY runs.run_id
-                   HAVING COUNT(events.id) <> 17 OR MIN(events.event_idx) <> 0
-                       OR MAX(events.event_idx) <> 16 OR MAX(runs.last_event_idx) <> 16
-                 ) invalid_runs",
+    let prefix = common::id("append-scale");
+    settings.db_pool_max_connections = 32 / replicas as u32;
+    settings.db_pool_min_connections = 0;
+    let mut pools = Vec::new();
+    let mut stores = Vec::new();
+    for replica in 0..replicas {
+        let pool = SharedPool::new(&settings).await.unwrap();
+        stores.push(
+            DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id(format!("scale-{replica}")),
+        );
+        pools.push(pool);
+    }
+    let identities: Vec<_> = (0..1000)
+        .map(|n| {
+            (
+                format!("{prefix}-u{}", n / 10),
+                format!("{prefix}-s{n}"),
+                format!("{prefix}-r{n}"),
             )
+        })
+        .collect();
+    let seed_started = std::time::Instant::now();
+    stream::iter(identities.iter().enumerate())
+        .for_each_concurrent(32, |(n, (user, session, run))| {
+            let pool = &pools[n % replicas];
+            let store = &stores[n % replicas];
+            async move {
+                insert_run_fixture(
+                    pool,
+                    store,
+                    durable_run_record(run.clone(), user.clone(), session.clone()),
+                )
+                .await;
+            }
+        })
+        .await;
+    eprintln!(
+        "seed_scale replicas={replicas} sessions=1000 wall_ms={}",
+        seed_started.elapsed().as_millis()
+    );
+    let batch: Vec<_> = (0..16)
+        .map(|n| make_idempotent_event("agent_progress", &format!("scale-{n}"), json!({"n":n})))
+        .collect();
+    for replay in [false, true] {
+        let barrier = Arc::new(tokio::sync::Barrier::new(1000));
+        let started = std::time::Instant::now();
+        let calls = identities
+            .iter()
+            .enumerate()
+            .map(|(n, (user, session, run))| {
+                // Replay through a different replica, not an instance-local cache.
+                let store = &stores[(n + usize::from(replay)) % replicas];
+                let batch = &batch;
+                let barrier = barrier.clone();
+                async move {
+                    barrier.wait().await;
+                    let started = std::time::Instant::now();
+                    let result = store.append_events_batch(user, session, run, batch).await;
+                    (result, started.elapsed().as_micros())
+                }
+            });
+        let results = tokio::time::timeout(Duration::from_secs(120), join_all(calls))
+            .await
+            .unwrap();
+        let mut latencies: Vec<_> = results
+            .into_iter()
+            .map(|(result, elapsed)| {
+                result.unwrap();
+                elapsed
+            })
+            .collect();
+        latencies.sort_unstable();
+        eprintln!(
+            "append_scale replicas={replicas} total_connections=32 sessions=1000 owners=100 replay={replay} wall_ms={} p50_us={} p95_us={} p99_us={}",
+            started.elapsed().as_millis(),
+            latencies[499],
+            latencies[949],
+            latencies[989]
+        );
+        let bad: i64 = sqlx::query_scalar(
+            "SELECT CAST(COUNT(*) AS SIGNED) FROM (
+               SELECT runs.run_id FROM agent_runs runs
+               LEFT JOIN agent_run_events events
+                 ON events.user_id = runs.user_id AND events.run_id = runs.run_id
+               WHERE runs.user_id LIKE ? GROUP BY runs.run_id
+               HAVING COUNT(events.id) <> 17 OR MIN(events.event_idx) <> 0
+                   OR MAX(events.event_idx) <> 16 OR MAX(runs.last_event_idx) <> 16
+             ) invalid_runs",
+        )
+        .bind(format!("{prefix}%"))
+        .fetch_one(bootstrap.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            bad, 0,
+            "every run must retain its exact contiguous result after cross-replica replay"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE user_id LIKE ?")
             .bind(format!("{prefix}%"))
             .fetch_one(bootstrap.get())
             .await
             .unwrap();
-            assert_eq!(
-                bad, 0,
-                "every run must retain its exact contiguous result after cross-replica replay"
-            );
-            let count: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE user_id LIKE ?")
-                    .bind(format!("{prefix}%"))
-                    .fetch_one(bootstrap.get())
-                    .await
-                    .unwrap();
-            assert_eq!(count, 1000);
-        }
-        let facts = [
-            json!({"event_type":"run_started","idempotency_key":"status-start","data":{"transport":"edge","explain_analyze_requested":true}}),
-            json!({"event_type":"workspace_bound","idempotency_key":"status-workspace","data":{"workspace":{"id":"scale-workspace"}}}),
-            json!({"event_type":"executor_bound","idempotency_key":"status-executor","data":{"executor":{"id":"scale-executor"}}}),
-            json!({"event_type":"run_finished","idempotency_key":"status-finish","data":{"prompt_tokens":10}}),
-            json!({"event_type":"run_accounting_finalized","idempotency_key":"status-accounting","data":{"prompt_tokens":20}}),
-            json!({"event_type":"run_finished","idempotency_key":"status-later-finish","data":{"prompt_tokens":99}}),
-        ];
-        eprintln!("status_fixture replicas={replicas} prefix={prefix}");
-        // Both empty and populated facts must work through another pool owner.
-        for populated in [false, true] {
-            if populated {
-                stream::iter(identities.iter().enumerate())
-                    .for_each_concurrent(32, |(n, (user, session, run))| {
-                        let store = &stores[n % replicas];
-                        let facts = &facts;
-                        async move {
-                            store
-                                .append_events_batch(user, session, run, facts)
-                                .await
-                                .unwrap();
-                        }
-                    })
-                    .await;
-            }
-            let started = std::time::Instant::now();
-            let statuses = identities
-                .iter()
-                .enumerate()
-                .map(|(n, (user, session, run))| {
-                    let store = &stores[(n + 1) % replicas];
-                    async move {
-                        let started = std::time::Instant::now();
-                        let status = store
-                            .load_run_status_snapshot(user, run)
-                            .await
-                            .unwrap()
-                            .unwrap();
-                        assert_eq!(
-                            (&status.user_id, &status.session_id, &status.run_id),
-                            (user, session, run)
-                        );
-                        assert_eq!(status.last_event_idx, if populated { 22 } else { 16 });
-                        assert_eq!(status.explain_requested, populated);
-                        if populated {
-                            assert_eq!(status.workspace.unwrap()["id"], "scale-workspace");
-                            assert_eq!(status.executor.unwrap()["id"], "scale-executor");
-                            assert_eq!(status.transport.as_deref(), Some("edge"));
-                            assert_eq!(status.accounting.unwrap()["prompt_tokens"], 20);
-                        } else {
-                            assert!(
-                                status.workspace.is_none()
-                                    && status.executor.is_none()
-                                    && status.accounting.is_none()
-                            );
-                        }
-                        started.elapsed().as_micros()
-                    }
-                });
-            let mut latencies = tokio::time::timeout(Duration::from_secs(120), join_all(statuses))
-                .await
-                .unwrap();
-            latencies.sort_unstable();
-            eprintln!(
-                "status_scale replicas={replicas} populated={populated} total_connections=32 sessions=1000 owners=100 wall_ms={} p50_us={} p95_us={}",
-                started.elapsed().as_millis(),
-                latencies[499],
-                latencies[949]
-            );
-        }
-        drop(stores);
-        for pool in pools {
-            pool.close().await;
-        }
+        assert_eq!(count, 1000);
     }
+    let facts = [
+        json!({"event_type":"run_started","idempotency_key":"status-start","data":{"transport":"edge","explain_analyze_requested":true}}),
+        json!({"event_type":"workspace_bound","idempotency_key":"status-workspace","data":{"workspace":{"id":"scale-workspace"}}}),
+        json!({"event_type":"executor_bound","idempotency_key":"status-executor","data":{"executor":{"id":"scale-executor"}}}),
+        json!({"event_type":"run_finished","idempotency_key":"status-finish","data":{"prompt_tokens":10}}),
+        json!({"event_type":"run_finished","idempotency_key":"status-later-finish","data":{"prompt_tokens":99}}),
+    ];
+    eprintln!("status_fixture replicas={replicas} prefix={prefix}");
+    // Empty and populated facts use the next store; four replicas exercise
+    // a different pool owner, while the one-replica case stays on one pool.
+    for populated in [false, true] {
+        if populated {
+            let facts_started = std::time::Instant::now();
+            stream::iter(identities.iter().enumerate())
+                .for_each_concurrent(32, |(n, (user, session, run))| {
+                    let store = &stores[n % replicas];
+                    let facts = &facts;
+                    async move {
+                        store
+                            .append_events_batch(user, session, run, facts)
+                            .await
+                            .unwrap();
+                    }
+                })
+                .await;
+            eprintln!(
+                "facts_scale replicas={replicas} sessions=1000 wall_ms={}",
+                facts_started.elapsed().as_millis()
+            );
+        }
+        let started = std::time::Instant::now();
+        let statuses = identities
+            .iter()
+            .enumerate()
+            .map(|(n, (user, session, run))| {
+                let store = &stores[(n + 1) % replicas];
+                async move {
+                    let started = std::time::Instant::now();
+                    let status = store
+                        .load_run_status_snapshot(user, run)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        (&status.user_id, &status.session_id, &status.run_id),
+                        (user, session, run)
+                    );
+                    assert_eq!(status.last_event_idx, if populated { 21 } else { 16 });
+                    assert_eq!(status.explain_requested, populated);
+                    if populated {
+                        assert_eq!(status.workspace.unwrap()["id"], "scale-workspace");
+                        assert_eq!(status.executor.unwrap()["id"], "scale-executor");
+                        assert_eq!(status.transport.as_deref(), Some("edge"));
+                        assert_eq!(status.accounting.unwrap()["prompt_tokens"], 99);
+                    } else {
+                        assert!(
+                            status.workspace.is_none()
+                                && status.executor.is_none()
+                                && status.accounting.is_none()
+                        );
+                    }
+                    started.elapsed().as_micros()
+                }
+            });
+        let mut latencies = tokio::time::timeout(Duration::from_secs(120), join_all(statuses))
+            .await
+            .unwrap();
+        latencies.sort_unstable();
+        eprintln!(
+            "status_scale replicas={replicas} populated={populated} total_connections=32 sessions=1000 owners=100 wall_ms={} p50_us={} p95_us={}",
+            started.elapsed().as_millis(),
+            latencies[499],
+            latencies[949]
+        );
+    }
+    let teardown_started = std::time::Instant::now();
+    drop(stores);
+    for pool in pools {
+        pool.close().await;
+    }
+    bootstrap.close().await;
+    eprintln!(
+        "total_scale replicas={replicas} sessions=1000 teardown_ms={} total_ms={}",
+        teardown_started.elapsed().as_millis(),
+        total_started.elapsed().as_millis()
+    );
+}
+
+#[cfg(feature = "capacity-probes")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne; opt in with --features capacity-probes"]
+async fn thousand_session_append_preserves_results_one_pool() {
+    assert_thousand_session_append_preserves_results(1).await;
+}
+
+#[cfg(feature = "capacity-probes")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne; opt in with --features capacity-probes"]
+async fn thousand_session_append_preserves_results_four_pools() {
+    assert_thousand_session_append_preserves_results(4).await;
 }
 
 /// Dedup + non-keyed events: events without idempotency_key are never affected
@@ -2793,11 +3030,11 @@ async fn insert_ignore_toctou_dedup_and_index_accounting() {
             .fetch_one(_pool.get())
             .await
             .unwrap();
-    assert_eq!(count_before, 2);
+    assert_eq!(count_before, 1);
 
-    // Re-append the same events — SELECT finds all keys → no INSERT.
+    // Re-append the physical event; the opening is owned by immutable Run metadata.
     store
-        .append_events_batch(&user_id, &session_id, &run_id, &events)
+        .append_events_batch(&user_id, &session_id, &run_id, &events[1..])
         .await
         .expect("re-append same keys");
 
@@ -2807,7 +3044,7 @@ async fn insert_ignore_toctou_dedup_and_index_accounting() {
             .fetch_one(_pool.get())
             .await
             .unwrap();
-    assert_eq!(count_after, 2, "no new events — all deduped");
+    assert_eq!(count_after, 1, "no new events — all deduped");
 
     // last_event_idx unchanged: actually_inserted=0 → early return.
     let loaded = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
@@ -2815,7 +3052,7 @@ async fn insert_ignore_toctou_dedup_and_index_accounting() {
 
     // Mixed batch: one exact immutable replay plus one new event advances by one.
     let mixed: Vec<serde_json::Value> = vec![
-        events[0].clone(),
+        events[1].clone(),
         make_idempotent_event("tool_result", "tctou-k3", json!({"output": "done"})),
     ];
     store
@@ -2829,7 +3066,7 @@ async fn insert_ignore_toctou_dedup_and_index_accounting() {
             .fetch_one(_pool.get())
             .await
             .unwrap();
-    assert_eq!(count_final, 3, "1 new + 2 original = 3");
+    assert_eq!(count_final, 2, "one new event plus one physical original");
 
     let loaded2 = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
     assert_eq!(
@@ -2904,6 +3141,7 @@ async fn terminal_transition_persists_error_code_with_event_batch() {
         .expect("load run")
         .expect("run exists");
     assert_eq!(loaded.status, "failed");
+    assert!(loaded.terminal_at.is_some());
     assert_eq!(loaded.error_code.as_deref(), Some("network"));
     assert_eq!(
         loaded.error_message.as_deref(),
@@ -2963,7 +3201,6 @@ async fn root_discovery_uses_admission_order_and_decodes_narrow_owner_scoped_ide
     for (run_id, owner, session, day) in fixtures {
         let mut run = durable_run_record(run_id.clone(), owner.clone(), session.clone());
         run.status = "completed".into();
-        run.checkpoint_json = Some("x".repeat(512 * 1024));
         if run_id == &child {
             run.depth = 1;
             run.parent_run_id = Some(newer_root.clone());
@@ -2971,6 +3208,14 @@ async fn root_discovery_uses_admission_order_and_decodes_narrow_owner_scoped_ide
             run.ancestor_path = Some(format!("{newer_root}/{child}"));
         }
         insert_run_fixture(&pool, store.as_ref(), run).await;
+        seed_current_checkpoint_fixture(
+            &pool,
+            owner,
+            session,
+            run_id,
+            Some(&"x".repeat(512 * 1024)),
+        )
+        .await;
         store
             .append_event(
                 owner,
@@ -3098,11 +3343,15 @@ async fn root_discovery_uses_admission_order_and_decodes_narrow_owner_scoped_ide
     }
 }
 
-async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &DurableRunRecord) {
+async fn assert_auto_model_routing_commit(
+    store: &dyn RunStateStore,
+    run: &DurableRunRecord,
+    pool: Option<&SharedPool>,
+    discriminator: &str,
+) {
     use astra_services::model_routing::{DECISION_KEY, EVENT_TYPE, ModelRoutingDecision};
     use astra_turn_types::model_routing::{AutoModelRoutingPolicy, ModelRoutingReason};
     let decision = ModelRoutingDecision {
-        rollout: None,
         schema_version: 2,
         features: None,
         policy_version: "easy-read-only-v1".into(),
@@ -3120,8 +3369,98 @@ async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &Durab
         delegation_model_requirement: None,
         delegation_model_source: None,
     };
-    let event =
+    let mut event =
         json!({"event_type": EVENT_TYPE, "idempotency_key": DECISION_KEY, "data": decision});
+    if discriminator == "type" {
+        let kind = event.as_object_mut().unwrap().remove("event_type").unwrap();
+        event["type"] = kind;
+    }
+    // Reject retired provenance and unknown policies through the same fenced
+    // append used by production, without changing the baseline or event cursor.
+    let before = store
+        .load_run(&run.user_id, &run.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    for change in [
+        json!({"rollout": null}),
+        json!({"rollout": {"cohort": "control"}}),
+        json!({"rollout": {"cohort": "shadow"}}),
+        json!({"rollout": {"cohort": "treatment"}}),
+        json!({"policy_version": "learned-canary-v1"}),
+        json!({"policy_version": "unknown-policy"}),
+    ] {
+        let mut rejected = event.clone();
+        rejected["data"]
+            .as_object_mut()
+            .unwrap()
+            .extend(change.as_object().unwrap().clone());
+        assert!(
+            store
+                .append_events_if_current_generation_and_status(
+                    &run.user_id,
+                    &run.session_id,
+                    &run.run_id,
+                    run.run_generation,
+                    &["running"],
+                    &[rejected],
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .load_run(&run.user_id, &run.run_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+    }
+    if let Some(pool) = pool {
+        let before = store
+            .load_run(&run.user_id, &run.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let original: String = sqlx::query_scalar(
+            "SELECT opening_events_json FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&run.user_id)
+        .bind(&run.run_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        let mut changed: serde_json::Value = serde_json::from_str(&original).unwrap();
+        changed[0]["data"]["integrity_probe"] = json!(true);
+        sqlx::query("UPDATE agent_run_openings SET opening_events_json = ? WHERE user_id = ? AND run_id = ?")
+            .bind(changed.to_string()).bind(&run.user_id).bind(&run.run_id).execute(pool.get()).await.unwrap();
+        let error = store
+            .append_events_if_current_generation_and_status(
+                &run.user_id,
+                &run.session_id,
+                &run.run_id,
+                run.run_generation,
+                &["running"],
+                std::slice::from_ref(&event),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("immutable Run opening does not match its admitted identity"),
+            "{error}"
+        );
+        sqlx::query("UPDATE agent_run_openings SET opening_events_json = ? WHERE user_id = ? AND run_id = ?")
+            .bind(original).bind(&run.user_id).bind(&run.run_id).execute(pool.get()).await.unwrap();
+        assert_eq!(
+            store
+                .load_run(&run.user_id, &run.run_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+    }
     let mut batch = vec![event.clone()];
     batch.extend((0..24).map(|index| {
         json!({
@@ -3220,7 +3559,7 @@ async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &Durab
         !unchanged
             .events
             .iter()
-            .any(|e| e["event_type"] == EVENT_TYPE)
+            .any(|e| astra_services::runs::extract_event_type(e) == EVENT_TYPE)
     );
     for _ in 0..2 {
         assert!(
@@ -3251,7 +3590,7 @@ async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &Durab
         committed
             .events
             .iter()
-            .filter(|e| e["event_type"] == EVENT_TYPE)
+            .filter(|e| astra_services::runs::extract_event_type(e) == EVENT_TYPE)
             .count(),
         1
     );
@@ -3306,16 +3645,19 @@ async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &Durab
 
 #[tokio::test]
 async fn auto_model_routing_memory_commit_is_atomic_and_fenced() {
-    let store = astra_services::runs::InMemoryRunStateStore::new();
-    let mut run = durable_run_record(
-        "routing-memory".into(),
-        "routing-user".into(),
-        "routing-session".into(),
-    );
-    run.model_offering_id = Some("strong".into());
-    run.resolved_model_name = Some("strong-model".into());
-    store.insert_run(run.clone()).await.unwrap();
-    assert_auto_model_routing_commit(&store, &run).await;
+    for discriminator in ["event_type", "type"] {
+        let store = astra_services::runs::InMemoryRunStateStore::new();
+        let mut run = durable_run_record(
+            format!("routing-memory-{discriminator}"),
+            "routing-user".into(),
+            "routing-session".into(),
+        );
+        run.events = vec![make_event("run_started", json!({}))];
+        run.model_offering_id = Some("strong".into());
+        run.resolved_model_name = Some("strong-model".into());
+        store.insert_run(run.clone()).await.unwrap();
+        assert_auto_model_routing_commit(&store, &run, None, discriminator).await;
+    }
 }
 
 #[tokio::test]
@@ -3323,14 +3665,535 @@ async fn auto_model_routing_memory_commit_is_atomic_and_fenced() {
 async fn auto_model_routing_database_commit_is_atomic_and_fenced() {
     isolated_database::require_isolated_database(&common::require_db_it_env().database);
     let (pool, store) = setup().await;
-    let id = uuid::Uuid::new_v4().to_string();
-    let mut run = durable_run_record(
-        format!("routing-{id}"),
-        format!("routing-user-{id}"),
-        format!("routing-session-{id}"),
+    for discriminator in ["event_type", "type"] {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut run = durable_run_record(
+            format!("routing-{id}"),
+            format!("routing-user-{id}"),
+            format!("routing-session-{id}"),
+        );
+        run.events = vec![make_event("run_started", json!({}))];
+        run.model_offering_id = Some("strong".into());
+        run.resolved_model_name = Some("strong-model".into());
+        insert_run_fixture(&pool, store.as_ref(), run.clone()).await;
+        assert_auto_model_routing_commit(store.as_ref(), &run, Some(&pool), discriminator).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn guarded_request_reuses_locked_identity_and_rolls_back_index_exhaustion() {
+    use astra_services::runs::{
+        AtomicRunActionAdmissionRequest, AtomicRunToolRequestCommitOutcome,
+        AtomicRunToolRequestCommitRequest,
+    };
+    let (pool, store) = setup().await;
+    let user = format!("guarded-user-{}", uuid::Uuid::new_v4());
+    for agent in [None, Some("guarded-agent")] {
+        let session = uuid::Uuid::new_v4().to_string();
+        let run = uuid::Uuid::new_v4().to_string();
+        let mut record = durable_run_record(run.clone(), user.clone(), session.clone());
+        record.agent_id = agent.map(str::to_string);
+        insert_run_fixture(&pool, store.as_ref(), record).await;
+        let initial = store.load_run(&user, &run).await.unwrap().unwrap();
+        let event = json!({"event_type":"tool_request","idempotency_key":"edge-tool-request:guarded-write","data":{"request_id":"guarded-write","tool":"write_file","arguments":{"path":"/workspace/synthetic.txt"}}});
+        let action = AtomicRunActionAdmissionRequest {
+            user_id: &user,
+            expected_session_id: &session,
+            run_id: &run,
+            action_id: "guarded-write",
+            expected_owner_generation: initial.run_generation,
+            expected_control_epoch: initial.last_event_idx,
+        };
+        let request = AtomicRunToolRequestCommitRequest {
+            action,
+            tool_request_event: &event,
+        };
+        let count = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+            )
+            .bind(&user)
+            .bind(&run)
+            .fetch_one(pool.get())
+            .await
+            .unwrap()
+        };
+        let initial_count = count().await;
+        let mut wrong_session = request;
+        wrong_session.action.expected_session_id = "foreign-session";
+        assert_eq!(
+            store
+                .commit_guarded_tool_request(wrong_session)
+                .await
+                .unwrap(),
+            AtomicRunToolRequestCommitOutcome::Missing
+        );
+        let mut stale = request;
+        stale.action.expected_owner_generation = initial.run_generation + 1;
+        assert!(matches!(
+            store.commit_guarded_tool_request(stale).await.unwrap(),
+            AtomicRunToolRequestCommitOutcome::OwnerGenerationMismatch { .. }
+        ));
+        let mut invalid = event.clone();
+        invalid["data"]["run_id"] = json!("another-run");
+        assert!(
+            store
+                .commit_guarded_tool_request(AtomicRunToolRequestCommitRequest {
+                    tool_request_event: &invalid,
+                    ..request
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            count().await,
+            initial_count,
+            "failure after staging must roll back its grant and request"
+        );
+        assert_eq!(
+            store
+                .load_run_control(&user, &run)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_event_idx,
+            initial.last_event_idx
+        );
+        let queries = Queries::default();
+        let subscriber = tracing_subscriber::registry().with(queries.clone());
+        let committed = store
+            .commit_guarded_tool_request(request)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        let AtomicRunToolRequestCommitOutcome::Committed(receipt) = committed else {
+            panic!("expected commit: {committed:?}");
+        };
+        assert_eq!(receipt.action_event_index, initial.last_event_idx + 1);
+        assert_eq!(receipt.tool_request_event_index, initial.last_event_idx + 2);
+        assert_eq!(
+            store.commit_guarded_tool_request(request).await.unwrap(),
+            AtomicRunToolRequestCommitOutcome::AlreadyCommitted(receipt)
+        );
+        assert_eq!(
+            count().await,
+            initial_count + 2,
+            "replay never appends another pair"
+        );
+        let facts: Vec<(String, i64, String, Option<String>)> = sqlx::query_as("SELECT event_type,event_idx,session_id,agent_id FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx > ? ORDER BY event_idx")
+            .bind(&user).bind(&run).bind(initial.last_event_idx).fetch_all(pool.get()).await.unwrap();
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].0, "action_admission_granted");
+        assert_eq!(facts[1].0, "tool_request");
+        assert!(
+            facts
+                .iter()
+                .all(|fact| fact.2 == session
+                    && fact.3.as_deref() == Some(agent.unwrap_or_default()))
+        );
+        {
+            let captured = queries.0.lock().unwrap();
+            assert!(!captured.is_empty());
+            assert!(
+                captured
+                    .iter()
+                    .all(|sql| !sql.contains("agent_run_openings")
+                        && !sql.contains("checkpoint_json")),
+                "guarded dispatch must not reload immutable bodies: {captured:?}"
+            );
+        }
+
+        let overflow_event = json!({"event_type":"tool_request","idempotency_key":"edge-tool-request:overflow","data":{"request_id":"overflow","tool":"write_file","arguments":{}}});
+        for frontier in [i64::MAX - 1, i64::MAX] {
+            sqlx::query(
+                "UPDATE agent_runs SET last_event_idx = ? WHERE user_id = ? AND run_id = ?",
+            )
+            .bind(frontier)
+            .bind(&user)
+            .bind(&run)
+            .execute(pool.get())
+            .await
+            .unwrap();
+            let overflow = AtomicRunToolRequestCommitRequest {
+                action: AtomicRunActionAdmissionRequest {
+                    action_id: "overflow",
+                    expected_control_epoch: frontier,
+                    ..action
+                },
+                tool_request_event: &overflow_event,
+            };
+            assert!(store.commit_guarded_tool_request(overflow).await.is_err());
+            assert_eq!(
+                count().await,
+                initial_count + 2,
+                "index exhaustion must roll back a staged grant"
+            );
+            assert_eq!(
+                store
+                    .load_run_control(&user, &run)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .last_event_idx,
+                frontier
+            );
+        }
+        sqlx::query("UPDATE agent_runs SET last_event_idx = ? WHERE user_id = ? AND run_id = ?")
+            .bind(i64::MAX - 2)
+            .bind(&user)
+            .bind(&run)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        let boundary = AtomicRunToolRequestCommitRequest {
+            action: AtomicRunActionAdmissionRequest {
+                action_id: "overflow",
+                expected_control_epoch: i64::MAX - 2,
+                ..action
+            },
+            tool_request_event: &overflow_event,
+        };
+        assert!(
+            matches!(store.commit_guarded_tool_request(boundary).await.unwrap(), AtomicRunToolRequestCommitOutcome::Committed(ref receipt) if receipt.tool_request_event_index == i64::MAX)
+        );
+        for statement in [
+            "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        ] {
+            sqlx::query(statement)
+                .bind(&user)
+                .bind(&run)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn checkpoint_save_keeps_large_opening_out_of_the_locked_read() {
+    use astra_services::runs::{
+        CheckpointWriteAuthority, DurableRunOpening, RunCheckpointWriteRequest,
+    };
+    let (pool, store) = setup().await;
+    let user = uuid::Uuid::new_v4().to_string();
+    let session = uuid::Uuid::new_v4().to_string();
+    let run = uuid::Uuid::new_v4().to_string();
+    let mut record = durable_run_record(run.clone(), user.clone(), session.clone());
+    record.events =
+        vec![json!({"event_type":"run_started", "data":{"text":"x".repeat(6 * 1024 * 1024)}})];
+    record.opening = DurableRunOpening::capture(&record.events).unwrap().into();
+    insert_run_fixture(&pool, &store, record).await;
+    let body = r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"small"}"#;
+    let queries = Queries::default();
+    let subscriber = tracing_subscriber::registry().with(queries.clone());
+    let request = || RunCheckpointWriteRequest {
+        user_id: &user,
+        expected_session_id: &session,
+        run_id: &run,
+        checkpoint_json: body,
+        authority: CheckpointWriteAuthority::ControlPlane,
+    };
+    assert!(
+        store
+            .save_checkpoint(request())
+            .with_subscriber(subscriber)
+            .await
+            .unwrap()
+            .is_some()
     );
-    run.model_offering_id = Some("strong".into());
-    run.resolved_model_name = Some("strong-model".into());
-    insert_run_fixture(&pool, store.as_ref(), run.clone()).await;
-    assert_auto_model_routing_commit(store.as_ref(), &run).await;
+    let statements = queries.0.lock().unwrap().clone();
+    assert!(
+        statements
+            .iter()
+            .any(|sql| sql.contains("FROM agent_runs") && sql.contains("FOR UPDATE"))
+    );
+    assert!(
+        statements
+            .iter()
+            .all(|sql| !sql.contains("agent_run_openings")),
+        "checkpoint save must not access the cold opening table"
+    );
+    assert!(
+        store
+            .load_run(&user, &run)
+            .await
+            .unwrap()
+            .unwrap()
+            .opening
+            .loaded()
+            .unwrap()
+            .is_some()
+    );
+
+    // Corrupt cold data is still rejected by a complete read, while a control
+    // write neither transfers nor decodes it. It cannot repair that corruption.
+    sqlx::query("UPDATE agent_run_openings SET opening_events_json = 'invalid' WHERE user_id = ? AND run_id = ?")
+        .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+    assert!(store.save_checkpoint(request()).await.unwrap().is_some());
+    assert!(store.load_run(&user, &run).await.is_err());
+    sqlx::query(
+        "UPDATE agent_runs SET current_checkpoint_hash = ? WHERE user_id = ? AND run_id = ?",
+    )
+    .bind("z".repeat(64))
+    .bind(&user)
+    .bind(&run)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    assert!(
+        store.save_checkpoint(request()).await.is_err(),
+        "the control read must still validate the current checkpoint reference"
+    );
+    DatabaseSessionService::new(pool.settings().clone())
+        .with_pool(pool.clone())
+        .delete_session(session, user)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn recovery_claim_keeps_large_openings_out_of_locked_batch() {
+    use astra_services::runs::{DurableRunOpening, OpeningBody};
+    let (pool, store) = setup().await;
+    let user = uuid::Uuid::new_v4().to_string();
+    let session = uuid::Uuid::new_v4().to_string();
+    let mut expected = Vec::new();
+    for _ in 0..2 {
+        let run = uuid::Uuid::new_v4().to_string();
+        let mut record = durable_run_record(run.clone(), user.clone(), session.clone());
+        record.events =
+            vec![json!({"event_type":"run_started", "data":{"text":"x".repeat(6 * 1024 * 1024)}})];
+        record.opening = DurableRunOpening::capture(&record.events).unwrap().into();
+        insert_run_fixture(&pool, &store, record).await;
+        seed_current_checkpoint_fixture(
+            &pool,
+            &user,
+            &session,
+            &run,
+            Some(r#"{"version":"phase_checkpoint_v1"}"#),
+        )
+        .await;
+        expected.push(store.load_run(&user, &run).await.unwrap().unwrap());
+    }
+    let queries = Queries::default();
+    let claims = store
+        .claim_recoverable_active_runs(256)
+        .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
+        .await
+        .unwrap();
+    let statements = queries.0.lock().unwrap().clone();
+    assert!(
+        statements
+            .iter()
+            .any(|sql| sql.contains("FROM agent_runs") && sql.contains("FOR UPDATE"))
+    );
+    assert!(
+        statements
+            .iter()
+            .all(|sql| !sql.contains("agent_run_openings")),
+        "ownership claims must not load cold openings"
+    );
+    for before in expected {
+        let claim = claims
+            .iter()
+            .find(|claim| claim.run.run_id == before.run_id)
+            .expect("run claimed");
+        assert_eq!(claim.claimed_from_generation, before.run_generation);
+        assert_eq!(claim.run.run_generation, before.run_generation + 1);
+        assert_eq!(claim.run.last_event_idx, before.last_event_idx);
+        assert_eq!(claim.run.current_checkpoint, before.current_checkpoint);
+        assert_eq!(claim.run.opening_hash, before.opening_hash);
+        assert!(matches!(claim.run.opening, OpeningBody::NotLoaded));
+        let after = store
+            .load_run(&user, &before.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.opening, before.opening,
+            "complete reads must retain the original bytes and integrity checks"
+        );
+    }
+    DatabaseSessionService::new(pool.settings().clone())
+        .with_pool(pool.clone())
+        .delete_session(session, user)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn corrupt_cold_openings_do_not_block_control_but_cannot_resume_execution() {
+    let (pool, store) = setup().await;
+    let user = uuid::Uuid::new_v4().to_string();
+    let session = uuid::Uuid::new_v4().to_string();
+    let mut runs = Vec::new();
+    for statement in [
+        Some(
+            "UPDATE agent_run_openings SET opening_events_json = 'invalid' WHERE user_id = ? AND run_id = ?",
+        ),
+        Some("DELETE FROM agent_run_openings WHERE user_id = ? AND run_id = ?"),
+        None,
+    ] {
+        let run = uuid::Uuid::new_v4().to_string();
+        insert_run_fixture(
+            &pool,
+            &store,
+            durable_run_record(run.clone(), user.clone(), session.clone()),
+        )
+        .await;
+        if let Some(statement) = statement {
+            sqlx::query(statement)
+                .bind(&user)
+                .bind(&run)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+        runs.push(run);
+    }
+    let healthy_run = runs.last().unwrap().clone();
+    let claims = store.claim_recoverable_active_runs(256).await.unwrap();
+    for run in runs {
+        let claim = claims
+            .iter()
+            .find(|claim| claim.run.run_id == run)
+            .expect("cold corruption must not poison the control batch");
+        let generation = claim.run.run_generation;
+        let events = [make_idempotent_event(
+            "agent_progress",
+            "control-drain",
+            json!({"text":"accounting drain"}),
+        )];
+        assert!(
+            !store
+                .append_events_if_current_generation_and_status(
+                    &user,
+                    &session,
+                    &run,
+                    generation - 1,
+                    &["running"],
+                    &events
+                )
+                .await
+                .unwrap()
+        );
+        let queries = Queries::default();
+        assert!(
+            store
+                .append_events_if_current_generation_and_status(
+                    &user,
+                    &session,
+                    &run,
+                    generation,
+                    &["running"],
+                    &events
+                )
+                .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
+                .await
+                .unwrap()
+        );
+        assert!(
+            queries
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|sql| !sql.contains("agent_run_openings"))
+        );
+        assert!(
+            store
+                .update_run_status_with_events_if_current(
+                    &user,
+                    &session,
+                    &run,
+                    &["running"],
+                    Some(generation),
+                    "paused",
+                    Some("user_resume"),
+                    None,
+                    &[]
+                )
+                .await
+                .unwrap()
+        );
+        if run != healthy_run {
+            assert!(
+                store
+                    .update_run_status_with_events_if_current(
+                        &user,
+                        &session,
+                        &run,
+                        &["paused"],
+                        Some(generation),
+                        "running",
+                        None,
+                        None,
+                        &[]
+                    )
+                    .await
+                    .is_err(),
+                "execution transitions still require a valid opening"
+            );
+            assert!(store.load_run(&user, &run).await.is_err());
+        } else {
+            assert_eq!(
+                store.load_run(&user, &run).await.unwrap().unwrap().status,
+                "paused"
+            );
+        }
+        let queries = Queries::default();
+        let projection = store
+            .load_run_interaction_projection(
+                &user,
+                &run,
+                astra_services::runs::DurableRunInteractionKind::Approval,
+            )
+            .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.status, "paused");
+        assert_eq!(projection.session_id, session);
+        assert!(projection.recent_events.is_empty());
+        assert!(
+            queries
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|sql| !sql.contains("agent_run_openings"))
+        );
+        assert!(
+            store
+                .load_run_interaction_projection(
+                    "different-owner",
+                    &run,
+                    astra_services::runs::DurableRunInteractionKind::Approval
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let control = store.load_run_control(&user, &run).await.unwrap().unwrap();
+        assert_eq!(control.status, "paused");
+        assert_eq!(control.run_generation, generation);
+        assert_eq!(control.last_event_idx, claim.run.last_event_idx + 1);
+    }
+    DatabaseSessionService::new(pool.settings().clone())
+        .with_pool(pool.clone())
+        .delete_session(session, user)
+        .await
+        .unwrap();
 }

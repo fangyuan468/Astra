@@ -15,7 +15,7 @@ async fn declared_genesis_max_effort_reaches_gateway() {
         }))],
     )])
     .await;
-    let ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+    let ledger = crate::server::provider_test_support::ProviderObservationsFixture::default();
     let mut execution = test_gateway_execution(
         format!("{}/v1/chat/completions", provider.base_url),
         Some(2000),
@@ -23,9 +23,9 @@ async fn declared_genesis_max_effort_reaches_gateway() {
     execution.model_name = "kimi-k3".into();
     execution.thinking_capability = Some(ThinkingCapability::EffortOnly);
     execution.thinking_protocol = Some(ThinkingProtocol::ReasoningEffort);
-    execution.reasoning_efforts = Some(vec!["low".into(), "high".into(), "max".into()]);
+    execution.supported_reasoning_efforts = Some(vec!["low".into(), "high".into(), "max".into()]);
     let mut host = test_host_builder("effort-user", "effort-session")
-        .with_test_inference_ledger(ledger.clone())
+        .with_provider_observations(ledger.clone())
         .with_admitted_model_execution(Some(execution))
         .build();
     let mut state = create_durable_execution_test_state("effort-session");
@@ -99,7 +99,7 @@ async fn glm_captured_reasoning_is_exact_on_second_and_third_provider_requests()
             }
         }, vec![ProviderResponse::OpenAi(json!({"model":"glm-5.3", "choices":[{"index":0,"message":{"role":"assistant","content":"finished","reasoning_content":"final"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}))]),
     ]).await;
-    let ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+    let ledger = crate::server::provider_test_support::ProviderObservationsFixture::default();
     let mut execution = test_gateway_execution(
         format!("{}/v1/chat/completions", provider.base_url),
         Some(2000),
@@ -111,7 +111,7 @@ async fn glm_captured_reasoning_is_exact_on_second_and_third_provider_requests()
     let mut host = test_host_builder("replay-user", "replay-session")
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
-        .with_test_inference_ledger(ledger.clone())
+        .with_provider_observations(ledger.clone())
         .with_admitted_model_execution(Some(execution))
         .build();
     let mut state = create_durable_execution_test_state("replay-session");
@@ -127,24 +127,29 @@ async fn glm_captured_reasoning_is_exact_on_second_and_third_provider_requests()
     ] {
         let canonical_before = state.messages.clone();
         state.step_recorder.begin_turn(round);
+        state.current_round_index = round;
         let result = host.execute_turn(&mut state).await.unwrap();
         assert_eq!(
             state.messages, canonical_before,
             "wire projection cannot rewrite canonical transcript"
         );
-        let assistant = assistant_message_with_tool_calls_and_reasoning(
+        let mut assistant = assistant_message_with_tool_calls_and_reasoning(
             &result.accum.tool_calls,
             &result.accum.reasoning_content,
             false,
         );
-        assert_eq!(assistant, expected);
+        assert_eq!(assistant["reasoning_content"], expected["reasoning_content"]);
+        assert_ne!(assistant["tool_calls"][0]["id"], expected["tool_calls"][0]["id"]);
         assert!(result.accum.error_message.is_none());
+        host.attest_current_model_message(&state, &mut assistant);
         // This projection fixture supplies tool results manually. Adopt the
         // actual provider decision through the same lease owner used by normal
         // execute_turn_and_ingest_phase before starting its next request.
         state.commit_volatile_attempt_lease();
+        let mut canonical_result = tool_result;
+        canonical_result["tool_call_id"] = assistant["tool_calls"][0]["id"].clone();
         state.messages.push(assistant);
-        state.messages.push(tool_result);
+        state.messages.push(canonical_result);
         state.llm_rounds_completed += 1;
     }
     let canonical_before = state.messages.clone();

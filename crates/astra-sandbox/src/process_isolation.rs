@@ -32,7 +32,8 @@ use tokio_util::sync::CancellationToken;
 
 mod framed;
 pub use framed::{
-    FramedProcess, FramedProcessEnd, FramedProcessInput, FramedProcessLimits, FramedProcessOutcome,
+    OwnedProcess, ProcessEnd, ProcessInput, ProcessInputError, ProcessIoLimits, ProcessOutcome,
+    ProcessOutput,
 };
 
 const MAX_CAPTURED_STDOUT_BYTES: usize = 64 * 1024;
@@ -1000,42 +1001,73 @@ fn set_fd_nonblocking(fd: RawFd, enabled: bool) -> std::io::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn settle_subreaper_children(helper_pid: u32, timeout: Duration) -> Option<bool> {
+    settle_subreaper_children_with(
+        timeout,
+        || {
+            let waited = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+            if waited == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(waited)
+            }
+        },
+        || {
+            let children_path = format!("/proc/{helper_pid}/task/{helper_pid}/children");
+            let children = std::fs::read_to_string(children_path)?;
+            let mut descendants_terminated = false;
+            for pid in children
+                .split_ascii_whitespace()
+                .filter_map(|value| value.parse::<libc::pid_t>().ok())
+            {
+                descendants_terminated = true;
+                let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            Ok(descendants_terminated)
+        },
+    )
+}
+
+// Keep the kernel wait and auxiliary enumeration injectable in the same loop:
+// tests must not reap unrelated children or depend on this host's proc mount.
+#[cfg(target_os = "linux")]
+fn settle_subreaper_children_with(
+    timeout: Duration,
+    mut wait: impl FnMut() -> std::io::Result<libc::pid_t>,
+    mut terminate_enumerated: impl FnMut() -> std::io::Result<bool>,
+) -> Option<bool> {
     let deadline = std::time::Instant::now() + timeout;
     let mut descendants_terminated = false;
     loop {
-        loop {
-            let waited = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
-            if waited > 0 {
-                continue;
+        match wait() {
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                return Some(descendants_terminated);
             }
-            if waited == -1 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ECHILD) {
-                    return Some(descendants_terminated);
+            Err(error) if error.raw_os_error() == Some(libc::EINTR) => {}
+            Err(_) => return None,
+            Ok(0) => {
+                match terminate_enumerated() {
+                    Ok(terminated) => descendants_terminated |= terminated,
+                    Err(error) => {
+                        // Enumeration only assists killing adopted children. Its
+                        // absence is neither an empty scope nor a settlement proof.
+                        tracing::debug!(
+                            error_kind = ?error.kind(),
+                            raw_os_error = error.raw_os_error(),
+                            "subreaper child enumeration unavailable"
+                        );
+                    }
                 }
-                if error.raw_os_error() == Some(libc::EINTR) {
-                    continue;
+                if std::time::Instant::now() >= deadline {
+                    return None;
                 }
-                return None;
+                std::thread::sleep(SUPERVISOR_POLL_INTERVAL);
             }
-            break;
+            Ok(_) => {}
         }
-
-        let children_path = format!("/proc/{helper_pid}/task/{helper_pid}/children");
-        let Ok(children) = std::fs::read_to_string(children_path) else {
-            return None;
-        };
-        for pid in children
-            .split_ascii_whitespace()
-            .filter_map(|value| value.parse::<libc::pid_t>().ok())
-        {
-            descendants_terminated = true;
-            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
-        }
+        // Reaping and EINTR retries share the original deadline too.
         if std::time::Instant::now() >= deadline {
             return None;
         }
-        std::thread::sleep(SUPERVISOR_POLL_INTERVAL);
     }
 }
 
@@ -1902,6 +1934,20 @@ fn drain_stream_chunks(
     capture.drain_ready(rx);
 }
 
+fn process_exit_code(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status
+            .code()
+            .or_else(|| status.signal().map(|signal| 128 + signal))
+    }
+    #[cfg(not(unix))]
+    {
+        status.code()
+    }
+}
+
 fn trim_incomplete_trailing_line(output: &mut String) {
     if output.is_empty() || output.ends_with('\n') || output.ends_with('\r') {
         return;
@@ -2548,6 +2594,7 @@ async fn execute_isolated_with_cancel_impl(
     std_cmd.current_dir(&config.working_dir);
     std_cmd
         .env_clear()
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -2795,7 +2842,7 @@ async fn execute_isolated_with_cancel_impl(
                 } else {
                     settle_process_scope_detailed(cg_path.as_deref(), leader_pid)
                 };
-                exit_code = status.code();
+                exit_code = process_exit_code(&status);
                 break;
             }
             Ok(None) => {}
@@ -2898,10 +2945,10 @@ async fn execute_isolated_with_cancel_impl(
     } = capture;
     let mut stdout = String::from_utf8_lossy(&stdout).into_owned();
     let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
-    if timed_out || stdout_capped {
+    if timed_out || cancelled || stdout_capped {
         trim_incomplete_trailing_line(&mut stdout);
     }
-    if timed_out || stderr_capped {
+    if timed_out || cancelled || stderr_capped {
         trim_incomplete_trailing_line(&mut stderr);
     }
 
@@ -2926,6 +2973,121 @@ async fn execute_isolated_with_cancel_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn signaled_process_is_not_a_successful_exit() {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "kill -9 $$"])
+            .status()
+            .expect("start shell");
+        assert_eq!(process_exit_code(&status), Some(137));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn subreaper_settlement_reaps_after_unavailable_enumeration() {
+        // A killed group may still be waitable before the kernel reports ECHILD.
+        for errno in [libc::ENOENT, libc::EACCES] {
+            let mut waits = [
+                Ok(0),
+                Ok(42),
+                Err(std::io::Error::from_raw_os_error(libc::ECHILD)),
+            ]
+            .into_iter();
+            let mut scans = 0;
+            assert_eq!(
+                settle_subreaper_children_with(
+                    Duration::from_secs(1),
+                    || waits.next().expect("must stop at ECHILD"),
+                    || {
+                        scans += 1;
+                        Err(std::io::Error::from_raw_os_error(errno))
+                    },
+                ),
+                Some(false)
+            );
+            assert_eq!(scans, 1);
+            assert!(waits.next().is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn subreaper_settlement_live_child_without_enumeration_expires_unsettled() {
+        // An escaped live child remains waitpid(0); no scan means no way to kill it.
+        let timeout = Duration::from_millis(10);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            settle_subreaper_children_with(
+                timeout,
+                || Ok(0),
+                || Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
+            ),
+            None
+        );
+        assert!(
+            started.elapsed() >= timeout,
+            "must keep waiting until deadline"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn subreaper_settlement_empty_enumeration_is_not_proof() {
+        assert_eq!(
+            settle_subreaper_children_with(Duration::ZERO, || Ok(0), || Ok(false)),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn subreaper_settlement_non_echild_error_is_not_retried() {
+        let mut wait_calls = 0;
+        assert_eq!(
+            settle_subreaper_children_with(
+                Duration::from_secs(1),
+                || {
+                    wait_calls += 1;
+                    Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+                },
+                || panic!("wait failure cannot authorize enumeration or settlement"),
+            ),
+            None
+        );
+        assert_eq!(wait_calls, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn subreaper_settlement_reap_and_eintr_cannot_extend_deadline() {
+        for wait in [Ok(42), Err(std::io::Error::from_raw_os_error(libc::EINTR))] {
+            let mut waits = Some(wait);
+            assert_eq!(
+                settle_subreaper_children_with(
+                    Duration::ZERO,
+                    || waits.take().expect("deadline must stop retries"),
+                    || panic!("no live-child observation"),
+                ),
+                None
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn subreaper_settlement_preserves_descendant_kill_receipt_until_echild() {
+        let mut waits = [Ok(0), Err(std::io::Error::from_raw_os_error(libc::ECHILD))].into_iter();
+        assert_eq!(
+            settle_subreaper_children_with(
+                Duration::from_secs(1),
+                || waits.next().expect("must stop at ECHILD"),
+                || Ok(true),
+            ),
+            Some(true)
+        );
+    }
 
     #[cfg(not(target_os = "linux"))]
     #[test]

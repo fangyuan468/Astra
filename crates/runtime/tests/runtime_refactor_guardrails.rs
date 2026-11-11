@@ -124,10 +124,10 @@ async fn build_app_keeps_core_http_and_websocket_surfaces_registered() {
         ),
     )
     .await;
-    assert_ne!(
+    assert_eq!(
         segment_upload,
         StatusCode::NOT_FOUND,
-        "bounded immutable segment staging remains part of attach/fork hydration"
+        "Context content is committed with its manifest; standalone staging is retired"
     );
 
     let delegate = request_status(
@@ -222,19 +222,14 @@ async fn build_test_router_keeps_representative_domain_routes_registered() {
 
     let introspection = request_status(
         app.clone(),
-        request(
-            "GET",
-            "/introspection/context/trend",
-            auth_headers,
-            Body::empty(),
-        ),
+        request("GET", "/introspection/skills", auth_headers, Body::empty()),
     )
     .await;
     assert_ne!(introspection, StatusCode::NOT_FOUND);
 
     let marketplace = request_status(
         app.clone(),
-        request("GET", "/marketplace/search", auth_headers, Body::empty()),
+        request("GET", "/marketplace/installed", auth_headers, Body::empty()),
     )
     .await;
     assert_ne!(marketplace, StatusCode::NOT_FOUND);
@@ -307,4 +302,37 @@ async fn legacy_task_plan_and_todo_surfaces_are_not_routable() {
     )
     .await;
     assert_eq!(skills_test, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn retired_metadata_routes_are_not_registered() {
+    let app = build_test_router(build_guardrail_state());
+    let headers = &[
+        ("authorization", "Bearer test-token"),
+        ("content-type", "application/json"),
+    ];
+    for (method, path) in [
+        ("POST", "/sandbox"),
+        ("GET", "/sandbox"),
+        ("GET", "/sandbox/example"),
+        ("DELETE", "/sandbox/example"),
+        ("POST", "/data-versioning/sandbox/example/checkpoint"),
+        ("POST", "/marketplace/quality-report"),
+        ("GET", "/marketplace/stats/example"),
+        ("GET", "/marketplace/search"),
+    ] {
+        assert_eq!(
+            request_status(
+                app.clone(),
+                request(method, path, headers, Body::from("{}"))
+            )
+            .await,
+            StatusCode::NOT_FOUND,
+            "{method} {path}"
+        );
+    }
+    assert_ne!(
+        request_status(app, request("GET", "/events", headers, Body::empty())).await,
+        StatusCode::NOT_FOUND
+    );
 }

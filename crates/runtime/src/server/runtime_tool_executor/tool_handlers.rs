@@ -318,7 +318,7 @@ impl MemoryToolHandler {
             }
         };
         if action == astra_tools::memory_tool_contract::MemoryAction::SessionAudit {
-            let inventory = if let Some(shared_pool) = context.context_manifest_pool.as_ref() {
+            let inventory = if let Some(shared_pool) = context.service_pool.as_ref() {
                 match astra_services::session_memory_inventory::load_database_session_memory_inventory(
                     shared_pool.get(),
                     &context.user_id,
@@ -582,18 +582,29 @@ impl ToolHandler<RuntimeToolExecutor> for EnterPlanModeToolHandler {
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
             return astra_tools::cancelled_tool_result("enter_plan_mode", false);
         }
-        astra_tools::ToolResult::text(
-            execute_enter_plan_mode(
-                context.plan_repo.as_ref(),
-                &context.session_id,
-                &context.user_id,
-                context.plan_mode_cache.as_ref(),
-                context.plan_resume_hint_handle.as_ref(),
-                context.plan_authoring_active_handle.as_ref(),
-                args,
-            )
-            .await,
+        execute_enter_plan_mode(
+            context.plan_repo.as_ref(),
+            &context.session_id,
+            &context.user_id,
+            &context.plan_mode_cache,
+            context.plan_resume_hint_handle.as_ref(),
+            context.plan_authoring_active_handle.as_ref(),
+            args,
+            cancel_token,
         )
+        .await
+    }
+}
+
+fn plan_review_request_id(session_id: &str, invocation_id: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    match invocation_id {
+        Some(id) => {
+            let identity =
+                serde_json::to_vec(&(session_id, id)).expect("string tuple serialization");
+            format!("plan-review:{:x}", Sha256::digest(identity))
+        }
+        None => format!("plan-review:{}", uuid::Uuid::new_v4()),
     }
 }
 
@@ -628,31 +639,27 @@ impl ToolHandler<RuntimeToolExecutor> for ExitPlanModeToolHandler {
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
             return astra_tools::cancelled_tool_result("exit_plan_mode", false);
         }
-        astra_tools::ToolResult::text(
-            execute_exit_plan_mode(
-                context.plan_repo.as_ref(),
-                &context.user_id,
-                &context.session_id,
-                context.plan_mode_cache.as_ref(),
-                context.plan_resume_hint_handle.as_ref(),
-                context.plan_authoring_active_handle.as_ref(),
-                context.approval_gate.as_deref(),
-                &invocation
-                    .tool_call_id
-                    .map(|tool_call_id| {
-                        format!("plan-review:{}:{tool_call_id}", context.session_id)
-                    })
-                    .unwrap_or_else(|| {
-                        format!(
-                            "plan-review:{}:{}",
-                            context.session_id,
-                            uuid::Uuid::new_v4()
-                        )
-                    }),
-                args,
-            )
-            .await,
-        )
+        let request_id = plan_review_request_id(&context.session_id, invocation.tool_call_id);
+        let exit = execute_exit_plan_mode(
+            context.plan_repo.as_ref(),
+            &context.user_id,
+            &context.session_id,
+            context.plan_mode_cache.as_ref(),
+            context.plan_resume_hint_handle.as_ref(),
+            context.plan_authoring_active_handle.as_ref(),
+            context.approval_gate.as_deref(),
+            &request_id,
+            args,
+        );
+        match cancel_token {
+            Some(token) => tokio::select! {
+                biased;
+                result = exit => result,
+                _ = token.cancelled() => astra_tools::cancelled_tool_result("exit_plan_mode", true)
+                    .with_execution_outcome_unknown(),
+            },
+            None => exit.await,
+        }
     }
 }
 
@@ -694,7 +701,7 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
                 );
             };
             return match crate::server::explain_analyze_artifact::resolve_selector(
-                context.context_manifest_pool.as_ref(),
+                context.service_pool.as_ref(),
                 context.session_artifact_store.as_deref(),
                 engine,
                 &context.user_id,
@@ -821,7 +828,7 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
                         Err(JudgmentUsageCoverage::SourceExcluded)
                     } else {
                         load_introspect_judgment_usage_capture(
-                            context.context_manifest_pool.as_ref(),
+                            context.service_pool.as_ref(),
                             &context.user_id,
                             &context.session_id,
                             include_semantic_execution,
@@ -830,7 +837,7 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
                     }
                 },
                 astra_services::semantic_judgment_observation::load_semantic_judgment_view(
-                    context.context_manifest_pool.as_ref(),
+                    context.service_pool.as_ref(),
                     &context.user_id,
                     &context.session_id,
                     request.source_policy,
@@ -1256,13 +1263,15 @@ impl ToolHandler<RuntimeToolExecutor> for RollbackFileEditsToolHandler {
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
-        if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::cancelled_tool_result("rollback_file_edits", false);
-        }
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
             return astra_tools::cancelled_tool_result("rollback_file_edits", false);
         }
-        if args.get("scope").and_then(Value::as_str) == Some("source_receipt") {
+        let scope = args
+            .get("scope")
+            .and_then(Value::as_str)
+            .or_else(|| args.get("path").map(|_| "file"))
+            .unwrap_or("current_turn");
+        let receipt = if scope == "source_receipt" {
             let receipt_id = match args.get("receipt_id").and_then(Value::as_str) {
                 Some(receipt_id) if !receipt_id.trim().is_empty() => receipt_id,
                 _ => {
@@ -1286,28 +1295,34 @@ impl ToolHandler<RuntimeToolExecutor> for RollbackFileEditsToolHandler {
                     .to_string(),
                 );
             };
-            return tool_result_from_output(
-                match astra_tools::source_preimage::restore_receipt(
-                    &context.workspace_root,
-                    &owner_scope,
-                    receipt_id,
-                ) {
-                    Ok(()) => serde_json::json!({
-                        "success": true,
-                        "scope": "source_receipt",
-                        "receipt_id": receipt_id,
-                        "summary": "Restored the retained source preimage.",
-                    })
-                    .to_string(),
-                    Err(error) => serde_json::json!({
-                        "success": false,
-                        "scope": "source_receipt",
-                        "receipt_id": receipt_id,
-                        "error": error,
-                    })
-                    .to_string(),
-                },
-            );
+            match astra_tools::source_preimage::prepare_receipt_restore(
+                &context.workspace_root,
+                &owner_scope,
+                receipt_id,
+            ) {
+                Ok(receipt) => Some(receipt),
+                Err(error) => {
+                    return tool_result_from_output(
+                        serde_json::json!({
+                            "success": false,
+                            "scope": "source_receipt",
+                            "receipt_id": receipt_id,
+                            "error": error,
+                        })
+                        .to_string(),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(receipt) = receipt {
+            return tool_result_from_output(match receipt.restore() {
+                Ok(()) => serde_json::json!({"success":true, "scope":"source_receipt",
+                    "receipt_id":args["receipt_id"], "summary":"Restored the retained source preimage."}).to_string(),
+                Err(error) => serde_json::json!({"success":false, "scope":"source_receipt",
+                    "receipt_id":args["receipt_id"], "error":error}).to_string(),
+            });
         }
         tool_result_from_output(execute_rollback_file_edits(
             &context.workspace_root,
@@ -1527,6 +1542,33 @@ impl DynamicToolHandler<RuntimeToolExecutor> for McpToolHandler {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plan_review_ids_are_bounded_and_invocation_scoped() {
+        let session = "long-session:".repeat(128);
+        for id in ["a".repeat(64), "native:".repeat(1024)] {
+            let review = super::plan_review_request_id(&session, Some(&id));
+            assert_eq!(review.len(), 76);
+            assert_eq!(super::plan_review_request_id(&session, Some(&id)), review);
+            assert_ne!(
+                super::plan_review_request_id("another-session", Some(&id)),
+                review
+            );
+            assert_ne!(
+                super::plan_review_request_id(&session, Some(&(id + ":next"))),
+                review
+            );
+        }
+        assert_ne!(
+            super::plan_review_request_id("a:b", Some("c")),
+            super::plan_review_request_id("a", Some("b:c"))
+        );
+        let first = super::plan_review_request_id(&session, None);
+        let second = super::plan_review_request_id(&session, None);
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 48);
+        assert!(uuid::Uuid::parse_str(first.strip_prefix("plan-review:").unwrap()).is_ok());
+    }
+
     #[tokio::test]
     async fn dynamic_mcp_adapter_does_not_promote_argument_call_identity() {
         use astra_tools::tool_engine::DynamicToolHandler;

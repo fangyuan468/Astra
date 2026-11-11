@@ -238,6 +238,8 @@ impl Drop for SandboxPolicyGuard<'_> {
 
 /// Client dependencies for one Server execution stream and its local callbacks.
 pub(crate) struct CliServerAdmissionHost<'a> {
+    /// Sticky request-local evidence that admission dispatch may have begun.
+    pub server_admission_dispatched: &'a mut bool,
     pub runtime_config: Arc<astra_config::RuntimeConfig>,
     pub api: &'a astra_thin_client::ThinClient,
     pub token: String,
@@ -295,11 +297,6 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     /// observer queue. The TUI must apply this snapshot before settlement so
     /// a dropped live suffix cannot be mistaken for a complete capture.
     pub pending_explain_analyze_snapshot: Option<crate::cli::chat_stream::StreamEvent>,
-    /// Token suffix retained by the SSE host after interactive observation
-    /// backpressure. It is delivered before the settled marker so the TUI can
-    /// reconcile the complete answer in stream order.
-    pub deferred_token_projection:
-        Option<std::collections::VecDeque<crate::cli::chat_stream::StreamEvent>>,
     /// Request-scoped live lane for every child run, including `delegate`
     /// coordination. This is distinct from parent stream events so
     /// child activity cannot delay parent completion.
@@ -346,6 +343,7 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     /// Latest immutable physical SSE owner, retained through final-output
     /// delivery and durable cancellation.
     pub last_physical_run_id: Option<String>,
+    pub failed_run_terminal: Option<astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminal>,
     pub turn_evaluation: Option<astra_services::session_journal::JournalEvent>,
     /// Structured admission failure metadata retained after the accumulator is
     /// moved into the shared loop.  These facts drive user-facing recovery and
@@ -505,20 +503,6 @@ impl CliServerAdmissionHost<'_> {
         }
     }
 
-    /// Deliver a control-plane disposition in order. Token/status progress is
-    /// allowed to coalesce under UI backpressure, but an accepted intent must
-    /// leave the pending queue exactly once when its durable Applied/Returned
-    /// disposition commits. Treating that receipt as ordinary progress leaves
-    /// the TUI claiming that already-applied guidance is still queued.
-    async fn emit_ordered_control_event(&mut self, event: crate::cli::chat_stream::StreamEvent) {
-        emit_ordered_control_event_with_backpressure(
-            self.stream_event_tx.as_ref(),
-            &mut self.pending_ordered_stream_events,
-            event,
-        )
-        .await;
-    }
-
     fn retain_ordered_stream_event(&mut self, event: crate::cli::chat_stream::StreamEvent) {
         match event {
             crate::cli::chat_stream::StreamEvent::ExplainAnalyzeSnapshot { .. } => {
@@ -611,38 +595,11 @@ fn retain_ordered_stream_event_in_queue(
     queue.push_back(event);
 }
 
-/// User-intent dispositions transfer custody of user-authored input. They are
-/// rare, authoritative control facts and cannot be dropped, coalesced, or used
-/// to evict an unrelated lifecycle edge. Apply bounded channel backpressure
-/// instead of growing the process-local fallback queue without limit.
-async fn emit_ordered_control_event_with_backpressure(
-    stream_event_tx: Option<&crate::cli::chat_stream::StreamEventTx>,
-    pending_ordered: &mut std::collections::VecDeque<crate::cli::chat_stream::StreamEvent>,
-    event: crate::cli::chat_stream::StreamEvent,
-) {
-    let Some(tx) = stream_event_tx else {
-        return;
-    };
-    while let Some(pending) = pending_ordered.pop_front() {
-        if let Err(error) = tx.send(pending).await {
-            tracing::debug!(%error, "ordered stream receiver closed during control drain");
-            pending_ordered.clear();
-            return;
-        }
-    }
-    if let Err(error) = tx.send(event).await {
-        tracing::debug!(%error, "ordered stream receiver closed during control delivery");
-    }
-}
-
 async fn emit_final_output_ready(
     stream_event_tx: Option<&crate::cli::chat_stream::StreamEventTx>,
     pending_ordered: &mut std::collections::VecDeque<crate::cli::chat_stream::StreamEvent>,
     pending_explain_analyze_snapshot: &mut Option<crate::cli::chat_stream::StreamEvent>,
     pending_artifact_publication: &mut Option<astra_turn_types::ArtifactPublicationV1>,
-    deferred_token_projection: &mut Option<
-        std::collections::VecDeque<crate::cli::chat_stream::StreamEvent>,
-    >,
 ) -> (bool, bool) {
     let Some(tx) = stream_event_tx else {
         return (true, false);
@@ -708,31 +665,6 @@ async fn emit_final_output_ready(
             }
         }
     }
-    let token_drain_deadline = tokio::time::Instant::now() + TERMINAL_STREAM_DRAIN_TIMEOUT;
-    while let Some(event) = deferred_token_projection
-        .as_ref()
-        .and_then(|events| events.front().cloned())
-    {
-        match tokio::time::timeout_at(token_drain_deadline, tx.send(event)).await {
-            Ok(Ok(())) => {
-                // Clear the suffix only after the receiver accepted it. If a
-                // prior ordered event or this send fails, the caller transfers
-                // the still-owned suffix to the bounded reconciliation lane.
-                if let Some(events) = deferred_token_projection.as_mut() {
-                    events.pop_front();
-                }
-            }
-            Ok(Err(error)) => {
-                tracing::debug!(%error, "deferred token projection receiver closed during terminal drain");
-                return (false, explain_snapshot_delivered);
-            }
-            Err(_) => {
-                tracing::warn!("timed out delivering the deferred token projection");
-                return (false, explain_snapshot_delivered);
-            }
-        }
-    }
-    *deferred_token_projection = None;
     let retry = crate::cli::chat_stream::StreamEvent::AssistantOutputSettled;
     match tokio::time::timeout(TERMINAL_STREAM_DRAIN_TIMEOUT, tx.send(retry)).await {
         Ok(Ok(())) => (true, explain_snapshot_delivered),
@@ -749,16 +681,12 @@ async fn emit_final_output_ready(
 
 /// Transfer terminal projection state to the display consumer after the
 /// synchronous finalization deadline has elapsed. This lane owns its inputs:
-/// dropping the host must not silently drop the latest artifact publication or
-/// the answer suffix retained by the SSE host.
+/// dropping the host must not silently drop the latest artifact publication.
 async fn reconcile_terminal_stream_projection(
     tx: crate::cli::chat_stream::StreamEventTx,
     mut pending_ordered: std::collections::VecDeque<crate::cli::chat_stream::StreamEvent>,
     pending_explain_analyze_snapshot: Option<crate::cli::chat_stream::StreamEvent>,
     pending_artifact_publication: Option<astra_turn_types::ArtifactPublicationV1>,
-    deferred_token_projection: Option<
-        std::collections::VecDeque<crate::cli::chat_stream::StreamEvent>,
-    >,
     warning: Option<String>,
 ) -> (bool, bool) {
     let deadline = tokio::time::Instant::now() + TERMINAL_STREAM_RECONCILIATION_TIMEOUT;
@@ -811,11 +739,6 @@ async fn reconcile_terminal_stream_projection(
         .await
     {
         return (false, explain_snapshot_delivered);
-    }
-    for event in deferred_token_projection.into_iter().flatten() {
-        if !send(event).await {
-            return (false, explain_snapshot_delivered);
-        }
     }
     (
         send(crate::cli::chat_stream::StreamEvent::AssistantOutputSettled).await,
@@ -1010,6 +933,7 @@ impl CliServerAdmissionHost<'_> {
         macro_rules! fetch_turn_sse {
             () => {
                 fetch_chat_turn_sse(ChatTurnSseFetchRequest {
+                    server_admission_dispatched: self.server_admission_dispatched,
                     completion_checks: Some(&state.completion_checks),
                     tool_surface_config: &self.runtime_config.tool_surface,
                     api: self.api,
@@ -1094,7 +1018,19 @@ impl CliServerAdmissionHost<'_> {
         refresh_root_permission_context(&mut state.permission_context, self.perm_manager).await;
         state.approval_overrides = self.perm_manager.export_session_overrides();
 
-        let mut turn_result = turn_result?;
+        let mut turn_result = turn_result.inspect_err(|error| {
+            if let Some(details) = error
+                .details_json
+                .as_deref()
+                .and_then(|details| serde_json::from_str::<Value>(details).ok())
+            {
+                self.last_error_code = details
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                self.last_error_metadata = Some(details);
+            }
+        })?;
 
         // Capture observed coordination before ingest can reject an incomplete
         // remote terminal. The existing success/failure journal commit owns
@@ -1125,18 +1061,16 @@ impl CliServerAdmissionHost<'_> {
         }
 
         // A saturated interactive projection may have retained terminal
-        // Explain Analyze facts, a publication, and the answer suffix outside
+        // Explain Analyze facts and a publication outside
         // the normal stream queue. Reattach them to the outer host before
         // finalization: the canonical snapshot and publication each have a
-        // dedicated latest-value slot, while the token suffix is flushed
-        // immediately before `AssistantOutputSettled`.
+        // dedicated latest-value slot.
         if let Some(event) = turn_result.pending_explain_analyze_snapshot.clone() {
             self.retain_ordered_stream_event(event);
         }
         if let Some(event) = turn_result.pending_reliable_stream_event.clone() {
             self.retain_ordered_stream_event(event);
         }
-        self.deferred_token_projection = turn_result.deferred_token_projection.clone();
 
         // The server owns the final provider request and may merge schemas
         // (notably durable Work tools) that are absent from the Edge preflight
@@ -1171,7 +1105,10 @@ impl CliServerAdmissionHost<'_> {
         // final conversation commit and restart history match durable state.
         state.applied_user_intents = turn_result.core.applied_user_intents.clone();
 
-        if let Some(interruption) = turn_result.core.server_interruption.clone() {
+        if let Some(interruption) = turn_result.core.server_interruption.clone().filter(|_| {
+            turn_result.core.server_loop_terminal
+                || turn_result.core.has_authoritative_interrupted_terminal()
+        }) {
             let interruption = serde_json::from_value(interruption).map_err(|error| {
                 format!("server terminal carried an invalid interruption record: {error}")
             })?;
@@ -1188,7 +1125,9 @@ impl CliServerAdmissionHost<'_> {
             .extend(turn_result.core.explain_analyze_events.iter().cloned());
         state.telemetry.explain_analyze_degraded |= turn_result.core.explain_analyze_degraded;
 
-        if turn_result.core.server_loop_terminal {
+        if turn_result.core.server_loop_terminal
+            || turn_result.core.has_authoritative_failed_terminal()
+        {
             // Server-owned runs execute their tools remotely, so the thin
             // client has no local ToolCallRecord ledger to re-evaluate at the
             // final boundary. Receipt closure is the terminal integrity fact;
@@ -1231,7 +1170,7 @@ impl CliServerAdmissionHost<'_> {
         // ─── Injection-freshness observation (post-turn) ────────────────────
         // wip-7: split observation across two input lanes.
         //   1. CLI-owned raw text for channels the CLI authoritatively
-        //      knows (lessons from session_lessons_snapshot, self_awareness
+        //      knows (self_awareness
         //      from build_self_model_snapshot). These fingerprint with a
         //      full preview so introspect can render the first 80 chars.
         //   2. Bridge-supplied opaque fingerprints for the bridge-internal
@@ -1248,19 +1187,7 @@ impl CliServerAdmissionHost<'_> {
         // the freshness report surfaces the broken pipe rather than
         // hiding it behind uniformly-"empty" entries.
         //
-        // `lessons_text` is recomputed here (cheap — `session_lessons_snapshot`
-        // is an Arc clone) rather than threaded from `prepare_chat_turn_payload`
-        // to avoid widening the prepare/fetch signature. The fingerprint uses
-        // `LessonKind::as_str()` (stable snake_case DB tag), NOT `Debug`, so
-        // enum-variant renames do not flip every channel from Stale→Fresh.
         if let Some(session_lock) = &self.executor.observability_session {
-            let lessons_text = self
-                .executor
-                .session_lessons_snapshot()
-                .iter()
-                .map(|l| format!("{}:{}:{}", l.kind.as_str(), l.trigger_signal, l.action))
-                .collect::<Vec<_>>()
-                .join("|");
             // Rebuild the self-awareness section off the same
             // SelfModel snapshot the CLI injects into edge_profile so
             // the fingerprint matches the bytes the model saw.
@@ -1274,7 +1201,6 @@ impl CliServerAdmissionHost<'_> {
             if let Ok(mut session) = session_lock.write() {
                 session.observe_injections_partial(
                     astra_runtime::observability::InjectionPreviews {
-                        lessons: &lessons_text,
                         self_awareness: &self_awareness_text,
                         ..astra_runtime::observability::InjectionPreviews::EMPTY
                     },
@@ -1561,7 +1487,6 @@ impl CliServerAdmissionHost<'_> {
             &mut self.pending_ordered_stream_events,
             &mut self.pending_explain_analyze_snapshot,
             &mut self.pending_artifact_publication,
-            &mut self.deferred_token_projection,
         )
         .await;
         if !delivered {
@@ -1569,14 +1494,12 @@ impl CliServerAdmissionHost<'_> {
             // outer TUI owner closes receiver admission. The reconciliation
             // deadline is bounded, so a stalled consumer cannot hold turn
             // settlement forever, while a healthy bridge can drain the exact
-            // publication and answer suffix before its TurnComplete barrier.
+            // publication before its TurnComplete barrier.
             let pending = std::mem::take(&mut self.pending_ordered_stream_events);
             let pending_snapshot = self.pending_explain_analyze_snapshot.take();
             let pending_publication = self.pending_artifact_publication.take();
-            let deferred = self.deferred_token_projection.take();
             let pending_count = pending.len();
             let snapshot_pending = pending_snapshot.is_some();
-            let deferred_present = deferred.is_some();
             let warning = terminal_stream_projection_warning(
                 &pending,
                 snapshot_pending,
@@ -1595,7 +1518,6 @@ impl CliServerAdmissionHost<'_> {
                         pending,
                         pending_snapshot,
                         pending_publication,
-                        deferred,
                         warning,
                     )
                     .await;
@@ -1633,7 +1555,6 @@ impl CliServerAdmissionHost<'_> {
             }
             tracing::error!(
                 pending = pending_count,
-                deferred = deferred_present,
                 "terminal stream projection moved to bounded reconciliation"
             );
         } else if snapshot_was_pending && !snapshot_delivered {
@@ -1709,10 +1630,9 @@ mod tests {
     use super::{
         SandboxPolicyGuard, TERMINAL_STREAM_DRAIN_TIMEOUT, authoritative_provider_surface_report,
         child_cancellation_scope, derive_turn_interaction_mode, emit_final_output_ready,
-        emit_ordered_control_event_with_backpressure, is_pre_admission_rejection,
-        permission_mode_change_audit_event, reconcile_terminal_stream_projection,
-        retain_ordered_stream_event_in_queue, server_terminal_requires_unverified,
-        stream_event_requires_ordered_delivery,
+        is_pre_admission_rejection, permission_mode_change_audit_event,
+        reconcile_terminal_stream_projection, retain_ordered_stream_event_in_queue,
+        server_terminal_requires_unverified, stream_event_requires_ordered_delivery,
     };
 
     #[test]
@@ -1922,6 +1842,7 @@ mod tests {
                 status: astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminalStatus::Failed,
                 error: Some("already settled".to_string()),
                 error_kind: Some(astra_core::ErrorKind::ContractViolation),
+                interruption: None,
             },
         );
         assert!(
@@ -2061,87 +1982,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn applied_guidance_backpressures_without_evicting_or_unbounded_buffering() {
-        use crate::cli::chat_stream::StreamEvent;
-        use std::collections::VecDeque;
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        tx.send(StreamEvent::StatusLine("channel-full".into()))
-            .await
-            .unwrap();
-        let mut pending = VecDeque::from([
-            StreamEvent::ToolStarted {
-                name: "read_file".into(),
-                description: "inspect".into(),
-                tool_use_id: "call-0".into(),
-                parent_tool_use_id: None,
-            },
-            StreamEvent::AgentControlStarted {
-                action: "spawn".into(),
-                label: "agent".into(),
-                tool_use_id: "agent-1".into(),
-                agent_id: Some("child-1".into()),
-                fanout_slot: None,
-                fanout_title: None,
-            },
-            StreamEvent::AskUserPrompted {
-                request_id: "approval-2".into(),
-                prompt: json!({"question": "continue?"}),
-            },
-        ]);
-        let task = tokio::spawn(async move {
-            emit_ordered_control_event_with_backpressure(
-                Some(&tx),
-                &mut pending,
-                StreamEvent::UserIntentApplied {
-                    intent_id: "intent-priority".into(),
-                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
-                    status: astra_turn_types::UserIntentStatus::Applied,
-                    event_index: 9,
-                    content: "new objective".into(),
-                },
-            )
-            .await;
-            pending
-        });
-
-        tokio::task::yield_now().await;
-        assert!(
-            !task.is_finished(),
-            "full renderer lane must apply backpressure"
-        );
-        assert!(matches!(rx.recv().await, Some(StreamEvent::StatusLine(_))));
-        assert!(matches!(
-            rx.recv().await,
-            Some(StreamEvent::ToolStarted { .. })
-        ));
-        assert!(matches!(
-            rx.recv().await,
-            Some(StreamEvent::AgentControlStarted { .. })
-        ));
-        assert!(matches!(
-            rx.recv().await,
-            Some(StreamEvent::AskUserPrompted { .. })
-        ));
-        assert!(matches!(
-            rx.recv().await,
-            Some(StreamEvent::UserIntentApplied { intent_id, .. }) if intent_id == "intent-priority"
-        ));
-        assert!(task.await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
     async fn final_output_ready_reaches_the_typed_stream_lane() {
         let (tx, mut rx) = crate::cli::chat_stream::stream_event_channel();
         let mut pending_publication = None;
-        let mut deferred = None;
 
         emit_final_output_ready(
             Some(&tx),
             &mut std::collections::VecDeque::new(),
             &mut None,
             &mut pending_publication,
-            &mut deferred,
         )
         .await;
 
@@ -2206,16 +2055,8 @@ mod tests {
             received
         });
 
-        let mut deferred = None;
         let mut pending_publication = None;
-        emit_final_output_ready(
-            Some(&tx),
-            &mut pending,
-            &mut None,
-            &mut pending_publication,
-            &mut deferred,
-        )
-        .await;
+        emit_final_output_ready(Some(&tx), &mut pending, &mut None, &mut pending_publication).await;
         let received = consumer.await.unwrap();
 
         assert!(matches!(received[0], StreamEvent::StatusLine(_)));
@@ -2238,17 +2079,10 @@ mod tests {
             text: "terminal suffix".into(),
         }]);
         let mut pending_publication = None;
-        let mut deferred = None;
 
         let (delivered, _) = tokio::time::timeout(
             std::time::Duration::from_millis(1_500),
-            emit_final_output_ready(
-                Some(&tx),
-                &mut pending,
-                &mut None,
-                &mut pending_publication,
-                &mut deferred,
-            ),
+            emit_final_output_ready(Some(&tx), &mut pending, &mut None, &mut pending_publication),
         )
         .await
         .expect("terminal drain must have a bounded deadline");
@@ -2262,7 +2096,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_drain_preserves_publication_and_deferred_answer_when_queue_stays_full() {
+    async fn terminal_drain_preserves_publication_when_queue_stays_full() {
         use crate::cli::chat_stream::StreamEvent;
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
@@ -2282,20 +2116,10 @@ mod tests {
         };
         let mut pending = std::collections::VecDeque::new();
         let mut pending_publication = Some(publication);
-        let mut deferred = Some(std::collections::VecDeque::from([StreamEvent::Token {
-            model_item_id: Some("retained-response".into()),
-            text: "answer suffix".into(),
-        }]));
 
         let (delivered, _) = tokio::time::timeout(
             std::time::Duration::from_millis(1_500),
-            emit_final_output_ready(
-                Some(&tx),
-                &mut pending,
-                &mut None,
-                &mut pending_publication,
-                &mut deferred,
-            ),
+            emit_final_output_ready(Some(&tx), &mut pending, &mut None, &mut pending_publication),
         )
         .await
         .expect("terminal drain must have a bounded deadline");
@@ -2303,11 +2127,6 @@ mod tests {
         assert!(!delivered);
         assert!(pending.is_empty());
         assert!(pending_publication.is_some());
-        assert!(
-            matches!(deferred.as_ref().and_then(|events| events.front()),
-            Some(StreamEvent::Token { model_item_id: Some(id), text })
-                if id == "retained-response" && text == "answer suffix")
-        );
     }
 
     #[tokio::test]
@@ -2336,10 +2155,6 @@ mod tests {
             pending,
             Some(snapshot),
             Some(publication.clone()),
-            Some(std::collections::VecDeque::from([StreamEvent::Token {
-                model_item_id: None,
-                text: "answer suffix".into(),
-            }])),
             Some("display warning".into()),
         )
         .await;
@@ -2363,10 +2178,6 @@ mod tests {
         ));
         assert!(matches!(
             rx.recv().await,
-            Some(StreamEvent::Token { text, .. }) if text == "answer suffix"
-        ));
-        assert!(matches!(
-            rx.recv().await,
             Some(StreamEvent::AssistantOutputSettled)
         ));
     }
@@ -2386,7 +2197,6 @@ mod tests {
             tx,
             std::collections::VecDeque::new(),
             Some(snapshot),
-            None,
             None,
             None,
         ));
@@ -2464,31 +2274,15 @@ mod tests {
             pending,
             Some(snapshot),
             Some(publication.clone()),
-            Some(std::collections::VecDeque::from([StreamEvent::Token {
-                model_item_id: None,
-                text: "answer suffix".into(),
-            }])),
             Some("display warning".into()),
         ));
-
-        tokio::task::yield_now().await;
-        assert!(
-            !reconciliation.is_finished(),
-            "full bridge must apply backpressure before the owner closes it"
-        );
 
         let mut warning_seen = false;
         let mut snapshot_seen = false;
         let mut publication_seen = false;
-        let mut answer_seen = false;
         let mut settled_seen = false;
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while !(warning_seen
-                && snapshot_seen
-                && publication_seen
-                && answer_seen
-                && settled_seen)
-            {
+            while !(warning_seen && snapshot_seen && publication_seen && settled_seen) {
                 let Some(event) = tui_rx.recv().await else {
                     panic!("bridge closed before terminal reconciliation completed");
                 };
@@ -2506,9 +2300,6 @@ mod tests {
                         if text == "Explain Analyze report saved on server" =>
                     {
                         publication_seen = true;
-                    }
-                    TuiAppEvent::Token { text, .. } if text == "answer suffix" => {
-                        answer_seen = true;
                     }
                     TuiAppEvent::AssistantOutputSettled => settled_seen = true,
                     _ => {}

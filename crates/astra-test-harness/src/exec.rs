@@ -136,7 +136,9 @@ pub(crate) fn configured_astra_command(cfg: &RunnerConfig, case: &Case) -> tokio
 impl CaseExecutor for AstraCliExecutor {
     async fn execute(&self, case: &Case, model: &str) -> RunOutcome {
         let mut outcome = run_case_subprocess(&self.cfg, case, model).await;
-        if crate::criteria::requires_execution_capture(&case.criteria) {
+        if !outcome.is_pre_execution_failure()
+            && crate::criteria::requires_execution_capture(&case.criteria)
+        {
             let capture = crate::execution_capture::load(&self.cfg, case, &outcome).await;
             if let Some(stream) = outcome.stream_capture.as_mut() {
                 match capture {
@@ -432,12 +434,6 @@ async fn observe_machine_event_file(
     {
         observation.invalid = Some("machine event file ends with a partial line".into());
     }
-    if let Ok(mut observation) = observation.lock()
-        && observation.invalid.is_none()
-        && observation.event_count == 0
-    {
-        observation.invalid = Some("machine event file is empty".into());
-    }
     Ok(())
 }
 
@@ -605,6 +601,8 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
         Ok(dir) => dir,
         Err(error) => {
             return RunOutcome {
+                error_code: None,
+                server_admission_not_dispatched: false,
                 model: model.into(),
                 exit_code: -1,
                 text: format!("failed to allocate machine-event directory: {error}"),
@@ -667,6 +665,8 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
         Ok(c) => c,
         Err(e) => {
             return RunOutcome {
+                error_code: None,
+                server_admission_not_dispatched: false,
                 model: model.into(),
                 exit_code: -1,
                 text: format!("subprocess spawn error: {e}"),
@@ -700,7 +700,8 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
     let stderr = child.stderr.take().expect("piped stderr is present");
     let machine_observation = Arc::new(Mutex::new(MachineEventObservation {
         stream: (cfg.artifacts_dir.is_some()
-            || crate::criteria::requires_execution_capture(&case.criteria))
+            || crate::criteria::requires_execution_capture(&case.criteria)
+            || crate::criteria::requires_judger_evidence(&case.criteria))
         .then(Default::default),
         ..Default::default()
     }));
@@ -763,18 +764,38 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
                 deadline,
             )
             .await;
+            // Empty is meaningful only after the terminal envelope and OS
+            // status agree. Corrupt or missing files never reach this exception.
+            let terminal = stdout.as_ref().ok().map(|bytes| {
+                parse_executor_outcome(
+                    &String::from_utf8_lossy(bytes),
+                    model,
+                    status.code().unwrap_or(-1),
+                )
+            });
+            let machine = machine.and_then(|identity| {
+                let empty = machine_observation
+                    .lock()
+                    .map_err(|_| "machine event lock poisoned".to_string())?
+                    .event_count
+                    == 0;
+                if empty
+                    && !terminal
+                        .as_ref()
+                        .is_some_and(RunOutcome::is_pre_execution_failure)
+                {
+                    return Err("machine event file is empty".into());
+                }
+                Ok(identity)
+            });
             let (stdout, stderr, (observed_session_id, _observed_run_id)) = match (
                 stdout, stderr, machine,
             ) {
                 (Ok(stdout), Ok(stderr), Ok(machine)) => (stdout, stderr, machine),
-                (Ok(stdout), Ok(stderr), Err(error)) => {
+                (Ok(_stdout), Ok(stderr), Err(error)) => {
                     // Keep terminal diagnostics, but never use an unbound
                     // identity to load a journal or certify task success.
-                    let mut out = parse_executor_outcome(
-                        &String::from_utf8_lossy(&stdout),
-                        model,
-                        status.code().unwrap_or(-1),
-                    );
+                    let mut out = terminal.expect("stdout was collected");
                     out.exit_code = -1;
                     out.session_id = None;
                     out.run_id = None;
@@ -798,16 +819,34 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
                     return finish_failed_evidence_outcome(cfg, &machine_observation, out).await;
                 }
             };
-            let stdout = String::from_utf8_lossy(&stdout).into_owned();
+            let _ = stdout;
             let stderr = String::from_utf8_lossy(&stderr).into_owned();
-            let process_exit = status.code().unwrap_or(-1);
-            let mut out = parse_executor_outcome(&stdout, model, process_exit);
+            let mut out = terminal.expect("stdout was collected");
             if out.stderr.starts_with(PROTOCOL_ERROR_MARKER) && !stderr.is_empty() {
                 out.stderr = format!("{}\n{stderr}", out.stderr);
-            } else if !out.stderr.starts_with(PROTOCOL_ERROR_MARKER) {
-                out.stderr = stderr;
+            } else if !out.stderr.starts_with(PROTOCOL_ERROR_MARKER) && !stderr.is_empty() {
+                if !out.stderr.is_empty() {
+                    out.stderr.push('\n');
+                }
+                out.stderr.push_str(&stderr);
             }
             out.duration_ms = start.elapsed().as_millis() as u64;
+            if out.is_pre_execution_failure() {
+                let has_events = machine_observation
+                    .lock()
+                    .expect("machine observation")
+                    .event_count
+                    != 0;
+                if has_events {
+                    out.exit_code = -1;
+                    out.session_id = None;
+                    out.stderr = format!(
+                        "{PROTOCOL_ERROR_MARKER} local rejection contains machine execution events"
+                    );
+                    return finish_failed_evidence_outcome(cfg, &machine_observation, out).await;
+                }
+                return out;
+            }
             let cleanup_identity = reconcile_observed_session(&mut out, observed_session_id);
             if let Some(identity) = cleanup_identity {
                 let cleanup = cleanup_observed_session(cfg, Some(&identity)).await;
@@ -1281,6 +1320,8 @@ pub(crate) mod test_support {
                 .get(&key)
                 .cloned()
                 .unwrap_or(RunOutcome {
+                    error_code: None,
+                    server_admission_not_dispatched: false,
                     model: model.into(),
                     exit_code: -1,
                     text: format!("fake: no seed for {}/{}", case.name, model),
@@ -1927,6 +1968,148 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_execution_failure_allows_only_valid_empty_machine_evidence() {
+        let baseline = serde_json::json!({
+            "trace_id":null, "request_id":null, "run_id":null, "session_id":null,
+            "text":"", "final_state":"failed", "interruption_kind":null,
+            "tool_result_class_counts":{}, "prompt_tokens":0, "fresh_prompt_tokens":0,
+            "cache":{"hit":false,"read_tokens":0,"creation_tokens":0},
+            "completion_tokens":0,"llm_rounds":0,"tool_calls_count":0,"tools_used":[],
+            "persistence_error":null,"exit_code":1,"success":false,
+            "error_kind":"tool_unavailable","error_code":"workspace_host_unsupported",
+            "error":"administrator must repair the root-owned temporary directory",
+            "server_admission_not_dispatched":true
+        });
+        for case in [
+            "valid",
+            "selected_session",
+            "absent_fact",
+            "false_fact",
+            "wrong_type",
+            "progress",
+            "cached_progress",
+            "malformed_coverage",
+            "provider_coverage",
+            "authoritative_terminal",
+            "aggregate_progress",
+            "run",
+            "exit_mismatch",
+            "missing_file",
+            "corrupt_file",
+            "partial_file",
+            "bound_file",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let shim = temp.path().join("local-failure");
+            let mut terminal = baseline.clone();
+            let mut process_exit = 1;
+            let events = match case {
+                "missing_file" => ":",
+                "corrupt_file" => r#"printf 'invalid\n' > "$arg""#,
+                "partial_file" => r#"printf '{' > "$arg""#,
+                "bound_file" => {
+                    r#"printf '%s\n' '{"type":"session_bound","session_id":"550e8400-e29b-41d4-a716-446655440000"}' '{"type":"run_bound","session_id":"550e8400-e29b-41d4-a716-446655440000","run_id":"550e8400-e29b-41d4-a716-446655440001"}' > "$arg""#
+                }
+                _ => r#": > "$arg""#,
+            };
+            match case {
+                "selected_session" => {
+                    terminal["session_id"] =
+                        serde_json::json!("550e8400-e29b-41d4-a716-446655440000")
+                }
+                "absent_fact" => {
+                    terminal
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("server_admission_not_dispatched");
+                }
+                "false_fact" => {
+                    terminal["server_admission_not_dispatched"] = serde_json::json!(false)
+                }
+                "wrong_type" => {
+                    terminal["server_admission_not_dispatched"] = serde_json::json!("true")
+                }
+                "progress" => terminal["llm_rounds"] = serde_json::json!(1),
+                "cached_progress" => terminal["cache"]["read_tokens"] = serde_json::json!(1),
+                "aggregate_progress" => terminal["prompt_tokens"] = serde_json::json!(1),
+                "malformed_coverage" => {
+                    terminal["token_usage_coverage"] = serde_json::json!({
+                        "scope":"logical_provider_calls", "attempts":1,"provider_reported":1,"unavailable":0,"status":"none"
+                    })
+                }
+                "provider_coverage" => {
+                    terminal["token_usage_coverage"] = serde_json::json!({
+                        "scope":"logical_provider_calls", "attempts":1,"provider_reported":1,"unavailable":0,"status":"complete"
+                    })
+                }
+                "authoritative_terminal" => {
+                    terminal["server_terminal_authoritative"] = serde_json::json!(true)
+                }
+                "run" => terminal["run_id"] = serde_json::json!("run-1"),
+                "exit_mismatch" => process_exit = 3,
+                _ => {}
+            }
+            let cancelled = temp.path().join("cancelled-session");
+            let cancelled_arg = shell_escape(cancelled.display().to_string());
+            let script = format!(
+                r#"#!/bin/sh
+if [ "$1" = session ]; then
+  if [ "$2" != cancel ] || [ "$3" != 550e8400-e29b-41d4-a716-446655440000 ]; then exit 88; fi
+  printf '%s\n' "$3" > {cancelled_arg}
+  printf '%s\n' '{{"session_id":"550e8400-e29b-41d4-a716-446655440000","status":"cancelled","execution_settled":true}}'
+  exit 0
+fi
+next_is_events=0
+for arg in "$@"; do
+  if [ "$next_is_events" = 1 ]; then {events}; next_is_events=0;
+  elif [ "$arg" = --stream-events ]; then next_is_events=1; fi
+done
+printf '%s\n' '{terminal}'
+exit {process_exit}
+"#
+            );
+            crate::test_support::write_executable_shim(&shim, &script).unwrap();
+            let out = AstraCliExecutor::new(RunnerConfig::new(shim))
+                .execute(&simple_case(), "m")
+                .await;
+            if case == "bound_file" {
+                assert_eq!(
+                    std::fs::read_to_string(&cancelled).unwrap().trim(),
+                    "550e8400-e29b-41d4-a716-446655440000"
+                );
+                assert!(!out.stderr.contains("cleanup failed"), "{out:?}");
+                assert!(out.session_id.is_none() && out.run_id.is_none());
+            } else {
+                assert!(
+                    !cancelled.exists(),
+                    "{case} must not gain cancellation authority"
+                );
+            }
+            if matches!(case, "valid" | "selected_session") {
+                assert_eq!(out.exit_code, 1, "{case}: {out:?}");
+                assert_eq!(
+                    out.error_code.as_deref(),
+                    Some("workspace_host_unsupported")
+                );
+                assert!(out.run_id.is_none());
+                assert!(!out.stderr.starts_with(PROTOCOL_ERROR_MARKER));
+                assert!(out.stderr.contains("administrator must repair"));
+                assert_eq!(
+                    crate::classify::classify(&out, &[]),
+                    crate::classify::FailureClass::ToolUnavailable
+                );
+            } else {
+                assert_eq!(out.exit_code, -1, "{case}: {out:?}");
+                assert!(
+                    out.stderr.starts_with(PROTOCOL_ERROR_MARKER),
+                    "{case}: {out:?}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn empty_machine_evidence_preserves_terminal_diagnostics_but_not_identity() {
         if !std::path::Path::new("/bin/sh").exists() {
@@ -1988,14 +2171,6 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
                 run.parent_run_id = Some(root.into());
             }
         }
-        capture
-            .reflection
-            .model_requests
-            .terminal
-            .as_mut()
-            .unwrap()
-            .groups[0]
-            .parent_run_id = Some(root.into());
         for fact in capture.reflection.graph_slice.nodes[0]
             .metadata
             .as_mut()
@@ -2656,6 +2831,8 @@ cat "$TERMINAL_FILE"
     async fn fake_executor_records_calls_and_returns_seeded_outcome() {
         let fe = test_support::FakeExecutor::new();
         let mut seed = RunOutcome {
+            error_code: None,
+            server_admission_not_dispatched: false,
             model: "qwen-flash".into(),
             exit_code: 0,
             text: "hello".into(),

@@ -74,6 +74,38 @@ class SchemaInventoryTest(unittest.TestCase):
             "duplicate manifest source paths must not be hidden by set comparison",
         )
 
+    def test_runtime_admission_ddl_after_test_helper_is_inventoried(self) -> None:
+        source = next(
+            source
+            for source in schema_inventory.SCHEMA_SOURCES
+            if source.domain == "runtime_admission"
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / source.path
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                '#[cfg(test)]\nmod mysql_response_proxy;\n'
+                'const WINDOWS: &str = "CREATE TABLE IF NOT EXISTS '
+                'llm_provider_admission_windows (bucket_key VARCHAR(64) PRIMARY KEY)";\n'
+                'const PACING: &str = "CREATE TABLE IF NOT EXISTS '
+                'llm_provider_admission_pacing (bucket_key VARCHAR(64) PRIMARY KEY)";\n',
+                encoding="utf-8",
+            )
+            inventory = schema_inventory.build_inventory(root, sources=(source,))
+            self.assertEqual(
+                {row["table"] for row in inventory["tables"]},
+                {"llm_provider_admission_windows", "llm_provider_admission_pacing"},
+            )
+            self.assertEqual(
+                {row["startup_owner"] for row in inventory["tables"]},
+                {"ensure_llm_provider_admission_schema_if_configured"},
+            )
+            self.assertEqual(
+                schema_inventory.discover_production_ddl_source_paths(root),
+                [source.path],
+            )
+
     def test_work_schema_source_and_exact_table_set(self) -> None:
         work_source = next(
             source
@@ -96,22 +128,17 @@ class SchemaInventoryTest(unittest.TestCase):
             "works",
             "work_establishment_operations",
             "work_goal_revisions",
-            "work_criteria",
             "work_criterion_revisions",
             "work_criterion_sets",
             "work_graph_revisions",
             "work_graph_sequences",
             "work_items",
             "work_item_revisions",
-            "work_item_edges",
             "work_branches",
             "work_branch_creation_operations",
             "work_branch_control_operations",
             "work_branch_deletion_operations",
             "work_branch_subjects",
-            "work_patch_artifacts",
-            "work_patch_materialization_operations",
-            "work_patch_commit_operations",
             "work_proposal_sequences",
             "work_proposals",
             "work_proposal_trigger_attempts",
@@ -131,7 +158,7 @@ class SchemaInventoryTest(unittest.TestCase):
             row["table"] for row in self.inventory["tables"] if row["domain"] == "work"
         }
         self.assertEqual(expected, actual)
-        self.assertEqual(33, len(actual))
+        self.assertEqual(28, len(actual))
 
     def test_storage_and_work_metadata_are_explicit_and_closed_world(self) -> None:
         inventory_names = {row["table"] for row in self.inventory["tables"]}
@@ -366,11 +393,7 @@ fn char_literal() { let slash = '/'; }
             "agent_sessions",
             "agent_runs",
             "run_checkpoints",
-            "run_display_projections",
-            "conversation_log",
             "session_transcript_items",
-            "session_tool_output_batches",
-            "session_tool_outputs",
             "tool_invocation_ledger",
             "semantic_read_observations",
         }
@@ -403,24 +426,12 @@ fn char_literal() { let slash = '/'; }
             self.tables["agent_run_events"]["merge_guidance"],
         )
         self.assertIn(
-            "large payload",
-            self.tables["session_tool_outputs"]["state_class"],
-        )
-        self.assertIn(
             "owner lease recovery",
             self.tables["agent_runs"]["primary_query"],
         )
         self.assertIn(
             "not rebuildable from events",
             self.tables["agent_runs"]["rebuildability"],
-        )
-        self.assertIn(
-            "do not merge into agent_runs",
-            self.tables["run_display_projections"]["merge_guidance"],
-        )
-        self.assertIn(
-            "rebuildable from agent_runs",
-            self.tables["run_display_projections"]["rebuildability"],
         )
         self.assertIn(
             "do not merge into agent_runs",
@@ -431,7 +442,7 @@ fn char_literal() { let slash = '/'; }
         sessions = self.tables["agent_sessions"]
         runs = self.tables["agent_runs"]
         checkpoints = self.tables["run_checkpoints"]
-        projections = self.tables["run_display_projections"]
+        self.assertNotIn("run_display_projections", self.tables)
 
         self.assertIn("parent lifecycle row", sessions["retention_policy"])
         self.assertIn("cleanup boundary", sessions["merge_guidance"])
@@ -441,23 +452,17 @@ fn char_literal() { let slash = '/'; }
         self.assertIn("pause/cancel", runs["retention_policy"])
         self.assertIn("owner lease generation", runs["rebuildability"])
         self.assertIn("events own replay", runs["merge_guidance"])
-        self.assertIn("projections own repairable display state", runs["merge_guidance"])
+        self.assertIn("display snapshots are derived on read", runs["merge_guidance"])
 
         self.assertIn("no independent age-based TTL", checkpoints["retention_policy"])
         self.assertIn("checkpoint_json", checkpoints["rebuildability"])
         self.assertIn("typed, idempotent, multi-version", checkpoints["merge_guidance"])
 
-        self.assertIn("derived run display projection", projections["state_class"])
-        self.assertIn("clear and rebuild", projections["retention_policy"])
-        self.assertIn("repairable display state", projections["merge_guidance"])
 
     def test_state_task_workspace_tables_have_semantic_metadata(self) -> None:
         second_batch = {
-            "context_manifests",
             "session_device_leases",
             "session_device_lease_events",
-            "session_state_items",
-            "data_versioning_checkpoints",
             "sweeper_leases",
             "workspace_records",
             "workspace_cleanup_debts",
@@ -483,24 +488,12 @@ fn char_literal() { let slash = '/'; }
 
     def test_state_task_workspace_metadata_locks_boundary_decisions(self) -> None:
         self.assertIn(
-            "parent manifest summary",
-            self.tables["context_manifests"]["merge_guidance"],
-        )
-        self.assertIn(
-            "current projection surface",
-            self.tables["session_state_items"]["merge_guidance"],
-        )
-        self.assertIn(
             "mutable current state",
             self.tables["session_device_leases"]["merge_guidance"],
         )
         self.assertIn(
             "append-only audit",
             self.tables["session_device_lease_events"]["merge_guidance"],
-        )
-        self.assertIn(
-            "DatabaseDataVersioningService reads and writes",
-            self.tables["data_versioning_checkpoints"]["merge_guidance"],
         )
         self.assertIn(
             "cleanup debt can outlive the workspace record",
@@ -563,7 +556,7 @@ fn char_literal() { let slash = '/'; }
             self.tables["auth_roles"]["retention_policy"],
         )
         self.assertIn(
-            "ordered bounded batches",
+            "bounded keyed batches",
             self.tables["auth_refresh_tokens"]["retention_policy"],
         )
         self.assertIn(
@@ -598,16 +591,9 @@ fn char_literal() { let slash = '/'; }
     def test_skill_and_agent_tables_have_semantic_metadata(self) -> None:
         skill_agent_tables = {
             "skills_registry",
-            "skill_metrics",
-            "skill_selection_events",
             "skill_installations",
             "skill_settings",
             "skill_resource_bindings",
-            "skill_user_credentials",
-            "user_skill_sources",
-            "user_skill_versions",
-            "user_skill_evaluations",
-            "agent_agents",
             "agent_bindings",
         }
         for table in skill_agent_tables:
@@ -635,14 +621,6 @@ fn char_literal() { let slash = '/'; }
             self.tables["skills_registry"]["merge_guidance"],
         )
         self.assertIn(
-            "high-churn projections",
-            self.tables["skill_metrics"]["merge_guidance"],
-        )
-        self.assertIn(
-            "readers stop querying this table directly",
-            self.tables["skill_selection_events"]["merge_guidance"],
-        )
-        self.assertIn(
             "user's installed/activated state",
             self.tables["skill_installations"]["merge_guidance"],
         )
@@ -653,26 +631,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "external resources",
             self.tables["skill_resource_bindings"]["merge_guidance"],
-        )
-        self.assertIn(
-            "encrypted user secrets",
-            self.tables["skill_user_credentials"]["merge_guidance"],
-        )
-        self.assertIn(
-            "source owns authoring identity",
-            self.tables["user_skill_sources"]["merge_guidance"],
-        )
-        self.assertIn(
-            "authoring/version content",
-            self.tables["user_skill_versions"]["merge_guidance"],
-        )
-        self.assertIn(
-            "run-linked review facts",
-            self.tables["user_skill_evaluations"]["merge_guidance"],
-        )
-        self.assertIn(
-            "user-owned agent definitions",
-            self.tables["agent_agents"]["merge_guidance"],
         )
         self.assertIn(
             "idempotent creation semantics",
@@ -686,11 +644,9 @@ fn char_literal() { let slash = '/'; }
             "session_artifact_content_refs",
             "session_artifact_content_reservations",
             "session_artifact_content_upload_leases",
-            "session_checkpoints",
             "user_preferences",
             "edge_agent_registry",
             "plans",
-            "infra_sandbox_metadata",
         }
         for table in session_workflow_tables:
             with self.subTest(table=table):
@@ -721,10 +677,6 @@ fn char_literal() { let slash = '/'; }
             self.tables["session_artifacts"]["merge_guidance"],
         )
         self.assertIn(
-            "session-level restore snapshots",
-            self.tables["session_checkpoints"]["merge_guidance"],
-        )
-        self.assertIn(
             "per-user sync state",
             self.tables["user_preferences"]["merge_guidance"],
         )
@@ -736,10 +688,6 @@ fn char_literal() { let slash = '/'; }
             "current mutable plan state",
             self.tables["plans"]["merge_guidance"],
         )
-        self.assertIn(
-            "workspace_records track reusable workspaces",
-            self.tables["infra_sandbox_metadata"]["merge_guidance"],
-        )
 
 
     def test_high_growth_tables_have_retention_metadata(self) -> None:
@@ -747,10 +695,6 @@ fn char_literal() { let slash = '/'; }
             "agent_events",
             "agent_run_events",
             "run_checkpoints",
-            "conversation_log",
-            "session_tool_outputs",
-            "prompt_request_records",
-            "prompt_deltas",
             "agent_message_queue",
         ]
         for table in high_growth_tables:
@@ -762,23 +706,6 @@ fn char_literal() { let slash = '/'; }
                 self.assertNotEqual(row["rebuildability"], "unclassified")
                 self.assertNotEqual(row["merge_guidance"], "unclassified")
 
-    def test_prompt_delta_retention_is_parent_bound(self) -> None:
-        parent = self.tables["prompt_request_records"]
-        child = self.tables["prompt_deltas"]
-        self.assertIn("parent fact", parent["state_class"])
-        self.assertIn("user_id/request_id", parent["primary_query"])
-        self.assertIn("session is inactive", parent["retention_policy"])
-        self.assertIn("run is terminal", parent["retention_policy"])
-        self.assertIn("ordered bounded batches", parent["retention_policy"])
-        self.assertIn("after child deltas", parent["retention_policy"])
-        self.assertIn("created_at_unix_ms", parent["retention_policy"])
-        self.assertIn("MatrixOne", parent["retention_policy"])
-        self.assertIn("do not delete child deltas independently", parent["merge_guidance"])
-        self.assertIn("prompt_request_records", child["retention_policy"])
-        self.assertIn("independent TTL breaks", child["retention_policy"])
-        self.assertIn("bounded batches", child["retention_policy"])
-        self.assertIn("before prompt_request_records", child["retention_policy"])
-        self.assertIn("position/delta_seq", child["primary_query"])
 
     def test_session_sync_log_is_removed_from_production_schema(self) -> None:
         self.assertNotIn(
@@ -852,7 +779,6 @@ fn char_literal() { let slash = '/'; }
             "session_state_revisions",
             "session_history_chunks",
             "session_artifacts_grants",
-            "data_versioning_checkpoints",
         }
         self.assertEqual(set(self.p1_5_reviews), expected)
 
@@ -887,21 +813,12 @@ fn char_literal() { let slash = '/'; }
             "creation path",
             self.p1_5_reviews["session_artifacts_grants"]["rationale"],
         )
-        self.assertIn(
-            "rollback/list",
-            self.p1_5_reviews["data_versioning_checkpoints"]["user_api_impact"],
-        )
 
     def test_p1_5_consolidation_source_evidence_still_exists(self) -> None:
         expectations = {
             "crates/services/src/state_sync.rs": [
                 "pull_all_preferences",
                 "user_preferences",
-            ],
-            "crates/services/src/data_versioning.rs": [
-                "data_versioning_checkpoints",
-                "create_checkpoint",
-                "list_checkpoints",
             ],
             "crates/services/src/storage.rs": [
                 "validate_core_schema_table_claim",
@@ -924,44 +841,34 @@ fn char_literal() { let slash = '/'; }
         self.assertIn("ordered bounded batches", delivery["retention_policy"])
         self.assertIn("consumer-scoped delivery state", delivery["merge_guidance"])
 
-    def test_conversation_log_retention_has_runtime_compaction_boundary(self) -> None:
-        row = self.tables["conversation_log"]
-        self.assertIn("model context reconstruction", row["retention_policy"])
-        self.assertIn("runtime compaction", row["retention_policy"])
-        self.assertIn("ordered bounded batches", row["retention_policy"])
-        self.assertIn("session hard delete", row["retention_policy"])
+    def test_retired_projection_tables_are_absent(self) -> None:
+        for table in (
+            "conversation_log", "skill_selection_events", "infra_sandbox_metadata",
+            "skill_metrics", "session_checkpoints", "mcp_tools", "skill_user_credentials",
+        ):
+            self.assertNotIn(table, self.tables)
 
     def test_session_high_growth_retention_mentions_bounded_hard_delete(self) -> None:
         for table in [
             "agent_events",
             "agent_run_events",
-            "session_tool_output_batches",
-            "session_tool_outputs",
         ]:
             with self.subTest(table=table):
                 policy = self.tables[table]["retention_policy"]
                 self.assertIn("session hard delete", policy)
                 self.assertIn("ordered bounded batches", policy)
 
-    def test_replay_and_tool_output_tables_do_not_have_independent_age_ttl(self) -> None:
+    def test_replay_tables_do_not_have_independent_age_ttl(self) -> None:
         run_events = self.tables["agent_run_events"]
         self.assertIn("no independent age-based TTL", run_events["retention_policy"])
         self.assertIn("projection repair", run_events["retention_policy"])
         self.assertIn("not rebuildable", run_events["rebuildability"])
-
-        batches = self.tables["session_tool_output_batches"]
-        outputs = self.tables["session_tool_outputs"]
-        self.assertIn("no independent age-based TTL", batches["retention_policy"])
-        self.assertIn("no independent age-based TTL", outputs["retention_policy"])
-        self.assertIn("artifact refs", outputs["retention_policy"])
-        self.assertIn("not rebuildable", outputs["rebuildability"])
 
     def test_external_hot_coordination_tables_have_semantic_metadata(self) -> None:
         for table in [
             "agent_message_queue",
             "agent_message_broadcast_delivery",
             "edge_pending_dispatch",
-            "context_manifest_items",
             "resource_limits",
             "resource_usage",
             "llm_provider_admission_windows",
@@ -985,7 +892,6 @@ fn char_literal() { let slash = '/'; }
         self.assertEqual(auto_increment, set())
         self.assertNotIn("agent_message_queue", auto_increment)
         self.assertNotIn("edge_pending_dispatch", auto_increment)
-        self.assertNotIn("context_manifest_items", auto_increment)
         self.assertNotIn("session_state_item_events", auto_increment)
         self.assertNotIn("auth_user_roles", auto_increment)
         self.assertNotIn("mcp_servers", auto_increment)
@@ -1019,19 +925,12 @@ fn char_literal() { let slash = '/'; }
         self.assertIn("turn_chain_id", row["primary_query"])
         self.assertIn("edge poll", row["primary_query"])
 
-    def test_context_manifest_items_uses_manifest_order_identity(self) -> None:
-        row = self.tables["context_manifest_items"]
-        self.assertEqual(row["primary_key"], ["user_id", "manifest_id", "item_order"])
-        self.assertEqual(row["auto_increment_columns"], [])
-        self.assertEqual(row["auto_increment_hotspot_risk"], "not_applicable")
-        self.assertIn("manifest-local item", row["primary_query"])
 
-    def test_session_state_item_events_uses_owner_event_identity(self) -> None:
-        row = self.tables["session_state_item_events"]
-        self.assertEqual(row["primary_key"], ["user_id", "event_id"])
-        self.assertEqual(row["auto_increment_columns"], [])
-        self.assertEqual(row["auto_increment_hotspot_risk"], "not_applicable")
-        self.assertIn("state item audit", row["primary_query"])
+    def test_run_opening_has_payload_identity_and_no_parallel_control(self) -> None:
+        row = self.tables["agent_run_openings"]
+        self.assertEqual(row["primary_key"], ["user_id", "run_id"])
+        self.assertIn("single control owner", row["merge_guidance"])
+        self.assertIn("one row per Run", row["retention_policy"])
 
     def test_auth_grants_use_product_identity(self) -> None:
         role_row = self.tables["auth_user_roles"]
@@ -1050,11 +949,6 @@ fn char_literal() { let slash = '/'; }
         self.assertEqual(binding_row["primary_key"], ["owner_user_id", "id"])
         self.assertEqual(binding_row["auto_increment_columns"], [])
         self.assertIn("encrypted credential", binding_row["rebuildability"])
-
-        tool_row = self.tables["mcp_tools"]
-        self.assertEqual(tool_row["primary_key"], ["owner_user_id", "binding_id", "tool_name"])
-        self.assertEqual(tool_row["auto_increment_columns"], [])
-        self.assertIn("rediscovering tools", tool_row["rebuildability"])
 
     def test_every_auto_increment_table_has_risk_audit_metadata(self) -> None:
         self.assertEqual([], self.summary["unaudited_auto_increment_tables"])

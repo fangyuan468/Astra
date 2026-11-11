@@ -129,6 +129,11 @@ pub enum StreamEvent {
     /// loop. Active-run guidance must target this identity, never the CLI's
     /// local orchestration id.
     RunBound(String),
+    RunModelOutcome {
+        run_id: String,
+        session_id: String,
+        outcome: astra_turn_types::RunModelOutcome,
+    },
     /// Catalog-backed raw window and the exact usable input ceiling after
     /// deterministic output/summary/protocol reserves.
     ContextWindowPolicy {
@@ -487,7 +492,7 @@ pub type AskUserRequestTx = mpsc::Sender<AskUserRequest>;
 pub enum PlanReviewDecision {
     /// User approved and chose an execution mode.
     Approve {
-        mode: crate::cli::permission_manager::PermissionMode,
+        mode: Option<crate::cli::permission_manager::PermissionMode>,
     },
     /// User wants to keep planning — provide feedback on next turn.
     KeepPlanning,
@@ -504,10 +509,14 @@ pub struct PlanReviewRequest {
 
 pub type PlanReviewRequestTx = mpsc::Sender<PlanReviewRequest>;
 
-/// Parameters for a single agentic chat turn — groups the many arguments
-/// to `stream_chat_sse` into a named struct to reduce cognitive load.
 use crate::cli::cli_config::cli_context::CliContext;
 
+/// Request-local reference to the canonical ordinary executor, published once.
+pub(crate) type CliExecutorObserver =
+    Arc<std::sync::OnceLock<Arc<crate::edge_tools::ToolExecutor>>>;
+
+/// Parameters for a single agentic chat turn — groups the many arguments
+/// to `stream_chat_sse` into a named struct to reduce cognitive load.
 pub(crate) struct ChatTurnParams<'a> {
     pub(crate) api: &'a astra_thin_client::ThinClient,
     pub(crate) token: &'a str,
@@ -553,14 +562,6 @@ pub(crate) struct ChatTurnParams<'a> {
         Option<&'a mut Vec<astra_turn_types::DeferredToolActivation>>,
     pub(crate) tool_health_entries: &'a [ToolHealthEntry],
     pub(crate) resume_restricted_tools: &'a [String],
-    /// P6 seam: cross-session lessons loaded once at session bootstrap.
-    /// Passed through to the ToolExecutor via `set_session_lessons` so
-    /// every SelfModel snapshot surfaces prior-session advice.
-    pub(crate) session_lessons: &'a [astra_services::LessonHint],
-    pub(crate) memory_selection_reports: &'a [astra_turn_types::MemorySelectionReport],
-    /// Evaluator-derived feedback from the previous turn. This is injected
-    /// alongside self-awareness on the next turn and cleared by the caller
-    /// once a healthy turn completes.
     pub(crate) latest_turn_quality_feedback:
         Option<&'a astra_runtime::self_model::TurnQualityFeedback>,
     /// Unified skill registry (single source of truth for all skill resolution).
@@ -582,6 +583,9 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Incremental turn state for surviving interruptions.
     /// Written during streaming; snapped on force-exit to recover partial data.
     pub(crate) incremental_state: Option<Arc<IncrementalTurnState>>,
+    /// Observe the exact ordinary SSE executor through request settlement.
+    /// This carries a reference only, never a copied workspace or authority.
+    pub(crate) executor_observer: Option<CliExecutorObserver>,
     /// Request-scoped execution authority. Headless fresh-session calls bind
     /// this from the first accepted Server session identity before any edge
     /// tool can execute, then retain it through canonical local persistence.
@@ -655,8 +659,8 @@ pub(crate) struct ChatTurnParams<'a> {
         Option<std::sync::Arc<std::sync::Mutex<crate::edge_tools::SessionStateRollbackJournal>>>,
     /// Shared command queue for the TUI's BackgroundTaskRegistry.
     /// When present, tool executor pushes spawn/kill/output commands here.
-    pub(crate) bg_task_commands:
-        Option<std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
+    pub(crate) background_tasks:
+        Option<crate::edge_tools::background_tasks::BackgroundTaskRegistry>,
     /// Shared background task list cache.
     /// When the TUI is active the event loop refreshes this every tick.
     /// [`ToolExecutor::task_list_bg`] reads it directly, bypassing the
@@ -665,9 +669,10 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Detach slot for bash Ctrl+B promotion. When present, the
     /// executor pulls a fresh handle from this slot per tool call;
     /// the TUI refills between calls.
-    pub(crate) bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
-    /// 1-based session turn currently in progress; used to tag journal entries
-    /// and rollback scopes.
+    pub(crate) foreground_wait_control: Option<astra_tools::detach::ForegroundWaitControl>,
+    /// 1-based local journal turn currently in progress. Every local tool
+    /// mutation, checkpoint, trace and rollback scope uses this clock. Server
+    /// admission and Server feedback own an independent turn sequence.
     pub(crate) turn_index: u32,
     /// Pre-loaded CSL messages (from CslManager.load() in chat_turn).
     /// Restored pipeline state from a checkpoint (enables warm-start on resume).
@@ -730,14 +735,14 @@ pub(crate) struct BasicCliChatContext<'a> {
     /// wiring. When `agent_spawner` is None this is ignored.
     pub root_agent_id: Option<&'a str>,
     /// Shared command queue for the TUI's BackgroundTaskRegistry.
-    pub bg_task_commands:
-        Option<std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
+    pub(crate) background_tasks:
+        Option<crate::edge_tools::background_tasks::BackgroundTaskRegistry>,
     /// Shared background task list cache for direct reads.
     pub bg_task_list_cache: Option<std::sync::Arc<tokio::sync::RwLock<String>>>,
     /// Shared detach slot for bash Ctrl+B promotion. The TUI refills
     /// this between tool calls; the bash runner takes from it on
     /// entry. `None` for headless paths.
-    pub bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
+    pub foreground_wait_control: Option<astra_tools::detach::ForegroundWaitControl>,
     /// Optional channel for forwarding stream events (used by --stream-events).
     pub stream_event_tx: Option<StreamEventTx>,
     /// Strict protocol observation sink used only by `stream-json`.
@@ -788,8 +793,6 @@ impl<'a> ChatTurnParams<'a> {
             deferred_tool_activations: None,
             tool_health_entries: &[],
             resume_restricted_tools: &[],
-            session_lessons: &[],
-            memory_selection_reports: &[],
 
             latest_turn_quality_feedback: None,
             unified_skill_registry: ctx.unified_skill_registry,
@@ -799,6 +802,7 @@ impl<'a> ChatTurnParams<'a> {
             execution_time_budget: None,
             run_control: None,
             incremental_state: None,
+            executor_observer: None,
             request_session_execution_lease: None,
             plan_assemble_line_release: None,
             stream_event_tx: ctx.stream_event_tx.clone(),
@@ -819,9 +823,9 @@ impl<'a> ChatTurnParams<'a> {
 
             git_worktree_journal: None,
             session_state_journal: None,
-            bg_task_commands: ctx.bg_task_commands.clone(),
+            background_tasks: ctx.background_tasks.clone(),
             bg_task_list_cache: ctx.bg_task_list_cache.clone(),
-            bash_detach_slot: ctx.bash_detach_slot.clone(),
+            foreground_wait_control: ctx.foreground_wait_control.clone(),
             turn_index: DEFAULT_TURN_INDEX,
             pipeline_state: None,
             compaction_state: None,

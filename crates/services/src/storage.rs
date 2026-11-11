@@ -6,7 +6,7 @@ use astra_core::{
 };
 use axum::{Json, http::StatusCode};
 use sha2::Digest;
-use sqlx::{Execute, Executor, MySql, QueryBuilder, Row, Transaction, query, query_scalar};
+use sqlx::{Execute, Executor, MySql, QueryBuilder, Row, query, query_scalar};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -106,7 +106,30 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-17-v105";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-10-v124";
+const USER_LLM_MODELS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS user_llm_models (
+            model_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
+            model_alias VARCHAR(100) NOT NULL,
+            model_name VARCHAR(255) NOT NULL,
+            provider VARCHAR(50) NOT NULL,
+            inference_protocol VARCHAR(32) NULL,
+            responses_reasoning_history VARCHAR(16) NULL,
+            api_key_encrypted TEXT NULL,
+            connection_id VARCHAR(64) NULL,
+            base_url VARCHAR(500) NOT NULL,
+            context_window INT NOT NULL,
+            thinking_probe_json JSON NULL,
+            is_default SMALLINT NOT NULL DEFAULT 0,
+            is_active SMALLINT NOT NULL DEFAULT 1,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, model_id),
+            UNIQUE KEY uq_user_llm_models_alias (user_id, model_alias),
+            CONSTRAINT chk_user_llm_models_context_window CHECK (context_window > 0),
+            INDEX idx_user_llm_models_catalog (user_id, is_active, provider, model_alias, model_id),
+            INDEX idx_user_llm_models_default (user_id, is_default, is_active)
+        )";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -152,8 +175,10 @@ const AGENT_RUNS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS agent_runs (
     cancellation_requested_at DATETIME(6) NULL,
     run_generation BIGINT NOT NULL DEFAULT 0,
     last_event_idx BIGINT NOT NULL DEFAULT -1,
+    last_guidance_event_idx BIGINT NOT NULL DEFAULT -1,
     checkpoint_version VARCHAR(32) NULL,
-    checkpoint_json LONGTEXT NULL,
+    current_checkpoint_id VARCHAR(64) NULL,
+    current_checkpoint_hash CHAR(64) NULL,
     error_code VARCHAR(128) NULL,
     error_message TEXT NULL,
     total_prompt_tokens BIGINT NOT NULL DEFAULT 0,
@@ -168,6 +193,10 @@ const AGENT_RUNS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS agent_runs (
     resolved_model_name VARCHAR(255) NULL,
     runtime_profile VARCHAR(64) NULL,
     start_request_fingerprint VARCHAR(64) NULL,
+    opening_hash VARCHAR(64) NULL,
+    context_admission_hash VARCHAR(64) NULL,
+    terminal_receipt_json LONGTEXT NULL,
+    terminal_at DATETIME(6) NULL,
     work_id VARCHAR(64) NULL,
     work_branch_id VARCHAR(64) NULL,
     work_graph_revision BIGINT NULL,
@@ -176,6 +205,10 @@ const AGENT_RUNS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS agent_runs (
     work_item_attempt_id VARCHAR(64) NULL,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    CONSTRAINT chk_agent_runs_current_checkpoint CHECK (
+        (checkpoint_version IS NULL AND current_checkpoint_id IS NULL AND current_checkpoint_hash IS NULL)
+        OR (checkpoint_version IS NOT NULL AND current_checkpoint_id IS NOT NULL AND current_checkpoint_hash IS NOT NULL)
+    ),
     CONSTRAINT chk_agent_runs_retry_scope CHECK (retry_scope IN ('node', 'subtree', 'siblings')),
     CONSTRAINT chk_agent_runs_work_binding CHECK (
         (work_id IS NULL AND work_branch_id IS NULL AND work_graph_revision IS NULL)
@@ -196,8 +229,8 @@ const AGENT_RUNS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS agent_runs (
     INDEX idx_agent_runs_owner_parent_status_updated (user_id, parent_run_id, status, updated_at),
     INDEX idx_agent_runs_owner_retry_of (user_id, retry_of),
     INDEX idx_agent_runs_owner_lease (owner_pod_id, owner_lease_expires_at),
-    INDEX idx_agent_runs_binding (agent_binding_id, created_at),
-    INDEX idx_agent_runs_model_offering (model_offering_id, created_at),
+    INDEX idx_agent_runs_session_lease (user_id, session_id, owner_lease_expires_at),
+    INDEX idx_agent_runs_session_activity (user_id, session_id, status, waiting_for),
     INDEX idx_agent_runs_owner_work_branch_created (
         user_id, work_id, work_branch_id, created_at, run_id
     ),
@@ -210,6 +243,10 @@ const AGENT_RUNS_RUNTIME_AUTHORITY_COLUMNS: &[&str] = &[
     "model_offering_id",
     "resolved_model_name",
     "start_request_fingerprint",
+    "opening_hash",
+    "context_admission_hash",
+    "terminal_receipt_json",
+    "terminal_at",
 ];
 const AGENT_RUNS_WORK_BINDING_COLUMNS: &[&str] =
     &["work_id", "work_branch_id", "work_graph_revision"];
@@ -237,8 +274,10 @@ const AGENT_RUNS_PRESERVED_COLUMNS: &[&str] = &[
     "cancellation_requested_at",
     "run_generation",
     "last_event_idx",
+    "last_guidance_event_idx",
     "checkpoint_version",
-    "checkpoint_json",
+    "current_checkpoint_id",
+    "current_checkpoint_hash",
     "error_code",
     "error_message",
     "total_prompt_tokens",
@@ -346,8 +385,10 @@ impl CoreSchemaAuthority {
 
 macro_rules! core_schema_create {
     ($pool:expr, $table_name:literal, $ddl:expr $(,)?) => {{
-        let ddl = $ddl;
-        ($pool).authority.declare(($pool).owner, $table_name, ddl);
+        let ddl = sqlx::SqlSafeStr::into_sql_str($ddl);
+        ($pool)
+            .authority
+            .declare(($pool).owner, $table_name, ddl.as_str());
         query(ddl)
     }};
 }
@@ -413,25 +454,15 @@ impl<'c> Executor<'c> for &'c CoreSchemaExecutor {
         (&self.pool).fetch_optional(query)
     }
 
-    fn prepare_with<'e, 'q: 'e>(
+    fn prepare_with<'e>(
         self,
-        sql: &'q str,
+        sql: sqlx::SqlStr,
         parameters: &'e [sqlx::mysql::MySqlTypeInfo],
-    ) -> futures_util::future::BoxFuture<'e, Result<sqlx::mysql::MySqlStatement<'q>, sqlx::Error>>
+    ) -> futures_util::future::BoxFuture<'e, Result<sqlx::mysql::MySqlStatement, sqlx::Error>>
     where
         'c: 'e,
     {
         (&self.pool).prepare_with(sql, parameters)
-    }
-
-    fn describe<'e, 'q: 'e>(
-        self,
-        sql: &'q str,
-    ) -> futures_util::future::BoxFuture<'e, Result<sqlx::Describe<MySql>, sqlx::Error>>
-    where
-        'c: 'e,
-    {
-        (&self.pool).describe(sql)
     }
 }
 
@@ -708,6 +739,19 @@ async fn inspect_core_schema_catalog(
     if contracts.is_empty() {
         return Ok(CoreSchemaCatalogState::Invalid(
             "core schema table authority is empty for the current contract".to_string(),
+        ));
+    }
+    let model_hash = format!(
+        "{:x}",
+        sha2::Sha256::digest(USER_LLM_MODELS_CREATE_SQL.trim().as_bytes())
+    );
+    if contracts
+        .iter()
+        .find(|table| table.name == "user_llm_models")
+        .is_none_or(|table| table.owner != "storage" || table.ddl_sha256 != model_hash)
+    {
+        return Ok(CoreSchemaCatalogState::Invalid(
+            "invalid user_llm_models schema declaration; recreate the database".into(),
         ));
     }
     let malformed = contracts
@@ -995,39 +1039,19 @@ where
 pub(crate) struct SessionWriteAdmissionFacts {
     pub(crate) user_id: String,
     pub(crate) session_id: String,
-    session_status: String,
 }
 
-impl SessionWriteAdmissionFacts {
-    pub(crate) fn session_status(&self) -> &str {
-        &self.session_status
-    }
-}
-
-/// Facts established by the canonical session -> execution-slot admission
-/// order. The slot tuple is already protected by the transaction's row/key
-/// lock and can be reused by the immediate run mutation for this exact
-/// session. It must not outlive that transaction or be reused after the slot
-/// is mutated.
+/// Transaction-local identity and status protected by lifecycle -> Session
+/// admission. Actual Runs and invocation custody own execution occupancy.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SessionExecutionAdmissionFacts {
     user_id: String,
     session_id: String,
-    session_status: String,
-    slot: Option<(String, chrono::NaiveDateTime)>,
 }
 
 impl SessionExecutionAdmissionFacts {
     pub(crate) fn belongs_to(&self, user_id: &str, session_id: &str) -> bool {
         self.user_id == user_id && self.session_id == session_id
-    }
-
-    pub(crate) fn session_is_active(&self) -> bool {
-        self.session_status == "active"
-    }
-
-    pub(crate) fn slot(&self) -> Option<&(String, chrono::NaiveDateTime)> {
-        self.slot.as_ref()
     }
 }
 
@@ -1093,7 +1117,6 @@ where
         return Ok(SessionWriteAdmissionFacts {
             user_id,
             session_id,
-            session_status: status,
         });
     }
     if !allow_lazy_create {
@@ -1103,8 +1126,8 @@ where
         Ok(()) | Err(sqlx::Error::RowNotFound) => {}
         Err(error) => return Err(error),
     }
-    let created: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT user_id, session_id, status FROM agent_sessions
+    let created: Option<(String, String)> = sqlx::query_as(
+        "SELECT user_id, session_id FROM agent_sessions
          WHERE user_id = ? AND session_id = ? AND status <> 'deleting'
          LIMIT 1 FOR UPDATE",
     )
@@ -1112,11 +1135,10 @@ where
     .bind(session_id)
     .fetch_optional(&mut **tx)
     .await?;
-    if let Some((user_id, session_id, session_status)) = created {
+    if let Some((user_id, session_id)) = created {
         Ok(SessionWriteAdmissionFacts {
             user_id,
             session_id,
-            session_status,
         })
     } else {
         Err(sqlx::Error::RowNotFound)
@@ -1127,8 +1149,7 @@ where
 /// run and any session-scoped execution authority derived from it.
 ///
 /// The caller supplies the session identity it already owns. We first fence
-/// the active, non-deleted session, then the session execution slot, and
-/// only then may the caller lock run rows. Sessions without an active run
+/// the active, non-deleted session, then may the caller lock or mutate Run rows. Sessions without an active run
 /// still use this fence, so run creation cannot race an idle handoff check.
 pub async fn admit_session_execution_write<T>(
     tx: &mut T,
@@ -1143,9 +1164,8 @@ where
         .map(|_| ())
 }
 
-/// Establish the session and execution-slot locks once and return the facts
-/// needed by the immediate mutation. The returned slot is not a cache; it is
-/// a transaction-local snapshot protected by the locks acquired below.
+/// Establish lifecycle and owned Session admission once. Ordinary mutations
+/// do not rediscover occupancy; independent creation checks actual owners.
 pub(crate) async fn admit_session_execution_write_with_facts<T>(
     tx: &mut T,
     session_id: &str,
@@ -1154,35 +1174,213 @@ pub(crate) async fn admit_session_execution_write_with_facts<T>(
 where
     T: TransactionConnection,
 {
-    let session = admit_session_event_write_with_facts(tx, session_id, user_id, false).await?;
+    admit_session_event_write(tx, session_id, user_id, false).await?;
 
-    // Lock the derived slot before any run row. A missing slot is a valid
-    // state; the SELECT still establishes the canonical access order for
-    // engines that protect the key range on FOR UPDATE.
-    let slot = query(
-        "SELECT run_id, updated_at FROM agent_session_execution_slots
-         WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
+    Ok(SessionExecutionAdmissionFacts {
+        user_id: user_id.to_string(),
+        session_id: session_id.to_string(),
+    })
+}
+
+/// A standalone Context root need not have a Server display Session. Lock an
+/// existing display row when present, preserving the same deletion/Session order;
+/// absence never becomes an active-Session proof usable to create a Run.
+pub(crate) async fn admit_context_execution_write_with_facts<T>(
+    tx: &mut T,
+    session_id: &str,
+    user_id: &str,
+) -> Result<SessionExecutionAdmissionFacts, sqlx::Error>
+where
+    T: TransactionConnection,
+{
+    match lock_agent_session_write_fence_state(tx, session_id, user_id).await? {
+        AgentSessionWriteFenceState::Writable => {}
+        AgentSessionWriteFenceState::PendingDelete
+        | AgentSessionWriteFenceState::CompletedDelete => return Err(sqlx::Error::RowNotFound),
+        AgentSessionWriteFenceState::Missing => {
+            return Err(sqlx::Error::Protocol(
+                "session lifecycle fence disappeared before it could be locked".into(),
+            ));
+        }
+    }
+    let status: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM agent_sessions WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
     )
     .bind(user_id)
     .bind(session_id)
     .fetch_optional(&mut **tx)
-    .await?
-    .map(|row| {
-        Ok::<_, sqlx::Error>((
-            row.try_get::<String, _>("run_id")?,
-            row.try_get::<chrono::NaiveDateTime, _>("updated_at")?,
-        ))
-    })
-    .transpose()?;
+    .await?;
+    if status.as_deref() == Some("deleting") {
+        return Err(sqlx::Error::RowNotFound);
+    }
     Ok(SessionExecutionAdmissionFacts {
         user_id: user_id.to_string(),
         session_id: session_id.to_string(),
-        session_status: session.session_status,
-        slot,
     })
 }
 
-/// Admit a session/slot and require an exact run when the caller has no
+/// Read the actual execution owners for one explicit user/Session. Each inner
+/// query must bind its own scope: MatrixOne may otherwise apply LIMIT before
+/// decorrelating an EXISTS, letting another Session hide this one's owner.
+/// Callers retain the lifecycle/Session fence and current-read locks.
+fn push_session_active_runs(
+    query: &mut sqlx::QueryBuilder<MySql>,
+    user_id: &str,
+    session_id: &str,
+    except_run_id: Option<&str>,
+) {
+    query.push("CAST((EXISTS (SELECT 1 FROM agent_runs activity WHERE activity.user_id = ")
+        .push_bind(user_id).push(" AND activity.session_id = ").push_bind(session_id)
+        .push(" AND (activity.status IN ('running', 'waiting') OR (activity.status = 'paused' AND activity.waiting_for IS NOT NULL))");
+    if let Some(run_id) = except_run_id {
+        query.push(" AND activity.run_id <> ").push_bind(run_id);
+    }
+    query.push(" LIMIT 1 FOR UPDATE) OR EXISTS (SELECT 1 FROM agent_runs executor WHERE executor.user_id = ")
+        .push_bind(user_id).push(" AND executor.session_id = ").push_bind(session_id)
+        .push(" AND executor.owner_lease_expires_at >= NOW(6) AND executor.owner_pod_id IS NOT NULL");
+    if let Some(run_id) = except_run_id {
+        query.push(" AND executor.run_id <> ").push_bind(run_id);
+    }
+    query.push(" LIMIT 1 FOR UPDATE)) AS SIGNED) AS execution_active");
+}
+
+fn push_session_execution_activity(
+    query: &mut sqlx::QueryBuilder<MySql>,
+    user_id: &str,
+    session_id: &str,
+    except_run_id: Option<&str>,
+) {
+    push_session_active_runs(query, user_id, session_id, except_run_id);
+    query
+        .push(
+            ", CAST(EXISTS (SELECT 1 FROM tool_invocation_ledger custody WHERE custody.user_id = ",
+        )
+        .push_bind(user_id)
+        .push(" AND custody.session_id = ")
+        .push_bind(session_id)
+        .push(" AND custody.state IN ('prepared', 'dispatched', 'outcome_unknown')");
+    if let Some(run_id) = except_run_id {
+        query.push(" AND custody.run_id <> ").push_bind(run_id);
+    }
+    query.push(" LIMIT 1 FOR UPDATE) AS SIGNED) AS execution_debt");
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionExecutionActivity {
+    pub(crate) active_run: bool,
+    pub(crate) unresolved_invocations: bool,
+}
+
+impl SessionExecutionActivity {
+    pub(crate) fn is_idle(&self) -> bool {
+        !self.active_run && !self.unresolved_invocations
+    }
+
+    fn from_row(row: &sqlx::mysql::MySqlRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            active_run: row.try_get::<i64, _>("execution_active")? != 0,
+            unresolved_invocations: row.try_get::<i64, _>("execution_debt")? != 0,
+        })
+    }
+}
+
+/// New independent executions check occupancy in their existing owned Session
+/// read, before inserting a Run. Excluding the requested Run key permits only
+/// the unique-key replay path; a duplicate never returns a new execution grant.
+/// Return the capture override from the same locked read. The outer `None`
+/// means occupied; the inner `None` uses the runtime's default.
+pub(crate) async fn admit_independent_run_creation<T>(
+    tx: &mut T,
+    session_id: &str,
+    user_id: &str,
+    run_id: &str,
+) -> Result<Option<Option<bool>>, sqlx::Error>
+where
+    T: TransactionConnection,
+{
+    lock_agent_session_write_fence(tx, session_id, user_id)
+        .await
+        .map_err(|error| match error {
+            sqlx::Error::Protocol(message) if message == "session has a durable deletion fence" => {
+                sqlx::Error::RowNotFound
+            }
+            error => error,
+        })?;
+    let mut query = sqlx::QueryBuilder::<MySql>::new(
+        "SELECT session.status, CAST(CASE \
+         WHEN JSON_TYPE(session.metadata) = 'OBJECT' \
+          AND JSON_TYPE(JSON_EXTRACT(session.metadata, '$.full_llm_capture')) = 'BOOLEAN' \
+         THEN CASE JSON_UNQUOTE(JSON_EXTRACT(session.metadata, '$.full_llm_capture')) \
+          WHEN 'true' THEN 1 WHEN 'false' THEN 0 ELSE -1 END \
+         ELSE NULL END AS SIGNED) AS full_llm_capture_override, ",
+    );
+    push_session_active_runs(&mut query, user_id, session_id, Some(run_id));
+    query
+        .push(" FROM agent_sessions session WHERE session.user_id = ")
+        .push_bind(user_id)
+        .push(" AND session.session_id = ")
+        .push_bind(session_id)
+        .push(" LIMIT 1 FOR UPDATE");
+    let row = query
+        .build()
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
+    let status: String = row.try_get("status")?;
+    if status != "active" {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    if row.try_get::<i64, _>("execution_active")? != 0 {
+        return Ok(None);
+    }
+    let capture = match row.try_get::<Option<i64>, _>("full_llm_capture_override")? {
+        None => None,
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        Some(_) => {
+            return Err(sqlx::Error::Protocol(
+                "invalid session capture override".into(),
+            ));
+        }
+    };
+    Ok(Some(capture))
+}
+
+/// Read live Run owners under an existing Session fence. Old unknown tool
+/// outcomes remain in their invocation ledger, but are not live Run owners.
+pub(crate) async fn session_has_active_run<T>(
+    tx: &mut T,
+    user_id: &str,
+    session_id: &str,
+    except_run_id: Option<&str>,
+) -> Result<bool, sqlx::Error>
+where
+    T: TransactionConnection,
+{
+    let mut query = sqlx::QueryBuilder::<MySql>::new("SELECT ");
+    push_session_active_runs(&mut query, user_id, session_id, except_run_id);
+    let row = query.build().fetch_one(&mut **tx).await?;
+    Ok(row.try_get::<i64, _>("execution_active")? != 0)
+}
+
+/// Read actual Run/lease/effect custody under an already held Session fence.
+/// Resume may exclude its exact Run only after checkpoint/custody validation.
+pub(crate) async fn session_execution_activity<T>(
+    tx: &mut T,
+    user_id: &str,
+    session_id: &str,
+    except_run_id: Option<&str>,
+) -> Result<SessionExecutionActivity, sqlx::Error>
+where
+    T: TransactionConnection,
+{
+    let mut query = sqlx::QueryBuilder::<MySql>::new("SELECT ");
+    push_session_execution_activity(&mut query, user_id, session_id, except_run_id);
+    let row = query.build().fetch_one(&mut **tx).await?;
+    SessionExecutionActivity::from_row(&row)
+}
+
+/// Admit a Session and require an exact run when the caller has no
 /// authoritative run lookup of its own. Callers that read the run should use
 /// session/execution admission followed by that locking read, not both.
 pub async fn admit_session_scoped_run_write<T>(
@@ -1390,59 +1588,6 @@ where
         (Some(_), None) => AgentSessionWriteFenceState::PendingDelete,
         (_, Some(_)) => AgentSessionWriteFenceState::CompletedDelete,
     })
-}
-
-/// Lock a session fence for diagnostic expiry, claiming a fence-less session
-/// only when its durable root no longer exists.
-///
-/// A historical prompt diagnostic can outlive both its session row and fence.
-/// The claim is serialized with every session writer: if no root exists while
-/// holding the fence, record a completed deletion fence before deleting the
-/// diagnostic so a later writer cannot recreate that session identity.
-pub(crate) async fn lock_or_claim_orphaned_agent_session_write_fence(
-    tx: &mut Transaction<'_, MySql>,
-    session_id: &str,
-    user_id: &str,
-) -> Result<AgentSessionWriteFenceState, sqlx::Error> {
-    query(
-        "INSERT IGNORE INTO agent_session_lifecycle_fences \
-         (session_id, user_id, created_at, updated_at) \
-         VALUES (?, ?, NOW(6), NOW(6))",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .execute(&mut **tx)
-    .await?;
-
-    match lock_existing_agent_session_write_fence(tx, session_id, user_id).await? {
-        AgentSessionWriteFenceState::Writable => {
-            let session_exists: Option<i32> = sqlx::query_scalar(
-                "SELECT 1 FROM agent_sessions \
-                 WHERE user_id = ? AND session_id = ? FOR UPDATE",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-            if session_exists.is_some() {
-                return Ok(AgentSessionWriteFenceState::Writable);
-            }
-
-            query(
-                "UPDATE agent_session_lifecycle_fences \
-                 SET delete_requested_at = COALESCE(delete_requested_at, NOW(6)), \
-                     database_deleted_at = COALESCE(database_deleted_at, NOW(6)), \
-                     updated_at = NOW(6) \
-                 WHERE user_id = ? AND session_id = ?",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .execute(&mut **tx)
-            .await?;
-            lock_existing_agent_session_write_fence(tx, session_id, user_id).await
-        }
-        state => Ok(state),
-    }
 }
 
 /// Acquire the durable lifecycle fence for one session-bound write.
@@ -1722,7 +1867,10 @@ async fn ensure_matrixone_database_exists(
         "CREATE DATABASE IF NOT EXISTS {}",
         crate::snapshot_sql::quote_mysql_identifier(&settings.database)
     );
-    let create_result = query(&ddl).execute(admin_pool.pool()).await.map(|_| ());
+    let create_result = query(sqlx::AssertSqlSafe(ddl))
+        .execute(admin_pool.pool())
+        .await
+        .map(|_| ());
     finish_bootstrap_operation(create_result, admin_pool.release().await)
 }
 
@@ -1810,51 +1958,67 @@ fn validate_schema_identifier(raw: &str, kind: &str) -> Result<(), sqlx::Error> 
     })
 }
 
-fn validate_edge_pending_dispatch_result_storage(
+fn validate_edge_pending_dispatch_text_storage(
+    column: &str,
     data_type: &str,
     nullable: bool,
+    expected_nullable: bool,
 ) -> Result<(), sqlx::Error> {
     // MatrixOne reports declared LONGTEXT as TEXT.
-    if nullable
+    if nullable == expected_nullable
         && (data_type.eq_ignore_ascii_case("longtext") || data_type.eq_ignore_ascii_case("text"))
     {
         return Ok(());
     }
     Err(sqlx::Error::Protocol(format!(
-        "edge_pending_dispatch.result_json requires nullable lossless text storage, found {data_type} (nullable={nullable}); recreate the database"
+        "edge_pending_dispatch.{column} requires lossless text storage (nullable={expected_nullable}), found {data_type} (nullable={nullable}); recreate the database"
     )))
 }
 
-/// Validate lossless storage for the bytes hashed by the Edge dispatch protocol.
-async fn ensure_edge_pending_dispatch_result_json_lossless(
+/// Both the request and receipt must survive storage without JSON normalization.
+async fn ensure_edge_pending_dispatch_text_storage(
     pool: &sqlx::Pool<MySql>,
     database: &str,
 ) -> Result<(), sqlx::Error> {
     validate_schema_identifier(database, "matrixone database")?;
-    let row = query(
-        "SELECT DATA_TYPE, IS_NULLABLE FROM information_schema.COLUMNS \
+    let rows = query(
+        "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM information_schema.COLUMNS \
          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'edge_pending_dispatch' \
-           AND COLUMN_NAME = 'result_json' LIMIT 1",
+           AND COLUMN_NAME IN ('payload_json', 'result_json')",
     )
     .bind(database)
-    .fetch_optional(pool)
-    .await?
-    .ok_or_else(|| {
-        sqlx::Error::Protocol(
-            "edge_pending_dispatch.result_json is missing after table creation".to_string(),
-        )
-    })?;
-    let data_type: String = row.try_get("DATA_TYPE")?;
-    let nullable = match row.try_get::<String, _>("IS_NULLABLE")?.as_str() {
-        "YES" => true,
-        "NO" => false,
-        value => {
-            return Err(sqlx::Error::Protocol(format!(
-                "edge_pending_dispatch.result_json has invalid IS_NULLABLE value {value}"
-            )));
-        }
-    };
-    validate_edge_pending_dispatch_result_storage(&data_type, nullable)
+    .fetch_all(pool)
+    .await?;
+    for (column, expected_nullable) in [("payload_json", false), ("result_json", true)] {
+        let row = rows
+            .iter()
+            .find(|row| {
+                row.try_get::<String, _>("COLUMN_NAME")
+                    .is_ok_and(|name| name.eq_ignore_ascii_case(column))
+            })
+            .ok_or_else(|| {
+                sqlx::Error::Protocol(format!(
+                    "edge_pending_dispatch.{column} is missing after table creation"
+                ))
+            })?;
+        let data_type: String = row.try_get("DATA_TYPE")?;
+        let nullable = match row.try_get::<String, _>("IS_NULLABLE")?.as_str() {
+            "YES" => true,
+            "NO" => false,
+            value => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "edge_pending_dispatch.{column} has invalid IS_NULLABLE value {value}"
+                )));
+            }
+        };
+        validate_edge_pending_dispatch_text_storage(
+            column,
+            &data_type,
+            nullable,
+            expected_nullable,
+        )?;
+    }
+    Ok(())
 }
 
 async fn existing_table_columns(
@@ -1877,55 +2041,6 @@ async fn existing_table_columns(
     .collect::<Result<BTreeSet<_>, _>>()
 }
 
-#[derive(Clone, Debug)]
-struct WeightedAdmissionColumnShape {
-    data_type: String,
-    numeric_precision: Option<i64>,
-    numeric_scale: Option<i64>,
-    nullable: bool,
-}
-
-async fn weighted_admission_table_shapes(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
-    table: &str,
-) -> Result<BTreeMap<String, WeightedAdmissionColumnShape>, sqlx::Error> {
-    validate_schema_identifier(database, "matrixone database")?;
-    validate_schema_identifier(table, "matrixone table")?;
-    let rows = query(
-        "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE
-         FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-    )
-    .bind(database)
-    .bind(table)
-    .fetch_all(pool)
-    .await?;
-    rows.into_iter()
-        .map(|row| {
-            let name: String = row.try_get("COLUMN_NAME")?;
-            let nullable = match row.try_get::<String, _>("IS_NULLABLE")?.as_str() {
-                "YES" => true,
-                "NO" => false,
-                value => {
-                    return Err(sqlx::Error::Protocol(format!(
-                        "schema column {table}.{name} has invalid IS_NULLABLE value {value}"
-                    )));
-                }
-            };
-            Ok((
-                name,
-                WeightedAdmissionColumnShape {
-                    data_type: row.try_get("DATA_TYPE")?,
-                    numeric_precision: row.try_get("NUMERIC_PRECISION")?,
-                    numeric_scale: row.try_get("NUMERIC_SCALE")?,
-                    nullable,
-                },
-            ))
-        })
-        .collect()
-}
-
 async fn table_exists(
     pool: &sqlx::Pool<MySql>,
     database: &str,
@@ -1942,153 +2057,6 @@ async fn table_exists(
     .fetch_optional(pool)
     .await
     .map(|row| row.is_some())
-}
-
-/// The current admission protocol stores materialized usage beside the
-/// durable gate. `CREATE TABLE IF NOT EXISTS` cannot add those columns to a
-/// database created by an older contract, and this branch intentionally has
-/// no compatibility migration. Refuse that physical schema explicitly before
-/// publishing a new readiness marker; operators must recreate the database
-/// with the current contract instead.
-async fn reject_obsolete_weighted_admission_schema(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
-) -> Result<(), sqlx::Error> {
-    const GATE: &str = "session_weighted_admission_gates";
-    const OWNER_USAGE: &str = "session_weighted_admission_owner_usage";
-    const REQUIRED_GATE_COLUMNS: &[&str] = &[
-        "usage_initialized",
-        "earliest_expiry_at",
-        "used_resident_bytes",
-        "used_context_tokens",
-        "used_provider_slots",
-        "used_cpu_units",
-        "used_io_bytes",
-        "allocated_resident_bytes",
-        "allocated_context_tokens",
-        "allocated_provider_slots",
-        "allocated_cpu_units",
-        "allocated_io_bytes",
-    ];
-
-    if !table_exists(pool, database, GATE).await? {
-        // A brand-new database has no admission tables yet; the bootstrap DDL
-        // below will create the complete current shape.
-        return Ok(());
-    }
-
-    let gate_columns = weighted_admission_table_shapes(pool, database, GATE).await?;
-    let missing = REQUIRED_GATE_COLUMNS
-        .iter()
-        .filter(|column| !gate_columns.contains_key(**column))
-        .copied()
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Err(sqlx::Error::Protocol(format!(
-            "weighted admission schema does not match the current contract; missing {}. Recreate database {database} with the current schema",
-            missing.join(", ")
-        )));
-    }
-    if !table_exists(pool, database, OWNER_USAGE).await? {
-        return Err(sqlx::Error::Protocol(format!(
-            "weighted admission schema is incomplete; missing table {OWNER_USAGE}. Recreate database {database} with the current schema"
-        )));
-    }
-
-    let mut mismatches = Vec::new();
-    if let Some(column) = gate_columns.get("earliest_expiry_at")
-        && (!column.data_type.eq_ignore_ascii_case("datetime") || !column.nullable)
-    {
-        mismatches.push(format!(
-            "{GATE}.earliest_expiry_at must be nullable DATETIME"
-        ));
-    }
-    if let Some(column) = gate_columns.get("usage_initialized")
-        && (!column.data_type.eq_ignore_ascii_case("tinyint") || column.nullable)
-    {
-        mismatches.push(format!(
-            "{GATE}.usage_initialized must be NOT NULL TINYINT (found {}{})",
-            column.data_type,
-            if column.nullable { " NULL" } else { "" }
-        ));
-    }
-    for name in [
-        "used_resident_bytes",
-        "used_context_tokens",
-        "used_provider_slots",
-        "used_cpu_units",
-        "used_io_bytes",
-        "allocated_resident_bytes",
-        "allocated_context_tokens",
-        "allocated_provider_slots",
-        "allocated_cpu_units",
-        "allocated_io_bytes",
-    ] {
-        if let Some(column) = gate_columns.get(name)
-            && (!column.data_type.eq_ignore_ascii_case("decimal")
-                || column.numeric_precision != Some(20)
-                || column.numeric_scale != Some(0)
-                || column.nullable)
-        {
-            mismatches.push(format!(
-                "{GATE}.{name} must be NOT NULL DECIMAL(20,0) (found {}({:?},{:?}){})",
-                column.data_type,
-                column.numeric_precision,
-                column.numeric_scale,
-                if column.nullable { " NULL" } else { "" }
-            ));
-        }
-    }
-
-    let owner_columns = weighted_admission_table_shapes(pool, database, OWNER_USAGE).await?;
-    for name in [
-        "resident_bytes",
-        "context_tokens",
-        "provider_slots",
-        "cpu_units",
-        "io_bytes",
-    ] {
-        match owner_columns.get(name) {
-            None => mismatches.push(format!("{OWNER_USAGE}.{name} is missing")),
-            Some(column)
-                if !column.data_type.eq_ignore_ascii_case("decimal")
-                    || column.numeric_precision != Some(20)
-                    || column.numeric_scale != Some(0)
-                    || column.nullable =>
-            {
-                mismatches.push(format!(
-                    "{OWNER_USAGE}.{name} must be NOT NULL DECIMAL(20,0) (found {}({:?},{:?}){})",
-                    column.data_type,
-                    column.numeric_precision,
-                    column.numeric_scale,
-                    if column.nullable { " NULL" } else { "" }
-                ));
-            }
-            Some(_) => {}
-        }
-    }
-    if !mismatches.is_empty() {
-        return Err(sqlx::Error::Protocol(format!(
-            "weighted admission schema does not match the current physical shape: {}. Recreate database {database} with the current schema",
-            mismatches.join(", ")
-        )));
-    }
-    let reservation_columns =
-        weighted_admission_table_shapes(pool, database, "session_weighted_admission_reservations")
-            .await?;
-    // Interrupted fresh bootstrap may not have created this table yet.
-    if !reservation_columns.is_empty()
-        && !reservation_columns
-            .get("idempotency_hash")
-            .is_some_and(|column| {
-                column.data_type.eq_ignore_ascii_case("varchar") && !column.nullable
-            })
-    {
-        return Err(sqlx::Error::Protocol(format!(
-            "weighted admission idempotency_hash must be NOT NULL VARCHAR; recreate database {database} with the current schema"
-        )));
-    }
-    Ok(())
 }
 
 fn agent_runs_canonical_columns() -> BTreeSet<String> {
@@ -2116,35 +2084,6 @@ async fn verify_work_canonical_schema(
         (
             "work_check_runs",
             &["work_item_id", "work_item_revision", "work_item_attempt_id"],
-        ),
-        (
-            "work_patch_materialization_operations",
-            &[
-                "executor_token",
-                "executor_lease_expires_at",
-                "recovery_after",
-                "apply_invocation_ref",
-                "observed_subject_revision",
-                "apply_outcome",
-                "failure_code",
-                "verification_evidence_hash",
-                "verification_outcome",
-            ],
-        ),
-        (
-            "work_patch_commit_operations",
-            &[
-                "active_target_branch_id",
-                "provider_ref",
-                "policy_decision_ref",
-                "executor_token",
-                "executor_lease_expires_at",
-                "recovery_after",
-                "commit_invocation_ref",
-                "index_reconciled",
-                "commit_author_name",
-                "commit_author_email",
-            ],
         ),
         ("work_items", &["last_revision"]),
         ("work_item_revisions", &["parent_revision"]),
@@ -2218,23 +2157,6 @@ async fn verify_work_canonical_schema(
             "work_branches",
             "idx_work_branches_deletion",
             &["owner_id", "deletion_operation_id", "deletion_requested_at"],
-        ),
-        (
-            "work_patch_materialization_operations",
-            "idx_work_patch_materialization_recovery",
-            &["operation_state", "recovery_after", "operation_id"],
-        ),
-        (
-            "work_patch_materialization_operations",
-            "idx_work_patch_materialization_source_history",
-            &[
-                "owner_id",
-                "work_id",
-                "target_branch_id",
-                "source_branch_id",
-                "created_at",
-                "operation_id",
-            ],
         ),
         (
             "work_branch_control_operations",
@@ -2358,12 +2280,12 @@ async fn verify_agent_runs_canonical_schema(
             &["owner_pod_id", "owner_lease_expires_at"],
         ),
         (
-            "idx_agent_runs_binding",
-            &["agent_binding_id", "created_at"],
+            "idx_agent_runs_session_activity",
+            &["user_id", "session_id", "status", "waiting_for"],
         ),
         (
-            "idx_agent_runs_model_offering",
-            &["model_offering_id", "created_at"],
+            "idx_agent_runs_session_lease",
+            &["user_id", "session_id", "owner_lease_expires_at"],
         ),
         (
             "idx_agent_runs_owner_work_branch_created",
@@ -2578,34 +2500,6 @@ fn inference_provider_attempt_schema_mismatches(
         None => reasons.push("missing nullable column context_expired_at".to_string()),
     }
 
-    for (name, expected_type, expected_width) in [
-        ("canonical_transition_id", "char", Some(64_i64)),
-        ("canonical_parent_transition_id", "char", Some(64_i64)),
-        ("canonical_transition_hash", "char", Some(64_i64)),
-    ] {
-        let Some(column) = columns.get(name) else {
-            reasons.push(format!("missing nullable column {name}"));
-            continue;
-        };
-        if !column.nullable {
-            reasons.push(format!("non-nullable column {name}"));
-        }
-        if !column.data_type.eq_ignore_ascii_case(expected_type) {
-            reasons.push(format!(
-                "column {name} has type {}, expected {expected_type}",
-                column.data_type
-            ));
-        }
-        if let Some(expected_width) = expected_width
-            && column.character_maximum_length != Some(expected_width)
-        {
-            reasons.push(format!(
-                "column {name} has width {:?}, expected {expected_width}",
-                column.character_maximum_length
-            ));
-        }
-    }
-
     for (name, expected_columns) in [
         ("PRIMARY", &["user_id", "attempt_id"][..]),
         (
@@ -2634,207 +2528,6 @@ fn inference_provider_attempt_schema_mismatches(
         }
     }
     reasons
-}
-
-fn inference_canonical_transition_head_schema_mismatches(
-    columns: &BTreeMap<String, ObservedColumnShape>,
-    indexes: &BTreeMap<String, ObservedIndexShape>,
-) -> Vec<String> {
-    let mut reasons = Vec::new();
-    for (name, expected_type, expected_width) in [
-        ("user_id", "varchar", Some(128_i64)),
-        ("session_id", "varchar", Some(64_i64)),
-        ("turn_index", "bigint", None),
-        ("head_transition_id", "char", Some(64_i64)),
-        ("head_attempt_id", "varchar", Some(64_i64)),
-        ("head_result_count", "bigint", None),
-        ("head_result_root_hash", "char", Some(64_i64)),
-        ("chain_length", "bigint", None),
-        ("chain_payload_bytes", "bigint", None),
-        ("updated_at", "datetime", None),
-    ] {
-        let Some(column) = columns.get(name) else {
-            reasons.push(format!("missing NOT NULL column {name}"));
-            continue;
-        };
-        if column.nullable {
-            reasons.push(format!("nullable column {name}"));
-        }
-        if !column.data_type.eq_ignore_ascii_case(expected_type) {
-            reasons.push(format!(
-                "column {name} has type {}, expected {expected_type}",
-                column.data_type
-            ));
-        }
-        if let Some(expected_width) = expected_width
-            && column.character_maximum_length != Some(expected_width)
-        {
-            reasons.push(format!(
-                "column {name} has width {:?}, expected {expected_width}",
-                column.character_maximum_length
-            ));
-        }
-    }
-    for (name, expected_columns) in [
-        ("PRIMARY", &["user_id", "session_id", "turn_index"][..]),
-        (
-            "uq_inference_canonical_head_attempt",
-            &["user_id", "head_attempt_id"][..],
-        ),
-    ] {
-        let Some(index) = indexes.get(name) else {
-            reasons.push(format!("missing unique constraint {name}"));
-            continue;
-        };
-        if index.non_unique {
-            reasons.push(format!("constraint {name} is not unique"));
-        }
-        if !index
-            .columns
-            .iter()
-            .map(String::as_str)
-            .eq(expected_columns.iter().copied())
-        {
-            reasons.push(format!(
-                "constraint {name} has columns ({}), expected ({})",
-                index.columns.join(", "),
-                expected_columns.join(", ")
-            ));
-        }
-    }
-    reasons
-}
-
-fn inference_canonical_transition_wal_schema_mismatches(
-    columns: &BTreeMap<String, ObservedColumnShape>,
-    indexes: &BTreeMap<String, ObservedIndexShape>,
-) -> Vec<String> {
-    let mut reasons = Vec::new();
-    for (name, expected_type, expected_width, nullable) in [
-        ("user_id", "varchar", Some(128_i64), false),
-        ("session_id", "varchar", Some(64_i64), false),
-        ("turn_index", "bigint", None, false),
-        ("round_index", "bigint", None, false),
-        ("logical_attempt", "bigint", None, false),
-        ("physical_attempt", "bigint", None, false),
-        ("transition_id", "char", Some(64_i64), false),
-        ("parent_transition_id", "char", Some(64_i64), true),
-        ("attempt_id", "varchar", Some(64_i64), false),
-        ("payload_hash", "char", Some(64_i64), false),
-        ("payload_bytes", "bigint", None, false),
-        ("predecessor_count", "bigint", None, false),
-        ("predecessor_root_hash", "char", Some(64_i64), false),
-        ("result_count", "bigint", None, false),
-        ("result_root_hash", "char", Some(64_i64), false),
-        ("recovery_mode", "varchar", Some(32_i64), false),
-        ("created_at", "datetime", None, false),
-    ] {
-        let Some(column) = columns.get(name) else {
-            reasons.push(format!("missing column {name}"));
-            continue;
-        };
-        if column.nullable != nullable {
-            reasons.push(format!(
-                "column {name} has nullable={}, expected {nullable}",
-                column.nullable
-            ));
-        }
-        if !column.data_type.eq_ignore_ascii_case(expected_type) {
-            reasons.push(format!(
-                "column {name} has type {}, expected {expected_type}",
-                column.data_type
-            ));
-        }
-        if let Some(expected_width) = expected_width
-            && column.character_maximum_length != Some(expected_width)
-        {
-            reasons.push(format!(
-                "column {name} has width {:?}, expected {expected_width}",
-                column.character_maximum_length
-            ));
-        }
-    }
-    match columns.get("payload_json") {
-        Some(column)
-            if !column.nullable
-                && (column.data_type.eq_ignore_ascii_case("text")
-                    || column.data_type.eq_ignore_ascii_case("longtext")) => {}
-        Some(column) if column.nullable => {
-            reasons.push("nullable column payload_json".to_string());
-        }
-        Some(column) => reasons.push(format!(
-            "column payload_json has type {}, expected text-compatible storage",
-            column.data_type
-        )),
-        None => reasons.push("missing NOT NULL column payload_json".to_string()),
-    }
-    for (name, expected_columns, expected_non_unique) in [
-        (
-            "PRIMARY",
-            &["user_id", "session_id", "turn_index", "transition_id"][..],
-            false,
-        ),
-        (
-            "uq_inference_canonical_wal_attempt",
-            &["user_id", "attempt_id"][..],
-            false,
-        ),
-        (
-            "idx_inference_canonical_wal_parent",
-            &[
-                "user_id",
-                "session_id",
-                "turn_index",
-                "parent_transition_id",
-            ][..],
-            true,
-        ),
-    ] {
-        let Some(index) = indexes.get(name) else {
-            reasons.push(format!("missing index {name}"));
-            continue;
-        };
-        if index.non_unique != expected_non_unique {
-            reasons.push(format!(
-                "index {name} has non_unique={}, expected {expected_non_unique}",
-                index.non_unique
-            ));
-        }
-        if !index
-            .columns
-            .iter()
-            .map(String::as_str)
-            .eq(expected_columns.iter().copied())
-        {
-            reasons.push(format!(
-                "index {name} has columns ({}), expected ({})",
-                index.columns.join(", "),
-                expected_columns.join(", ")
-            ));
-        }
-    }
-    reasons
-}
-
-fn inference_canonical_transition_wal_definition_mismatches(create_sql: &str) -> Vec<String> {
-    let normalized = create_sql.to_ascii_lowercase();
-    if normalized.contains("'checkpoint_from_parent'") {
-        Vec::new()
-    } else {
-        vec![
-            "recovery-mode CHECK does not admit checkpoint_from_parent; rebuild this pre-release WAL table before startup"
-                .to_string(),
-        ]
-    }
-}
-
-fn database_reports_check_constraints_in_show_create(version: &str) -> bool {
-    // MatrixOne currently accepts CHECK syntax but omits CHECK clauses from
-    // SHOW CREATE TABLE. Treating the omitted text as proof of an obsolete
-    // table makes every freshly bootstrapped MatrixOne database fail startup.
-    // MySQL-compatible engines that do report the definition retain the
-    // strict recovery-mode contract check below.
-    !version.to_ascii_lowercase().contains("matrixone")
 }
 
 fn inference_invocation_schema_mismatches(
@@ -2999,182 +2692,6 @@ async fn verify_inference_provider_attempt_schema_contract(
     }
 
     let reasons = inference_provider_attempt_schema_mismatches(&columns, &indexes);
-    if reasons.is_empty() {
-        return Ok(());
-    }
-    Err(sqlx::Error::Protocol(format!(
-        "obsolete core schema table {table} is unsupported; recreate the database before startup: {}",
-        reasons.join(", ")
-    )))
-}
-
-async fn verify_inference_canonical_transition_head_schema_contract(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
-) -> Result<(), sqlx::Error> {
-    validate_schema_identifier(database, "matrixone database")?;
-    let table = "inference_canonical_transition_heads";
-    let column_rows = query(
-        "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE
-         FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-    )
-    .bind(database)
-    .bind(table)
-    .fetch_all(pool)
-    .await?;
-    let mut columns = BTreeMap::new();
-    for row in column_rows {
-        let name: String = row.try_get("COLUMN_NAME")?;
-        let nullable = match row.try_get::<String, _>("IS_NULLABLE")?.as_str() {
-            "YES" => true,
-            "NO" => false,
-            value => {
-                return Err(sqlx::Error::Protocol(format!(
-                    "schema column {table}.{name} has invalid IS_NULLABLE value {value}"
-                )));
-            }
-        };
-        columns.insert(
-            name,
-            ObservedColumnShape {
-                data_type: row.try_get("DATA_TYPE")?,
-                character_maximum_length: row.try_get("CHARACTER_MAXIMUM_LENGTH")?,
-                nullable,
-            },
-        );
-    }
-    let index_rows = query(
-        "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME
-         FROM information_schema.STATISTICS
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-           AND INDEX_NAME IN ('PRIMARY', 'uq_inference_canonical_head_attempt')
-         ORDER BY INDEX_NAME, SEQ_IN_INDEX",
-    )
-    .bind(database)
-    .bind(table)
-    .fetch_all(pool)
-    .await?;
-    let mut indexes = BTreeMap::<String, ObservedIndexShape>::new();
-    for row in index_rows {
-        let name: String = row.try_get("INDEX_NAME")?;
-        let non_unique = match row.try_get::<i64, _>("NON_UNIQUE")? {
-            0 => false,
-            1 => true,
-            value => {
-                return Err(sqlx::Error::Protocol(format!(
-                    "schema constraint {table}.{name} has invalid NON_UNIQUE value {value}"
-                )));
-            }
-        };
-        let column: String = row.try_get("COLUMN_NAME")?;
-        let index = indexes
-            .entry(name.clone())
-            .or_insert_with(|| ObservedIndexShape {
-                columns: Vec::new(),
-                non_unique,
-            });
-        if index.non_unique != non_unique {
-            return Err(sqlx::Error::Protocol(format!(
-                "schema constraint {table}.{name} reports inconsistent uniqueness"
-            )));
-        }
-        index.columns.push(column);
-    }
-    let reasons = inference_canonical_transition_head_schema_mismatches(&columns, &indexes);
-    if reasons.is_empty() {
-        return Ok(());
-    }
-    Err(sqlx::Error::Protocol(format!(
-        "obsolete core schema table {table} is unsupported; recreate the database before startup: {}",
-        reasons.join(", ")
-    )))
-}
-
-async fn verify_inference_canonical_transition_wal_schema_contract(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
-) -> Result<(), sqlx::Error> {
-    validate_schema_identifier(database, "matrixone database")?;
-    let table = "inference_canonical_transition_wal";
-    let column_rows = query(
-        "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE
-         FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-    )
-    .bind(database)
-    .bind(table)
-    .fetch_all(pool)
-    .await?;
-    let mut columns = BTreeMap::new();
-    for row in column_rows {
-        let name: String = row.try_get("COLUMN_NAME")?;
-        let nullable = match row.try_get::<String, _>("IS_NULLABLE")?.as_str() {
-            "YES" => true,
-            "NO" => false,
-            value => {
-                return Err(sqlx::Error::Protocol(format!(
-                    "schema column {table}.{name} has invalid IS_NULLABLE value {value}"
-                )));
-            }
-        };
-        columns.insert(
-            name,
-            ObservedColumnShape {
-                data_type: row.try_get("DATA_TYPE")?,
-                character_maximum_length: row.try_get("CHARACTER_MAXIMUM_LENGTH")?,
-                nullable,
-            },
-        );
-    }
-    let index_rows = query(
-        "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME
-         FROM information_schema.STATISTICS
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-           AND INDEX_NAME IN ('PRIMARY', 'uq_inference_canonical_wal_attempt',
-                              'idx_inference_canonical_wal_parent')
-         ORDER BY INDEX_NAME, SEQ_IN_INDEX",
-    )
-    .bind(database)
-    .bind(table)
-    .fetch_all(pool)
-    .await?;
-    let mut indexes = BTreeMap::<String, ObservedIndexShape>::new();
-    for row in index_rows {
-        let name: String = row.try_get("INDEX_NAME")?;
-        let non_unique = match row.try_get::<i64, _>("NON_UNIQUE")? {
-            0 => false,
-            1 => true,
-            value => {
-                return Err(sqlx::Error::Protocol(format!(
-                    "schema constraint {table}.{name} has invalid NON_UNIQUE value {value}"
-                )));
-            }
-        };
-        let column: String = row.try_get("COLUMN_NAME")?;
-        let index = indexes
-            .entry(name.clone())
-            .or_insert_with(|| ObservedIndexShape {
-                columns: Vec::new(),
-                non_unique,
-            });
-        if index.non_unique != non_unique {
-            return Err(sqlx::Error::Protocol(format!(
-                "schema constraint {table}.{name} reports inconsistent uniqueness"
-            )));
-        }
-        index.columns.push(column);
-    }
-    let mut reasons = inference_canonical_transition_wal_schema_mismatches(&columns, &indexes);
-    let show_create = format!("SHOW CREATE TABLE `{database}`.`{table}`");
-    let create_row = query(&show_create).fetch_one(pool).await?;
-    let create_sql: String = create_row.try_get(1_usize)?;
-    let database_version: String = query_scalar("SELECT VERSION()").fetch_one(pool).await?;
-    if database_reports_check_constraints_in_show_create(&database_version) {
-        reasons.extend(inference_canonical_transition_wal_definition_mismatches(
-            &create_sql,
-        ));
-    }
     if reasons.is_empty() {
         return Ok(());
     }
@@ -3519,19 +3036,16 @@ async fn ensure_core_schema_while_leased(
         pool,
         "auth_refresh_tokens",
         "CREATE TABLE IF NOT EXISTS auth_refresh_tokens (
-            token_id VARCHAR(64) PRIMARY KEY,
+            session_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NULL,
             token_hash VARCHAR(255) NOT NULL,
-            token_prefix VARCHAR(16) NULL,
+            browser_handle_hash VARCHAR(64) NULL,
+            browser_ciphertext TEXT NULL,
             expires_at DATETIME(6) NOT NULL,
             is_revoked SMALLINT NOT NULL DEFAULT 0,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_auth_refresh_tokens_hash (token_hash),
-            INDEX idx_auth_refresh_tokens_session (session_id),
             INDEX idx_auth_refresh_tokens_user_expires (user_id, expires_at),
-            INDEX idx_auth_refresh_tokens_expires_at (expires_at),
-            INDEX idx_auth_refresh_tokens_prefix (token_prefix)
+            INDEX idx_auth_refresh_tokens_expires_at (expires_at)
         )",
     )
     .execute(&pool)
@@ -3592,7 +3106,7 @@ async fn ensure_core_schema_while_leased(
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (provider_id, external_subject),
-            INDEX idx_external_identity_user (astra_user_id)
+            INDEX idx_external_identity_user (astra_user_id, provider_id, external_subject, updated_at)
         )",
     )
     .execute(&pool)
@@ -3663,7 +3177,7 @@ async fn ensure_core_schema_while_leased(
                 (delete_requested_at, user_id, session_id),
             INDEX idx_agent_sessions_user_last_active (user_id, last_active_at),
             INDEX idx_agent_sessions_agent_status (agent_id, status),
-            INDEX idx_agent_sessions_active_plan_id (active_plan_id),
+            INDEX idx_agent_sessions_active_plan_id (user_id, active_plan_id),
             INDEX idx_agent_sessions_config_version (config_version_id),
             INDEX idx_sessions_project (user_id, project_id, updated_at)
         )",
@@ -3722,7 +3236,9 @@ async fn ensure_core_schema_while_leased(
     let agent_events_sql = agent_events_create_sql();
     pool.authority
         .declare("storage", "agent_events", &agent_events_sql);
-    query(&agent_events_sql).execute(&pool).await?;
+    query(sqlx::AssertSqlSafe(agent_events_sql))
+        .execute(&pool)
+        .await?;
 
     let workspace_schema = pool.owned_by("workspace_records");
     for (table_name, ddl) in [
@@ -3748,17 +3264,17 @@ async fn ensure_core_schema_while_leased(
 
     core_schema_create!(
         pool,
-        "agent_session_execution_slots",
-        "CREATE TABLE IF NOT EXISTS agent_session_execution_slots (
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            run_id VARCHAR(64) NOT NULL,
-            acquired_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id),
-            INDEX idx_session_execution_slots_run (user_id, run_id),
-            INDEX idx_session_execution_slots_updated (updated_at)
-        )",
+        "agent_run_openings",
+        "CREATE TABLE IF NOT EXISTS agent_run_openings (
+        user_id VARCHAR(128) NOT NULL,
+        run_id VARCHAR(64) NOT NULL,
+        session_id VARCHAR(64) NOT NULL,
+        opening_events_json LONGTEXT NULL,
+        opening_context_json LONGTEXT NULL,
+        admitted_model_name LONGTEXT NULL,
+        PRIMARY KEY (user_id, run_id),
+        INDEX idx_run_openings_owner_session_run (user_id, session_id, run_id)
+    )"
     )
     .execute(&pool)
     .await?;
@@ -3846,25 +3362,6 @@ async fn ensure_core_schema_while_leased(
                 (owner_user_id, session_id, branch_id, updated_at),
             CONSTRAINT chk_session_execution_switch_expected_generation CHECK (expected_generation > 0),
             CONSTRAINT chk_session_execution_switch_switching_generation CHECK (switching_generation > 0)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "conversation_segments",
-        "CREATE TABLE IF NOT EXISTS conversation_segments (
-            isolation_domain VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL,
-            segment_hash CHAR(64) NOT NULL,
-            canonical_root_hash CHAR(64) NOT NULL,
-            canonical_bytes BIGINT NOT NULL,
-            message_count BIGINT NOT NULL,
-            segment_json LONGTEXT NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (isolation_domain, owner_user_id, segment_hash),
-            INDEX idx_conversation_segments_created (created_at)
         )",
     )
     .execute(&pool)
@@ -3966,42 +3463,12 @@ async fn ensure_core_schema_while_leased(
             canonical_segment_bytes BIGINT NOT NULL,
             total_canonical_bytes BIGINT NOT NULL,
             total_message_count BIGINT NOT NULL,
-            reachable TINYINT NOT NULL DEFAULT 0,
+            reachable TINYINT NOT NULL DEFAULT 1,
             manifest_json LONGTEXT NOT NULL,
+            content_json LONGTEXT NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, manifest_root),
-            INDEX idx_context_manifest_parent (isolation_domain, owner_user_id, session_id, branch_id, parent_manifest_root),
-            INDEX idx_context_manifest_sequence (isolation_domain, owner_user_id, session_id, branch_id, conversation_seq),
-            INDEX idx_context_manifest_reachable_sequence (isolation_domain, owner_user_id, session_id, branch_id, reachable, conversation_seq),
-            INDEX idx_context_manifest_generation_sequence (isolation_domain, owner_user_id, session_id, branch_id, compaction_generation, reachable, conversation_seq)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "conversation_manifest_segments",
-        "CREATE TABLE IF NOT EXISTS conversation_manifest_segments (
-            isolation_domain VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(128) NOT NULL,
-            branch_id VARCHAR(128) NOT NULL,
-            manifest_root CHAR(64) NOT NULL,
-            segment_position BIGINT NOT NULL,
-            segment_hash CHAR(64) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (
-                isolation_domain, owner_user_id, session_id, branch_id,
-                manifest_root, segment_position
-            ),
-            INDEX idx_manifest_segments_hash (
-                isolation_domain, owner_user_id, segment_hash, manifest_root
-            ),
-            INDEX idx_manifest_segments_session (
-                owner_user_id, session_id, branch_id, manifest_root
-            ),
-            INDEX idx_manifest_segments_created (created_at)
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, compaction_generation, conversation_seq),
+            UNIQUE KEY uq_context_manifest_root (manifest_root)
         )",
     )
     .execute(&pool)
@@ -4182,91 +3649,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    core_schema_create!(
-        pool,
-        "session_weighted_admission_owner_usage",
-        "CREATE TABLE IF NOT EXISTS session_weighted_admission_owner_usage (
-            scope_name VARCHAR(64) NOT NULL,
-            isolation_domain VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL COLLATE utf8mb4_bin,
-            resident_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            context_tokens DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            provider_slots DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            cpu_units DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            io_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (scope_name, isolation_domain, owner_user_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    // Both admission tables must validate before readiness is published.
-    core_schema_create!(
-        pool,
-        "session_weighted_admission_gates",
-        "CREATE TABLE IF NOT EXISTS session_weighted_admission_gates (
-            scope_name VARCHAR(64) NOT NULL,
-            capacity_hash CHAR(64) NULL,
-            usage_initialized TINYINT NOT NULL DEFAULT 0,
-            earliest_expiry_at DATETIME(6) NULL,
-            used_resident_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            used_context_tokens DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            used_provider_slots DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            used_cpu_units DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            used_io_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            allocated_resident_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            allocated_context_tokens DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            allocated_provider_slots DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            allocated_cpu_units DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            allocated_io_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (scope_name)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-    let mut gates = sqlx::QueryBuilder::<MySql>::new(
-        "INSERT IGNORE INTO session_weighted_admission_gates (scope_name) ",
-    );
-    gates.push_values(
-        0..crate::weighted_admission::DISTRIBUTED_ADMISSION_PARTITIONS,
-        |mut row, partition| {
-            row.push_bind(crate::weighted_admission::distributed_admission_scope(
-                partition,
-            ));
-        },
-    );
-    gates.build().execute(&pool).await?;
-
-    core_schema_create!(
-        pool,
-        "session_weighted_admission_reservations",
-        "CREATE TABLE IF NOT EXISTS session_weighted_admission_reservations (
-            scope_name VARCHAR(64) NOT NULL,
-            reservation_id CHAR(36) NOT NULL,
-            isolation_domain VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL COLLATE utf8mb4_bin,
-            session_id VARCHAR(128) NOT NULL,
-            branch_id VARCHAR(128) NOT NULL,
-            idempotency_hash VARCHAR(64) NOT NULL,
-            resident_bytes BIGINT NOT NULL,
-            context_tokens BIGINT NOT NULL,
-            provider_slots BIGINT NOT NULL,
-            cpu_units BIGINT NOT NULL,
-            io_bytes BIGINT NOT NULL,
-            expires_at DATETIME(6) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (scope_name, isolation_domain, owner_user_id, idempotency_hash),
-            UNIQUE KEY uq_weighted_admission_reservation (scope_name, reservation_id),
-            INDEX idx_weighted_admission_expiry (scope_name, expires_at),
-            INDEX idx_weighted_admission_owner_expiry
-                (scope_name, isolation_domain, owner_user_id, expires_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     core_schema_create!(pool, "agent_run_events",
         "CREATE TABLE IF NOT EXISTS agent_run_events (
             id VARCHAR(64) NOT NULL,
@@ -4295,8 +3677,7 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_agent_run_events_owner_session_run_idx (user_id, session_id, run_id, event_idx),
             INDEX idx_agent_run_events_owner_session_subject (user_id, session_id, event_type, subject_run_id, event_idx),
             INDEX idx_agent_run_events_interaction (user_id, run_id, interaction_request_id, event_type, event_idx),
-            INDEX idx_agent_run_events_user_created (user_id, created_at),
-            INDEX idx_agent_run_events_event_id (event_id)
+            INDEX idx_agent_run_events_user_created (user_id, created_at)
         )",
     )
     .execute(&pool)
@@ -4318,82 +3699,6 @@ async fn ensure_core_schema_while_leased(
             UNIQUE KEY uniq_run_checkpoint_idem (user_id, run_id, checkpoint_kind, idempotency_key),
             INDEX idx_run_checkpoints_user_run_created (user_id, run_id, created_at),
             INDEX idx_run_checkpoints_session_kind_created (user_id, session_id, checkpoint_kind, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "run_display_projections",
-        "CREATE TABLE IF NOT EXISTS run_display_projections (
-            run_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            status VARCHAR(32) NOT NULL,
-            waiting_for VARCHAR(64) NULL,
-            error_message TEXT NULL,
-            projection_event_idx BIGINT NOT NULL DEFAULT -1,
-            latest_event_type VARCHAR(64) NULL,
-            latest_checkpoint_id VARCHAR(64) NULL,
-            latest_checkpoint_kind VARCHAR(32) NULL,
-            latest_checkpoint_version VARCHAR(32) NULL,
-            total_prompt_tokens BIGINT NOT NULL DEFAULT 0,
-            total_completion_tokens BIGINT NOT NULL DEFAULT 0,
-            total_tool_calls BIGINT NOT NULL DEFAULT 0,
-            projection_hash VARCHAR(64) NOT NULL,
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, run_id),
-            INDEX idx_run_display_projections_owner_session_updated (user_id, session_id, updated_at),
-            INDEX idx_run_display_projections_user_updated (user_id, updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "session_tool_output_batches",
-        "CREATE TABLE IF NOT EXISTS session_tool_output_batches (
-            batch_id VARCHAR(64) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            run_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            output_count INT NOT NULL,
-            payload_bytes BIGINT NOT NULL,
-            status VARCHAR(32) NOT NULL DEFAULT 'committed',
-            request_id VARCHAR(64) NULL,
-            trace_id VARCHAR(64) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, batch_id),
-            INDEX idx_tool_output_batches_user_run_created (user_id, run_id, created_at, batch_id),
-            INDEX idx_tool_output_batches_user_session_created (user_id, session_id, created_at, batch_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "session_tool_outputs",
-        "CREATE TABLE IF NOT EXISTS session_tool_outputs (
-            output_id VARCHAR(64) NOT NULL,
-            batch_id VARCHAR(64) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            run_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            output_idx INT NOT NULL,
-            parent_output_id VARCHAR(64) NULL,
-            tool_call_id VARCHAR(128) NULL,
-            tool_name VARCHAR(128) NOT NULL,
-            output_json LONGTEXT NOT NULL,
-            payload_bytes BIGINT NOT NULL,
-            preview_text LONGTEXT NULL,
-            preview_status VARCHAR(32) NOT NULL DEFAULT 'template',
-            artifact_ref VARCHAR(255) NULL,
-            content_hash VARCHAR(128) NULL,
-            normalize_version VARCHAR(32) NOT NULL DEFAULT 'raw_v1',
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, output_id),
-            UNIQUE KEY uq_tool_outputs_batch_idx (user_id, session_id, batch_id, output_idx),
-            INDEX idx_tool_outputs_user_run_created (user_id, run_id, created_at, output_id),
-            INDEX idx_tool_outputs_user_session_created (user_id, session_id, created_at, output_id),
-            INDEX idx_tool_outputs_parent (user_id, parent_output_id),
-            INDEX idx_tool_outputs_artifact_ref (user_id, artifact_ref)
         )",
     )
     .execute(&pool)
@@ -4423,10 +3728,7 @@ async fn ensure_core_schema_while_leased(
             dispatch_lease_expires_at DATETIME(6) NULL,
             outcome_json        JSON NULL,
             completion_source_json JSON NULL,
-            created_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, session_id, run_id, turn_chain_id, invocation_id),
-            INDEX idx_tool_invocation_updated (updated_at),
             INDEX idx_tool_invocation_run_compaction
                 (user_id, session_id, run_id, state, identity_key),
             INDEX idx_tool_invocation_session_state
@@ -4518,86 +3820,9 @@ async fn ensure_core_schema_while_leased(
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, session_id, item_seq),
             INDEX idx_transcript_owner_run (user_id, run_id),
-            INDEX idx_transcript_owner_session_source_event (user_id, session_id, source_event_id),
+            UNIQUE KEY uq_transcript_owner_session_source_event (user_id, session_id, source_event_id),
             INDEX idx_transcript_owner_session_commit_item
                 (user_id, session_id, canonical_completed_turn, item_seq)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "session_transcript_projection_heads",
-        "CREATE TABLE IF NOT EXISTS session_transcript_projection_heads (
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            completed_turn BIGINT NOT NULL,
-            journal_event_seq BIGINT NOT NULL,
-            conversation_seq BIGINT NOT NULL,
-            canonical_root_hash VARCHAR(64) NOT NULL,
-            projection_schema BIGINT NOT NULL,
-            compaction_generation BIGINT NOT NULL,
-            config_version_id VARCHAR(128) NULL,
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "prompt_request_records",
-        "CREATE TABLE IF NOT EXISTS prompt_request_records (
-            request_id VARCHAR(64) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            run_id VARCHAR(64) NULL,
-            turn BIGINT NOT NULL,
-            round BIGINT NOT NULL,
-            attempt BIGINT NOT NULL,
-            source VARCHAR(64) NOT NULL,
-            model VARCHAR(128) NOT NULL,
-            provider VARCHAR(64) NOT NULL,
-            max_output_tokens BIGINT NULL,
-            message_count BIGINT NOT NULL,
-            tool_count BIGINT NOT NULL,
-            previous_request_id VARCHAR(64) NULL,
-            request_hash VARCHAR(64) NOT NULL,
-            summary_json LONGTEXT NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            created_at_unix_ms BIGINT NULL,
-            PRIMARY KEY (user_id, request_id),
-            UNIQUE KEY uq_prompt_request_attempt (user_id, session_id, run_id, turn, round, source, attempt),
-            INDEX idx_prompt_requests_owner_session_created (user_id, session_id, created_at, turn, round, attempt),
-            INDEX idx_prompt_requests_owner_run_created (user_id, run_id, created_at, turn, round, attempt),
-            INDEX idx_prompt_requests_owner_previous (user_id, session_id, previous_request_id),
-            INDEX idx_prompt_requests_retention_ms (created_at_unix_ms, user_id, request_id, session_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "prompt_deltas",
-        "CREATE TABLE IF NOT EXISTS prompt_deltas (
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            request_id VARCHAR(64) NOT NULL,
-            delta_seq INT NOT NULL,
-            logical_key VARCHAR(191) NOT NULL,
-            chunk_kind VARCHAR(32) NOT NULL,
-            position INT NOT NULL,
-            op VARCHAR(16) NOT NULL,
-            reuse_count INT NULL,
-            chunk_id VARCHAR(80) NULL,
-            chunk_hash VARCHAR(64) NULL,
-            previous_chunk_hash VARCHAR(64) NULL,
-            chunk_tokens BIGINT NULL,
-            chunk_bytes BIGINT NULL,
-            previous_chunk_tokens BIGINT NULL,
-            previous_chunk_bytes BIGINT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, request_id, delta_seq),
-            INDEX idx_prompt_deltas_owner_request_position (user_id, session_id, request_id, position, delta_seq)
         )",
     )
     .execute(&pool)
@@ -4716,69 +3941,6 @@ async fn ensure_core_schema_while_leased(
     .await?;
 
     // ── Context manifest v1 (Phase 3 / G1+G3+G10+G26+G27) ───────────────
-    core_schema_create!(pool, "context_manifests",
-        "CREATE TABLE IF NOT EXISTS context_manifests (
-            manifest_id VARCHAR(128) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(128) NOT NULL,
-            run_id VARCHAR(128) NULL,
-            turn_id VARCHAR(128) NOT NULL,
-            model_provider VARCHAR(64) NOT NULL,
-            model_name VARCHAR(128) NOT NULL,
-            context_window_tokens INT NOT NULL,
-            max_output_tokens INT NOT NULL,
-            total_estimated_tokens INT NOT NULL,
-            stable_prefix_hash VARCHAR(128) NULL,
-            prompt_cache_key VARCHAR(255) NULL,
-            compaction_version VARCHAR(64) NULL,
-            policy_version VARCHAR(64) NOT NULL,
-            tokenizer_id VARCHAR(128) NULL,
-            budget_template_id VARCHAR(64) NULL,
-            turn_intent VARCHAR(64) NULL,
-            reason VARCHAR(64) NOT NULL,
-            dropped_count INT NOT NULL DEFAULT 0,
-            manifest_json LONGTEXT NOT NULL,
-            request_id VARCHAR(128) NULL,
-            trace_id VARCHAR(128) NULL,
-            payload_hash VARCHAR(80) NOT NULL,
-            ingestion_write_id VARCHAR(64) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, manifest_id),
-            INDEX idx_ctx_manifest_owner_session_created (user_id, session_id, created_at, manifest_id),
-            INDEX idx_ctx_manifest_owner_session_run_created (user_id, session_id, run_id, created_at, manifest_id),
-            INDEX idx_ctx_manifest_user_created (user_id, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "context_manifest_items",
-        "CREATE TABLE IF NOT EXISTS context_manifest_items (
-            user_id VARCHAR(128) NOT NULL,
-            manifest_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(128) NOT NULL,
-            item_order INT NOT NULL,
-            zone VARCHAR(64) NOT NULL,
-            source_table VARCHAR(64) NOT NULL,
-            source_id VARCHAR(128) NOT NULL,
-            source_hash VARCHAR(128) NULL,
-            included SMALLINT NOT NULL,
-            token_estimate INT NOT NULL DEFAULT 0,
-            budget_tokens INT NOT NULL DEFAULT 0,
-            reason VARCHAR(128) NOT NULL,
-            render_mode VARCHAR(64) NOT NULL,
-            raw_ref VARCHAR(255) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, manifest_id, item_order),
-            INDEX idx_manifest_items_source (user_id, source_table, source_id),
-            INDEX idx_manifest_items_manifest_zone (user_id, manifest_id, zone, included),
-            INDEX idx_manifest_items_raw_ref (user_id, raw_ref)
-        )",
-    )
-    .execute(&pool)
-    .await?;
 
     core_schema_create!(
         pool,
@@ -4805,73 +3967,6 @@ async fn ensure_core_schema_while_leased(
     .await?;
 
     // ── State projection v1 (Phase 4 / G2+G4+G5+G6+G14+G16+G20) ────────
-    core_schema_create!(pool, "session_state_items",
-        "CREATE TABLE IF NOT EXISTS session_state_items (
-            item_id VARCHAR(128) PRIMARY KEY,
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(128) NOT NULL,
-            scope VARCHAR(32) NOT NULL DEFAULT 'session',
-            category VARCHAR(64) NOT NULL,
-            item_key VARCHAR(255) NOT NULL,
-            status VARCHAR(32) NOT NULL DEFAULT 'active',
-            priority INT NOT NULL DEFAULT 0,
-            source VARCHAR(64) NOT NULL,
-            provenance_event_id VARCHAR(128) NULL,
-            run_id VARCHAR(128) NULL,
-            title VARCHAR(255) NULL,
-            summary_text TEXT NULL,
-            payload_json LONGTEXT NULL,
-            payload_hash VARCHAR(128) NULL,
-            token_estimate INT NOT NULL DEFAULT 0,
-            version BIGINT NOT NULL DEFAULT 1,
-            origin_session_id VARCHAR(128) NULL,
-            origin_chunk_id VARCHAR(128) NULL,
-            origin_state_item_id VARCHAR(128) NULL,
-            expires_at DATETIME(6) NULL,
-            request_id VARCHAR(128) NULL,
-            trace_id VARCHAR(128) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            CONSTRAINT chk_session_state_items_scope CHECK (scope IN ('session', 'user', 'project', 'workspace')),
-            UNIQUE KEY uq_state_current (user_id, session_id, scope, category, item_key),
-            INDEX idx_state_owner_session_status_category (user_id, session_id, status, category),
-            INDEX idx_state_user_category (user_id, category, status, updated_at),
-            INDEX idx_state_user_scope_category (user_id, scope, category, status, priority),
-            INDEX idx_state_owner_origin_session (user_id, origin_session_id, category, status),
-            INDEX idx_state_expires (expires_at),
-            INDEX idx_state_provenance (provenance_event_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "session_state_item_events",
-        "CREATE TABLE IF NOT EXISTS session_state_item_events (
-            event_id VARCHAR(64) NOT NULL,
-            item_id VARCHAR(128) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(128) NOT NULL,
-            category VARCHAR(64) NOT NULL,
-            item_key VARCHAR(255) NOT NULL,
-            mutation VARCHAR(32) NOT NULL,
-            previous_hash VARCHAR(128) NULL,
-            next_hash VARCHAR(128) NULL,
-            previous_version BIGINT NULL,
-            next_version BIGINT NULL,
-            payload_json LONGTEXT NULL,
-            provenance_event_id VARCHAR(128) NULL,
-            request_id VARCHAR(128) NULL,
-            trace_id VARCHAR(128) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            CONSTRAINT chk_state_item_event_mutation CHECK (mutation IN ('insert', 'update', 'replace', 'archive', 'delete', 'apply_suggestion', 'activate')),
-            PRIMARY KEY (user_id, event_id),
-            INDEX idx_state_events_item_created (item_id, created_at, event_id),
-            INDEX idx_state_events_owner_session_created (user_id, session_id, created_at, event_id),
-            INDEX idx_state_events_category_created (category, created_at, event_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
 
     core_schema_create!(
         pool,
@@ -4888,98 +3983,6 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_agent_event_edges_owner_session_child (user_id, session_id, child_event_id),
             INDEX idx_agent_event_edges_owner_child (user_id, child_event_id, parent_order),
             INDEX idx_agent_event_edges_owner_parent (user_id, parent_event_id, parent_order)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    // Harness diagnostic snapshots — separated from agent_events to avoid
-    // polluting session event counts and to carry causal_chain_id natively.
-    core_schema_create!(
-        pool,
-        "harness_snapshots",
-        "CREATE TABLE IF NOT EXISTS harness_snapshots (
-            snapshot_id VARCHAR(64) PRIMARY KEY,
-            session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            hook_point VARCHAR(32) NOT NULL,
-            turn_number INT UNSIGNED NOT NULL DEFAULT 0,
-            snapshot_json LONGTEXT NOT NULL,
-            causal_chain_id VARCHAR(128),
-            created_at DATETIME(6) DEFAULT NOW(6),
-            INDEX idx_harness_owner_session_created (user_id, session_id, created_at),
-            INDEX idx_harness_owner_session_turn (user_id, session_id, turn_number),
-            INDEX idx_harness_owner_chain (user_id, causal_chain_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    // Context / decisions / evaluation essentials used by turn persistence
-    let ctx_snapshot_ddl = format!(
-        "CREATE TABLE IF NOT EXISTS ctx_snapshots (
-            context_capture_id VARCHAR(64) PRIMARY KEY,
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            event_id VARCHAR({AGENT_EVENT_ID_LEN}) NOT NULL,
-            context_data JSON NULL,
-            llm_request_id VARCHAR({AGENT_EVENT_ID_LEN}) NULL,
-            llm_response_id VARCHAR({AGENT_EVENT_ID_LEN}) NULL,
-            token_budget INT NULL,
-            total_tokens BIGINT NULL,
-            assembly_time_ms BIGINT NULL,
-            relevance_scores JSON NULL,
-            token_usage JSON NULL,
-            task_type VARCHAR(64) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_ctx_snapshots_owner_session_created (user_id, session_id, created_at),
-            INDEX idx_ctx_snapshots_owner_event_id (user_id, event_id)
-        )",
-    );
-    core_schema_create!(pool, "ctx_snapshots", &ctx_snapshot_ddl)
-        .execute(&pool)
-        .await?;
-
-    core_schema_create!(pool, "ctx_decision_audits",
-        "CREATE TABLE IF NOT EXISTS ctx_decision_audits (
-            decision_id VARCHAR(64) PRIMARY KEY,
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            event_id VARCHAR(128) NULL,
-            context_capture_id VARCHAR(64) NULL,
-            decision_type VARCHAR(64) NOT NULL,
-            decision_output JSON NULL,
-            model_params JSON NULL,
-            model_used VARCHAR(128) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_ctx_decisions_owner_session_type_created (user_id, session_id, decision_type, created_at),
-            INDEX idx_ctx_decisions_owner_event_id (user_id, event_id),
-            INDEX idx_ctx_decisions_owner_context_capture_id (user_id, context_capture_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "skill_selection_events",
-        "CREATE TABLE IF NOT EXISTS skill_selection_events (
-            event_id VARCHAR(64) PRIMARY KEY,
-            session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            agent_id VARCHAR(255) NULL,
-            user_query LONGTEXT NULL,
-            selected_skills JSON NULL,
-            skill_name VARCHAR(255) NULL,
-            skill_version VARCHAR(64) NULL,
-            selection_method VARCHAR(64) NULL,
-            execution_success BIGINT NULL,
-            execution_time_ms BIGINT NULL,
-            user_feedback_score BIGINT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_skill_selection_owner_session_created (user_id, session_id, created_at),
-            INDEX idx_skill_selection_user_created (user_id, created_at),
-            INDEX idx_skill_selection_skill_created (skill_name, created_at)
         )",
     )
     .execute(&pool)
@@ -5016,29 +4019,21 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
+    core_schema_create!(pool, "user_llm_models", USER_LLM_MODELS_CREATE_SQL,)
+        .execute(&pool)
+        .await?;
+
     core_schema_create!(
         pool,
-        "user_llm_models",
-        "CREATE TABLE IF NOT EXISTS user_llm_models (
-            model_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            model_alias VARCHAR(100) NOT NULL,
-            model_name VARCHAR(255) NOT NULL,
-            provider VARCHAR(50) NOT NULL,
-            api_key_encrypted TEXT NOT NULL,
-            base_url VARCHAR(500) NOT NULL,
-            context_window INT NOT NULL,
-            thinking_probe_json JSON NULL,
-            is_default SMALLINT NOT NULL DEFAULT 0,
-            is_active SMALLINT NOT NULL DEFAULT 1,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, model_id),
-            UNIQUE KEY uq_user_llm_models_alias (user_id, model_alias),
-            CONSTRAINT chk_user_llm_models_context_window CHECK (context_window > 0),
-            INDEX idx_user_llm_models_catalog (user_id, is_active, provider, model_alias, model_id),
-            INDEX idx_user_llm_models_default (user_id, is_default, is_active)
-        )",
+        "user_llm_connections",
+        crate::chatgpt::CONNECTIONS_TABLE_SQL
+    )
+    .execute(&pool)
+    .await?;
+    core_schema_create!(
+        pool,
+        "user_llm_authorizations",
+        crate::chatgpt::AUTHORIZATIONS_TABLE_SQL
     )
     .execute(&pool)
     .await?;
@@ -5146,9 +4141,6 @@ async fn ensure_core_schema_while_leased(
             provider_protocol VARCHAR(32) NOT NULL,
             provider_wire_hash CHAR(64) NOT NULL,
             provider_wire_bytes BIGINT NOT NULL,
-            canonical_transition_id CHAR(64) NULL,
-            canonical_parent_transition_id CHAR(64) NULL,
-            canonical_transition_hash CHAR(64) NULL,
             status VARCHAR(32) NOT NULL,
             terminal_fingerprint CHAR(64) NULL,
             usage_status VARCHAR(32) NOT NULL,
@@ -5173,62 +4165,6 @@ async fn ensure_core_schema_while_leased(
             UNIQUE KEY uq_inference_provider_attempt (user_id, invocation_id, attempt_index),
             INDEX idx_inference_attempts_owner_session_started (user_id, session_id, started_at, attempt_id),
             INDEX idx_inference_attempts_owner_run_started (user_id, run_id, started_at, attempt_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "inference_canonical_transition_heads",
-        "CREATE TABLE IF NOT EXISTS inference_canonical_transition_heads (
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            turn_index BIGINT NOT NULL,
-            head_transition_id CHAR(64) NOT NULL,
-            head_attempt_id VARCHAR(64) NOT NULL,
-            head_result_count BIGINT NOT NULL,
-            head_result_root_hash CHAR(64) NOT NULL,
-            chain_length BIGINT NOT NULL,
-            chain_payload_bytes BIGINT NOT NULL,
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, turn_index),
-            UNIQUE KEY uq_inference_canonical_head_attempt (user_id, head_attempt_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "inference_canonical_transition_wal",
-        "CREATE TABLE IF NOT EXISTS inference_canonical_transition_wal (
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            turn_index BIGINT NOT NULL,
-            round_index BIGINT NOT NULL,
-            logical_attempt BIGINT NOT NULL,
-            physical_attempt BIGINT NOT NULL,
-            transition_id CHAR(64) NOT NULL,
-            parent_transition_id CHAR(64) NULL,
-            attempt_id VARCHAR(64) NOT NULL,
-            payload_json LONGTEXT NOT NULL,
-            payload_hash CHAR(64) NOT NULL,
-            payload_bytes BIGINT NOT NULL,
-            predecessor_count BIGINT NOT NULL,
-            predecessor_root_hash CHAR(64) NOT NULL,
-            result_count BIGINT NOT NULL,
-            result_root_hash CHAR(64) NOT NULL,
-            recovery_mode VARCHAR(32) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, turn_index, transition_id),
-            UNIQUE KEY uq_inference_canonical_wal_attempt (user_id, attempt_id),
-            INDEX idx_inference_canonical_wal_parent
-                (user_id, session_id, turn_index, parent_transition_id),
-            CONSTRAINT chk_inference_canonical_wal_recovery_mode
-                CHECK (recovery_mode IN ('append_from_durable_base', 'checkpoint_from_parent', 'replace_from_durable_base')),
-            CONSTRAINT chk_inference_canonical_wal_bounds
-                CHECK (payload_bytes > 0 AND predecessor_count >= 0 AND result_count >= 0)
         )",
     )
     .execute(&pool)
@@ -5357,18 +4293,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    core_schema_create!(
-        pool,
-        "model_router_deployments",
-        "CREATE TABLE IF NOT EXISTS model_router_deployments (
-            user_id VARCHAR(128) PRIMARY KEY,
-            revision BIGINT UNSIGNED NOT NULL,
-            state_json LONGTEXT NOT NULL
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // Server-wide admin config KV store. Holds settings that the admin explicitly manages
     // via `astra admin config set/get/unset` (first key: `reasoning_offering_id`).
     core_schema_create!(
@@ -5448,37 +4372,6 @@ async fn ensure_core_schema_while_leased(
 
     core_schema_create!(
         pool,
-        "skill_metrics",
-        "CREATE TABLE IF NOT EXISTS skill_metrics (
-            metric_id            VARCHAR(255) PRIMARY KEY,
-            skill_name           VARCHAR(255) NOT NULL,
-            metric_type          VARCHAR(32) NOT NULL,
-            metric_slot          VARCHAR(255) NOT NULL,
-            skill_version        VARCHAR(50) NULL,
-            runtime_version      VARCHAR(50) NULL,
-            publisher_id         VARCHAR(255) NULL,
-            total_installs       BIGINT NOT NULL DEFAULT 0,
-            active_users_7d      INT NOT NULL DEFAULT 0,
-            avg_quality          FLOAT NOT NULL DEFAULT 0.0,
-            avg_rating           FLOAT NOT NULL DEFAULT 0.0,
-            report_count         INT NOT NULL DEFAULT 0,
-            compatibility_score  FLOAT NOT NULL DEFAULT 0.0,
-            trust_tier           VARCHAR(32) NULL,
-            success_rate         FLOAT NULL,
-            avg_tokens           FLOAT NULL,
-            invocation_count     INT NULL,
-            created_at           DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at           DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_skill_metrics_slot (skill_name, metric_type, metric_slot),
-            INDEX idx_skill_metrics_lookup (skill_name, metric_type, created_at),
-            INDEX idx_skill_metrics_ranking (metric_type, avg_quality, active_users_7d),
-            INDEX idx_skill_metrics_tier (metric_type, trust_tier, updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-    core_schema_create!(
-        pool,
         "edge_agent_registry",
         "CREATE TABLE IF NOT EXISTS edge_agent_registry (
             user_id VARCHAR(128) NOT NULL,
@@ -5514,7 +4407,7 @@ async fn ensure_core_schema_while_leased(
             turn_chain_id VARCHAR(128) NOT NULL,
             edge_agent_id VARCHAR(255) NOT NULL,
             request_id VARCHAR(128) NOT NULL,
-            payload_json JSON NOT NULL,
+            payload_json LONGTEXT NOT NULL,
             result_json LONGTEXT NULL,
             status VARCHAR(16) NOT NULL DEFAULT 'pending',
             pod_id VARCHAR(128) NULL,
@@ -5522,7 +4415,7 @@ async fn ensure_core_schema_while_leased(
             completed_at DATETIME(6) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, session_id, run_id, turn_chain_id, request_id),
-            INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status, created_at, session_id, run_id, turn_chain_id, request_id),
+            INDEX idx_edge_dispatch_status_user (status, user_id, edge_agent_id, created_at, session_id, run_id, turn_chain_id, request_id),
             INDEX idx_edge_dispatch_created (created_at)
         )",
     )
@@ -5644,27 +4537,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    core_schema_create!(
-        pool,
-        "mcp_tools",
-        "CREATE TABLE IF NOT EXISTS mcp_tools (
-            owner_user_id VARCHAR(128) NOT NULL,
-            binding_id VARCHAR(64) NOT NULL,
-            tool_name VARCHAR(256) NOT NULL,
-            public_name VARCHAR(384) NOT NULL,
-            description TEXT NULL,
-            input_schema_json JSON NULL,
-            output_schema_json JSON NULL,
-            schema_hash VARCHAR(128) NOT NULL,
-            discovered_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (owner_user_id, binding_id, tool_name),
-            UNIQUE KEY uq_mcp_tools_owner_binding_public (owner_user_id, binding_id, public_name),
-            INDEX idx_mcp_tools_owner_binding (owner_user_id, binding_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // ── Plans: cloud-authoritative plan state (user-owned, session-linked) ──
     // `subtask_count` is denormalized so list endpoints don't need to parse
     // `plan_json` just to render a card. Maintained by `PlanRepository::save`.
@@ -5694,32 +4566,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    core_schema_create!(
-        pool,
-        "session_checkpoints",
-        "CREATE TABLE IF NOT EXISTS session_checkpoints (
-            checkpoint_id VARCHAR(64) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            number INT NOT NULL,
-            turn INT NOT NULL,
-            title VARCHAR(500) NULL,
-            summary LONGTEXT NULL,
-            tools_json JSON NULL,
-            state_json LONGTEXT NULL,
-            total_tokens BIGINT NOT NULL DEFAULT 0,
-            had_stalls SMALLINT NOT NULL DEFAULT 0,
-            error_count INT NOT NULL DEFAULT 0,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, checkpoint_id),
-            UNIQUE KEY uq_session_checkpoints_owner_number (user_id, session_id, number),
-            INDEX idx_ckpt_owner_session_turn (user_id, session_id, turn),
-            INDEX idx_ckpt_user_created (user_id, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     core_schema_create!(pool, "session_artifacts",
         "CREATE TABLE IF NOT EXISTS session_artifacts (
             artifact_id VARCHAR(64) NOT NULL,
@@ -5742,8 +4588,6 @@ async fn ensure_core_schema_while_leased(
             normalize_version VARCHAR(16) NULL,
             cold_storage_ref VARCHAR(255) NULL,
             derived_from_artifact_id VARCHAR(128) NULL,
-            referenced_by_manifest_count INT NOT NULL DEFAULT 0,
-            referenced_by_state_items_count INT NOT NULL DEFAULT 0,
             referenced_by_citation_count INT NOT NULL DEFAULT 0,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -5776,7 +4620,7 @@ async fn ensure_core_schema_while_leased(
             reference_id VARCHAR(128) NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             CONSTRAINT chk_artifact_reference_kind CHECK (
-                reference_kind IN ('invocation_ledger', 'manifest', 'state_item', 'citation', 'recovery_point', 'session_transcript')
+                reference_kind IN ('invocation_ledger', 'manifest', 'citation', 'recovery_point', 'session_transcript')
             ),
             PRIMARY KEY (user_id, session_id, artifact_id, reference_kind, reference_id),
             INDEX idx_artifact_references_owner_reference
@@ -5866,73 +4710,6 @@ async fn ensure_core_schema_while_leased(
 
     // ─── Skill management tables ─────────────────────────────────────────────────
 
-    core_schema_create!(pool, "user_skill_sources",
-        "CREATE TABLE IF NOT EXISTS user_skill_sources (
-            source_id VARCHAR(128) PRIMARY KEY,
-            owner_user_id VARCHAR(128) NOT NULL,
-            skill_name VARCHAR(128) NOT NULL,
-            visibility VARCHAR(32) NOT NULL DEFAULT 'private',
-            status VARCHAR(32) NOT NULL DEFAULT 'active',
-            description TEXT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            CONSTRAINT chk_user_skill_sources_visibility CHECK (visibility IN ('private', 'workspace', 'public')),
-            CONSTRAINT chk_user_skill_sources_status CHECK (status IN ('active', 'archived')),
-            UNIQUE KEY uq_user_skill_source_name (owner_user_id, skill_name),
-            INDEX idx_user_skill_owner_name (owner_user_id, skill_name),
-            INDEX idx_user_skill_status_updated (owner_user_id, status, updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "user_skill_versions",
-        "CREATE TABLE IF NOT EXISTS user_skill_versions (
-            version_id VARCHAR(128) PRIMARY KEY,
-            source_id VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL,
-            skill_name VARCHAR(128) NOT NULL,
-            version VARCHAR(64) NOT NULL,
-            manifest_json LONGTEXT NOT NULL,
-            content_markdown LONGTEXT NOT NULL,
-            content_hash VARCHAR(128) NOT NULL,
-            normalize_version VARCHAR(32) NOT NULL DEFAULT 'skill_md_v1',
-            token_estimate INT NOT NULL DEFAULT 0,
-            status VARCHAR(32) NOT NULL DEFAULT 'draft',
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            CONSTRAINT chk_user_skill_versions_status CHECK (status IN ('draft', 'published', 'superseded', 'quarantined')),
-            UNIQUE KEY uq_user_skill_source_version (source_id, version),
-            INDEX idx_user_skill_versions_owner_name (owner_user_id, skill_name, status, created_at),
-            INDEX idx_user_skill_versions_source (source_id, created_at),
-            INDEX idx_user_skill_versions_hash (content_hash)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "user_skill_evaluations",
-        "CREATE TABLE IF NOT EXISTS user_skill_evaluations (
-            evaluation_id VARCHAR(128) PRIMARY KEY,
-            owner_user_id VARCHAR(128) NOT NULL,
-            source_id VARCHAR(128) NOT NULL,
-            version_id VARCHAR(128) NOT NULL,
-            run_id VARCHAR(128) NULL,
-            hits BIGINT NOT NULL DEFAULT 0,
-            suspects BIGINT NOT NULL DEFAULT 0,
-            false_positives BIGINT NOT NULL DEFAULT 0,
-            payload_json LONGTEXT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_user_skill_eval_owner_source_created (owner_user_id, source_id, created_at),
-            INDEX idx_user_skill_eval_owner_version_created (owner_user_id, version_id, created_at),
-            INDEX idx_user_skill_eval_owner_run (owner_user_id, run_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     core_schema_create!(pool, "skill_installations",
         "CREATE TABLE IF NOT EXISTS skill_installations (
             installation_id  VARCHAR(36) PRIMARY KEY,
@@ -6008,98 +4785,10 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    core_schema_create!(pool, "skill_user_credentials",
-        "CREATE TABLE IF NOT EXISTS skill_user_credentials (
-            credential_id   VARCHAR(36) PRIMARY KEY,
-            user_id         VARCHAR(128) NOT NULL,
-            skill_name      VARCHAR(128) NOT NULL,
-            credential_name VARCHAR(128) NOT NULL,
-            value_encrypted TEXT NOT NULL,
-            created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            UNIQUE INDEX idx_suc_user_skill_cred (user_id, skill_name, credential_name)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // ─── Agent management tables ─────────────────────────────────────────────────
-
-    core_schema_create!(pool, "agent_agents",
-        "CREATE TABLE IF NOT EXISTS agent_agents (
-            agent_id       VARCHAR(255) PRIMARY KEY,
-            agent_name     VARCHAR(128) NOT NULL,
-            agent_type     VARCHAR(64) NOT NULL DEFAULT 'general',
-            owner_user_id  VARCHAR(128) NOT NULL,
-            is_active      SMALLINT NOT NULL DEFAULT 1,
-            agent_config   LONGTEXT,
-            data_source    TEXT,
-            created_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            UNIQUE INDEX idx_aa_owner_name (owner_user_id, agent_name),
-            INDEX idx_aa_type (agent_type)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    // ─── Infrastructure tables ───────────────────────────────────────────────────
-
-    core_schema_create!(pool, "infra_sandbox_metadata",
-        "CREATE TABLE IF NOT EXISTS infra_sandbox_metadata (
-            sandbox_name VARCHAR(128) PRIMARY KEY,
-            user_id      VARCHAR(128) NOT NULL,
-            description  TEXT NOT NULL,
-            created_by   VARCHAR(128) NOT NULL,
-            status       VARCHAR(32) NOT NULL DEFAULT 'active',
-            created_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            INDEX idx_ism_user (user_id),
-            INDEX idx_ism_status (status)
-        )",
-    )
-    .execute(&pool)
-    .await?;
 
     // ─── Data versioning tables ──────────────────────────────────────────────────
 
-    core_schema_create!(
-        pool,
-        "data_versioning_checkpoints",
-        "CREATE TABLE IF NOT EXISTS data_versioning_checkpoints (
-            checkpoint_id   VARCHAR(36) PRIMARY KEY,
-            checkpoint_name VARCHAR(128) NOT NULL,
-            user_id         VARCHAR(128) NOT NULL,
-            description     TEXT,
-            created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE INDEX idx_dvc_user_name (user_id, checkpoint_name)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    // ─── Conversation State Log (CSL) ──────────────────────────────────────────
-
-    core_schema_create!(
-        pool,
-        "conversation_log",
-        "CREATE TABLE IF NOT EXISTS conversation_log (
-            user_id       VARCHAR(128) NOT NULL,
-            session_id    VARCHAR(64) NOT NULL,
-            seq           BIGINT NOT NULL,
-            turn          INT NOT NULL,
-            entry_type    TINYINT NOT NULL,
-            trace_id      VARCHAR(64) DEFAULT NULL,
-            message_count INT DEFAULT NULL,
-            payload       MEDIUMTEXT NOT NULL,
-            created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, seq),
-            INDEX idx_csl_owner_snapshot (user_id, session_id, entry_type, seq DESC),
-            INDEX idx_csl_owner_turn (user_id, session_id, turn)
-        )",
-    )
-    .execute(&pool)
-    .await?;
     verify_core_schema_shape(&pool, &settings.database).await?;
     let declarations = pool.authority.declarations()?;
     publish_core_schema_table_contracts(&pool, &declarations).await?;
@@ -6112,7 +4801,6 @@ async fn verify_core_schema_shape(
     pool: &sqlx::Pool<MySql>,
     database: &str,
 ) -> Result<(), sqlx::Error> {
-    reject_obsolete_weighted_admission_schema(pool, database).await?;
     validate_schema_identifier(database, "matrixone database")?;
     // CREATE IF NOT EXISTS does not validate existing tables. Reject missing
     // runtime fields without restoring the historical ALTER/repair path.
@@ -6127,6 +4815,42 @@ async fn verify_core_schema_shape(
     .map(|row| {
         let table: String = row.try_get("TABLE_NAME")?;
         let column: String = row.try_get("COLUMN_NAME")?;
+        if table == "user_llm_models"
+            && matches!(column.as_str(), "api_key_encrypted" | "connection_id")
+        {
+            let connection = column == "connection_id";
+            if !row
+                .try_get::<String, _>("DATA_TYPE")?
+                .eq_ignore_ascii_case(if connection { "varchar" } else { "text" })
+                || row.try_get::<String, _>("IS_NULLABLE")? != "YES"
+                || (connection
+                    && row.try_get::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")? != Some(64))
+            {
+                return Err(sqlx::Error::Protocol(format!(
+                    "invalid user_llm_models.{column} shape"
+                )));
+            }
+        }
+        if table == "user_llm_models"
+            && matches!(
+                column.as_str(),
+                "inference_protocol" | "responses_reasoning_history"
+            )
+            && (!row
+                .try_get::<String, _>("DATA_TYPE")?
+                .eq_ignore_ascii_case("varchar")
+                || row.try_get::<String, _>("IS_NULLABLE")? != "YES"
+                || row.try_get::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")?
+                    != Some(if column == "inference_protocol" {
+                        32
+                    } else {
+                        16
+                    }))
+        {
+            return Err(sqlx::Error::Protocol(format!(
+                "invalid user_llm_models.{column} shape"
+            )));
+        }
         if table == "agent_run_events"
             && column == "invocation_supersession_scope_key"
             && (!row
@@ -6139,6 +4863,41 @@ async fn verify_core_schema_shape(
                 "agent_run_events.invocation_supersession_scope_key must be nullable VARCHAR(64)"
                     .into(),
             ));
+        }
+        if table == "auth_refresh_tokens"
+            && column == "session_id"
+            && (!row
+                .try_get::<String, _>("DATA_TYPE")?
+                .eq_ignore_ascii_case("varchar")
+                || row.try_get::<String, _>("IS_NULLABLE")? != "NO"
+                || row.try_get::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")? != Some(64))
+        {
+            return Err(sqlx::Error::Protocol(
+                "invalid auth_refresh_tokens.session_id shape".into(),
+            ));
+        }
+        if table == "auth_refresh_tokens"
+            && matches!(
+                column.as_str(),
+                "browser_handle_hash" | "browser_ciphertext"
+            )
+        {
+            let kind = if column == "browser_handle_hash" {
+                "varchar"
+            } else {
+                "text"
+            };
+            if !row
+                .try_get::<String, _>("DATA_TYPE")?
+                .eq_ignore_ascii_case(kind)
+                || row.try_get::<String, _>("IS_NULLABLE")? != "YES"
+                || (column == "browser_handle_hash"
+                    && row.try_get::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")? != Some(64))
+            {
+                return Err(sqlx::Error::Protocol(format!(
+                    "invalid auth_refresh_tokens.{column} shape"
+                )));
+            }
         }
         Ok((table, column))
     })
@@ -6158,7 +4917,10 @@ async fn verify_core_schema_shape(
                 "updated_at",
             ][..],
         ),
-        ("auth_refresh_tokens", &["session_id"][..]),
+        (
+            "auth_refresh_tokens",
+            &["session_id", "browser_handle_hash", "browser_ciphertext"][..],
+        ),
         (
             "agent_sessions",
             &[
@@ -6172,13 +4934,13 @@ async fn verify_core_schema_shape(
         (
             "conversation_manifest_nodes",
             &[
+                "content_json",
                 "total_canonical_bytes",
                 "total_message_count",
                 "reachable",
                 "compaction_generation",
             ][..],
         ),
-        ("session_weighted_admission_gates", &["capacity_hash"][..]),
         (
             "agent_run_events",
             &[
@@ -6206,17 +4968,6 @@ async fn verify_core_schema_shape(
                 "canonical_root_hash",
             ][..],
         ),
-        ("prompt_request_records", &["created_at_unix_ms"][..]),
-        (
-            "prompt_deltas",
-            &[
-                "reuse_count",
-                "chunk_tokens",
-                "chunk_bytes",
-                "previous_chunk_tokens",
-                "previous_chunk_bytes",
-            ][..],
-        ),
         ("inference_provider_attempts", &["context_expired_at"][..]),
         (
             "inference_invocation_settlement_debts",
@@ -6242,7 +4993,16 @@ async fn verify_core_schema_shape(
             ][..],
         ),
         ("infra_llm_models", &["thinking_probe_json"][..]),
-        ("user_llm_models", &["thinking_probe_json"][..]),
+        (
+            "user_llm_models",
+            &[
+                "thinking_probe_json",
+                "api_key_encrypted",
+                "responses_reasoning_history",
+                "connection_id",
+                "inference_protocol",
+            ][..],
+        ),
     ] {
         for column in required {
             if !columns.contains(&(table.to_owned(), (*column).to_owned())) {
@@ -6254,17 +5014,93 @@ async fn verify_core_schema_shape(
     }
     let mut indexes: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for row in query(
-        "SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME FROM information_schema.STATISTICS
+        "SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME, NON_UNIQUE FROM information_schema.STATISTICS
          WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
     )
     .bind(database)
     .fetch_all(pool)
     .await?
     {
+        let table: String = row.try_get("TABLE_NAME")?;
+        let index: String = row.try_get("INDEX_NAME")?;
+        if table == "auth_refresh_tokens"
+            && matches!(
+                index.as_str(),
+                "idx_auth_refresh_tokens_user_expires" | "idx_auth_refresh_tokens_expires_at"
+            )
+            && row.try_get::<i64, _>("NON_UNIQUE")? != 1
+        {
+            return Err(sqlx::Error::Protocol(format!(
+                "auth_refresh_tokens.{index} must be non-unique; recreate the database"
+            )));
+        }
+        if table == "session_transcript_items"
+            && index == "uq_transcript_owner_session_source_event"
+            && row.try_get::<i64, _>("NON_UNIQUE")? != 0
+        {
+            return Err(sqlx::Error::Protocol(
+                "transcript source identity requires a unique owner/session/source constraint; recreate the database".into(),
+            ));
+        }
+        if table == "conversation_manifest_nodes"
+            && index == "uq_context_manifest_root"
+            && row.try_get::<i64, _>("NON_UNIQUE")? != 0
+        {
+            return Err(sqlx::Error::Protocol(
+                "conversation_manifest_nodes.uq_context_manifest_root must be unique; recreate the database".into(),
+            ));
+        }
         indexes
-            .entry((row.try_get("TABLE_NAME")?, row.try_get("INDEX_NAME")?))
+            .entry((table, index))
             .or_default()
             .push(row.try_get("COLUMN_NAME")?);
+    }
+
+    for obsolete in [
+        "uq_auth_refresh_browser_handle",
+        "uq_auth_refresh_tokens_hash",
+        "idx_auth_refresh_tokens_session",
+    ] {
+        if indexes.contains_key(&("auth_refresh_tokens".to_owned(), obsolete.to_owned())) {
+            return Err(sqlx::Error::Protocol(format!(
+                "obsolete auth_refresh_tokens.{obsolete} index; recreate the database"
+            )));
+        }
+    }
+
+    // Cover canonical provider ownership and browser existence checks, including
+    // issuer ordering, so an absent identity never requires a base-table scan.
+    ensure_index_shape(
+        &indexes,
+        "auth_external_identities",
+        "idx_external_identity_user",
+        &[
+            "astra_user_id",
+            "provider_id",
+            "external_subject",
+            "updated_at",
+        ],
+    )?;
+
+    ensure_index_shape(&indexes, "auth_refresh_tokens", "PRIMARY", &["session_id"])?;
+    ensure_index_shape(
+        &indexes,
+        "auth_refresh_tokens",
+        "idx_auth_refresh_tokens_user_expires",
+        &["user_id", "expires_at"],
+    )?;
+
+    ensure_index_shape(
+        &indexes,
+        "auth_refresh_tokens",
+        "idx_auth_refresh_tokens_expires_at",
+        &["expires_at"],
+    )?;
+
+    if columns.contains(&("auth_refresh_tokens".to_owned(), "token_id".to_owned())) {
+        return Err(sqlx::Error::Protocol(
+            "obsolete auth_refresh_tokens.token_id column; recreate the database".into(),
+        ));
     }
 
     fail_if_obsolete_shape(
@@ -6276,23 +5112,6 @@ async fn verify_core_schema_shape(
         &["uq_auth_user_roles_user_role"],
     )
     .await?;
-    ensure_index_shape(
-        &indexes,
-        "session_weighted_admission_reservations",
-        "PRIMARY",
-        &[
-            "scope_name",
-            "isolation_domain",
-            "owner_user_id",
-            "idempotency_hash",
-        ],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "session_weighted_admission_reservations",
-        "uq_weighted_admission_reservation",
-        &["scope_name", "reservation_id"],
-    )?;
     ensure_index_shape(
         &indexes,
         "auth_user_roles",
@@ -6429,6 +5248,37 @@ async fn verify_core_schema_shape(
     }
     crate::workspace_records::verify_workspace_record_tables(pool).await?;
     verify_agent_runs_canonical_schema(pool, database).await?;
+    fail_if_required_columns_missing_or_nullable(
+        pool,
+        database,
+        "agent_run_openings",
+        &["user_id", "run_id", "session_id"],
+    )
+    .await?;
+    fail_if_required_columns_missing_or_not_nullable(
+        pool,
+        database,
+        "agent_run_openings",
+        &[
+            "opening_events_json",
+            "opening_context_json",
+            "admitted_model_name",
+        ],
+    )
+    .await?;
+    ensure_index_shape(
+        &indexes,
+        "agent_run_openings",
+        "PRIMARY",
+        &["user_id", "run_id"],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "agent_run_openings",
+        "idx_run_openings_owner_session_run",
+        &["user_id", "session_id", "run_id"],
+    )?;
+
     fail_if_varchar_columns_shorter_than(
         pool,
         database,
@@ -6438,48 +5288,22 @@ async fn verify_core_schema_shape(
     .await?;
     ensure_index_shape(
         &indexes,
-        "agent_session_execution_slots",
+        "conversation_manifest_nodes",
         "PRIMARY",
-        &["user_id", "session_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "agent_session_execution_slots",
-        "idx_session_execution_slots_run",
-        &["user_id", "run_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "agent_session_execution_slots",
-        "idx_session_execution_slots_updated",
-        &["updated_at"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "conversation_manifest_nodes",
-        "idx_context_manifest_reachable_sequence",
-        &[
-            "isolation_domain",
-            "owner_user_id",
-            "session_id",
-            "branch_id",
-            "reachable",
-            "conversation_seq",
-        ],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "conversation_manifest_nodes",
-        "idx_context_manifest_generation_sequence",
         &[
             "isolation_domain",
             "owner_user_id",
             "session_id",
             "branch_id",
             "compaction_generation",
-            "reachable",
             "conversation_seq",
         ],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "conversation_manifest_nodes",
+        "uq_context_manifest_root",
+        &["manifest_root"],
     )?;
     for (index, expected_columns) in [
         ("uq_run_event_idx", &["user_id", "run_id", "event_idx"][..]),
@@ -6546,73 +5370,7 @@ async fn verify_core_schema_shape(
         "idx_run_checkpoints_session_kind_created",
         &["user_id", "session_id", "checkpoint_kind", "created_at"],
     )?;
-    ensure_index_shape(
-        &indexes,
-        "run_display_projections",
-        "PRIMARY",
-        &["user_id", "run_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "run_display_projections",
-        "idx_run_display_projections_owner_session_updated",
-        &["user_id", "session_id", "updated_at"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "session_tool_output_batches",
-        "PRIMARY",
-        &["user_id", "session_id", "batch_id"],
-    )?;
-    for (index, expected_columns) in [
-        (
-            "idx_tool_output_batches_user_run_created",
-            &["user_id", "run_id", "created_at", "batch_id"][..],
-        ),
-        (
-            "idx_tool_output_batches_user_session_created",
-            &["user_id", "session_id", "created_at", "batch_id"][..],
-        ),
-    ] {
-        ensure_index_shape(
-            &indexes,
-            "session_tool_output_batches",
-            index,
-            expected_columns,
-        )?;
-    }
-    ensure_index_shape(
-        &indexes,
-        "session_tool_outputs",
-        "PRIMARY",
-        &["user_id", "session_id", "output_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "session_tool_outputs",
-        "uq_tool_outputs_batch_idx",
-        &["user_id", "session_id", "batch_id", "output_idx"],
-    )?;
-    for (index, expected_columns) in [
-        (
-            "idx_tool_outputs_user_run_created",
-            &["user_id", "run_id", "created_at", "output_id"][..],
-        ),
-        (
-            "idx_tool_outputs_user_session_created",
-            &["user_id", "session_id", "created_at", "output_id"][..],
-        ),
-        (
-            "idx_tool_outputs_parent",
-            &["user_id", "parent_output_id"][..],
-        ),
-        (
-            "idx_tool_outputs_artifact_ref",
-            &["user_id", "artifact_ref"][..],
-        ),
-    ] {
-        ensure_index_shape(&indexes, "session_tool_outputs", index, expected_columns)?;
-    }
+
     fail_if_required_columns_missing_or_nullable(
         pool,
         database,
@@ -6683,86 +5441,9 @@ async fn verify_core_schema_shape(
     ensure_index_shape(
         &indexes,
         "session_transcript_items",
-        "idx_transcript_owner_session_source_event",
+        "uq_transcript_owner_session_source_event",
         &["user_id", "session_id", "source_event_id"],
     )?;
-    ensure_index_shape(
-        &indexes,
-        "prompt_request_records",
-        "PRIMARY",
-        &["user_id", "request_id"],
-    )?;
-    for (index, expected_columns) in [
-        (
-            "uq_prompt_request_attempt",
-            &[
-                "user_id",
-                "session_id",
-                "run_id",
-                "turn",
-                "round",
-                "source",
-                "attempt",
-            ][..],
-        ),
-        (
-            "idx_prompt_requests_owner_session_created",
-            &[
-                "user_id",
-                "session_id",
-                "created_at",
-                "turn",
-                "round",
-                "attempt",
-            ][..],
-        ),
-        (
-            "idx_prompt_requests_owner_run_created",
-            &[
-                "user_id",
-                "run_id",
-                "created_at",
-                "turn",
-                "round",
-                "attempt",
-            ][..],
-        ),
-        (
-            "idx_prompt_requests_owner_previous",
-            &["user_id", "session_id", "previous_request_id"][..],
-        ),
-        (
-            "idx_prompt_requests_retention_ms",
-            &["created_at_unix_ms", "user_id", "request_id", "session_id"][..],
-        ),
-    ] {
-        ensure_index_shape(&indexes, "prompt_request_records", index, expected_columns)?;
-    }
-    fail_if_obsolete_shape(
-        pool,
-        database,
-        "prompt_deltas",
-        &[
-            "user_id",
-            "session_id",
-            "request_id",
-            "delta_seq",
-            "logical_key",
-            "chunk_kind",
-            "position",
-            "op",
-            "chunk_id",
-            "chunk_hash",
-            "previous_chunk_hash",
-            "created_at",
-        ],
-        &["delta_id", "payload_json"],
-        &[
-            "uq_prompt_delta_request_seq",
-            "idx_prompt_deltas_request_position",
-        ],
-    )
-    .await?;
     fail_if_obsolete_shape(
         pool,
         database,
@@ -6794,91 +5475,6 @@ async fn verify_core_schema_shape(
         "session_device_lease_events",
         "idx_lease_events_owner_session_device",
         &["user_id", "session_id", "device_id", "created_at"],
-    )?;
-    fail_if_obsolete_shape(
-        pool,
-        database,
-        "context_manifests",
-        &[
-            "user_id",
-            "manifest_id",
-            "payload_hash",
-            "ingestion_write_id",
-        ],
-        &[],
-        &[],
-    )
-    .await?;
-    fail_if_required_columns_missing_or_nullable(
-        pool,
-        database,
-        "context_manifests",
-        &["payload_hash", "ingestion_write_id"],
-    )
-    .await?;
-    fail_if_varchar_columns_shorter_than(
-        pool,
-        database,
-        "context_manifests",
-        &[("payload_hash", 80), ("ingestion_write_id", 64)],
-    )
-    .await?;
-    ensure_index_shape(
-        &indexes,
-        "context_manifests",
-        "PRIMARY",
-        &["user_id", "manifest_id"],
-    )?;
-    for (index, expected_columns) in [
-        (
-            "idx_ctx_manifest_owner_session_created",
-            &["user_id", "session_id", "created_at", "manifest_id"][..],
-        ),
-        (
-            "idx_ctx_manifest_owner_session_run_created",
-            &[
-                "user_id",
-                "session_id",
-                "run_id",
-                "created_at",
-                "manifest_id",
-            ][..],
-        ),
-    ] {
-        ensure_index_shape(&indexes, "context_manifests", index, expected_columns)?;
-    }
-    fail_if_obsolete_shape(
-        pool,
-        database,
-        "context_manifest_items",
-        &["user_id", "manifest_id", "item_order"],
-        &["id"],
-        &["uq_manifest_item_order"],
-    )
-    .await?;
-    ensure_index_shape(
-        &indexes,
-        "context_manifest_items",
-        "PRIMARY",
-        &["user_id", "manifest_id", "item_order"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "context_manifest_items",
-        "idx_manifest_items_manifest_zone",
-        &["user_id", "manifest_id", "zone", "included"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "context_manifest_items",
-        "idx_manifest_items_source",
-        &["user_id", "source_table", "source_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "context_manifest_items",
-        "idx_manifest_items_raw_ref",
-        &["user_id", "raw_ref"],
     )?;
     fail_if_obsolete_shape(
         pool,
@@ -6950,55 +5546,6 @@ async fn verify_core_schema_shape(
             expected_columns,
         )?;
     }
-    for (index, expected_columns) in [
-        (
-            "idx_state_owner_session_status_category",
-            &["user_id", "session_id", "status", "category"][..],
-        ),
-        (
-            "idx_state_user_scope_category",
-            &["user_id", "scope", "category", "status", "priority"][..],
-        ),
-        (
-            "idx_state_owner_origin_session",
-            &["user_id", "origin_session_id", "category", "status"][..],
-        ),
-    ] {
-        ensure_index_shape(&indexes, "session_state_items", index, expected_columns)?;
-    }
-    fail_if_obsolete_shape(
-        pool,
-        database,
-        "session_state_item_events",
-        &["user_id", "event_id"],
-        &["id"],
-        &[],
-    )
-    .await?;
-    ensure_index_shape(
-        &indexes,
-        "session_state_item_events",
-        "PRIMARY",
-        &["user_id", "event_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "session_state_item_events",
-        "idx_state_events_item_created",
-        &["item_id", "created_at", "event_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "session_state_item_events",
-        "idx_state_events_owner_session_created",
-        &["user_id", "session_id", "created_at", "event_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "session_state_item_events",
-        "idx_state_events_category_created",
-        &["category", "created_at", "event_id"],
-    )?;
     fail_if_obsolete_shape(
         pool,
         database,
@@ -7035,81 +5582,6 @@ async fn verify_core_schema_shape(
         ],
     )
     .await?;
-    for (index, expected_columns) in [
-        (
-            "idx_harness_owner_session_created",
-            &["user_id", "session_id", "created_at"][..],
-        ),
-        (
-            "idx_harness_owner_session_turn",
-            &["user_id", "session_id", "turn_number"][..],
-        ),
-        (
-            "idx_harness_owner_chain",
-            &["user_id", "causal_chain_id"][..],
-        ),
-    ] {
-        ensure_index_shape(&indexes, "harness_snapshots", index, expected_columns)?;
-    }
-    fail_if_varchar_columns_shorter_than(
-        pool,
-        database,
-        "ctx_snapshots",
-        &[
-            ("event_id", AGENT_EVENT_ID_LEN as u64),
-            ("llm_request_id", AGENT_EVENT_ID_LEN as u64),
-            ("llm_response_id", AGENT_EVENT_ID_LEN as u64),
-        ],
-    )
-    .await?;
-    for (index, expected_columns) in [
-        (
-            "idx_ctx_snapshots_owner_session_created",
-            &["user_id", "session_id", "created_at"][..],
-        ),
-        (
-            "idx_ctx_snapshots_owner_event_id",
-            &["user_id", "event_id"][..],
-        ),
-    ] {
-        ensure_index_shape(&indexes, "ctx_snapshots", index, expected_columns)?;
-    }
-    fail_if_varchar_columns_shorter_than(
-        pool,
-        database,
-        "ctx_decision_audits",
-        &[("event_id", AGENT_EVENT_ID_LEN as u64)],
-    )
-    .await?;
-    for (index, expected_columns) in [
-        (
-            "idx_ctx_decisions_owner_session_type_created",
-            &["user_id", "session_id", "decision_type", "created_at"][..],
-        ),
-        (
-            "idx_ctx_decisions_owner_event_id",
-            &["user_id", "event_id"][..],
-        ),
-        (
-            "idx_ctx_decisions_owner_context_capture_id",
-            &["user_id", "context_capture_id"][..],
-        ),
-    ] {
-        ensure_index_shape(&indexes, "ctx_decision_audits", index, expected_columns)?;
-    }
-    fail_if_required_columns_missing_or_nullable(
-        pool,
-        database,
-        "skill_selection_events",
-        &["user_id"],
-    )
-    .await?;
-    ensure_index_shape(
-        &indexes,
-        "skill_selection_events",
-        "idx_skill_selection_owner_session_created",
-        &["user_id", "session_id", "created_at"],
-    )?;
     ensure_index_shape(
         &indexes,
         "inference_invocations",
@@ -7188,8 +5660,6 @@ async fn verify_core_schema_shape(
     .await?;
     verify_inference_invocation_schema_contract(pool, database).await?;
     verify_inference_provider_attempt_schema_contract(pool, database).await?;
-    verify_inference_canonical_transition_head_schema_contract(pool, database).await?;
-    verify_inference_canonical_transition_wal_schema_contract(pool, database).await?;
     for (table, nullable_columns) in [
         ("inference_routes", &["run_id"][..]),
         ("inference_invocations", &["run_id"][..]),
@@ -7214,7 +5684,7 @@ async fn verify_core_schema_shape(
         "PRIMARY",
         &["user_id", "registry_id"],
     )?;
-    ensure_edge_pending_dispatch_result_json_lossless(pool, database).await?;
+    ensure_edge_pending_dispatch_text_storage(pool, database).await?;
     fail_if_obsolete_shape(
         pool,
         database,
@@ -7233,11 +5703,11 @@ async fn verify_core_schema_shape(
     ensure_index_shape(
         &indexes,
         "edge_pending_dispatch",
-        "idx_edge_dispatch_user_status",
+        "idx_edge_dispatch_status_user",
         &[
+            "status",
             "user_id",
             "edge_agent_id",
-            "status",
             "created_at",
             "session_id",
             "run_id",
@@ -7323,35 +5793,6 @@ async fn verify_core_schema_shape(
         "idx_mcp_bindings_owner_mcp",
         &["owner_user_id", "mcp_id"],
     )?;
-    fail_if_obsolete_shape(
-        pool,
-        database,
-        "mcp_tools",
-        &["owner_user_id", "binding_id", "tool_name"],
-        &["id"],
-        &["uq_mcp_tools_binding_tool", "uq_mcp_tools_binding_public"],
-    )
-    .await?;
-    fail_if_varchar_columns_shorter_than(pool, database, "mcp_tools", &[("binding_id", 64)])
-        .await?;
-    ensure_index_shape(
-        &indexes,
-        "mcp_tools",
-        "PRIMARY",
-        &["owner_user_id", "binding_id", "tool_name"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "mcp_tools",
-        "uq_mcp_tools_owner_binding_public",
-        &["owner_user_id", "binding_id", "public_name"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "mcp_tools",
-        "idx_mcp_tools_owner_binding",
-        &["owner_user_id", "binding_id"],
-    )?;
     ensure_index_shape(&indexes, "plans", "PRIMARY", &["user_id", "plan_id"])?;
     ensure_index_shape(
         &indexes,
@@ -7359,25 +5800,6 @@ async fn verify_core_schema_shape(
         "idx_plans_owner_session_updated",
         &["user_id", "session_id", "updated_at"],
     )?;
-    ensure_index_shape(
-        &indexes,
-        "session_checkpoints",
-        "PRIMARY",
-        &["user_id", "session_id", "checkpoint_id"],
-    )?;
-    for (index, expected_columns) in [
-        (
-            "uq_session_checkpoints_owner_number",
-            &["user_id", "session_id", "number"][..],
-        ),
-        (
-            "idx_ckpt_owner_session_turn",
-            &["user_id", "session_id", "turn"][..],
-        ),
-        ("idx_ckpt_user_created", &["user_id", "created_at"][..]),
-    ] {
-        ensure_index_shape(&indexes, "session_checkpoints", index, expected_columns)?;
-    }
     ensure_index_shape(
         &indexes,
         "session_artifacts",
@@ -7522,30 +5944,6 @@ async fn verify_core_schema_shape(
     fail_if_obsolete_shape(
         pool,
         database,
-        "user_skill_evaluations",
-        &[
-            "evaluation_id",
-            "owner_user_id",
-            "source_id",
-            "version_id",
-            "run_id",
-            "hits",
-            "suspects",
-            "false_positives",
-            "payload_json",
-            "created_at",
-        ],
-        &[],
-        &[
-            "idx_user_skill_eval_source_created",
-            "idx_user_skill_eval_version_created",
-            "idx_user_skill_eval_run",
-        ],
-    )
-    .await?;
-    fail_if_obsolete_shape(
-        pool,
-        database,
         "skill_installations",
         &[
             "installation_id",
@@ -7603,40 +6001,6 @@ pub fn database_user_from_row(
     row: sqlx::mysql::MySqlRow,
 ) -> Result<DatabaseUserRecord, sqlx::Error> {
     decode_database_user_row(&row)
-}
-
-trait ActiveSkillVersionRow {
-    fn string_column(&self, column: &'static str) -> Result<String, sqlx::Error>;
-}
-
-impl ActiveSkillVersionRow for sqlx::mysql::MySqlRow {
-    fn string_column(&self, column: &'static str) -> Result<String, sqlx::Error> {
-        self.try_get(column)
-    }
-}
-
-fn invalid_active_skill_version_value(column: &'static str, value: &str) -> sqlx::Error {
-    sqlx::Error::Decode(Box::new(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        format!("skills_registry decode column `{column}`: empty value `{value}`"),
-    )))
-}
-
-fn decode_active_skill_version_row(
-    row: &impl ActiveSkillVersionRow,
-) -> Result<(String, String), sqlx::Error> {
-    let skill_name = row.string_column("skill_name")?;
-    if skill_name.trim().is_empty() {
-        return Err(invalid_active_skill_version_value(
-            "skill_name",
-            &skill_name,
-        ));
-    }
-    let version = row.string_column("version")?;
-    if version.trim().is_empty() {
-        return Err(invalid_active_skill_version_value("version", &version));
-    }
-    Ok((skill_name, version))
 }
 
 pub fn session_record_from_row(
@@ -7700,37 +6064,6 @@ pub async fn log_session_audit(
     }
 }
 
-pub async fn resolve_active_skill_versions(
-    pool: &sqlx::Pool<MySql>,
-    skill_names: BTreeSet<&str>,
-) -> Result<HashMap<String, String>, sqlx::Error> {
-    if skill_names.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let mut query_builder = QueryBuilder::<MySql>::new(
-        "SELECT skill_name, version FROM skills_registry WHERE is_active = 1 AND skill_name IN (",
-    );
-    {
-        let mut separated = query_builder.separated(", ");
-        for skill_name in &skill_names {
-            separated.push_bind(skill_name);
-        }
-    }
-    query_builder.push(") ORDER BY skill_name ASC, version DESC");
-
-    let rows = query_builder.build().fetch_all(pool).await?;
-    let mut versions = HashMap::new();
-    for row in rows {
-        let (skill_name, version) = decode_active_skill_version_row(&row)?;
-        if versions.contains_key(&skill_name) {
-            continue;
-        }
-        versions.insert(skill_name, version);
-    }
-    Ok(versions)
-}
-
 // ─── Expired Data Cleanup ────────────────────────────────────────────────────
 
 /// Result of a single table cleanup operation.
@@ -7742,7 +6075,7 @@ pub struct CleanupResult {
 
 /// Configuration for expiry policies of authentication and operational data.
 pub struct RetentionPolicy {
-    /// Max age in days for expired/revoked refresh tokens (default: 7)
+    /// Minimum days to retain refresh tokens after expiry (default: 7).
     pub refresh_token_days: u32,
     /// Max age in days for inactive auth tokens (default: 30)
     pub auth_token_days: u32,
@@ -7767,16 +6100,128 @@ pub async fn cleanup_inactive_memoria_credentials(pool: &sqlx::MySqlPool) -> Res
         .map_err(|error| format!("cleanup inactive Memoria credentials: {error}"))
 }
 
+const AUTH_REFRESH_TOKEN_BATCH_LIMIT: u32 = 1000;
+
+/// Result of a refresh retention batch, including evidence of an invalid index result.
+pub struct RefreshCleanupBatch {
+    pub selected: usize,
+    pub invalid: usize,
+    pub deleted: u64,
+    pub cutoff: chrono::NaiveDateTime,
+}
+
+/// Whether a batch warrants another pass, a retry, or no immediate work.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RefreshCleanupStatus {
+    More,
+    Retry,
+    Idle,
+}
+
+impl RefreshCleanupBatch {
+    pub fn status(&self) -> RefreshCleanupStatus {
+        if self.invalid > 0 || (self.selected > 0 && self.deleted == 0) {
+            RefreshCleanupStatus::Retry
+        } else if self.selected >= AUTH_REFRESH_TOKEN_BATCH_LIMIT as usize {
+            RefreshCleanupStatus::More
+        } else {
+            RefreshCleanupStatus::Idle
+        }
+    }
+}
+
+/// Remove one batch of expired refresh sessions. This runs off the request path.
+pub async fn cleanup_refresh_session_batch(
+    pool: &sqlx::MySqlPool,
+    policy: &RetentionPolicy,
+    round_cutoff: Option<chrono::NaiveDateTime>,
+) -> Result<RefreshCleanupBatch, String> {
+    let retention = chrono::Duration::try_days(i64::from(policy.refresh_token_days))
+        .ok_or_else(|| "invalid refresh retention duration".to_string())?;
+    let app_cutoff = chrono::Utc::now()
+        .naive_utc()
+        .checked_sub_signed(retention)
+        .ok_or_else(|| "refresh retention cutoff out of range".to_string())?;
+    let cutoff = match round_cutoff {
+        Some(cutoff) => cutoff.min(app_cutoff),
+        None => {
+            let database_now: chrono::NaiveDateTime = sqlx::query_scalar("SELECT UTC_TIMESTAMP(6)")
+                .fetch_one(pool)
+                .await
+                .map_err(|error| format!("read refresh cleanup time: {error}"))?;
+            database_now
+                .checked_sub_signed(retention)
+                .ok_or_else(|| "refresh retention cutoff out of range".to_string())?
+                .min(app_cutoff)
+        }
+    };
+
+    // MatrixOne 4.2.5 can return future rows when NOW()/DATE_SUB() is used
+    // directly as an index range bound. Bind a concrete DATETIME instead.
+    let candidates: Vec<(String, chrono::NaiveDateTime)> = sqlx::query_as(
+        "SELECT session_id, expires_at FROM auth_refresh_tokens FORCE INDEX (idx_auth_refresh_tokens_expires_at) WHERE expires_at < ? LIMIT ?",
+    )
+    .bind(cutoff)
+    .bind(AUTH_REFRESH_TOKEN_BATCH_LIMIT)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("select refresh cleanup candidates: {error}"))?;
+    let selected = candidates.len();
+    let ids: std::collections::BTreeSet<_> = candidates
+        .into_iter()
+        .filter_map(|(id, expiry)| (expiry < cutoff).then_some(id))
+        .collect();
+    let invalid = selected - ids.len();
+    if ids.is_empty() {
+        return Ok(RefreshCleanupBatch {
+            selected,
+            invalid,
+            deleted: 0,
+            cutoff,
+        });
+    }
+
+    let deleted = delete_expired_refresh_candidates(pool, ids, cutoff, policy.refresh_token_days)
+        .await
+        .map_err(|error| format!("delete expired refresh sessions: {error}"))?;
+    Ok(RefreshCleanupBatch {
+        selected,
+        invalid,
+        deleted,
+        cutoff,
+    })
+}
+
+async fn delete_expired_refresh_candidates(
+    pool: &sqlx::MySqlPool,
+    ids: std::collections::BTreeSet<String>,
+    cutoff: chrono::NaiveDateTime,
+    retention_days: u32,
+) -> Result<u64, sqlx::Error> {
+    let mut deletion =
+        QueryBuilder::<MySql>::new("DELETE FROM auth_refresh_tokens WHERE session_id IN (");
+    let mut values = deletion.separated(", ");
+    for id in ids {
+        values.push_bind(id);
+    }
+    deletion
+        .push(") AND expires_at < ")
+        .push_bind(cutoff)
+        .push(" AND expires_at < DATE_SUB(UTC_TIMESTAMP(6), INTERVAL ")
+        .push_bind(retention_days)
+        .push(" DAY)");
+    Ok(deletion.build().execute(pool).await?.rows_affected())
+}
+
 /// Purge expired authentication and operational records with TTL/expiry semantics.
 ///
-/// Returns a list of per-table cleanup results showing how many rows were deleted.
-/// Each DELETE uses a LIMIT to avoid long-running locks; callers should invoke
-/// repeatedly until all results show 0 rows deleted for a full sweep.
+/// Returns per-table deletion counts for one bounded sweep. A failure can
+/// follow committed batches; callers may retry. A zero count reflects only the
+/// candidates returned by the database, not proof that an index omitted none.
 pub async fn cleanup_expired_data(
     pool: &sqlx::Pool<MySql>,
     policy: &RetentionPolicy,
 ) -> Result<Vec<CleanupResult>, String> {
-    const AUTH_REFRESH_TOKEN_BATCH_LIMIT: u32 = 1000;
     const AUTH_PROOF_BATCH_LIMIT: u32 = 1000;
     const DEVICE_CHALLENGE_BATCH_LIMIT: u32 = 1000;
     const AUTH_TOKEN_BATCH_LIMIT: u32 = 1000;
@@ -7784,24 +6229,29 @@ pub async fn cleanup_expired_data(
     const AUTH_AUDIT_LOG_BATCH_LIMIT: u32 = 1000;
     let mut results = Vec::new();
 
-    // 1. Expired + revoked refresh tokens
-    let deleted = sqlx::query(
-        "DELETE FROM auth_refresh_tokens \
-         WHERE (expires_at < NOW(6) OR is_revoked = 1) \
-           AND created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
-         ORDER BY created_at ASC, token_id ASC \
-         LIMIT ?",
-    )
-    .bind(policy.refresh_token_days)
-    .bind(AUTH_REFRESH_TOKEN_BATCH_LIMIT)
-    .execute(pool)
-    .await
-    .map(|r| r.rows_affected())
-    .map_err(|e| format!("cleanup auth_refresh_tokens: {e}"))?;
-    results.push(CleanupResult {
-        table: "auth_refresh_tokens",
-        rows_deleted: deleted,
-    });
+    let refresh_error = match cleanup_refresh_session_batch(pool, policy, None).await {
+        Ok(batch) => {
+            results.push(CleanupResult {
+                table: "auth_refresh_tokens",
+                rows_deleted: batch.deleted,
+            });
+            if batch.status() == RefreshCleanupStatus::Retry {
+                tracing::warn!(
+                    selected = batch.selected,
+                    invalid = batch.invalid,
+                    deleted = batch.deleted,
+                    "refresh retention made incomplete progress"
+                );
+                Some("refresh retention made incomplete progress; retry cleanup".to_owned())
+            } else {
+                None
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "refresh retention batch failed");
+            Some(error)
+        }
+    };
 
     let deleted = sqlx::query(
         "DELETE FROM auth_reauthentication_proofs
@@ -7893,12 +6343,94 @@ pub async fn cleanup_expired_data(
         rows_deleted: deleted,
     });
 
+    if let Some(error) = refresh_error {
+        return Err(error);
+    }
     Ok(results)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_cleanup_distinguishes_more_work_from_stalled_or_invalid_results() {
+        let cutoff = chrono::Utc::now().naive_utc();
+        for (selected, invalid, deleted, expected) in [
+            (0, 0, 0, RefreshCleanupStatus::Idle),
+            (12, 0, 12, RefreshCleanupStatus::Idle),
+            (1000, 0, 999, RefreshCleanupStatus::More),
+            (1000, 0, 0, RefreshCleanupStatus::Retry),
+            (1000, 1, 999, RefreshCleanupStatus::Retry),
+            (1, 1, 0, RefreshCleanupStatus::Retry),
+        ] {
+            assert_eq!(
+                RefreshCleanupBatch {
+                    selected,
+                    invalid,
+                    deleted,
+                    cutoff
+                }
+                .status(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1 and an isolated MatrixOne catalog"]
+    async fn refresh_cleanup_rechecks_retention_for_every_selected_key() {
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let settings = MatrixOneSettings::from_env();
+        ensure_core_schema(&settings, "mysql").await.unwrap();
+        let pool = connect_matrixone(&settings).await.unwrap();
+        let now: chrono::NaiveDateTime = sqlx::query_scalar("SELECT UTC_TIMESTAMP(6)")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // Simulate a previously captured cutoff from a faster clock: only the
+        // database-time retention recheck can reject the other three IDs.
+        let cutoff = now + chrono::Duration::days(30);
+        let ids: Vec<String> = (0..4).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+        for (id, expiry) in ids.iter().zip([
+            now - chrono::Duration::days(8),
+            now - chrono::Duration::days(1),
+            now + chrono::Duration::days(1),
+            now - chrono::Duration::days(8),
+        ]) {
+            sqlx::query("INSERT INTO auth_refresh_tokens (session_id,user_id,token_hash,expires_at) VALUES (?, ?, ?, ?)")
+                .bind(id).bind(id).bind(id).bind(expiry).execute(&pool).await.unwrap();
+        }
+        // Model a candidate renewed after selection but before the keyed DELETE.
+        sqlx::query("UPDATE auth_refresh_tokens SET expires_at = ? WHERE session_id = ?")
+            .bind(now + chrono::Duration::days(1))
+            .bind(&ids[3])
+            .execute(&pool)
+            .await
+            .unwrap();
+        let deleted =
+            delete_expired_refresh_candidates(&pool, ids.iter().cloned().collect(), cutoff, 7)
+                .await
+                .unwrap();
+        assert_eq!(deleted, 1);
+        for (index, id) in ids.iter().enumerate() {
+            let exists: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM auth_refresh_tokens WHERE session_id = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(exists, i64::from(index != 0));
+        }
+        for id in &ids {
+            sqlx::query("DELETE FROM auth_refresh_tokens WHERE session_id = ?")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        pool.close().await;
+    }
 
     #[test]
     fn fresh_database_visibility_retry_is_limited_to_unknown_database() {
@@ -8028,13 +6560,30 @@ mod tests {
     }
 
     #[test]
-    fn edge_dispatch_result_storage_requires_nullable_lossless_text() {
-        for data_type in ["longtext", "text", "TEXT"] {
-            assert!(validate_edge_pending_dispatch_result_storage(data_type, true).is_ok());
-            assert!(validate_edge_pending_dispatch_result_storage(data_type, false).is_err());
-        }
-        for data_type in ["json", "mediumtext"] {
-            assert!(validate_edge_pending_dispatch_result_storage(data_type, true).is_err());
+    fn edge_dispatch_storage_requires_lossless_text_with_correct_nullability() {
+        for (column, nullable) in [("payload_json", false), ("result_json", true)] {
+            for data_type in ["longtext", "text", "TEXT"] {
+                assert!(
+                    validate_edge_pending_dispatch_text_storage(
+                        column, data_type, nullable, nullable
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    validate_edge_pending_dispatch_text_storage(
+                        column, data_type, !nullable, nullable
+                    )
+                    .is_err()
+                );
+            }
+            for data_type in ["json", "mediumtext"] {
+                assert!(
+                    validate_edge_pending_dispatch_text_storage(
+                        column, data_type, nullable, nullable
+                    )
+                    .is_err()
+                );
+            }
         }
     }
 
@@ -8136,97 +6685,6 @@ mod tests {
         }
     }
 
-    struct FakeActiveSkillVersionRow {
-        failed_column: Option<&'static str>,
-        skill_name: &'static str,
-        version: &'static str,
-    }
-
-    impl FakeActiveSkillVersionRow {
-        fn complete() -> Self {
-            Self {
-                failed_column: None,
-                skill_name: "skill-a",
-                version: "v2",
-            }
-        }
-
-        fn fail_on(column: &'static str) -> Self {
-            Self {
-                failed_column: Some(column),
-                ..Self::complete()
-            }
-        }
-
-        fn with_values(skill_name: &'static str, version: &'static str) -> Self {
-            Self {
-                failed_column: None,
-                skill_name,
-                version,
-            }
-        }
-    }
-
-    impl ActiveSkillVersionRow for FakeActiveSkillVersionRow {
-        fn string_column(&self, column: &'static str) -> Result<String, sqlx::Error> {
-            if self.failed_column == Some(column) {
-                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
-            }
-
-            Ok(match column {
-                "skill_name" => self.skill_name,
-                "version" => self.version,
-                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
-            }
-            .to_string())
-        }
-    }
-
-    #[test]
-    fn active_skill_version_row_decode_preserves_database_values() {
-        let (skill_name, version) =
-            decode_active_skill_version_row(&FakeActiveSkillVersionRow::complete()).unwrap();
-
-        assert_eq!(skill_name, "skill-a");
-        assert_eq!(version, "v2");
-    }
-
-    #[test]
-    fn active_skill_version_row_decode_fails_loudly_on_missing_columns() {
-        for column in ["skill_name", "version"] {
-            match decode_active_skill_version_row(&FakeActiveSkillVersionRow::fail_on(column))
-                .unwrap_err()
-            {
-                sqlx::Error::ColumnNotFound(name) => assert_eq!(name, column),
-                err => panic!("expected ColumnNotFound({column}), got {err:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn active_skill_version_row_decode_fails_loudly_on_empty_values() {
-        for (column, row) in [
-            (
-                "skill_name",
-                FakeActiveSkillVersionRow::with_values("   ", "v2"),
-            ),
-            (
-                "version",
-                FakeActiveSkillVersionRow::with_values("skill-a", ""),
-            ),
-        ] {
-            let error = decode_active_skill_version_row(&row).unwrap_err();
-            assert!(
-                matches!(error, sqlx::Error::Decode(_)),
-                "expected decode error for `{column}`, got {error:?}"
-            );
-            assert!(
-                error.to_string().contains(column),
-                "decode error should identify `{column}`: {error}"
-            );
-        }
-    }
-
     /// Every `agent_id`, `edge_agent_id`, `holder_agent_id`, and
     /// `parent_agent_id` column in DDL MUST use the width encoded in
     /// [`AGENT_ID_LEN`].
@@ -8323,30 +6781,6 @@ mod tests {
                 },
             ),
             (
-                "canonical_transition_id",
-                ObservedColumnShape {
-                    data_type: "char".to_string(),
-                    character_maximum_length: Some(64),
-                    nullable: true,
-                },
-            ),
-            (
-                "canonical_parent_transition_id",
-                ObservedColumnShape {
-                    data_type: "char".to_string(),
-                    character_maximum_length: Some(64),
-                    nullable: true,
-                },
-            ),
-            (
-                "canonical_transition_hash",
-                ObservedColumnShape {
-                    data_type: "char".to_string(),
-                    character_maximum_length: Some(64),
-                    nullable: true,
-                },
-            ),
-            (
                 "usage_status",
                 ObservedColumnShape {
                     data_type: "varchar".to_string(),
@@ -8386,125 +6820,6 @@ mod tests {
         .collect()
     }
 
-    fn canonical_transition_head_columns() -> BTreeMap<String, ObservedColumnShape> {
-        [
-            ("user_id", "varchar", Some(128), false),
-            ("session_id", "varchar", Some(64), false),
-            ("turn_index", "bigint", None, false),
-            ("head_transition_id", "char", Some(64), false),
-            ("head_attempt_id", "varchar", Some(64), false),
-            ("head_result_count", "bigint", None, false),
-            ("head_result_root_hash", "char", Some(64), false),
-            ("chain_length", "bigint", None, false),
-            ("chain_payload_bytes", "bigint", None, false),
-            ("updated_at", "datetime", None, false),
-        ]
-        .into_iter()
-        .map(|(name, data_type, character_maximum_length, nullable)| {
-            (
-                name.to_string(),
-                ObservedColumnShape {
-                    data_type: data_type.to_string(),
-                    character_maximum_length,
-                    nullable,
-                },
-            )
-        })
-        .collect()
-    }
-
-    fn canonical_transition_head_indexes() -> BTreeMap<String, ObservedIndexShape> {
-        [
-            ("PRIMARY", vec!["user_id", "session_id", "turn_index"]),
-            (
-                "uq_inference_canonical_head_attempt",
-                vec!["user_id", "head_attempt_id"],
-            ),
-        ]
-        .into_iter()
-        .map(|(name, columns)| {
-            (
-                name.to_string(),
-                ObservedIndexShape {
-                    columns: columns.into_iter().map(str::to_string).collect(),
-                    non_unique: false,
-                },
-            )
-        })
-        .collect()
-    }
-
-    fn canonical_transition_wal_columns() -> BTreeMap<String, ObservedColumnShape> {
-        [
-            ("user_id", "varchar", Some(128), false),
-            ("session_id", "varchar", Some(64), false),
-            ("turn_index", "bigint", None, false),
-            ("round_index", "bigint", None, false),
-            ("logical_attempt", "bigint", None, false),
-            ("physical_attempt", "bigint", None, false),
-            ("transition_id", "char", Some(64), false),
-            ("parent_transition_id", "char", Some(64), true),
-            ("attempt_id", "varchar", Some(64), false),
-            ("payload_json", "text", None, false),
-            ("payload_hash", "char", Some(64), false),
-            ("payload_bytes", "bigint", None, false),
-            ("predecessor_count", "bigint", None, false),
-            ("predecessor_root_hash", "char", Some(64), false),
-            ("result_count", "bigint", None, false),
-            ("result_root_hash", "char", Some(64), false),
-            ("recovery_mode", "varchar", Some(32), false),
-            ("created_at", "datetime", None, false),
-        ]
-        .into_iter()
-        .map(|(name, data_type, character_maximum_length, nullable)| {
-            (
-                name.to_string(),
-                ObservedColumnShape {
-                    data_type: data_type.to_string(),
-                    character_maximum_length,
-                    nullable,
-                },
-            )
-        })
-        .collect()
-    }
-
-    fn canonical_transition_wal_indexes() -> BTreeMap<String, ObservedIndexShape> {
-        [
-            (
-                "PRIMARY",
-                vec!["user_id", "session_id", "turn_index", "transition_id"],
-                false,
-            ),
-            (
-                "uq_inference_canonical_wal_attempt",
-                vec!["user_id", "attempt_id"],
-                false,
-            ),
-            (
-                "idx_inference_canonical_wal_parent",
-                vec![
-                    "user_id",
-                    "session_id",
-                    "turn_index",
-                    "parent_transition_id",
-                ],
-                true,
-            ),
-        ]
-        .into_iter()
-        .map(|(name, columns, non_unique)| {
-            (
-                name.to_string(),
-                ObservedIndexShape {
-                    columns: columns.into_iter().map(str::to_string).collect(),
-                    non_unique,
-                },
-            )
-        })
-        .collect()
-    }
-
     #[test]
     fn provider_attempt_schema_contract_accepts_the_exact_wire_shape() {
         assert!(
@@ -8513,109 +6828,6 @@ mod tests {
                 &canonical_provider_attempt_indexes(),
             )
             .is_empty()
-        );
-    }
-
-    #[test]
-    fn canonical_transition_head_schema_contract_is_exact_and_fail_closed() {
-        let exact_columns = canonical_transition_head_columns();
-        let exact_indexes = canonical_transition_head_indexes();
-        assert!(
-            inference_canonical_transition_head_schema_mismatches(&exact_columns, &exact_indexes,)
-                .is_empty()
-        );
-
-        let mut missing_id = exact_columns.clone();
-        missing_id.remove("head_transition_id");
-        assert!(
-            inference_canonical_transition_head_schema_mismatches(&missing_id, &exact_indexes)
-                .iter()
-                .any(|reason| reason.contains("missing NOT NULL column head_transition_id"))
-        );
-
-        let mut wrong_width = exact_columns.clone();
-        wrong_width
-            .get_mut("head_transition_id")
-            .unwrap()
-            .character_maximum_length = Some(32);
-        assert!(
-            inference_canonical_transition_head_schema_mismatches(&wrong_width, &exact_indexes)
-                .iter()
-                .any(|reason| reason.contains("head_transition_id has width Some(32)"))
-        );
-
-        let mut wrong_primary = exact_indexes;
-        wrong_primary.get_mut("PRIMARY").unwrap().columns.swap(1, 2);
-        assert!(
-            inference_canonical_transition_head_schema_mismatches(&exact_columns, &wrong_primary)
-                .iter()
-                .any(|reason| reason.contains("constraint PRIMARY has columns"))
-        );
-    }
-
-    #[test]
-    fn canonical_transition_wal_schema_contract_is_exact_and_fail_closed() {
-        assert!(!database_reports_check_constraints_in_show_create(
-            "8.0.30-MatrixOne-v2.1.0"
-        ));
-        assert!(database_reports_check_constraints_in_show_create(
-            "8.0.36 MySQL Community Server"
-        ));
-        let exact_columns = canonical_transition_wal_columns();
-        let exact_indexes = canonical_transition_wal_indexes();
-        assert!(
-            inference_canonical_transition_wal_schema_mismatches(&exact_columns, &exact_indexes,)
-                .is_empty()
-        );
-        assert!(
-            inference_canonical_transition_wal_definition_mismatches(
-                "CONSTRAINT chk CHECK (recovery_mode IN ('append_from_durable_base', 'checkpoint_from_parent', 'replace_from_durable_base'))"
-            )
-            .is_empty()
-        );
-        assert!(
-            inference_canonical_transition_wal_definition_mismatches(
-                "CONSTRAINT chk CHECK (recovery_mode IN ('append_from_durable_base', 'replace_from_durable_base'))"
-            )
-            .iter()
-            .any(|reason| reason.contains("does not admit checkpoint_from_parent"))
-        );
-
-        let mut nullable_owner = exact_columns.clone();
-        nullable_owner.get_mut("user_id").unwrap().nullable = true;
-        assert!(
-            inference_canonical_transition_wal_schema_mismatches(&nullable_owner, &exact_indexes,)
-                .iter()
-                .any(|reason| reason.contains("user_id has nullable=true"))
-        );
-
-        let mut wrong_parent_index = exact_indexes.clone();
-        wrong_parent_index
-            .get_mut("idx_inference_canonical_wal_parent")
-            .unwrap()
-            .columns
-            .remove(0);
-        assert!(
-            inference_canonical_transition_wal_schema_mismatches(
-                &exact_columns,
-                &wrong_parent_index,
-            )
-            .iter()
-            .any(|reason| reason.contains("idx_inference_canonical_wal_parent has columns"))
-        );
-
-        let mut non_unique_attempt = exact_indexes;
-        non_unique_attempt
-            .get_mut("uq_inference_canonical_wal_attempt")
-            .unwrap()
-            .non_unique = true;
-        assert!(
-            inference_canonical_transition_wal_schema_mismatches(
-                &exact_columns,
-                &non_unique_attempt,
-            )
-            .iter()
-            .any(|reason| reason.contains("uq_inference_canonical_wal_attempt has non_unique=true"))
         );
     }
 
@@ -8740,58 +6952,6 @@ mod tests {
         columns.get_mut("provider_wire_bytes").unwrap().data_type = "int".to_string();
         cases.push((
             "provider_wire_bytes has type int",
-            columns,
-            exact_indexes.clone(),
-        ));
-
-        let mut columns = exact_columns.clone();
-        columns.remove("canonical_transition_id");
-        cases.push((
-            "missing nullable column canonical_transition_id",
-            columns,
-            exact_indexes.clone(),
-        ));
-
-        let mut columns = exact_columns.clone();
-        columns
-            .get_mut("canonical_parent_transition_id")
-            .unwrap()
-            .nullable = false;
-        cases.push((
-            "non-nullable column canonical_parent_transition_id",
-            columns,
-            exact_indexes.clone(),
-        ));
-
-        let mut columns = exact_columns.clone();
-        columns
-            .get_mut("canonical_transition_id")
-            .unwrap()
-            .character_maximum_length = Some(32);
-        cases.push((
-            "canonical_transition_id has width Some(32)",
-            columns,
-            exact_indexes.clone(),
-        ));
-
-        let mut columns = exact_columns.clone();
-        columns
-            .get_mut("canonical_transition_hash")
-            .unwrap()
-            .nullable = false;
-        cases.push((
-            "non-nullable column canonical_transition_hash",
-            columns,
-            exact_indexes.clone(),
-        ));
-
-        let mut columns = exact_columns.clone();
-        columns
-            .get_mut("canonical_transition_hash")
-            .unwrap()
-            .character_maximum_length = Some(32);
-        cases.push((
-            "canonical_transition_hash has width Some(32)",
             columns,
             exact_indexes.clone(),
         ));

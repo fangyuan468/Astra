@@ -8,10 +8,10 @@ use astra_services::runs::{
     AtomicRunInteractionBatchRegistration, AtomicRunInteractionBatchRegistrationRequest,
     AtomicRunInteractionWaitRequest, COLLABORATOR_NATIVE_SESSION_METADATA_KEY,
     CollaboratorNativeSession, CollaboratorProvider, CollaboratorStageAdmission,
-    CollaboratorStageReceipt, CollaboratorStoreError, DatabaseRunStateStore,
-    DurableRunInteractionKind, DurableRunInteractionResolveOutcome,
-    DurableRunInteractionWaitOutcome, DurableRunRecord, InMemoryRunStateStore, RunStateStore,
-    ToolInteractionAdmissionError, ToolInvocationInteractionOrigin,
+    CollaboratorStageReceipt, DatabaseRunStateStore, DurableRunInteractionKind,
+    DurableRunInteractionResolveOutcome, DurableRunInteractionWaitOutcome, DurableRunRecord,
+    InMemoryRunStateStore, RunAdmissionError, RunStateStore, ToolInteractionAdmissionError,
+    ToolInvocationInteractionOrigin,
 };
 use astra_services::tool_invocation_ledger::{
     DatabaseToolInvocationLedger, ToolInvocationDispatchAdmission,
@@ -29,9 +29,11 @@ use uuid::Uuid;
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and real MatrixOne"]
 async fn committed_terminal_guidance_withholding_survives_late_physical_completion() {
     use astra_services::runs::{
-        AtomicRunGuidanceAdmissionRequest, AtomicRunTerminalSettlementRequest,
-        AtomicRunTerminalSettlementResolution,
+        AtomicRunGuidanceAdmissionRequest, CanonicalRunTerminalReceipt,
+        CanonicalRunTerminalRequest, CanonicalTerminalClaim, CanonicalTerminalContext,
+        CanonicalTerminalOutcome, CanonicalTerminalTranscript,
     };
+    use sha2::{Digest, Sha256};
     let fixture = Fixture::new().await;
     let (ledger, identity) = fixture.interaction_invocation().await;
     let source = json!({"event_type":"user_intent", "idempotency_key":"user_intent:uncertain-before-terminal",
@@ -48,38 +50,85 @@ async fn committed_terminal_guidance_withholding_survives_late_physical_completi
         })
         .await
         .unwrap();
-    let terminal = [
-        json!({"event_type":"run_finished", "idempotency_key":"terminal:uncertain-guidance",
-        "data":{"status":"completed"}}),
-    ];
-    let request = AtomicRunTerminalSettlementRequest {
+    let opened = fixture
+        .store
+        .load_run_admission(&fixture.user_id, &identity.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let opened = opened.run();
+    let mut digest = Sha256::new();
+    digest.update(b"astra.run-terminal-transcript.v1\0");
+    digest.update(0_u64.to_be_bytes());
+    let receipt = CanonicalRunTerminalReceipt {
+        schema_version: 1,
+        user_id: fixture.user_id.clone(),
+        session_id: fixture.session_id.clone(),
+        run_id: identity.run_id.clone(),
+        generation: opened.run_generation,
+        opening_hash: opened.opening_hash.clone().unwrap(),
+        context_admission_hash: opened.context_admission_hash.clone(),
+        outcome: CanonicalTerminalOutcome::Completed,
+        error_hash: None,
+        error_code: None,
+        error_kind: None,
+        error_metadata: None,
+        interruption: None,
+        context: CanonicalTerminalContext::Unowned,
+        transcript: CanonicalTerminalTranscript {
+            item_count: 0,
+            digest: format!("{:x}", digest.finalize()),
+            assistant_source_event_id: None,
+        },
+        usage: None,
+        tool_ledger: None,
+    };
+    let request = CanonicalRunTerminalRequest {
         user_id: &fixture.user_id,
         run_id: &identity.run_id,
         expected_session_id: &fixture.session_id,
         expected_statuses: &["running"],
-        expected_owner_generation: 1,
+        expected_owner_generation: opened.run_generation,
         status: "completed",
         waiting_for: None,
         error_message: None,
-        events: &terminal,
+        error_code: None,
+        error_kind: None,
+        error_metadata: None,
+        interruption: None,
+        cancellation_origin: None,
         prompt_tokens: 0,
         completion_tokens: 0,
         tool_calls: 0,
     };
     let mut tx = fixture.pool.get().begin().await.unwrap();
-    let committed = fixture
+    astra_services::storage::admit_session_execution_write(
+        &mut tx,
+        &fixture.session_id,
+        &fixture.user_id,
+    )
+    .await
+    .unwrap();
+    let CanonicalTerminalClaim::Claimed { control_events, .. } = fixture
         .store
-        .settle_terminal_in_existing_transaction(&mut tx, request)
+        .claim_canonical_terminal_with_controls_in_transaction(&mut tx, request, &receipt)
         .await
         .unwrap()
-        .unwrap();
+    else {
+        panic!("canonical terminal must commit")
+    };
     assert!(
-        committed
-            .committed_events
+        control_events
             .iter()
             .all(|event| event["event_type"] != "user_intent_returned")
     );
     tx.commit().await.unwrap();
+    let committed = fixture
+        .store
+        .resolve_canonical_terminal_receipt(request, &receipt)
+        .await
+        .unwrap()
+        .unwrap();
     let outcome = ToolInvocationTerminalOutcome::Succeeded {
         result: ToolInvocationResultPayload::new("finished later", BTreeMap::new(), None).unwrap(),
     };
@@ -92,17 +141,36 @@ async fn committed_terminal_guidance_withholding_survives_late_physical_completi
         )
         .await
         .unwrap();
-    for receipts in [None, Some(committed.event_receipts.as_slice())] {
-        let resolved = fixture
+    assert_eq!(
+        fixture
             .store
-            .resolve_atomic_terminal_settlement(request, receipts)
+            .resolve_canonical_terminal_receipt(request, &receipt)
             .await
-            .unwrap();
-        assert!(
-            matches!(resolved, AtomicRunTerminalSettlementResolution::Exact(_)),
-            "late completion cannot change the committed terminal prefix: {resolved:?}"
-        );
-    }
+            .unwrap()
+            .unwrap(),
+        committed,
+        "late completion cannot change the committed terminal prefix"
+    );
+    sqlx::query("UPDATE agent_run_openings SET opening_events_json = 'invalid' WHERE user_id = ? AND run_id = ?")
+        .bind(&fixture.user_id).bind(&identity.run_id).execute(fixture.pool.get()).await.unwrap();
+    assert!(
+        fixture
+            .store
+            .load_run(&fixture.user_id, &identity.run_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .resolve_canonical_terminal_receipt(request, &receipt)
+            .await
+            .unwrap()
+            .unwrap(),
+        committed,
+        "exact terminal receipt resolution must not depend on a cold execution body"
+    );
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -542,7 +610,7 @@ async fn cancelled_native_receipt_recovers_session_after_store_restart_without_r
                 1
             )
             .await,
-        Err(CollaboratorStoreError::ParentNotCurrent { .. })
+        Err(RunAdmissionError::ParentNotCurrent { .. })
     ));
     assert!(matches!(
         restarted
@@ -554,7 +622,7 @@ async fn cancelled_native_receipt_recovers_session_after_store_restart_without_r
                 2
             )
             .await,
-        Err(CollaboratorStoreError::PreviousStageChanged { .. })
+        Err(RunAdmissionError::PreviousStageChanged { .. })
     ));
     let grant: (i64, String) = sqlx::query_as("SELECT event_idx, event_hash FROM agent_run_events
         WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = 'action_admission_granted' LIMIT 1")
@@ -573,7 +641,7 @@ async fn cancelled_native_receipt_recovers_session_after_store_restart_without_r
                 2
             )
             .await,
-        Err(CollaboratorStoreError::NativeSessionUnproven)
+        Err(RunAdmissionError::NativeSessionUnproven)
     ));
     sqlx::query("UPDATE agent_run_events SET event_hash = ? WHERE user_id = ? AND run_id = ? AND event_idx = ?")
         .bind(grant.1).bind(&fixture.user_id).bind(&first.run_id).bind(grant.0)
@@ -629,7 +697,7 @@ async fn cancelled_native_receipt_recovers_session_after_store_restart_without_r
                 2
             )
             .await,
-        Err(CollaboratorStoreError::SessionUnavailable)
+        Err(RunAdmissionError::SessionUnavailable)
     ));
     // The existing live parent admits a later stage; recording the old receipt
     // did not restart or renew the cancelled stage or create another root run.
@@ -689,9 +757,9 @@ impl Fixture {
             "tool_invocation_archive_chunks",
             "edge_pending_dispatch",
         ] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
-            ))
+            )))
             .bind(&self.user_id)
             .bind(&self.session_id)
             .execute(self.pool.get())
@@ -719,6 +787,7 @@ impl Fixture {
         sqlx::query("INSERT INTO agent_sessions (user_id, session_id, status, created_at, updated_at, last_active_at)
                      VALUES (?, ?, 'active', NOW(6), NOW(6), NOW(6))")
             .bind(&user_id).bind(&session_id).execute(pool.get()).await.unwrap();
+        collaborator_fixture::seed_execution_binding(&pool, &user_id, &session_id).await;
         let parent = record(&user_id, &session_id, None);
         let parent_id = parent.run_id.clone();
         store.insert_run(parent).await.unwrap();
@@ -858,6 +927,26 @@ impl Fixture {
         (ledger, identity)
     }
 
+    async fn alter_opening(&self, run_id: &str) -> String {
+        let original: String = sqlx::query_scalar(
+            "SELECT opening_events_json FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&self.user_id)
+        .bind(run_id)
+        .fetch_one(self.pool.get())
+        .await
+        .unwrap();
+        let mut changed: Value = serde_json::from_str(&original).unwrap();
+        changed[0]["data"]["integrity_probe"] = json!(true);
+        self.restore_opening(run_id, &changed.to_string()).await;
+        original
+    }
+
+    async fn restore_opening(&self, run_id: &str, opening: &str) {
+        sqlx::query("UPDATE agent_run_openings SET opening_events_json = ? WHERE user_id = ? AND run_id = ?")
+            .bind(opening).bind(&self.user_id).bind(run_id).execute(self.pool.get()).await.unwrap();
+    }
+
     async fn interaction_invocation(
         &self,
     ) -> (DatabaseToolInvocationLedger, ToolInvocationIdentity) {
@@ -994,6 +1083,44 @@ async fn native_interaction_real_producer_register_begin_resolve_and_early_answe
             AtomicRunInteractionBatchRegistration::Registered
         );
         let response = json!({"request_id":"native-question", "outcome":"submitted", "payload":{"answer":"yes"}});
+        if !early {
+            let before = fixture
+                .store
+                .load_run_control(&fixture.user_id, &identity.run_id)
+                .await
+                .unwrap();
+            let original = fixture.alter_opening(&identity.run_id).await;
+            let wait_error = begin_interaction(&callback, &origin).await.unwrap_err();
+            assert!(
+                wait_error.contains("immutable Run opening does not match its admitted identity"),
+                "{wait_error}"
+            );
+            let resolve_error = callback
+                .resolve_run_interaction(
+                    &fixture.user_id,
+                    &fixture.session_id,
+                    &identity.run_id,
+                    "native-question",
+                    DurableRunInteractionKind::Provider,
+                    response.clone(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                resolve_error
+                    .contains("immutable Run opening does not match its admitted identity"),
+                "{resolve_error}"
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .load_run_control(&fixture.user_id, &identity.run_id)
+                    .await
+                    .unwrap(),
+                before
+            );
+            fixture.restore_opening(&identity.run_id, &original).await;
+        }
         if early {
             assert!(matches!(
                 resolve_interaction(&callback, &origin, response.clone()).await,
@@ -1275,7 +1402,7 @@ async fn native_interaction_lookup_work_does_not_grow_with_guidance_history() {
                 let mut explain = format!("EXPLAIN ANALYZE {sql}");
                 explain = explain.replacen('?', &format!("'{key}'"), 1);
                 explain = explain.replacen('?', &origin.control_epoch.to_string(), 1);
-                let rows = sqlx::raw_sql(&explain)
+                let rows = sqlx::raw_sql(sqlx::AssertSqlSafe(explain))
                     .fetch_all(fixture.pool.get())
                     .await
                     .unwrap();
@@ -1484,6 +1611,40 @@ async fn native_question_remains_answerable_after_current_run_guidance() {
                     .is_err(),
                 "an arbitrary identity is not invocation proof"
             );
+        }
+        if timing == 2 && accepted {
+            let before = fixture
+                .store
+                .load_run_control(&fixture.user_id, &identity.run_id)
+                .await
+                .unwrap();
+            let original = fixture.alter_opening(&identity.run_id).await;
+            let error = fixture
+                .store
+                .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
+                    purpose: astra_services::runs::UserIntentApplyPurpose::ModelBoundary,
+                    invocation_identity: Some(&identity),
+                    user_id: &fixture.user_id,
+                    run_id: &identity.run_id,
+                    expected_session_id: &fixture.session_id,
+                    expected_owner_generation: origin.owner_generation,
+                    source_event_indices: &[event_index],
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("immutable Run opening does not match its admitted identity"),
+                "{error}"
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .load_run_control(&fixture.user_id, &identity.run_id)
+                    .await
+                    .unwrap(),
+                before
+            );
+            fixture.restore_opening(&identity.run_id, &original).await;
         }
         let applied = if accepted {
             Some(
@@ -1896,7 +2057,7 @@ async fn memory_store_does_not_invent_durable_ledger_or_session_evidence() {
         store
             .insert_run_with_collaborator_stage(child, request, None)
             .await,
-        Err(CollaboratorStoreError::Unsupported)
+        Err(RunAdmissionError::Unsupported)
     ));
 }
 
@@ -1928,7 +2089,7 @@ async fn source_replay_survives_store_recreation_and_does_not_create_candidate()
         reopened
             .insert_run_with_collaborator_stage(fixture.child(), conflict, None)
             .await,
-        Err(CollaboratorStoreError::SourceMessageConflict { .. })
+        Err(RunAdmissionError::SourceMessageConflict { .. })
     ));
     let association = reopened
         .load_collaborator_association(&fixture.user_id, &fixture.session_id, &first.anchor_run_id)
@@ -1952,7 +2113,7 @@ async fn concurrent_next_stages_have_one_winner_and_preserve_terminal_anchor() {
             .store
             .insert_run_with_collaborator_stage(fixture.child(), request.clone(), None)
             .await,
-        Err(CollaboratorStoreError::PreviousStageActive { .. })
+        Err(RunAdmissionError::PreviousStageActive { .. })
     ));
     fixture.bind_native_session(&first.run_id).await;
     fixture.settle(&first.run_id).await;
@@ -1974,13 +2135,8 @@ async fn concurrent_next_stages_have_one_winner_and_preserve_terminal_anchor() {
     );
     assert!(matches!(
         (&left, &right),
-        (
-            Ok(_),
-            Err(CollaboratorStoreError::PreviousStageChanged { .. })
-        ) | (
-            Err(CollaboratorStoreError::PreviousStageChanged { .. }),
-            Ok(_)
-        )
+        (Ok(_), Err(RunAdmissionError::PreviousStageChanged { .. }))
+            | (Err(RunAdmissionError::PreviousStageChanged { .. }), Ok(_))
     ));
     let after = fixture
         .store
@@ -1989,7 +2145,7 @@ async fn concurrent_next_stages_have_one_winner_and_preserve_terminal_anchor() {
         .unwrap()
         .unwrap();
     assert_eq!(after.status, "completed");
-    assert_eq!(after.checkpoint_json, before.checkpoint_json);
+    assert_eq!(after.current_checkpoint, before.current_checkpoint);
     assert_eq!(after.run_generation, before.run_generation);
     assert_eq!(after.last_event_idx, before.last_event_idx + 1);
     fixture.cleanup().await;
@@ -2013,7 +2169,7 @@ async fn codex_binding_uses_real_ledger_terminal_outcome() {
                 .store
                 .confirm_collaborator_native_session(&identity, &native, 1)
                 .await,
-            Err(CollaboratorStoreError::NativeSessionUnproven)
+            Err(RunAdmissionError::NativeSessionUnproven)
         ));
         let mut metadata = BTreeMap::new();
         metadata.insert("workspace_effect_settled".into(), json!(true));
@@ -2120,7 +2276,7 @@ async fn codex_binding_uses_real_ledger_terminal_outcome() {
                     .store
                     .confirm_collaborator_native_session(&probe, &native, 1)
                     .await,
-                Err(CollaboratorStoreError::NativeSessionUnproven)
+                Err(RunAdmissionError::NativeSessionUnproven)
             ));
             assert!(
                 fixture
@@ -2157,7 +2313,7 @@ async fn codex_binding_uses_real_ledger_terminal_outcome() {
                     .store
                     .confirm_collaborator_native_session(&identity, &native, 1)
                     .await,
-                Err(CollaboratorStoreError::NativeSessionUnproven)
+                Err(RunAdmissionError::NativeSessionUnproven)
             ));
             assert!(
                 fixture
@@ -2204,14 +2360,14 @@ async fn codex_binding_uses_real_ledger_terminal_outcome() {
                 .store
                 .confirm_collaborator_native_session(&identity, &mismatched, 1)
                 .await,
-            Err(CollaboratorStoreError::NativeSessionUnproven)
+            Err(RunAdmissionError::NativeSessionUnproven)
         ));
         assert!(matches!(
             fixture
                 .store
                 .confirm_collaborator_native_session(&identity, &native, 2)
                 .await,
-            Err(CollaboratorStoreError::ParentNotCurrent { .. })
+            Err(RunAdmissionError::ParentNotCurrent { .. })
         ));
         fixture
             .store
@@ -2225,7 +2381,7 @@ async fn codex_binding_uses_real_ledger_terminal_outcome() {
                 .store
                 .confirm_collaborator_native_session(&unrelated, &native, 1)
                 .await,
-            Err(CollaboratorStoreError::NativeSessionUnproven)
+            Err(RunAdmissionError::NativeSessionUnproven)
         ));
         fixture
             .store
@@ -2291,7 +2447,7 @@ async fn outcome_unknown_and_dispatched_previous_stages_fence_admission() {
                 .store
                 .insert_run_with_collaborator_stage(fixture.child(), request.clone(), None)
                 .await,
-            Err(CollaboratorStoreError::UnsettledDispatch { .. })
+            Err(RunAdmissionError::UnsettledDispatch { .. })
         ));
     }
     fixture.cleanup().await;
@@ -2310,7 +2466,7 @@ async fn tenant_generation_cancel_and_failed_insert_do_not_publish_association()
             .store
             .insert_run_with_collaborator_stage(foreign, request.clone(), None)
             .await,
-        Err(CollaboratorStoreError::SessionUnavailable)
+        Err(RunAdmissionError::SessionUnavailable)
     ));
     request.expected_parent_generation = 2;
     assert!(matches!(
@@ -2318,7 +2474,7 @@ async fn tenant_generation_cancel_and_failed_insert_do_not_publish_association()
             .store
             .insert_run_with_collaborator_stage(child.clone(), request.clone(), None)
             .await,
-        Err(CollaboratorStoreError::ParentNotCurrent { .. })
+        Err(RunAdmissionError::ParentNotCurrent { .. })
     ));
     request.expected_parent_generation = 1;
     let existing_child_id = child.run_id.clone();
@@ -2328,7 +2484,7 @@ async fn tenant_generation_cancel_and_failed_insert_do_not_publish_association()
             .store
             .insert_run_with_collaborator_stage(child, request, None)
             .await,
-        Err(CollaboratorStoreError::AssociationConflict { .. })
+        Err(RunAdmissionError::AssociationConflict { .. })
     ));
     assert!(
         fixture
@@ -2354,7 +2510,7 @@ async fn tenant_generation_cancel_and_failed_insert_do_not_publish_association()
             .store
             .insert_run_with_collaborator_stage(child.clone(), request, None)
             .await,
-        Err(CollaboratorStoreError::ParentNotCurrent { .. })
+        Err(RunAdmissionError::ParentNotCurrent { .. })
     ));
     assert!(
         fixture
@@ -2473,7 +2629,7 @@ async fn association_snapshots_do_not_wait_for_session_write_admission_locks() {
                 &stage.run_id
             )
             .await,
-        Err(CollaboratorStoreError::SessionUnavailable)
+        Err(RunAdmissionError::SessionUnavailable)
     ));
     assert_eq!(
         fixture
@@ -2503,10 +2659,7 @@ async fn association_snapshots_do_not_wait_for_session_write_admission_locks() {
                 .load_collaborator_association(&fixture.user_id, &fixture.session_id, &stage.run_id)
                 .await
         };
-        assert!(matches!(
-            result,
-            Err(CollaboratorStoreError::SessionUnavailable)
-        ));
+        assert!(matches!(result, Err(RunAdmissionError::SessionUnavailable)));
     }
     fixture.cleanup().await;
 }
@@ -2526,7 +2679,7 @@ async fn expired_budget_is_typed_and_external_native_binding_is_required() {
                 Some(tokio::time::Instant::now()),
             )
             .await,
-        Err(CollaboratorStoreError::DeadlineExpired)
+        Err(RunAdmissionError::DeadlineExpired)
     ));
     assert!(
         fixture
@@ -2545,7 +2698,7 @@ async fn expired_budget_is_typed_and_external_native_binding_is_required() {
             .store
             .insert_run_with_collaborator_stage(fixture.child(), request, None)
             .await,
-        Err(CollaboratorStoreError::NativeSessionUnbound { .. })
+        Err(RunAdmissionError::NativeSessionUnbound { .. })
     ));
     fixture.cleanup().await;
 }

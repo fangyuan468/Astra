@@ -61,7 +61,7 @@ COPY vendor ./vendor
 # CI and the real builder share this filesystem. Full dependency resolution
 # validates every path dependency, including patches outside workspace members;
 # cargo-chef prepare's --no-deps metadata alone cannot do that.
-RUN cargo chef cook --release --locked --no-default-features --recipe-path recipe.json --no-build && \
+RUN cargo chef cook --release --locked --no-default-features --features astra-runtime/otel --recipe-path recipe.json --no-build && \
     cargo metadata --locked --format-version 1 > /dev/null
 
 FROM dependency-inputs AS builder
@@ -71,7 +71,7 @@ ARG IMAGE_SOURCE_DIRTY
 
 # Runtime image intentionally ships the API server plus the single public CLI.
 # Test-only mock_mcp_server and the standalone astra-edge daemon are excluded.
-RUN cargo chef cook --release --locked --no-default-features --recipe-path recipe.json \
+RUN cargo chef cook --release --locked --no-default-features --features astra-runtime/otel --recipe-path recipe.json \
         -p astra-runtime --bin astra-server \
         -p astra-cli --bin astra
 
@@ -80,13 +80,13 @@ COPY crates ./crates
 COPY vendor ./vendor
 RUN ASTRA_BUILD_SOURCE_GIT_SHA="${IMAGE_REVISION}" \
     ASTRA_BUILD_SOURCE_GIT_DIRTY="${IMAGE_SOURCE_DIRTY}" \
-    cargo build --release --locked --no-default-features \
+    cargo build --release --locked --no-default-features --features astra-runtime/otel \
         -p astra-runtime --bin astra-server \
         -p astra-cli --bin astra && \
     mkdir -p /out && \
     cp target/release/astra-server target/release/astra /out/
 
-FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 
 ARG IMAGE_VERSION=dev
 ARG IMAGE_REVISION=unknown

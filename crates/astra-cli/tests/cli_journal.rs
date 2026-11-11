@@ -66,15 +66,16 @@ fn journal_commands_share_terminal_accounting_through_the_cli() {
                 event
             })
             .collect();
-    for terminal in [Some((33659, 2855)), Some((223453, 5330)), None] {
+    for terminal in [Some((33659, 2855, 12)), Some((223453, 5330, 541)), None] {
         let mut events = original.clone();
-        if let Some((input, output)) = terminal {
+        if let Some((input, output, tools)) = terminal {
             let turn = events
                 .iter_mut()
                 .find(|event| event["type"] == "turn")
                 .unwrap();
             turn["tokens_in"] = json!(input);
             turn["tokens_out"] = json!(output);
+            turn["tool_count"] = json!(tools);
         } else {
             events.retain(|event| event["type"] != "turn");
         }
@@ -91,7 +92,7 @@ fn journal_commands_share_terminal_accounting_through_the_cli() {
         let digest = parse(&["digest", sid, "--format", "json", "--focus", "summary"]);
         let diff = parse(&["diff", sid, sid, "--format", "json"]);
         let tree = parse(&["tree", sid, "--format", "json"]);
-        let (input, output) = terminal.unwrap_or((0, 0));
+        let (input, output, tools) = terminal.unwrap_or((0, 0, 0));
         assert_eq!(digest["aggregates"]["total_tokens_in"], input);
         assert_eq!(digest["aggregates"]["total_tokens_out"], output);
         assert_eq!(digest["journal_lines_malformed"], 1);
@@ -110,6 +111,10 @@ fn journal_commands_share_terminal_accounting_through_the_cli() {
             tree["root"]["self_completion_tokens"].as_u64().unwrap_or(0),
             output
         );
+        assert_eq!(tree["root"]["tool_calls"].as_u64().unwrap_or(0), tools);
+        let text = run_journal(root.path(), &["tree", sid]);
+        assert!(text.status.success(), "{text:?}");
+        assert!(String::from_utf8_lossy(&text.stdout).contains(&format!("tool_calls={tools}\n")));
     }
     let foreign = json!({"type":"llm_round", "ts":"t", "session_id":"foreign-session"});
     std::fs::write(&path, format!("{}\n{foreign}\n", original[0])).unwrap();

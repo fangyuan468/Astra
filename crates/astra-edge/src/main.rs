@@ -9,6 +9,7 @@
 //! astra-edge --server-url https://astra.example.com --workspace-dir ~/projects/my-app
 //! ```
 
+mod capacity_provider;
 mod runtime_process_authorization;
 mod token_manager;
 mod token_renewal;
@@ -34,7 +35,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(test)]
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{
-    Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config, connect_async,
+    Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
     tungstenite::client::IntoClientRequest,
 };
 use tokio_util::sync::CancellationToken;
@@ -69,10 +70,14 @@ struct Args {
     /// Auto-reconnect on disconnect
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     reconnect: bool,
+    /// Private local configuration for explicitly enabled sealed capacity providers.
+    #[arg(long)]
+    capacity_providers: Option<PathBuf>,
 }
 
 #[derive(Debug)]
 struct EdgeConfig {
+    capacity_providers: Vec<capacity_provider::LocalCapacityProvider>,
     server_url: String,
     /// Single owner of the token state machine: memory value, token file,
     /// startup fallback and persistence debt (see token_manager.rs).
@@ -270,6 +275,7 @@ fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
         .unwrap_or_else(|| default_edge_id(&workspace_dir));
     let materialization_id = load_or_create_materialization_id(&workspace_dir)?;
     Ok(EdgeConfig {
+        capacity_providers: capacity_provider::load(args.capacity_providers.as_deref())?,
         server_url: astra_edge::edge_ws_url(&raw_server_url)?,
         token_manager: token_manager::TokenManager::new(token, fallback_token, token_file),
         workspace_dir,
@@ -330,6 +336,8 @@ fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Val
     advertisement["protocol_capabilities"]
         [astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY] =
         Value::Bool(true);
+    advertisement["protocol_capabilities"]
+        [astra_server_types::edge_ws_protocol::W3C_TRACE_CONTEXT_V1_CAPABILITY] = Value::Bool(true);
     advertisement
 }
 
@@ -660,12 +668,7 @@ async fn connect_via_proxy(
     // handshake inside the tunnel before sending the WebSocket upgrade.
     // For ws://, no TLS is needed; send the upgrade directly over the tunnel.
     if ws_url.starts_with("wss://") {
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        let connector = Connector::Rustls(std::sync::Arc::new(tls_config));
+        let connector = Connector::Rustls(astra_core::net::public_root_tls_config());
         let request = edge_ws_request(ws_url, token)?;
         let tls_and_ws = client_async_tls_with_config(request, tcp, None, Some(connector));
         let (ws_stream, _) = tokio::time::timeout(connect_timeout, tls_and_ws)
@@ -747,7 +750,14 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
             })?
     } else {
         let request = edge_ws_request(&url, &token_snapshot)?;
-        let (ws, _) = connect_async(request).await.map_err(|e| {
+        let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
+            request,
+            None,
+            false,
+            Some(Connector::Rustls(astra_core::net::public_root_tls_config())),
+        )
+        .await
+        .map_err(|e| {
             tracing::error!(
                 target: "astra.edge",
                 edge_id = %config.edge_id,
@@ -774,10 +784,19 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
         interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.to_string(),
         hostname,
         workspace_dir: Some(workspace.to_string_lossy().to_string()),
-        capabilities: Some(edge_runtime_environment_capabilities(
-            &config.edge_id,
-            &workspace,
-        )),
+        capabilities: Some({
+            let mut value = edge_runtime_environment_capabilities(&config.edge_id, &workspace);
+            if !config.capacity_providers.is_empty() {
+                value["capacity_rpc_v1"] = serde_json::to_value(
+                    config
+                        .capacity_providers
+                        .iter()
+                        .map(|provider| provider.advertisement())
+                        .collect::<Vec<_>>(),
+                )?;
+            }
+            value
+        }),
     };
     let socket = write
         .reunite(read)
@@ -795,7 +814,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
             config.edge_id.clone(),
             session_id,
         )
-        .with_local_network(),
+        .with_local_network(astra_tools::web_fetch::configured_fake_ip_policy()),
     );
     astra_edge::serve_connection(
         socket,
@@ -810,15 +829,46 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
             ),
             ready: None,
         },
-        Arc::new(DefaultInvocationExecutor(executor)),
+        Arc::new(DefaultInvocationExecutor(
+            executor,
+            config.capacity_providers.clone(),
+        )),
         CancellationToken::new(),
     )
     .await
     .map_err(|error| error as Box<dyn std::error::Error>)
 }
 
-struct DefaultInvocationExecutor(Arc<astra_tools::executor::DefaultToolExecutor>);
+struct DefaultInvocationExecutor(
+    Arc<astra_tools::executor::DefaultToolExecutor>,
+    Vec<capacity_provider::LocalCapacityProvider>,
+);
 impl astra_edge::EdgeInvocationExecutor for DefaultInvocationExecutor {
+    fn execute_capacity(
+        &self,
+        provider_id: String,
+        payload: astra_server_types::edge_ws_protocol::SealedCapacityPayload,
+        timeout_secs: u64,
+        cancel: CancellationToken,
+    ) -> futures_util::future::BoxFuture<
+        '_,
+        Result<
+            astra_server_types::edge_ws_protocol::SealedCapacityPayload,
+            astra_server_types::edge_ws_protocol::CapacityRpcFailure,
+        >,
+    > {
+        Box::pin(async move {
+            let Some(provider) = self
+                .1
+                .iter()
+                .find(|provider| provider.advertisement().id == provider_id)
+            else {
+                return Err(astra_server_types::edge_ws_protocol::CapacityRpcFailure::Unsupported);
+            };
+            provider.call(payload, timeout_secs, cancel).await
+        })
+    }
+
     fn execute(
         &self,
         invocation: astra_edge::EdgeInvocation,
@@ -835,6 +885,10 @@ impl astra_edge::EdgeInvocationExecutor for DefaultInvocationExecutor {
                     self.0.as_ref(),
                     &invocation.args,
                     authorization,
+                    &runtime_process_authorization::CommandTraceContext {
+                        traceparent: invocation.traceparent.clone(),
+                        tracestate: invocation.tracestate.clone(),
+                    },
                     &cancel,
                 )
                 .await
@@ -882,6 +936,7 @@ async fn main() {
     let process_capture =
         match astra_core::history_work_baseline::ProductionProcessCaptureGuard::from_env(
             astra_core::history_work_baseline::ProductionProcessRole::Edge,
+            astra_build_info::current_attestation(),
         ) {
             Ok(process_capture) => process_capture,
             Err(error) => {
@@ -996,6 +1051,7 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = EdgeConfig {
+            capacity_providers: Vec::new(),
             server_url: format!("ws://{}/edge/ws", listener.local_addr().unwrap()),
             token_manager: token_manager::TokenManager::new(
                 "test-token".into(),
@@ -1044,6 +1100,9 @@ mod tests {
                 execution_timeout_ms: Some(86_400_000),
                 command_timeout_cap_ms: None,
                 execution_ceiling: None,
+
+                traceparent: None,
+                tracestate: None,
             };
             let mut original = None;
             for _ in 0..2 {
@@ -1112,6 +1171,7 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = EdgeConfig {
+            capacity_providers: Vec::new(),
             server_url: format!("ws://{}/edge/ws", listener.local_addr().unwrap()),
             token_manager: token_manager::TokenManager::new(
                 "test-token".into(),
@@ -1161,6 +1221,8 @@ mod tests {
                     execution_timeout_ms: None,
                     command_timeout_cap_ms: None,
                     execution_ceiling: None,
+                    traceparent: None,
+                    tracestate: None,
                 };
                 ws.send(Message::Text(
                     serde_json::to_string(&request).unwrap().into(),
@@ -1201,6 +1263,9 @@ mod tests {
                     execution_timeout_ms: None,
                     command_timeout_cap_ms: None,
                     execution_ceiling: None,
+
+                    traceparent: None,
+                    tracestate: None,
                 })
                 .unwrap()
                 .into(),
@@ -1491,6 +1556,11 @@ mod tests {
         assert_eq!(
             value["protocol_capabilities"]
                 [astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY],
+            true
+        );
+        assert_eq!(
+            value["protocol_capabilities"]
+                [astra_server_types::edge_ws_protocol::W3C_TRACE_CONTEXT_V1_CAPABILITY],
             true
         );
         assert!(

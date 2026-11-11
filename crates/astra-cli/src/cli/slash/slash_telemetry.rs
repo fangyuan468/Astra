@@ -42,7 +42,6 @@ pub(crate) fn handle_telemetry_command(arg: &str, state: &SessionState) {
         "context-detail" => show_context_detail(session, sub_arg),
         "session" => show_session_analysis(session),
         "tools" => show_tool_trace(session, sub_arg),
-        "compression" => show_compression_trace(session, sub_arg),
         "budget" => show_budget_evolution(session),
         "help" | "-h" | "--help" => show_help(),
         _ => {
@@ -432,10 +431,6 @@ fn show_help() {
         "/telemetry tools [N]".magenta()
     );
     eprintln!(
-        "  {}  History compression for turn N",
-        "/telemetry compression [N]".magenta()
-    );
-    eprintln!(
         "  {}   Token budget evolution",
         "/telemetry budget".magenta()
     );
@@ -677,40 +672,6 @@ fn show_context_trace(
         );
     }
 
-    // ── Decisions ──
-    if !trace.explanations.is_empty() {
-        eprintln!();
-        eprintln!("  {}", "▸ Decisions".bold());
-        for exp in &trace.explanations {
-            let type_label = format_trace_decision_type(&exp.decision_type);
-            let conf_str = format!("{:.0}%", exp.confidence * 100.0);
-            let conf = if exp.confidence > 0.7 {
-                conf_str.green()
-            } else if exp.confidence > 0.4 {
-                conf_str.yellow()
-            } else {
-                conf_str.red()
-            };
-            eprintln!(
-                "    {} {} — {} confidence",
-                "•".dim(),
-                type_label.magenta(),
-                conf
-            );
-            let reasoning: String = exp.reasoning.chars().take(80).collect();
-            let suffix = if exp.reasoning.len() > 80 { "…" } else { "" };
-            eprintln!("      {}{}", reasoning.dim(), suffix);
-            for alt in exp.alternatives_considered.iter().take(2) {
-                eprintln!(
-                    "      {} {} — {}",
-                    "↳".dim(),
-                    alt.description.clone().dim(),
-                    alt.why_not_chosen.clone().dim()
-                );
-            }
-        }
-    }
-
     eprintln!();
 }
 
@@ -783,153 +744,6 @@ fn show_tool_trace(
 }
 
 // ─── Deep Trace: History Compression ─────────────────────────────────────────
-
-fn show_compression_trace(
-    session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
-    arg: &str,
-) {
-    let session_guard = astra_core::sync_poison::recover_rwlock_read(&session);
-    let traces = &session_guard.context_traces;
-
-    if traces.is_empty() {
-        eprintln!("{}", "  No context assembly traces yet.".yellow());
-        return;
-    }
-
-    let trace = match resolve_turn_index(arg, traces.len()) {
-        Some(idx) => &traces[idx],
-        None => {
-            eprintln!(
-                "{}",
-                format!(
-                    "  Invalid turn: '{}'. Available: 1–{} or -1 for latest.",
-                    arg,
-                    traces.len()
-                )
-                .yellow()
-            );
-            return;
-        }
-    };
-
-    let h = &trace.history;
-
-    eprintln!(
-        "\n{}",
-        format!(
-            "─── History Compression — Turn {} ───────────────",
-            trace.turn_id
-        )
-        .bold()
-        .magenta()
-    );
-
-    eprintln!(
-        "  {:<22} {}",
-        "turns_available:".dim(),
-        h.total_turns_available.to_string().magenta()
-    );
-    let ratio_str = format!("{:.0}%", h.compression_ratio * 100.0);
-    let ratio = if h.compression_ratio > 0.5 {
-        ratio_str.red()
-    } else if h.compression_ratio > 0.2 {
-        ratio_str.yellow()
-    } else {
-        ratio_str.green()
-    };
-    eprintln!("  {:<22} {}", "compression_ratio:".dim(), ratio);
-    let saved = h.tokens_before.saturating_sub(h.tokens_after);
-    eprintln!(
-        "  {:<22} {} → {} ({} saved)",
-        "tokens:".dim(),
-        h.tokens_before.to_string().dim(),
-        h.tokens_after.to_string().magenta(),
-        saved.to_string().green()
-    );
-    eprintln!(
-        "  {:<22} {} retained · {} compressed · {} dropped",
-        "breakdown:".dim(),
-        h.turns_retained.len().to_string().green(),
-        h.turns_compressed.len().to_string().yellow(),
-        h.turns_dropped.len().to_string().red()
-    );
-
-    // Retained turns
-    if !h.turns_retained.is_empty() {
-        eprintln!();
-        eprintln!("  {}", "▸ Retained".bold());
-        for t in &h.turns_retained {
-            let tool_flag = if t.has_tool_calls { " 🔧" } else { "" };
-            eprintln!(
-                "    {} T{:<3} {:>6} tok  {}{}",
-                theme::icon_ok(),
-                t.turn_index,
-                t.tokens,
-                t.role.clone().dim(),
-                tool_flag
-            );
-        }
-    }
-
-    // Compressed turns
-    if !h.turns_compressed.is_empty() {
-        eprintln!();
-        eprintln!("  {}", "▸ Compressed".bold());
-        eprintln!(
-            "    {:<6} {:>8} {:>8}  {:>5}  {:<24}  {}",
-            "Turn".dim(),
-            "Before".dim(),
-            "After".dim(),
-            "Saved".dim(),
-            "Method".dim(),
-            "Info Lost".dim()
-        );
-        eprintln!("    {}", "─".repeat(72).dim());
-        for t in &h.turns_compressed {
-            let saved = t.original_tokens.saturating_sub(t.compressed_tokens);
-            let method = format_compression_method(&t.compression_method);
-            let info_lost = if t.information_lost.is_empty() {
-                "—".to_string()
-            } else {
-                t.information_lost
-                    .iter()
-                    .take(2)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            };
-            let info_preview: String = info_lost.chars().take(30).collect();
-            let suffix = if info_lost.len() > 30 { "…" } else { "" };
-            eprintln!(
-                "    T{:<4} {:>7} {:>7}  {:>5}  {:<24}  {}{}",
-                t.turn_index,
-                t.original_tokens,
-                t.compressed_tokens,
-                saved,
-                method.yellow(),
-                info_preview.dim(),
-                suffix
-            );
-        }
-    }
-
-    // Dropped turns
-    if !h.turns_dropped.is_empty() {
-        eprintln!();
-        eprintln!("  {}", "▸ Dropped".bold());
-        let turns_str: String = h
-            .turns_dropped
-            .iter()
-            .map(|t| format!("T{t}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        eprintln!("    {} {}", theme::icon_err(), turns_str.dim());
-    }
-
-    eprintln!();
-}
-
-// ─── Deep Trace: Token Budget Evolution ──────────────────────────────────────
 
 fn show_budget_evolution(
     session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
@@ -1175,7 +989,6 @@ fn show_context_detail(
 
     // ── History ──
     let hist_pct = tb.history_tokens as f64 / total * 100.0;
-    let hist = &trace.history;
     eprintln!();
     eprintln!(
         "  {} {} tokens ({:.1}%)",
@@ -1185,81 +998,23 @@ fn show_context_detail(
     );
     eprintln!("  {}", proportional_bar(hist_pct, 50));
 
-    if hist.tokens_before > 0 {
+    if let Some(history) = trace.history.as_ref() {
         eprintln!(
-            "    {:<20} {} → {} tokens ({:.0}% compression)",
-            "compression:".dim(),
-            hist.tokens_before.to_string().dim(),
-            hist.tokens_after.to_string().magenta(),
-            hist.compression_ratio * 100.0
+            "    Admission input: {} groups, ~{} tokens",
+            history.turns_retained.len(),
+            history.total_tokens
         );
-    }
-    eprintln!(
-        "    {:<20} {} retained, {} compressed, {} dropped",
-        "turns:".dim(),
-        hist.turns_retained.len().to_string().green(),
-        hist.turns_compressed.len().to_string().yellow(),
-        hist.turns_dropped.len().to_string().red()
-    );
-
-    // Show retained turns breakdown
-    if !hist.turns_retained.is_empty() {
-        let retained_total: u32 = hist.turns_retained.iter().map(|t| t.tokens).sum();
-        eprintln!(
-            "    {:<20} {} tokens across {} turns",
-            "retained:".dim(),
-            retained_total.to_string().magenta(),
-            hist.turns_retained.len()
-        );
-        for t in hist.turns_retained.iter().take(5) {
-            let tc_flag = if t.has_tool_calls { " ⚙" } else { "" };
-            let t_pct = t.tokens as f64 / total * 100.0;
+        for turn in history.turns_retained.iter().take(5) {
             eprintln!(
-                "      T{:<3} {:>5} {} tok ({:.1}%){tc_flag}",
-                t.turn_index,
-                t.role.clone().dim(),
-                t.tokens,
-                t_pct
+                "      group {:<3} {:>5} ~{} tokens{}",
+                turn.turn_index,
+                turn.role,
+                turn.tokens,
+                if turn.has_tool_calls { " [tools]" } else { "" }
             );
         }
-        if hist.turns_retained.len() > 5 {
-            eprintln!(
-                "      {} … and {} more",
-                "".dim(),
-                hist.turns_retained.len() - 5
-            );
-        }
-    }
-
-    // Show compressed turns
-    if !hist.turns_compressed.is_empty() {
-        let saved: u32 = hist
-            .turns_compressed
-            .iter()
-            .map(|t| t.original_tokens.saturating_sub(t.compressed_tokens))
-            .sum();
-        eprintln!(
-            "    {:<20} {} tokens saved",
-            "compressed:".dim(),
-            saved.to_string().yellow()
-        );
-        for t in hist.turns_compressed.iter().take(3) {
-            eprintln!(
-                "      T{:<3} {} → {} tok ({}) {}",
-                t.turn_index,
-                t.original_tokens.to_string().dim(),
-                t.compressed_tokens.to_string().magenta(),
-                format_compression_method(&t.compression_method),
-                t.information_lost
-                    .first()
-                    .map(|s| {
-                        let preview: String = s.chars().take(30).collect();
-                        format!("lost: {preview}…")
-                    })
-                    .unwrap_or_default()
-                    .dim()
-            );
-        }
+    } else {
+        eprintln!("    Admission input history unavailable");
     }
 
     // ── Memory Retrieval ──
@@ -1608,11 +1363,10 @@ fn show_session_analysis(
     );
 
     // ── Compression Events ──
-    let compression_turns: Vec<usize> = traces
+    let compression_turns: Vec<&str> = traces
         .iter()
-        .enumerate()
-        .filter(|(_, t)| t.token_budget.compression_triggered)
-        .map(|(i, _)| i + 1)
+        .filter(|trace| trace.token_budget.compression_triggered)
+        .map(|trace| trace.turn_id.as_str())
         .collect();
 
     if !compression_turns.is_empty() {
@@ -1629,7 +1383,7 @@ fn show_session_analysis(
             "turns:".dim(),
             compression_turns
                 .iter()
-                .map(|t| format!("T{t}"))
+                .map(|t| t.to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
                 .yellow()
@@ -1638,11 +1392,6 @@ fn show_session_analysis(
             "    {:<24} {:.0}%",
             "trigger_rate:".dim(),
             agg.compression_trigger_rate * 100.0
-        );
-        eprintln!(
-            "    {:<24} {:.0}%",
-            "avg_compression_ratio:".dim(),
-            agg.avg_compression_ratio * 100.0
         );
     }
 
@@ -1774,39 +1523,6 @@ fn format_rejection_reason(
             format!("duplicate of {of_memory_id}")
         }
         RejectionReason::Stale { age_days } => format!("{age_days} days old"),
-    }
-}
-
-fn format_compression_method(
-    method: &astra_turn_core::context_assembly_trace::CompressionMethod,
-) -> &'static str {
-    use astra_turn_core::context_assembly_trace::CompressionMethod;
-    match method {
-        CompressionMethod::ToolResultTruncation => "ToolResultTrunc",
-        CompressionMethod::DuplicateToolOutputElimination => "DuplicateToolOutputElim",
-        CompressionMethod::LlmSummarization => "LlmSummarize",
-        CompressionMethod::TieredCompaction => "TieredCompact",
-        CompressionMethod::ReactiveCompact => "ReactiveCompact",
-    }
-}
-
-fn format_trace_decision_type(
-    dt: &astra_turn_core::context_assembly_trace::DecisionType,
-) -> String {
-    use astra_turn_core::context_assembly_trace::DecisionType;
-    match dt {
-        DecisionType::ToolSurface { visible_tools } => {
-            format!("ToolSurface ({})", visible_tools.len())
-        }
-        DecisionType::HistoryCompression { turns_affected } => {
-            format!("HistoryCompression ({} turns)", turns_affected.len())
-        }
-        DecisionType::MemoryRetrieval { memories } => {
-            format!("MemoryRetrieval ({})", memories.len())
-        }
-        DecisionType::StrategyChoice { strategy } => {
-            format!("Strategy: {strategy}")
-        }
     }
 }
 

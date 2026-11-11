@@ -4,7 +4,7 @@ import { useRouter } from "next/navigation";
 import { appendExplainFact, markExplainGap, beginExplainRepair, finishExplainRepair } from "@/lib/explain-analyze-observation";
 import {
   useCallback,
-  useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type Dispatch,
@@ -24,7 +24,8 @@ import {
   updateChatModel,
   type PendingRunApproval,
 } from "@/lib/api/chats";
-import { mergeStreamRunUpdate } from "@/lib/api/active-run-merge";
+import { appendRunFailure } from "@/lib/api/stream-event-helpers";
+import { chatRunBinding, sameRunBinding, mergeStreamRunUpdate, type ChatRunBinding } from "@/lib/api/active-run-merge";
 import { createAssistantPatchController } from "@/lib/api/assistant-patch-controller";
 import {
   WebApiError,
@@ -105,43 +106,16 @@ export function canAttachRunStream(status: string | undefined | null) {
   return status ? ATTACHABLE_RUN_STATUSES.has(status) : false;
 }
 
-function findStreamingAssistantMessageId(messages: ChatMessage[]) {
-  return [...messages]
-    .reverse()
-    .find(
-      (message) =>
-        message.role === "assistant" &&
-        (message.status === "streaming" ||
-          message.reasoningStatus === "streaming"),
-    )?.id;
-}
-
-function completeLatestStreamingAssistantAsStopped(messages: ChatMessage[]) {
-  const index = [...messages]
-    .reverse()
-    .findIndex(
-      (message) =>
-        message.role === "assistant" &&
-        (message.status === "streaming" ||
-          message.reasoningStatus === "streaming"),
-    );
-  if (index < 0) {
-    return messages;
-  }
-  const actualIndex = messages.length - 1 - index;
-  return messages.map((message, i) =>
-    i === actualIndex
-      ? {
-          ...message,
-          status: "complete" as const,
-          content: message.content.trim()
-            ? `${message.content}${message.content.endsWith("\n") ? "" : "\n"}\nStopped.`
-            : "Stopped.",
-          completedAt: new Date().toISOString(),
-          reasoningStatus: "complete" as const,
-        }
-      : message,
-  );
+function stoppedAssistant(message: ChatMessage): ChatMessage {
+  return {
+    ...message,
+    status: "complete",
+    content: message.content.trim()
+      ? `${message.content}${message.content.endsWith("\n") ? "" : "\n"}\nStopped.`
+      : "Stopped.",
+    completedAt: new Date().toISOString(),
+    reasoningStatus: "complete",
+  };
 }
 
 function withClientTimeout<T>(
@@ -160,6 +134,21 @@ function withClientTimeout<T>(
   });
 }
 
+type StreamBinding = ChatRunBinding & { assistantMessageId: string };
+
+function streamBinding(detail: ChatDetail): StreamBinding | null {
+  const binding = chatRunBinding(detail);
+  return binding?.assistantMessageId ? { ...binding, assistantMessageId: binding.assistantMessageId } : null;
+}
+
+type StopOperation = {
+  binding: ChatRunBinding;
+  retired: boolean;
+  ensureReconciliation: () => void;
+  release: () => void;
+  retire: () => void;
+};
+
 export interface UseStreamLifecycleParams {
   detail: ChatDetail;
   setDetail: Dispatch<SetStateAction<ChatDetail>>;
@@ -169,7 +158,7 @@ export interface UseStreamLifecycleParams {
   workspaceSelectionExplicit: boolean;
   canStopRun: boolean;
   canResumeRun: boolean;
-  canQueueDeferredInput: boolean;
+  runControlBusy: boolean;
   setStartingRun: Dispatch<SetStateAction<boolean>>;
   setQueueingDeferredInput: Dispatch<SetStateAction<boolean>>;
   setResumingRun: Dispatch<SetStateAction<boolean>>;
@@ -186,22 +175,6 @@ export interface UseStreamLifecycleReturn {
   pendingApproval: PendingRunApproval | null;
   approvalResponsePending: boolean;
   respondToApproval: (decision: "allow" | "deny") => Promise<void>;
-  nextStreamAbortSignal: () => AbortSignal;
-  applyWorkSurfaceStreamEvent: (event: WorkSurfaceEvent) => void;
-  resetWorkSurfaceRun: (
-    runId: string | null,
-    sessionId?: string | null,
-  ) => void;
-  ensureStreamingAssistantMessage: (
-    preferredMessageId?: string | null,
-  ) => string;
-  scheduleAutoAttachRetry: (runId: string) => boolean;
-  attachExistingRunStream: (
-    runId: string,
-    assistantMessageId: string,
-    failureMessage: string,
-    options?: { scheduleRetry?: () => boolean },
-  ) => void;
   startStream: (params: {
     text: string;
     options: ComposerOptions;
@@ -218,16 +191,7 @@ export interface UseStreamLifecycleReturn {
   loadAgentRunProjection: (runId: string) => Promise<WorkSurfaceRunResponse>;
   refresh: () => Promise<void>;
   handleModelChange: (model: string) => void;
-  // Refs exposed for effect deps
-  streamAbortRef: React.RefObject<AbortController | null>;
-  attachedRunRef: React.RefObject<string | null>;
-  autoAttachAttemptedRunRef: React.RefObject<string | null>;
-  autoAttachRetryTimerRef: React.RefObject<number | undefined>;
-  autoAttachRetryCountsRef: React.RefObject<Map<string, number>>;
-  reconcileTimerRef: React.RefObject<number | undefined>;
-  reconcileIntervalRef: React.RefObject<number | undefined>;
-  stopReconcileRef: React.RefObject<() => void>;
-  runControlMutationRef: React.RefObject<boolean>;
+
 }
 
 export function useStreamLifecycle(
@@ -245,37 +209,40 @@ export function useStreamLifecycle(
     workspaceSelectionExplicit,
     canStopRun,
     canResumeRun,
-    canQueueDeferredInput,
+    runControlBusy,
     setStartingRun,
     setResumingRun,
     setStoppingRun,
     setQueueingDeferredInput,
     setWorkSurface,
-    runAttachRetrySignal: _runAttachRetrySignal,
+    runAttachRetrySignal,
     setRunAttachRetrySignal: _setRunAttachRetrySignal,
     refreshEdgeWorkspaces,
   } = params;
 
   // Refs
   const streamAbortRef = useRef<AbortController | null>(null);
-  const attachedRunRef = useRef<string | null>(null);
+  const attachedRunRef = useRef<StreamBinding | null>(null);
   const attachedRunLeaseRef = useRef(0);
-  const autoAttachAttemptedRunRef = useRef<string | null>(null);
+  const autoAttachAttemptedRunRef = useRef<StreamBinding | null>(null);
   const autoAttachRetryTimerRef = useRef<number | undefined>(undefined);
   const autoAttachRetryCountsRef = useRef<Map<string, number>>(new Map());
   const reconcileTimerRef = useRef<number | undefined>(undefined);
   const reconcileIntervalRef = useRef<number | undefined>(undefined);
   const stopReconcileRef = useRef<() => void>(() => {
-    if (reconcileTimerRef.current) {
-      window.clearTimeout(reconcileTimerRef.current);
-      reconcileTimerRef.current = undefined;
-    }
     if (reconcileIntervalRef.current) {
       window.clearInterval(reconcileIntervalRef.current);
       reconcileIntervalRef.current = undefined;
     }
+    if (reconcileTimerRef.current) {
+      window.clearTimeout(reconcileTimerRef.current);
+      reconcileTimerRef.current = undefined;
+    }
   });
+  const stopOperationRef = useRef<StopOperation | null>(null);
   const runControlMutationRef = useRef(false);
+  const detailRef = useRef(detail);
+  detailRef.current = detail;
   const [pendingApproval, setPendingApproval] = useState<PendingRunApproval | null>(null);
   const [approvalResponsePending, setApprovalResponsePending] = useState(false);
   const handleApprovalRequired = useCallback((approval: PendingRunApproval) => {
@@ -294,34 +261,29 @@ export function useStreamLifecycle(
   );
 
   // -- Stream signal helpers --
-  const nextStreamAbortSignal = useCallback(() => {
+  const nextStreamAbortController = useCallback(() => {
     streamAbortRef.current?.abort();
+    attachedRunLeaseRef.current += 1;
+    attachedRunRef.current = null;
     const controller = new AbortController();
     streamAbortRef.current = controller;
-    return controller.signal;
+    return controller;
   }, []);
 
-  const claimAttachedRun = useCallback((runId: string) => {
-    attachedRunLeaseRef.current += 1;
-    const lease = attachedRunLeaseRef.current;
-    attachedRunRef.current = runId;
-    return lease;
+  const claimAttachedRun = useCallback((binding: StreamBinding) => {
+    attachedRunRef.current = binding;
+    return attachedRunLeaseRef.current;
   }, []);
 
-  const clearAttachedRun = useCallback((runId: string, lease?: number) => {
+  const clearAttachedRun = useCallback((runId?: string, lease?: number) => {
+    if (runId && attachedRunRef.current?.runId !== runId) return;
+    if (lease !== undefined && attachedRunLeaseRef.current !== lease) return;
     if (lease === undefined) {
       attachedRunLeaseRef.current += 1;
-      if (attachedRunRef.current === runId) {
-        attachedRunRef.current = null;
-      }
-      return;
+      streamAbortRef.current?.abort();
     }
-    if (
-      attachedRunLeaseRef.current === lease &&
-      attachedRunRef.current === runId
-    ) {
-      attachedRunRef.current = null;
-    }
+    attachedRunRef.current = null;
+    streamAbortRef.current = null;
   }, []);
 
   const resetWorkSurfaceRun = useCallback(
@@ -339,78 +301,24 @@ export function useStreamLifecycle(
     [detail.session?.backendSessionId, setWorkSurface],
   );
 
-  const ensureStreamingAssistantMessage = useCallback(
-    (preferredMessageId?: string | null) => {
-      if (
-        preferredMessageId &&
-        detail.messages.some(
-          (message) =>
-            message.id === preferredMessageId && message.role === "assistant",
-        )
-      ) {
-        return preferredMessageId;
-      }
-      const existingAssistantMessageId = findStreamingAssistantMessageId(
-        detail.messages,
-      );
-      if (existingAssistantMessageId) {
-        return existingAssistantMessageId;
-      }
-      const assistantMessageId = preferredMessageId ?? crypto.randomUUID();
-      setDetail((current) =>
-        current.messages.some(
-          (message) =>
-            message.id === assistantMessageId && message.role === "assistant",
-        ) || findStreamingAssistantMessageId(current.messages)
-          ? current
-          : {
-              ...current,
-              messages: [
-                ...current.messages,
-                {
-                  id: assistantMessageId,
-                  role: "assistant" as const,
-                  content: "",
-                  createdAt: new Date().toISOString(),
-                  status: "streaming" as const,
-                  reasoning: "",
-                  reasoningStatus: "streaming" as const,
-                },
-              ],
-            },
-      );
-      return assistantMessageId;
-    },
-    [detail.messages, setDetail],
-  );
-
-  const scheduleAutoAttachRetry = useCallback(
-    (runId: string) => {
-      const attempts = autoAttachRetryCountsRef.current.get(runId) ?? 0;
-      if (attempts >= RUN_ATTACH_MAX_RETRIES) {
-        return false;
-      }
-      const nextAttempts = attempts + 1;
-      autoAttachRetryCountsRef.current.set(runId, nextAttempts);
-      if (autoAttachRetryTimerRef.current) {
-        window.clearTimeout(autoAttachRetryTimerRef.current);
-      }
-      const delayMs = Math.min(1_000 * 2 ** attempts, 8_000);
-      autoAttachRetryTimerRef.current = window.setTimeout(() => {
-        autoAttachRetryTimerRef.current = undefined;
-        if (autoAttachAttemptedRunRef.current === runId) {
-          autoAttachAttemptedRunRef.current = null;
-        }
-        _setRunAttachRetrySignal((signal) => signal + 1);
-      }, delayMs);
-      return true;
-    },
-    [_setRunAttachRetrySignal],
-  );
+  const scheduleAutoAttachRetry = useCallback((binding: StreamBinding) => {
+    const key = JSON.stringify(binding);
+    const attempts = autoAttachRetryCountsRef.current.get(key) ?? 0;
+    if (attempts >= RUN_ATTACH_MAX_RETRIES) return false;
+    autoAttachRetryCountsRef.current.set(key, attempts + 1);
+    if (autoAttachRetryTimerRef.current) window.clearTimeout(autoAttachRetryTimerRef.current);
+    autoAttachRetryTimerRef.current = window.setTimeout(() => {
+      autoAttachRetryTimerRef.current = undefined;
+      if (!sameRunBinding(streamBinding(detailRef.current), binding)) return;
+      if (sameRunBinding(autoAttachAttemptedRunRef.current, binding)) autoAttachAttemptedRunRef.current = null;
+      _setRunAttachRetrySignal(signal => signal + 1);
+    }, Math.min(1_000 * 2 ** attempts, 8_000));
+    return true;
+  }, [_setRunAttachRetrySignal]);
 
   // -- Hydrate work surface --
   const hydrateWorkSurfaceForChat = useCallback(
-    async (options?: { silent?: boolean }) => {
+    async (options?: { silent?: boolean; isCurrent?: () => boolean }) => {
       const sessionId = detail.session?.backendSessionId ?? null;
       if (!options?.silent) {
         setWorkSurface((current) =>
@@ -420,14 +328,14 @@ export function useStreamLifecycle(
       try {
         const response = await getChatWorkSurface(detail.chat.id);
         setWorkSurface((current) =>
-          hydrateWorkSurface(
+          options?.isCurrent && !options.isCurrent() ? current : hydrateWorkSurface(
             current,
             response as unknown as WorkSurfaceProjection,
           ),
         );
       } catch (error) {
         setWorkSurface((current) =>
-          failWorkSurfaceLoad(
+          options?.isCurrent && !options.isCurrent() ? current : failWorkSurfaceLoad(
             current,
             error instanceof Error
               ? error.message
@@ -493,15 +401,15 @@ export function useStreamLifecycle(
   );
 
   const applyArtifactPublication = useCallback(
-    (assistantMessageId: string, event: import("@astra/sdk").ArtifactPublicationV1) => {
-      setDetail((current) => ({ ...current, messages: current.messages.map((message) =>
+    (assistantMessageId: string, event: import("@astra/sdk").ArtifactPublicationV1, updateDetail = setDetail) => {
+      updateDetail((current) => ({ ...current, messages: current.messages.map((message) =>
         message.id === assistantMessageId ? { ...message, artifactPublication: event } : message) }));
     }, [setDetail],
   );
 
   const applyExplainAnalyzeEvent = useCallback(
-    (assistantMessageId: string, event: import("@astra/sdk").ExplainAnalyzeEventV1) => {
-      setDetail((current) => ({
+    (assistantMessageId: string, event: import("@astra/sdk").ExplainAnalyzeEventV1, updateDetail = setDetail) => {
+      updateDetail((current) => ({
         ...current,
         messages: current.messages.map((message) => {
           if (message.id !== assistantMessageId) return message;
@@ -512,8 +420,8 @@ export function useStreamLifecycle(
     [setDetail],
   );
 
-  const markExplainAnalyzeInvalid = useCallback((assistantMessageId: string) => {
-    setDetail((current) => ({ ...current, messages: current.messages.map((message) =>
+  const markExplainAnalyzeInvalid = useCallback((assistantMessageId: string, updateDetail = setDetail) => {
+    updateDetail((current) => ({ ...current, messages: current.messages.map((message) =>
       message.id === assistantMessageId ? markExplainGap(message, true) : message,
     ) }));
   }, [setDetail]);
@@ -602,184 +510,215 @@ export function useStreamLifecycle(
   );
 
   // -- Attach existing run stream --
-  const attachExistingRunStream = useCallback(
-    (
-      runId: string,
-      assistantMessageId: string,
-      failureMessage: string,
-      options?: { scheduleRetry?: () => boolean },
-    ) => {
-      if (attachedRunRef.current === runId) {
+  const handleProjectionFailure = useCallback((
+    error: unknown,
+    assistantMessageId: string,
+    assistantPatcher: ReturnType<typeof createAssistantPatchController>,
+    updateDetail = setDetail,
+  ): boolean => {
+    if (!(error instanceof WebApiError)) return false;
+    if (error.code === "stream_projection_busy" || error.code === "stream_continuation_unavailable") {
+      assistantPatcher.flushNow();
+      addToast(error.detail, "error");
+      return true;
+    }
+    if (error.code !== "canonical_persistence_failed") return false;
+    // The HTTP stream reached the runtime. Keep admitted output, including a
+    // pending animation-frame patch, instead of treating this as reconnect failure.
+    assistantPatcher.flushNow();
+    updateDetail((current) => ({
+      ...current,
+      activeRun: current.activeRun?.assistantMessageId === assistantMessageId ? undefined : current.activeRun,
+      messages: current.messages.map((message) => {
+        if (message.id !== assistantMessageId) return message;
+        const content = appendRunFailure(message.content, error.detail);
+        return {
+          ...message,
+          content,
+          completedAt: new Date().toISOString(),
+          status: "failed",
+          reasoningStatus: undefined,
+        };
+      }),
+    }));
+    return true;
+  }, [setDetail, addToast]);
+
+  const attachExistingRunStream = useCallback((binding: StreamBinding, nextEventIndex: number) => {
+    const { chatId, runId, assistantMessageId } = binding;
+    const controller = nextStreamAbortController();
+    const signal = controller.signal;
+    const lease = claimAttachedRun(binding);
+    let receiving = true;
+    const ownsSelection = (current: ChatDetail) => attachedRunLeaseRef.current === lease &&
+      sameRunBinding(streamBinding(current), binding);
+    const canReceive = () => receiving && !signal.aborted && ownsSelection(detailRef.current);
+    // React may execute an update after a replacement was queued in the same batch.
+    // EOF closes callbacks, but already-queued updates retain their valid lease.
+    const updateDetail: Dispatch<SetStateAction<ChatDetail>> = update => setDetail(current =>
+      ownsSelection(current)
+        ? typeof update === "function" ? update(current) : update
+        : current);
+    const assistantPatcher = createAssistantPatchController({ setDetail: updateDetail, getAssistantId: () => assistantMessageId });
+    const abort = () => { receiving = false; assistantPatcher.cancel(); };
+    signal.addEventListener("abort", abort, { once: true });
+    resetWorkSurfaceRun(runId);
+    const settleMessage = (content: string, paused = false) => {
+      assistantPatcher.flushNow();
+      updateDetail(current => ({
+        ...current,
+        activeRun: paused ? current.activeRun : undefined,
+        messages: current.messages.map(message => message.id === assistantMessageId ? {
+          ...message,
+          ...(content ? { content } : {}),
+          completedAt: new Date().toISOString(),
+          reasoningStatus: "complete",
+          status: "complete",
+        } : message),
+      }));
+    };
+    // Immediate layout cleanup (including StrictMode) invalidates this admission.
+    void Promise.resolve().then(async () => {
+      if (!canReceive()) return;
+      await streamExistingChatRun(chatId, runId, {
+        signal,
+        onWorkSurfaceEvent: event => {
+          if (canReceive()) applyWorkSurfaceStreamEvent(event);
+        },
+        onWarning: message => {
+          if (canReceive()) addToast(message, "warning");
+        },
+        onArtifactPublication: event => {
+          if (canReceive()) applyArtifactPublication(assistantMessageId, event, updateDetail);
+        },
+        onExplainAnalyzeEvent: event => {
+          if (canReceive()) applyExplainAnalyzeEvent(assistantMessageId, event, updateDetail);
+        },
+        onExplainAnalyzeInvalid: () => {
+          if (canReceive()) markExplainAnalyzeInvalid(assistantMessageId, updateDetail);
+        },
+        onStreamGap: gap => {
+          if (canReceive()) repairExplainAnalyzeFromDurable(assistantMessageId, gap.runId, gap.nextEventIndex);
+        },
+        onApprovalRequired: approval => {
+          if (canReceive()) handleApprovalRequired(approval);
+        },
+        onInteractionResolved: () => {
+          if (canReceive()) clearPendingInteraction();
+        },
+        onRunUpdated: run => {
+          if (canReceive()) updateDetail(current => ({
+            ...current,
+            activeRun: mergeStreamRunUpdate({ ...run, assistantMessageId }, current.activeRun),
+          }));
+        },
+        onRunFinished: run => {
+          if (canReceive()) {
+            assistantPatcher.patchNow({ contextNotSaved: run.contextNotSaved });
+            setStoppingRun(false);
+          }
+        },
+        onReasoning: reasoning => {
+          if (canReceive()) assistantPatcher.patchBatched({ reasoning, reasoningStatus: "streaming", status: "streaming" });
+        },
+        onReasoningDone: reasoning => {
+          if (canReceive()) assistantPatcher.patchBatched({ reasoning, reasoningStatus: "complete", status: "streaming" });
+        },
+        onText: content => {
+          if (canReceive()) assistantPatcher.patchBatched({ content, status: "streaming" });
+        },
+        onArtifacts: artifacts => {
+          if (canReceive()) assistantPatcher.patchBatched({ artifacts });
+        },
+        onDone: content => {
+          if (canReceive()) settleMessage(content || "Astra completed the run without returning visible text.");
+        },
+        onCancelled: content => {
+          if (canReceive()) settleMessage(content || "Stopped.");
+        },
+        onPaused: content => {
+          if (canReceive()) settleMessage(content, true);
+        },
+      }, { assistantMessageId, nextEventIndex });
+    }).catch(async (error: unknown) => {
+      if (!canReceive() || isAbortError(error)) return;
+      if (isAuthRequiredError(error)) {
+        router.push(`/login?next=${encodeURIComponent(`/chats/${chatId}`)}`);
         return;
       }
+      if (isNotFoundError(error)) {
+        router.replace(chatListHref);
+        return;
+      }
+      if (handleProjectionFailure(error, assistantMessageId, assistantPatcher, updateDetail)) return;
+      assistantPatcher.flushNow();
+      try {
+        const refreshed = await getChat(chatId);
+        if (!canReceive()) return;
+        updateDetail(refreshed);
+      } catch { /* Keep admitted output when authoritative refresh is unavailable. */ }
+      if (!canReceive()) return;
+      if (!scheduleAutoAttachRetry(binding)) {
+        addToast(error instanceof Error ? error.message : "The active run stream could not be reconnected.", "warning");
+      }
+    }).finally(() => {
+      receiving = false;
+      signal.removeEventListener("abort", abort);
+      clearAttachedRun(runId, lease);
+      assistantPatcher.cancel();
+    });
+  }, [nextStreamAbortController, claimAttachedRun, setDetail, resetWorkSurfaceRun,
+    applyWorkSurfaceStreamEvent, applyArtifactPublication, applyExplainAnalyzeEvent, markExplainAnalyzeInvalid,
+    addToast, repairExplainAnalyzeFromDurable, handleApprovalRequired,
+    clearPendingInteraction, setStoppingRun, router, chatListHref, handleProjectionFailure,
+    scheduleAutoAttachRetry, clearAttachedRun]);
 
-      const attachLease = claimAttachedRun(runId);
-      resetWorkSurfaceRun(runId);
-      const assistantPatcher = createAssistantPatchController({
-        setDetail,
-        getAssistantId: () => assistantMessageId,
-      });
-      const clearActiveRun = () => {
-        setDetail((current) =>
-          current.activeRun?.runId === runId
-            ? {
-                ...current,
-                activeRun: undefined,
-              }
-            : current,
-        );
-      };
-
-      void streamExistingChatRun(
-        detail.chat.id,
-        runId,
-        {
-          signal: nextStreamAbortSignal(),
-          onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
-          onWarning: (message) => addToast(message, "warning"),
-          onArtifactPublication: (event) => applyArtifactPublication(assistantMessageId, event),
-          onExplainAnalyzeEvent: (event) =>
-            applyExplainAnalyzeEvent(assistantMessageId, event),
-          onExplainAnalyzeInvalid: () => markExplainAnalyzeInvalid(assistantMessageId),
-          onStreamGap: (gap) =>
-            repairExplainAnalyzeFromDurable(
-              assistantMessageId,
-              gap.runId,
-              gap.nextEventIndex,
-            ),
-          onApprovalRequired: handleApprovalRequired,
-          onInteractionResolved: clearPendingInteraction,
-          onRunUpdated: (run) => {
-            setDetail((current) => ({
-              ...current,
-              activeRun: mergeStreamRunUpdate(
-                { ...run, assistantMessageId },
-                current.activeRun,
-              ),
-            }));
-          },
-          onRunFinished: () => {
-            setStoppingRun(false);
-            clearActiveRun();
-          },
-          onReasoning: (reasoning) => {
-            assistantPatcher.patchBatched({
-              reasoning,
-              reasoningStatus: "streaming",
-              status: "streaming",
-            });
-          },
-          onReasoningDone: (reasoning) => {
-            assistantPatcher.patchBatched({
-              reasoning,
-              reasoningStatus: "complete",
-              status: "streaming",
-            });
-          },
-          onText: (content) => {
-            assistantPatcher.patchBatched({ content, status: "streaming" });
-          },
-          onArtifacts: (artifacts) => {
-            assistantPatcher.patchBatched({ artifacts });
-          },
-          onDone: (content) => {
-            assistantPatcher.flushNow();
-            clearActiveRun();
-            assistantPatcher.patchNow({
-              content:
-                content ||
-                "Astra completed the run without returning visible text.",
-              completedAt: new Date().toISOString(),
-              reasoningStatus: "complete",
-              status: "complete",
-            });
-          },
-          onCancelled: (content) => {
-            assistantPatcher.flushNow();
-            clearActiveRun();
-            assistantPatcher.patchNow({
-              content: content || "Stopped.",
-              completedAt: new Date().toISOString(),
-              reasoningStatus: "complete",
-              status: "complete",
-            });
-          },
-          onPaused: (content) => {
-            assistantPatcher.flushNow();
-            assistantPatcher.patchNow({
-              ...(content ? { content } : {}),
-              completedAt: new Date().toISOString(),
-              reasoningStatus: "complete",
-              status: "complete",
-            });
-          },
-        },
-        {
-          assistantMessageId,
-          nextEventIndex:
-            detail.activeRun?.runId === runId
-              ? (detail.activeRun.nextEventIndex ?? null)
-              : null,
-        },
-      )
-        .catch((streamError: unknown) => {
-          if (isAbortError(streamError)) {
-            return;
-          }
-          if (isAuthRequiredError(streamError)) {
-            router.push(
-              `/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`,
-            );
-            return;
-          }
-          if (isNotFoundError(streamError)) {
-            router.replace(chatListHref);
-            return;
-          }
-          if (options?.scheduleRetry?.()) {
-            assistantPatcher.patchNow({
-              status: "streaming",
-              reasoningStatus: "streaming",
-            });
-            return;
-          }
-          assistantPatcher.patchNow({
-            content:
-              streamError instanceof Error
-                ? `${failureMessage} (${streamError.message})`
-                : failureMessage,
-            completedAt: new Date().toISOString(),
-            reasoningStatus: "complete",
-            status: "failed",
-          });
-        })
-        .finally(() => {
-          clearAttachedRun(runId, attachLease);
-          assistantPatcher.cancel();
-        });
-    },
-    [
-      addToast,
-      applyWorkSurfaceStreamEvent,
-      applyArtifactPublication,
-    applyExplainAnalyzeEvent,
-      markExplainAnalyzeInvalid,
-      repairExplainAnalyzeFromDurable,
-      clearPendingInteraction,
-      handleApprovalRequired,
-      chatListHref,
-      claimAttachedRun,
-      clearAttachedRun,
-      detail.activeRun?.nextEventIndex,
-      detail.activeRun?.runId,
-      detail.chat.id,
-      nextStreamAbortSignal,
-      resetWorkSurfaceRun,
-      setDetail,
-      setStoppingRun,
-      router,
-    ],
-  );
+  // One committed selection owns live GET admission. Cursor/status progress does
+  // not replace an existing transport; a different message/session/root does.
+  useLayoutEffect(() => {
+    const binding = streamBinding(detail);
+    const hasAssistant = !!binding && detail.messages.some(message =>
+      message.id === binding.assistantMessageId && message.role === "assistant");
+    if (attachedRunRef.current && (!sameRunBinding(attachedRunRef.current, binding) || !hasAssistant)) clearAttachedRun();
+    if (!sameRunBinding(autoAttachAttemptedRunRef.current, binding)) {
+      autoAttachAttemptedRunRef.current = null;
+      const selectedKey = binding ? JSON.stringify(binding) : null;
+      for (const key of autoAttachRetryCountsRef.current.keys()) {
+        if (key !== selectedKey) autoAttachRetryCountsRef.current.delete(key);
+      }
+      if (autoAttachRetryTimerRef.current) window.clearTimeout(autoAttachRetryTimerRef.current);
+      autoAttachRetryTimerRef.current = undefined;
+    }
+    const stop = stopOperationRef.current;
+    if (stop && (!sameRunBinding(chatRunBinding(detail), stop.binding) || !canAttachRunStream(detail.activeRun?.status))) {
+      stop.retire();
+    } else if (stop && detail.activeRun?.status === "cancelling") {
+      if (!runControlBusy) stop.ensureReconciliation();
+      return;
+    }
+    if (!canAttachRunStream(detail.activeRun?.status)) {
+      autoAttachAttemptedRunRef.current = null;
+      autoAttachRetryCountsRef.current.clear();
+      if (autoAttachRetryTimerRef.current) window.clearTimeout(autoAttachRetryTimerRef.current);
+      autoAttachRetryTimerRef.current = undefined;
+      return;
+    }
+    if (isArchived || detail.pendingTurn || runControlBusy || !detail.session?.backendSessionId || !binding ||
+      sameRunBinding(attachedRunRef.current, binding) ||
+      !Number.isSafeInteger(detail.activeRun?.nextEventIndex) || detail.activeRun!.nextEventIndex! < 0 ||
+      !hasAssistant) return;
+    const attempted = sameRunBinding(autoAttachAttemptedRunRef.current, binding);
+    if (stop && !stop.retired && sameRunBinding(stop.binding, binding) && detail.activeRun?.status !== "cancelling") {
+      // Recovery follows committed selection, including a late cancellation
+      // rejection. Hand off once; normal observation owns all later retries.
+      stop.retire();
+      if (attempted && !autoAttachRetryTimerRef.current) scheduleAutoAttachRetry(binding);
+    }
+    if (attempted) return;
+    autoAttachAttemptedRunRef.current = binding;
+    attachExistingRunStream(binding, detail.activeRun!.nextEventIndex!);
+  }, [detail, isArchived, runControlBusy, runAttachRetrySignal, attachExistingRunStream,
+    clearAttachedRun, scheduleAutoAttachRetry]);
 
   // -- Start new stream --
   const startStream = useCallback(
@@ -821,13 +760,24 @@ export function useStreamLifecycle(
         reasoningStatus: "streaming",
       };
 
+      const controller = nextStreamAbortController();
+      const signal = controller.signal;
+      const creationLease = attachedRunLeaseRef.current;
+      let streamRunId: string | null = null;
+      let streamRunLease: number | null = null;
+      let streamSessionId = detail.session?.backendSessionId ?? null;
+      const canReceive = () => !signal.aborted && attachedRunLeaseRef.current === creationLease;
+      const updateDetail: Dispatch<SetStateAction<ChatDetail>> = update => setDetail(current => {
+        if (attachedRunLeaseRef.current !== creationLease || current.chat.id !== detail.chat.id ||
+          streamRunId && current.activeRun && (current.activeRun.runId !== streamRunId ||
+            current.activeRun.assistantMessageId !== currentAssistantId)) return current;
+        return typeof update === "function" ? update(current) : update;
+      });
       const assistantPatcher = createAssistantPatchController({
-        setDetail,
+        setDetail: updateDetail,
         getAssistantId: () => currentAssistantId,
       });
       let recoveredFromHydration = false;
-      let streamRunId: string | null = null;
-      let streamRunLease: number | null = null;
       const canReconcilePersistedTranscript = Boolean(pendingMessageId);
       const stopReconcile = () => {
         stopReconcileRef.current();
@@ -835,12 +785,12 @@ export function useStreamLifecycle(
         reconcileIntervalRef.current = undefined;
       };
       const reconcilePersistedTranscript = async () => {
-        if (!canReconcilePersistedTranscript || recoveredFromHydration) {
+        if (!canReceive() || !canReconcilePersistedTranscript || recoveredFromHydration) {
           return;
         }
         const refreshed = await getChat(detail.chat.id).catch(() => null);
         if (
-          !refreshed ||
+          !canReceive() || !refreshed ||
           !hasCompletedAssistantAfterUser(refreshed, pendingMessageId!)
         ) {
           return;
@@ -849,8 +799,8 @@ export function useStreamLifecycle(
         stopReconcile();
         setStartingRun(false);
         setStoppingRun(false);
-        setDetail(refreshed);
-        streamAbortRef.current?.abort();
+        updateDetail(refreshed);
+        controller.abort();
       };
       if (canReconcilePersistedTranscript) {
         reconcileTimerRef.current = window.setTimeout(() => {
@@ -862,7 +812,7 @@ export function useStreamLifecycle(
       }
 
       setStartingRun(true);
-      setDetail((current) => ({
+      updateDetail((current) => ({
         ...current,
         chat: {
           ...current.chat,
@@ -883,30 +833,27 @@ export function useStreamLifecycle(
       };
       try {
         await streamChatMessage(detail.chat.id, streamPayload, {
-          signal: nextStreamAbortSignal(),
-          onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
-          onWarning: (message) => addToast(message, "warning"),
-          onArtifactPublication: (event) => applyArtifactPublication(currentAssistantId, event),
-          onExplainAnalyzeEvent: (event) =>
-            applyExplainAnalyzeEvent(currentAssistantId, event),
-          onExplainAnalyzeInvalid: () => markExplainAnalyzeInvalid(currentAssistantId),
-          onStreamGap: (gap) =>
-            repairExplainAnalyzeFromDurable(
-              currentAssistantId,
-              gap.runId,
-              gap.nextEventIndex,
-            ),
-          onApprovalRequired: handleApprovalRequired,
-          onInteractionResolved: clearPendingInteraction,
+          signal,
+          onWorkSurfaceEvent: event => { if (canReceive()) applyWorkSurfaceStreamEvent(event); },
+          onWarning: message => { if (canReceive()) addToast(message, "warning"); },
+          onArtifactPublication: event => { if (canReceive()) applyArtifactPublication(currentAssistantId, event, updateDetail); },
+          onExplainAnalyzeEvent: event => { if (canReceive()) applyExplainAnalyzeEvent(currentAssistantId, event, updateDetail); },
+          onExplainAnalyzeInvalid: () => { if (canReceive()) markExplainAnalyzeInvalid(currentAssistantId, updateDetail); },
+          onStreamGap: gap => {
+            if (canReceive()) repairExplainAnalyzeFromDurable(currentAssistantId, gap.runId, gap.nextEventIndex);
+          },
+          onApprovalRequired: approval => { if (canReceive()) handleApprovalRequired(approval); },
+          onInteractionResolved: () => { if (canReceive()) clearPendingInteraction(); },
           onLocalMessages: ({
             userMessage: localUserMessage,
             assistantMessage: localAssistantMessage,
           }) => {
+            if (!canReceive()) return;
             const previousAssistantId = currentAssistantId;
             const previousUserId = currentUserId;
             currentAssistantId = localAssistantMessage.id;
             currentUserId = localUserMessage.id;
-            setDetail((current) => {
+            updateDetail((current) => {
               let sawAssistant = false;
               let sawUser = false;
               const messages = current.messages.flatMap((message) => {
@@ -946,11 +893,13 @@ export function useStreamLifecycle(
             });
           },
           onRunStarted: (runId) => {
+            if (!canReceive()) return;
             streamRunId = runId;
-            streamRunLease = claimAttachedRun(runId);
+            streamRunLease = claimAttachedRun({ chatId: detail.chat.id, sessionId: streamSessionId ?? detail.session?.backendSessionId ?? detail.chat.id,
+              runId, assistantMessageId: currentAssistantId });
             resetWorkSurfaceRun(runId);
             setStartingRun(false);
-            setDetail((current) => ({
+            updateDetail((current) => ({
               ...current,
               activeRun: {
                 runId,
@@ -962,6 +911,11 @@ export function useStreamLifecycle(
             }));
           },
           onSessionBound: ({ sessionId }) => {
+            if (!canReceive()) return;
+            streamSessionId = sessionId;
+            if (streamRunLease !== null && attachedRunLeaseRef.current === streamRunLease && attachedRunRef.current) {
+              attachedRunRef.current = { ...attachedRunRef.current, sessionId };
+            }
             setWorkSurface((current) => ({
               ...resetWorkSurfaceForRun(current, {
                 sessionId,
@@ -969,7 +923,7 @@ export function useStreamLifecycle(
               }),
               error: null,
             }));
-            setDetail((current) => ({
+            updateDetail((current) => ({
               ...current,
               session: {
                 chatId: current.session?.chatId ?? current.chat.id,
@@ -980,7 +934,8 @@ export function useStreamLifecycle(
             }));
           },
           onRunUpdated: (run) => {
-            setDetail((current) => ({
+            if (!canReceive()) return;
+            updateDetail((current) => ({
               ...current,
               activeRun: mergeStreamRunUpdate(
                 { ...run, assistantMessageId: currentAssistantId },
@@ -988,19 +943,14 @@ export function useStreamLifecycle(
               ),
             }));
           },
-          onRunFinished: () => {
+          onRunFinished: run => {
+            if (!canReceive()) return;
+            assistantPatcher.patchNow({ contextNotSaved: run.contextNotSaved });
             setStoppingRun(false);
             setStartingRun(false);
-            setDetail((current) =>
-              streamRunId && current.activeRun?.runId === streamRunId
-                ? {
-                    ...current,
-                    activeRun: undefined,
-                  }
-                : current,
-            );
           },
           onReasoning: (reasoning) => {
+            if (!canReceive()) return;
             assistantPatcher.patchBatched({
               reasoning,
               reasoningStatus: "streaming",
@@ -1008,6 +958,7 @@ export function useStreamLifecycle(
             });
           },
           onReasoningDone: (reasoning) => {
+            if (!canReceive()) return;
             assistantPatcher.patchBatched({
               reasoning,
               reasoningStatus: "complete",
@@ -1015,15 +966,18 @@ export function useStreamLifecycle(
             });
           },
           onText: (content) => {
+            if (!canReceive()) return;
             assistantPatcher.patchBatched({ content, status: "streaming" });
           },
           onArtifacts: (artifacts) => {
+            if (!canReceive()) return;
             assistantPatcher.patchBatched({ artifacts });
           },
           onDone: (content) => {
+            if (!canReceive()) return;
             assistantPatcher.flushNow();
             setStartingRun(false);
-            setDetail((current) =>
+            updateDetail((current) =>
               streamRunId && current.activeRun?.runId === streamRunId
                 ? {
                     ...current,
@@ -1041,10 +995,11 @@ export function useStreamLifecycle(
             });
           },
           onCancelled: (content) => {
+            if (!canReceive()) return;
             assistantPatcher.flushNow();
             setStoppingRun(false);
             setStartingRun(false);
-            setDetail((current) =>
+            updateDetail((current) =>
               streamRunId && current.activeRun?.runId === streamRunId
                 ? {
                     ...current,
@@ -1060,6 +1015,7 @@ export function useStreamLifecycle(
             });
           },
           onPaused: (content) => {
+            if (!canReceive()) return;
             assistantPatcher.flushNow();
             assistantPatcher.patchNow({
               ...(content ? { content } : {}),
@@ -1070,7 +1026,7 @@ export function useStreamLifecycle(
           },
         });
       } catch (error) {
-        if (isAbortError(error)) {
+        if (!canReceive() || isAbortError(error)) {
           return;
         }
         if (isAuthRequiredError(error)) {
@@ -1082,7 +1038,7 @@ export function useStreamLifecycle(
         if (isNotFoundError(error)) {
           const targetAssistantId = currentAssistantId;
           const targetUserId = currentUserId;
-          setDetail((current) => ({
+          updateDetail((current) => ({
             ...current,
             messages: current.messages.filter(
               (message) =>
@@ -1093,6 +1049,21 @@ export function useStreamLifecycle(
           router.replace(chatListHref);
           return;
         }
+        if (error instanceof WebApiError && error.code === "stream_observation_interrupted") {
+          assistantPatcher.flushNow();
+          let observed = detailRef.current;
+          try {
+            const refreshed = await getChat(detail.chat.id);
+            if (!canReceive()) return;
+            observed = refreshed;
+            updateDetail(refreshed);
+          } catch { /* Keep the admitted answer and run when refresh is unavailable. */ }
+          if (!canReceive()) return;
+          const binding = streamBinding(observed);
+          if (!binding || !scheduleAutoAttachRetry(binding)) addToast(error.detail, "warning");
+          return;
+        }
+        if (handleProjectionFailure(error, currentAssistantId, assistantPatcher, updateDetail)) return;
         if (isWorkspaceSelectionError(error)) {
           setStartingRun(false);
           void refreshEdgeWorkspaces();
@@ -1116,8 +1087,10 @@ export function useStreamLifecycle(
           clearAttachedRun(streamRunId, streamRunLease);
         }
         assistantPatcher.cancel();
-        stopReconcile();
-        setStartingRun(false);
+        if (attachedRunLeaseRef.current === creationLease) {
+          stopReconcile();
+          setStartingRun(false);
+        }
       }
     },
     [
@@ -1129,12 +1102,15 @@ export function useStreamLifecycle(
       repairExplainAnalyzeFromDurable,
       clearPendingInteraction,
       handleApprovalRequired,
+      handleProjectionFailure,
+      scheduleAutoAttachRetry,
       chatListHref,
       claimAttachedRun,
       clearAttachedRun,
       detail.chat.archivedAt,
       detail.chat.id,
-      nextStreamAbortSignal,
+      detail.session?.backendSessionId,
+      nextStreamAbortController,
       refreshEdgeWorkspaces,
       resetWorkSurfaceRun,
       setDetail,
@@ -1150,12 +1126,13 @@ export function useStreamLifecycle(
   // -- Queue deferred input --
   const queueDeferredInput = useCallback(
     async ({ text, options }: { text: string; options: ComposerOptions }) => {
-      if (detail.chat.archivedAt) {
-        return;
+      if (detail.chat.archivedAt || runControlMutationRef.current) {
+        const error = new Error("Input was not queued. Review this session before submitting again.");
+        addToast(error.message, "error");
+        throw error;
       }
-      if (runControlMutationRef.current) {
-        return;
-      }
+      const binding = chatRunBinding(detail);
+      const matchesRequestedBinding = (current: ChatDetail) => sameRunBinding(chatRunBinding(current), binding);
       runControlMutationRef.current = true;
       setQueueingDeferredInput(true);
 
@@ -1166,362 +1143,169 @@ export function useStreamLifecycle(
           options,
           pendingMessageId,
         });
-        const assistantMessageId = result.assistantMessage.id;
-        const runId = result.activeRun.runId;
-        const attachLease = claimAttachedRun(runId);
-        resetWorkSurfaceRun(runId);
-        setDetail((current) => ({
-          ...current,
-          activeRun: result.activeRun,
-          messages: [
-            ...current.messages.filter(
-              (message) =>
-                message.id !== result.userMessage.id &&
-                message.id !== result.assistantMessage.id,
-            ),
-            result.userMessage,
-            result.assistantMessage,
-          ].sort(
-            (a, b) =>
-              new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
-          ),
-        }));
-        const assistantPatcher = createAssistantPatchController({
-          setDetail,
-          getAssistantId: () => assistantMessageId,
-        });
-        void streamExistingChatRun(
-          detail.chat.id,
-          runId,
-          {
-            signal: nextStreamAbortSignal(),
-            onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
-          onWarning: (message) => addToast(message, "warning"),
-            onArtifactPublication: (event) => applyArtifactPublication(assistantMessageId, event),
-            onExplainAnalyzeEvent: (event) =>
-              applyExplainAnalyzeEvent(assistantMessageId, event),
-          onExplainAnalyzeInvalid: () => markExplainAnalyzeInvalid(assistantMessageId),
-            onStreamGap: (gap) =>
-              repairExplainAnalyzeFromDurable(
-                assistantMessageId,
-                gap.runId,
-                gap.nextEventIndex,
-              ),
-            onApprovalRequired: handleApprovalRequired,
-            onInteractionResolved: clearPendingInteraction,
-            onRunUpdated: (run) => {
-              setDetail((current) => ({
-                ...current,
-                activeRun: mergeStreamRunUpdate(
-                  { ...run, assistantMessageId },
-                  current.activeRun,
-                ),
-              }));
-            },
-            onRunFinished: () => {
-              setStoppingRun(false);
-              setDetail((current) =>
-                current.activeRun?.runId === runId
-                  ? {
-                      ...current,
-                      activeRun: undefined,
-                    }
-                  : current,
-              );
-            },
-            onReasoning: (reasoning) => {
-              assistantPatcher.patchBatched({
-                reasoning,
-                reasoningStatus: "streaming",
-                status: "streaming",
-              });
-            },
-            onReasoningDone: (reasoning) => {
-              assistantPatcher.patchBatched({
-                reasoning,
-                reasoningStatus: "complete",
-                status: "streaming",
-              });
-            },
-            onText: (content) => {
-              assistantPatcher.patchBatched({ content, status: "streaming" });
-            },
-            onArtifacts: (artifacts) => {
-              assistantPatcher.patchBatched({ artifacts });
-            },
-            onDone: (content) => {
-              assistantPatcher.flushNow();
-              setDetail((current) =>
-                current.activeRun?.runId === runId
-                  ? {
-                      ...current,
-                      activeRun: undefined,
-                    }
-                  : current,
-              );
-              assistantPatcher.patchNow({
-                content:
-                  content ||
-                  "Astra completed the run without returning visible text.",
-                completedAt: new Date().toISOString(),
-                reasoningStatus: "complete",
-                status: "complete",
-              });
-            },
-            onCancelled: (content) => {
-              assistantPatcher.flushNow();
-              setDetail((current) =>
-                current.activeRun?.runId === runId
-                  ? {
-                      ...current,
-                      activeRun: undefined,
-                    }
-                  : current,
-              );
-              assistantPatcher.patchNow({
-                content: content || "Stopped.",
-                completedAt: new Date().toISOString(),
-                reasoningStatus: "complete",
-                status: "complete",
-              });
-            },
-            onPaused: (content) => {
-              assistantPatcher.flushNow();
-              assistantPatcher.patchNow({
-                ...(content ? { content } : {}),
-                completedAt: new Date().toISOString(),
-                reasoningStatus: "complete",
-                status: "complete",
-              });
-            },
-          },
-          {
-            assistantMessageId,
-            nextEventIndex: result.activeRun.nextEventIndex ?? null,
-          },
-        )
-          .catch((streamError: unknown) => {
-            if (isAbortError(streamError)) {
-              return;
-            }
-            if (isAuthRequiredError(streamError)) {
-              router.push(
-                `/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`,
-              );
-              return;
-            }
-            if (isNotFoundError(streamError)) {
-              router.replace(chatListHref);
-              return;
-            }
-            assistantPatcher.patchNow({
-              content:
-                streamError instanceof Error
-                  ? `The input was queued, but the web UI could not reconnect to the run stream. (${streamError.message})`
-                  : "The input was queued, but the web UI could not reconnect to the run stream.",
-              completedAt: new Date().toISOString(),
-              status: "failed",
-            });
-          })
-          .finally(() => {
-            clearAttachedRun(runId, attachLease);
-            assistantPatcher.cancel();
+        setDetail(current => !matchesRequestedBinding(current) ? current : {
+            ...current, activeRun: result.activeRun,
+            messages: [...current.messages.filter(message => message.id !== result.userMessage.id && message.id !== result.assistantMessage.id),
+              result.userMessage, result.assistantMessage].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt)),
           });
       } catch (error) {
-        if (isAuthRequiredError(error)) {
-          router.push(
-            `/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`,
-          );
-          return;
-        }
-        if (isNotFoundError(error)) {
-          router.replace(chatListHref);
-          return;
-        }
         if (error instanceof WebApiError && error.status === 409) {
           const refreshed = await getChat(detail.chat.id).catch(() => null);
-          if (refreshed) {
-            setDetail(refreshed);
-            if (!refreshed.chat.archivedAt && !refreshed.activeRun?.runId) {
-              void startStream({ text, options, appendUser: true });
-              return;
-            }
+          if (refreshed?.chat.id === detail.chat.id) {
+            setDetail(current => matchesRequestedBinding(current) ? refreshed : current);
           }
         }
         addToast(
-          error instanceof Error
-            ? error.message
-            : "Failed to queue input for the active run.",
+          `Queued input could not be confirmed. Your draft was kept. Review this session before submitting again.${error instanceof Error ? ` ${error.message}` : ""}`,
           "error",
         );
+        throw error;
       } finally {
         runControlMutationRef.current = false;
         setQueueingDeferredInput(false);
       }
     },
-    [
-      addToast,
-      applyWorkSurfaceStreamEvent,
-      applyArtifactPublication,
-    applyExplainAnalyzeEvent,
-      markExplainAnalyzeInvalid,
-      repairExplainAnalyzeFromDurable,
-      clearPendingInteraction,
-      handleApprovalRequired,
-      chatListHref,
-      claimAttachedRun,
-      clearAttachedRun,
-      detail.chat.archivedAt,
-      detail.chat.id,
-      nextStreamAbortSignal,
-      resetWorkSurfaceRun,
-      setDetail,
-      setQueueingDeferredInput,
-      setStoppingRun,
-      router,
-      startStream,
-    ],
+    [addToast, detail, setDetail, setQueueingDeferredInput],
   );
 
   // -- Stop active run --
   const stopActiveRun = useCallback(() => {
-    if (!detail.activeRun?.runId || !canStopRun) {
-      return;
-    }
-    const runId = detail.activeRun.runId;
-    const previousActiveRun = detail.activeRun;
-    const previousMessages = detail.messages;
-    if (runControlMutationRef.current) {
-      return;
-    }
+    const binding = chatRunBinding(detail);
+    if (!binding || !canStopRun || runControlMutationRef.current) return;
+    stopOperationRef.current?.retire();
+    stopReconcileRef.current();
+    const previousRun = detail.activeRun!;
+    const cancellingRun = { ...previousRun, status: "cancelling", waitingFor: "cancel_requested" };
+    const previousMessage = detail.messages.find(message => message.id === binding.assistantMessageId && message.role === "assistant");
+    const stoppedMessage = previousMessage ? stoppedAssistant(previousMessage) : undefined;
+    let released = false;
+    let timer: number | undefined;
+    const operation: StopOperation = {
+      binding, retired: false,
+      ensureReconciliation: () => scheduleReconciliation(STOP_RECONCILE_INITIAL_DELAY_MS),
+      release: () => {
+        if (released) return;
+        released = true;
+        if (stopOperationRef.current !== operation) return;
+        runControlMutationRef.current = false;
+        setStoppingRun(false);
+      },
+      retire: () => {
+        operation.retired = true;
+        if (timer !== undefined) {
+          window.clearTimeout(timer);
+          if (reconcileTimerRef.current === timer) reconcileTimerRef.current = undefined;
+          timer = undefined;
+        }
+        operation.release();
+        if (stopOperationRef.current === operation) stopOperationRef.current = null;
+      },
+    };
+    stopOperationRef.current = operation;
+    const owns = (current = detailRef.current) => !operation.retired &&
+      sameRunBinding(chatRunBinding(current), binding);
+    const hydrate = () => {
+      if (owns()) void hydrateWorkSurfaceForChat({ silent: true, isCurrent: owns });
+    };
+    const applyRefresh = (refreshed: ChatDetail, snapshot: ChatDetail) => setDetail(current =>
+      owns(current) && current === snapshot && refreshed.chat.id === binding.chatId &&
+      (refreshed.session?.backendSessionId ?? refreshed.chat.id) === binding.sessionId
+        ? refreshed : current);
     runControlMutationRef.current = true;
     setStoppingRun(true);
-    streamAbortRef.current?.abort();
-    clearAttachedRun(runId);
-    setDetail((current) => ({
+    if (sameRunBinding(attachedRunRef.current, streamBinding(detail))) clearAttachedRun(binding.runId);
+    setDetail(current => !owns(current) ? current : {
       ...current,
-      activeRun:
-        current.activeRun?.runId === runId
-          ? {
-              ...current.activeRun,
-              status: "cancelling",
-              waitingFor: "cancel_requested",
-            }
-          : current.activeRun,
-      messages: completeLatestStreamingAssistantAsStopped(current.messages),
-    }));
-    void hydrateWorkSurfaceForChat({ silent: true });
-    void withClientTimeout(
-      stopChatRun(detail.chat.id),
-      STOP_REQUEST_TIMEOUT_MS,
-      "Stop request timed out.",
-    )
-      .then((result) => {
-        setDetail((current) => ({
-          ...current,
-          activeRun: result.activeRun,
-        }));
-        void hydrateWorkSurfaceForChat({ silent: true });
-        if (result.cancelPending) {
-          const startedAt = Date.now();
-          let noticeShown = false;
-          const reconcileStop = async () => {
-            const refreshed = await getChat(detail.chat.id).catch(() => null);
-            if (!refreshed) {
-              return;
-            }
-            setDetail(refreshed);
-            void hydrateWorkSurfaceForChat({ silent: true });
-            const activeRun = refreshed.activeRun;
-            const stillCancelling =
-              activeRun?.runId === runId && activeRun.status === "cancelling";
-            if (!stillCancelling) {
-              stopReconcileRef.current();
-              return;
-            }
-            if (
-              !noticeShown &&
-              Date.now() - startedAt >= STOP_RECONCILE_NOTICE_MS
-            ) {
-              noticeShown = true;
-              addToast(
-                "Stop request is still being processed by the runtime.",
-                "info",
-              );
-            }
-          };
-          stopReconcileRef.current();
-          reconcileTimerRef.current = window.setTimeout(() => {
-            void reconcileStop();
-            reconcileIntervalRef.current = window.setInterval(() => {
-              void reconcileStop();
-            }, STOP_RECONCILE_INTERVAL_MS);
-          }, STOP_RECONCILE_INITIAL_DELAY_MS);
+      activeRun: current.activeRun === previousRun ? cancellingRun : current.activeRun,
+      messages: current.messages.map(message => message === previousMessage ? stoppedMessage! : message),
+    });
+    hydrate();
+    const startedAt = Date.now();
+    let noticeShown = false;
+    const scheduleReconciliation = (delay: number) => {
+      if (!released || timer !== undefined || !owns() || detailRef.current.activeRun?.status !== "cancelling") return;
+      // Reserve this cycle through its awaited read so committed renders cannot
+      // admit a second timer or overlapping reconciliation request.
+      const cycle = window.setTimeout(async () => {
+        try {
+          if (!owns() || detailRef.current.activeRun?.status !== "cancelling") return;
+          const snapshot = detailRef.current;
+          const refreshed = await getChat(binding.chatId).catch(() => null);
+          if (!owns() || detailRef.current.activeRun?.status !== "cancelling") return;
+          if (refreshed) applyRefresh(refreshed, snapshot);
+          hydrate();
+          if (!noticeShown && Date.now() - startedAt >= STOP_RECONCILE_NOTICE_MS) {
+            noticeShown = true;
+            addToast("Stop request is still being processed by the runtime.", "info");
+          }
+        } finally {
+          if (timer === cycle) timer = undefined;
+          if (reconcileTimerRef.current === cycle) reconcileTimerRef.current = undefined;
+          scheduleReconciliation(STOP_RECONCILE_INTERVAL_MS);
         }
-      })
-      .catch((error: unknown) => {
+      }, delay);
+      timer = cycle;
+      reconcileTimerRef.current = cycle;
+    };
+    void (async () => {
+      try {
+        const result = await withClientTimeout(stopChatRun(binding.chatId, binding),
+          STOP_REQUEST_TIMEOUT_MS, "Stop request timed out.");
+        if (!owns()) return;
+        if (result.activeRun && (result.activeRun.runId !== binding.runId ||
+          (result.activeRun.assistantMessageId ?? null) !== binding.assistantMessageId)) {
+          throw new Error("Stop response did not match the requested run.");
+        }
+        setDetail(current => !owns(current) || current.activeRun !== cancellingRun ? current : {
+          ...current,
+          activeRun: result.activeRun ? mergeStreamRunUpdate(result.activeRun, current.activeRun) : undefined,
+          messages: current.messages.map(message => message.id === binding.assistantMessageId && result.contextNotSaved !== undefined
+            ? { ...message, contextNotSaved: result.contextNotSaved } : message),
+        });
+        hydrate();
+      } catch (error) {
+        if (!owns()) return;
         if (isAuthRequiredError(error)) {
-          router.push(
-            `/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`,
-          );
+          router.push(`/login?next=${encodeURIComponent(`/chats/${binding.chatId}`)}`);
           return;
         }
         if (isNotFoundError(error)) {
           router.replace(chatListHref);
           return;
         }
-        void withClientTimeout(
-          getChat(detail.chat.id),
-          STOP_FAILURE_REFRESH_TIMEOUT_MS,
-          "Timed out refreshing the active run after stop failed.",
-        )
-          .then((refreshed) => {
-            setDetail(refreshed);
-            void hydrateWorkSurfaceForChat({ silent: true });
-          })
-          .catch(() => {
-            setDetail((current) => {
-              if (
-                current.activeRun?.runId !== runId ||
-                current.activeRun.status !== "cancelling"
-              ) {
-                return current;
-              }
-              return {
-                ...current,
-                activeRun: previousActiveRun,
-                messages: previousMessages,
-              };
-            });
-            void hydrateWorkSurfaceForChat({ silent: true });
+        const snapshot = detailRef.current;
+        try {
+          const refreshed = await withClientTimeout(getChat(binding.chatId),
+            STOP_FAILURE_REFRESH_TIMEOUT_MS, "Timed out refreshing the active run after stop failed.");
+          if (!owns()) return;
+          applyRefresh(refreshed, snapshot);
+        } catch {
+          setDetail(current => {
+            if (!owns(current) || current.activeRun !== cancellingRun) return current;
+            return {
+              ...current, activeRun: previousRun,
+              messages: current.messages.map(message => {
+                if (!previousMessage || !stoppedMessage || message.id !== previousMessage.id) return message;
+                return {
+                  ...message,
+                  ...Object.fromEntries((["content", "status", "completedAt", "reasoningStatus"] as const)
+                    .filter(key => message[key] === stoppedMessage[key])
+                    .map(key => [key, previousMessage[key]])),
+                };
+              }),
+            };
           });
-        addToast(
-          error instanceof Error
-            ? error.message
-            : "Failed to stop the active run.",
-          "error",
-        );
-      })
-      .finally(() => {
-        runControlMutationRef.current = false;
-        setStoppingRun(false);
-      });
-  }, [
-    addToast,
-    canStopRun,
-    chatListHref,
-    clearAttachedRun,
-    detail.activeRun,
-    detail.chat.id,
-    detail.messages,
-    hydrateWorkSurfaceForChat,
-    reconcileIntervalRef,
-    reconcileTimerRef,
-    setDetail,
-    setStoppingRun,
-    stopReconcileRef,
-    router,
-  ]);
+        }
+        if (owns()) {
+          hydrate();
+          addToast(error instanceof Error ? error.message : "Failed to stop the active run.", "error");
+        }
+      } finally {
+        operation.release();
+      }
+    })();
+  }, [addToast, canStopRun, chatListHref, clearAttachedRun, detail,
+    hydrateWorkSurfaceForChat, setDetail, setStoppingRun, router]);
 
   // -- Resume active run --
   const resumeActiveRun = useCallback(async () => {
@@ -1532,217 +1316,48 @@ export function useStreamLifecycle(
       return;
     }
     runControlMutationRef.current = true;
-    const existingAssistantMessageId = [...detail.messages]
-      .reverse()
-      .find(
-        (message) =>
-          message.role === "assistant" &&
-          (message.status === "streaming" ||
-            message.reasoningStatus === "streaming"),
-      )?.id;
-    const assistantMessageId =
-      existingAssistantMessageId ?? crypto.randomUUID();
+    const requestedRunId = detail.activeRun.runId;
+    const binding = chatRunBinding(detail)!;
+    const requestedSessionId = binding.sessionId;
+    const sameCurrentRun = (current = detailRef.current) => sameRunBinding(chatRunBinding(current), binding);
     setResumingRun(true);
-    let optimisticMessageId: string | null = null;
     try {
       const result = await resumeChatRun(detail.chat.id);
-      if (!result.activeRun?.runId) {
-        throw new Error("Resume response did not include an active run.");
+      if (!sameCurrentRun()) return;
+      if (result.activeRun?.runId !== requestedRunId) {
+        throw new Error("Resume response did not match the requested run.");
       }
-      const resumedActiveRun = result.activeRun;
-      const runId = resumedActiveRun.runId;
-      const attachLease = claimAttachedRun(runId);
-      resetWorkSurfaceRun(runId);
-      const appendedOptimistic =
-        !existingAssistantMessageId &&
-        !detail.messages.some((message) => message.id === assistantMessageId);
-      if (appendedOptimistic) {
-        optimisticMessageId = assistantMessageId;
-      }
-      setDetail((current) => ({
-        ...current,
-        activeRun: {
-          ...resumedActiveRun,
-          assistantMessageId,
-        },
-        messages:
-          existingAssistantMessageId ||
-          current.messages.some((message) => message.id === assistantMessageId)
-            ? current.messages
-            : [
-                ...current.messages,
-                {
-                  id: assistantMessageId,
-                  role: "assistant",
-                  content: "",
-                  createdAt: new Date().toISOString(),
-                  status: "streaming",
-                  reasoning: "",
-                  reasoningStatus: "streaming",
-                },
-              ],
-      }));
-      const assistantPatcher = createAssistantPatchController({
-        setDetail,
-        getAssistantId: () => assistantMessageId,
-      });
-      try {
-        await streamExistingChatRun(
-          detail.chat.id,
-          runId,
-          {
-            signal: nextStreamAbortSignal(),
-            onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
-          onWarning: (message) => addToast(message, "warning"),
-            onArtifactPublication: (event) => applyArtifactPublication(assistantMessageId, event),
-            onExplainAnalyzeEvent: (event) =>
-              applyExplainAnalyzeEvent(assistantMessageId, event),
-          onExplainAnalyzeInvalid: () => markExplainAnalyzeInvalid(assistantMessageId),
-            onStreamGap: (gap) =>
-              repairExplainAnalyzeFromDurable(
-                assistantMessageId,
-                gap.runId,
-                gap.nextEventIndex,
-              ),
-            onApprovalRequired: handleApprovalRequired,
-            onInteractionResolved: clearPendingInteraction,
-            onRunUpdated: (run) => {
-              setDetail((current) => ({
-                ...current,
-                activeRun: mergeStreamRunUpdate(
-                  { ...run, assistantMessageId },
-                  current.activeRun,
-                ),
-              }));
-            },
-            onRunFinished: () => {
-              setStoppingRun(false);
-              setDetail((current) =>
-                current.activeRun?.runId === runId
-                  ? {
-                      ...current,
-                      activeRun: undefined,
-                    }
-                  : current,
-              );
-            },
-            onReasoning: (reasoning) => {
-              assistantPatcher.patchBatched({
-                reasoning,
-                reasoningStatus: "streaming",
-                status: "streaming",
-              });
-            },
-            onReasoningDone: (reasoning) => {
-              assistantPatcher.patchBatched({
-                reasoning,
-                reasoningStatus: "complete",
-                status: "streaming",
-              });
-            },
-            onText: (content) => {
-              assistantPatcher.patchBatched({ content, status: "streaming" });
-            },
-            onArtifacts: (artifacts) => {
-              assistantPatcher.patchBatched({ artifacts });
-            },
-            onDone: (content) => {
-              assistantPatcher.flushNow();
-              setDetail((current) =>
-                current.activeRun?.runId === runId
-                  ? {
-                      ...current,
-                      activeRun: undefined,
-                    }
-                  : current,
-              );
-              assistantPatcher.patchNow({
-                content:
-                  content ||
-                  "Astra completed the run without returning visible text.",
-                completedAt: new Date().toISOString(),
-                reasoningStatus: "complete",
-                status: "complete",
-              });
-            },
-            onCancelled: (content) => {
-              assistantPatcher.flushNow();
-              setDetail((current) =>
-                current.activeRun?.runId === runId
-                  ? {
-                      ...current,
-                      activeRun: undefined,
-                    }
-                  : current,
-              );
-              assistantPatcher.patchNow({
-                content: content || "Stopped.",
-                completedAt: new Date().toISOString(),
-                reasoningStatus: "complete",
-                status: "complete",
-              });
-            },
-            onPaused: (content) => {
-              assistantPatcher.flushNow();
-              assistantPatcher.patchNow({
-                ...(content ? { content } : {}),
-                completedAt: new Date().toISOString(),
-                reasoningStatus: "complete",
-                status: "complete",
-              });
-            },
-          },
-          {
-            assistantMessageId,
-            nextEventIndex:
-              resumedActiveRun.nextEventIndex ??
-              detail.activeRun?.nextEventIndex ??
-              null,
-          },
-        );
-      } catch (streamError) {
-        if (isAbortError(streamError)) {
-          return;
-        }
-        if (isAuthRequiredError(streamError)) {
-          router.push(
-            `/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`,
-          );
-          return;
-        }
-        if (isNotFoundError(streamError)) {
-          router.replace(chatListHref);
-          return;
-        }
-        // Roll back optimistic message on stream error
-        if (optimisticMessageId) {
-          setDetail((current) => ({
-            ...current,
-            messages: current.messages.filter(
-              (message) => message.id !== optimisticMessageId,
-            ),
-          }));
-        }
+      const responseRun = result.activeRun;
+      let resumedActiveRun = responseRun;
+      let messages = detailRef.current.messages;
+      let refreshedDetail: ChatDetail | undefined;
+      const hasContinuation = () => !!resumedActiveRun.assistantMessageId &&
+        messages.some(message => message.id === resumedActiveRun.assistantMessageId && message.role === "assistant") &&
+        Number.isSafeInteger(resumedActiveRun.nextEventIndex) && resumedActiveRun.nextEventIndex! >= 0;
+      if (!hasContinuation()) {
+        let refreshed: ChatDetail;
         try {
-          const refreshed = await getChat(detail.chat.id);
-          setDetail(refreshed);
-        } catch (refreshError) {
-          console.warn(
-            "[stream-lifecycle] failed to refresh chat after stream error:",
-            refreshError,
-          );
-          // Keep the local running state if refresh also fails; the alert still
-          // tells the user that stream reconnection did not attach.
+          refreshed = await getChat(detail.chat.id);
+        } catch (error) {
+          setDetail(current => sameCurrentRun(current) ? { ...current,
+            activeRun: { ...responseRun, nextEventIndex: undefined } } : current);
+          throw error;
         }
-        addToast(
-          streamError instanceof Error
-            ? `The run resumed, but the web UI could not reconnect to its stream. (${streamError.message})`
-            : "The run resumed, but the web UI could not reconnect to its stream.",
-          "warning",
-        );
-      } finally {
-        clearAttachedRun(runId, attachLease);
-        assistantPatcher.cancel();
+        if (!sameCurrentRun()) return;
+        if (refreshed.activeRun?.runId !== requestedRunId ||
+          refreshed.session?.backendSessionId !== requestedSessionId) {
+          throw new Error("The run changed while restoring its stream binding.");
+        }
+        refreshedDetail = refreshed;
+        resumedActiveRun = refreshed.activeRun;
+        messages = refreshed.messages;
+      }
+      setDetail(current => sameCurrentRun(current)
+        ? { ...(refreshedDetail ?? current), activeRun: resumedActiveRun } : current);
+      if (!hasContinuation()) {
+        throw new WebApiError(409,
+          "The run resumed, but its stream continuation is unavailable. Reopen the session to inspect its recorded state.",
+          "stream_continuation_unavailable");
       }
     } catch (error) {
       if (isAbortError(error)) {
@@ -1758,15 +1373,6 @@ export function useStreamLifecycle(
         router.replace(chatListHref);
         return;
       }
-      // Roll back optimistic message on resume error
-      if (optimisticMessageId) {
-        setDetail((current) => ({
-          ...current,
-          messages: current.messages.filter(
-            (message) => message.id !== optimisticMessageId,
-          ),
-        }));
-      }
       addToast(
         error instanceof Error
           ? error.message
@@ -1777,30 +1383,7 @@ export function useStreamLifecycle(
       runControlMutationRef.current = false;
       setResumingRun(false);
     }
-  }, [
-    addToast,
-    applyWorkSurfaceStreamEvent,
-    applyArtifactPublication,
-    applyExplainAnalyzeEvent,
-    markExplainAnalyzeInvalid,
-    repairExplainAnalyzeFromDurable,
-    clearPendingInteraction,
-    handleApprovalRequired,
-    canResumeRun,
-    chatListHref,
-    claimAttachedRun,
-    clearAttachedRun,
-    detail.activeRun?.nextEventIndex,
-    detail.activeRun?.runId,
-    detail.chat.id,
-    detail.messages,
-    nextStreamAbortSignal,
-    resetWorkSurfaceRun,
-    setDetail,
-    setResumingRun,
-    setStoppingRun,
-    router,
-  ]);
+  }, [addToast, canResumeRun, chatListHref, detail, setDetail, setResumingRun, router]);
 
   // -- Refresh --
   const refresh = useCallback(async () => {
@@ -1861,39 +1444,34 @@ export function useStreamLifecycle(
   );
 
   // -- Cleanup on unmount --
-  useEffect(() => {
+  useLayoutEffect(() => {
     const stopReconcile = stopReconcileRef.current;
+    const retryCounts = autoAttachRetryCountsRef.current;
     return () => {
-      streamAbortRef.current?.abort();
+      clearAttachedRun();
+      autoAttachAttemptedRunRef.current = null;
+      retryCounts.clear();
       if (autoAttachRetryTimerRef.current) {
         window.clearTimeout(autoAttachRetryTimerRef.current);
       }
       if (reconcileTimerRef.current) {
         window.clearTimeout(reconcileTimerRef.current);
       }
-      if (reconcileIntervalRef.current) {
-        window.clearInterval(reconcileIntervalRef.current);
-      }
       stopReconcile();
+      stopOperationRef.current?.retire();
     };
   }, [
     streamAbortRef,
     autoAttachRetryTimerRef,
     reconcileTimerRef,
-    reconcileIntervalRef,
     stopReconcileRef,
+    clearAttachedRun,
   ]);
 
   return {
     pendingApproval,
     approvalResponsePending,
     respondToApproval,
-    nextStreamAbortSignal,
-    applyWorkSurfaceStreamEvent,
-    resetWorkSurfaceRun,
-    ensureStreamingAssistantMessage,
-    scheduleAutoAttachRetry,
-    attachExistingRunStream,
     startStream,
     queueDeferredInput,
     stopActiveRun,
@@ -1902,14 +1480,5 @@ export function useStreamLifecycle(
     loadAgentRunProjection,
     refresh,
     handleModelChange,
-    streamAbortRef,
-    attachedRunRef,
-    autoAttachAttemptedRunRef,
-    autoAttachRetryTimerRef,
-    autoAttachRetryCountsRef,
-    reconcileTimerRef,
-    reconcileIntervalRef,
-    stopReconcileRef,
-    runControlMutationRef,
   };
 }

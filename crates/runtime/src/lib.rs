@@ -49,9 +49,7 @@ pub use self_model::introspection;
 
 // ── Internal modules: runtime storage helpers ────────────────────────────────
 
-pub(crate) use data_layer::storage::{
-    ensure_core_schema, insert_turn_skill_selection, resolve_active_skill_versions,
-};
+pub(crate) use data_layer::storage::ensure_core_schema;
 
 // ── Public modules: runtime core ─────────────────────────────────────────────
 
@@ -60,7 +58,6 @@ pub mod bash_intent;
 pub mod capabilities;
 pub(crate) mod capability_endpoint_pool;
 pub(crate) mod capacity_model;
-pub mod learning;
 pub(crate) mod llm_provider_admission;
 pub mod matrix_cloud_runtime;
 pub mod memory_hooks;
@@ -129,39 +126,22 @@ pub use astra_services::{
         AdminTokenRecord, AdminTokenWriter, AdminUserRoleManager, AdminUserRoleRecord,
         AdminUserRoleRequestData, AuthenticatedUser,
     },
-    agents::{
-        AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,
-        AgentUpdateRequestData, DatabaseAgentService, UnconfiguredAgentService,
-    },
     auth::{
         AuthLoginRequestData, AuthPrincipal, AuthPrincipalOrigin, AuthRefreshRequestData,
         AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord,
-        DatabaseAdminAuditReader, DatabaseAdminAuthorizer, DatabaseAdminInitializer,
-        DatabaseAdminTokenReader, DatabaseAdminTokenWriter, DatabaseAdminUserRoleManager,
-        DatabaseAuthService, DatabaseSessionService, FernetTokenEncryptor,
-        ReauthenticationProofRecord, ReauthenticationPurpose, ReauthenticationRequestData,
-        SessionActivityRecord, SessionCreateRequestData, SessionListFilter, SessionListRecord,
-        SessionRecord, SessionService, SessionUpdateRequestData,
-    },
-    context::{
-        ContextService, DatabaseContextService, SnapshotCreateRequestData, SnapshotListFilter,
-        SnapshotListItem, SnapshotListRecord, SnapshotRecord, UnconfiguredContextService,
-    },
-    data_versioning::{
-        DataVersioningService, DatabaseDataVersioningService, UnconfiguredDataVersioningService,
-    },
-    decisions::{
-        DatabaseDecisionService, DecisionCreateRequestData, DecisionListFilter, DecisionListRecord,
-        DecisionRecord, DecisionService, DecisionWithContextRecord, UnconfiguredDecisionService,
+        BrowserSessionCreated, BrowserSessionRequest, DatabaseAdminAuditReader,
+        DatabaseAdminAuthorizer, DatabaseAdminInitializer, DatabaseAdminTokenReader,
+        DatabaseAdminTokenWriter, DatabaseAdminUserRoleManager, DatabaseAuthService,
+        DatabaseSessionService, FernetTokenEncryptor, ReauthenticationProofRecord,
+        ReauthenticationPurpose, ReauthenticationRequestData, SessionActivityRecord,
+        SessionCreateRequestData, SessionListFilter, SessionListRecord, SessionRecord,
+        SessionService, SessionUpdateRequestData,
     },
     events::{
         DatabaseEventService, EventCreateRequestData, EventListFilter, EventListRecord,
         EventRecord, EventService, UnconfiguredEventService,
     },
     marketplace::{DatabaseMarketplaceService, MarketplaceService, UnconfiguredMarketplaceService},
-    marketplace_stats::{
-        DatabaseMarketplaceStatsService, MarketplaceStatsService, NoopMarketplaceStatsService,
-    },
     mcp_registry::{
         DatabaseMcpRegistryService, McpRegisterRecord, McpRegisterRequestData, McpRegistryService,
         UnconfiguredMcpRegistryService,
@@ -180,7 +160,6 @@ pub use astra_services::{
         CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
         RunListRecord, RunStatusRecord,
     },
-    sandbox::{DatabaseSandboxService, SandboxRecord, SandboxService, UnconfiguredSandboxService},
     session_audit::{
         AuditSessionListItem, AuditSessionListParams, AuditSessionListResponse, CrossSessionStats,
         CrossSessionStatsParams, CrossSessionToolAnalytics, DatabaseSessionAuditService,
@@ -223,13 +202,12 @@ pub use orchestration::AgentHistoryRecord;
 // ── Re-exports: turn engine ──────────────────────────────────────────────────
 
 pub use astra_turn_core::contracts::{
-    TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnHookDbPersistPlan, TurnHookDbWriter,
-    TurnObserverRequest, TurnObserverWorker, TurnSkillSelectionRecord,
+    TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnObserverOutcome, TurnObserverRequest,
+    TurnObserverWorker,
 };
 
 pub use turn::services::{
-    DatabaseTraceEventWriter, DatabaseTurnAuxiliaryEventWriter, DatabaseTurnHookDbWriter,
-    DatabaseTurnObserverWorker,
+    DatabaseTraceEventWriter, DatabaseTurnAuxiliaryEventWriter, DatabaseTurnObserverWorker,
 };
 
 pub use astra_turn_core::{

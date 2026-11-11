@@ -3,17 +3,6 @@ use super::*;
 pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
     router
         .route(
-            "/agents",
-            post(crate::service_handlers::agents::create_agent_handler)
-                .get(crate::service_handlers::agents::list_agents_handler),
-        )
-        .route(
-            "/agents/{agent_id}",
-            get(crate::service_handlers::agents::get_agent_handler)
-                .put(crate::service_handlers::agents::update_agent_handler)
-                .delete(crate::service_handlers::agents::delete_agent_handler),
-        )
-        .route(
             "/events",
             post(crate::service_handlers::events::create_event_handler)
                 .get(crate::service_handlers::events::list_events_handler),
@@ -34,58 +23,5 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/events/session/{session_id}",
             get(crate::service_handlers::events::get_session_events_handler),
-        )
-        .route(
-            "/context",
-            post(crate::service_handlers::context::create_snapshot_handler)
-                .get(crate::service_handlers::context::list_snapshots_handler),
-        )
-        .route(
-            "/context/{context_capture_id}",
-            get(crate::service_handlers::context::get_snapshot_handler),
-        )
-        .route(
-            "/decisions",
-            post(crate::service_handlers::decisions::record_decision_handler)
-                .get(crate::service_handlers::decisions::list_decisions_handler),
-        )
-        .route(
-            "/decisions/{decision_id}",
-            get(crate::service_handlers::decisions::get_decision_handler),
-        )
-        .route(
-            "/decisions/{decision_id}/audit",
-            get(crate::service_handlers::decisions::audit_decision_handler),
-        )
-        .route(
-            "/sandbox",
-            post(crate::service_handlers::sandbox::create_sandbox_handler)
-                .get(crate::service_handlers::sandbox::list_sandboxes_handler),
-        )
-        .route(
-            "/sandbox/{name}",
-            get(crate::service_handlers::sandbox::get_sandbox_handler)
-                .delete(crate::service_handlers::sandbox::delete_sandbox_handler),
-        )
-        .route(
-            "/data-versioning/checkpoints",
-            post(data_layer::versioning::create_checkpoint_handler)
-                .get(data_layer::versioning::list_checkpoints_handler),
-        )
-        .route(
-            "/data-versioning/checkpoints/{name}/events",
-            get(data_layer::versioning::get_events_at_checkpoint_handler),
-        )
-        .route(
-            "/data-versioning/lineage/{event_id}/chain",
-            get(data_layer::versioning::get_causal_chain_handler),
-        )
-        .route(
-            "/data-versioning/lineage/{event_id}/upstream",
-            get(data_layer::versioning::trace_upstream_handler),
-        )
-        .route(
-            "/data-versioning/sandbox/{name}/checkpoint",
-            post(data_layer::versioning::sandbox_checkpoint_handler),
         )
 }

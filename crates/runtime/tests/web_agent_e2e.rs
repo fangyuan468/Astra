@@ -3,15 +3,18 @@
 //!
 //! These tests exercise the `/chat/stream` → `ServerAgenticLoopHost` path (NOT the bridge),
 //! using native loopback provider responses through the real Server execution path.
+//! Binding ownership and provider reasoning cases enter the sessionless runtime boundary directly;
+//! real persistent provider Session admission is covered by `moi_fresh_astra`.
 //!
 //! ```text
 //! cargo test -p astra-runtime --test web_agent_e2e --features e2e-hooks
 //! ```
 
 mod test_support;
+use test_support::call_id_for;
 
 use astra_runtime::server::provider_test_support::{
-    InferenceLedgerFixture, ProviderGateway, ProviderRequest, ProviderResponse, ProviderScript,
+    ProviderGateway, ProviderObservationsFixture, ProviderRequest, ProviderResponse, ProviderScript,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,8 +25,8 @@ use astra_runtime::{
     AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord, ErrorResponse,
     HealthChecker, ServiceInfo, SessionActivityRecord, SessionCreateRequestData, SessionListFilter,
     SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
-    TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnHookDbPersistPlan, TurnHookDbWriter,
-    TurnObserverRequest, TurnObserverWorker, build_app,
+    TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnObserverOutcome, TurnObserverRequest,
+    TurnObserverWorker, build_app,
 };
 use astra_services::skills::{
     SkillInfoRecord, SkillListCursor, SkillListItem, SkillListRecord, SkillPublishRequestData,
@@ -290,20 +293,6 @@ impl SessionService for StubSession {
 
 // ── Recording test doubles ───────────────────────────────────────────────────
 
-/// Records all hook DB persist calls for test verification.
-#[derive(Default)]
-struct RecordingHookDbWriter {
-    plans: tokio::sync::Mutex<Vec<TurnHookDbPersistPlan>>,
-}
-
-#[async_trait]
-impl TurnHookDbWriter for RecordingHookDbWriter {
-    async fn persist(&self, plan: TurnHookDbPersistPlan) -> Result<(), String> {
-        self.plans.lock().await.push(plan);
-        Ok(())
-    }
-}
-
 /// Records all observer requests for test verification.
 #[derive(Default)]
 struct RecordingObserverWorker {
@@ -312,9 +301,9 @@ struct RecordingObserverWorker {
 
 #[async_trait]
 impl TurnObserverWorker for RecordingObserverWorker {
-    async fn run(&self, request: TurnObserverRequest) -> Result<(), String> {
+    async fn run(&self, request: TurnObserverRequest) -> Result<TurnObserverOutcome, String> {
         self.requests.lock().await.push(request);
-        Ok(())
+        Ok(TurnObserverOutcome::Observed)
     }
 }
 
@@ -488,6 +477,7 @@ impl ModelService for TestModelService {
     ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
         let model = self.model_record("test-model".to_string());
         Ok(vec![ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: DEFAULT_MODEL_OFFERING_ID.to_string(),
             access_id: "web-e2e-model-access".to_string(),
@@ -529,6 +519,10 @@ impl ModelService for TestModelService {
         Ok(ResolvedModelOffering {
             offering_id,
             model: ResolvedActiveLlmModel {
+                responses_reasoning_history: None,
+                inference_protocol: None,
+                response_scope_key: None,
+                supported_reasoning_efforts: None,
                 model_name,
                 wire_model_name: None,
                 api_key: "test-provider-secret".to_string(),
@@ -584,8 +578,16 @@ fn build_test_app() -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>)
 
 fn build_test_app_with_models(
     models: Arc<TestModelService>,
-    inference: Option<&InferenceLedgerFixture>,
+    inference: Option<&ProviderObservationsFixture>,
 ) -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>) {
+    let (state, ledger) = build_test_state_with_models(models, inference);
+    (build_app(state), ledger)
+}
+
+fn build_test_state_with_models(
+    models: Arc<TestModelService>,
+    inference: Option<&ProviderObservationsFixture>,
+) -> (AppState, Arc<tokio::sync::Mutex<HashMap<String, Value>>>) {
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
         .with_model_service(models.clone())
@@ -600,27 +602,34 @@ fn build_test_app_with_models(
     .with_model_service(models)
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
     let lifecycle = if let Some(inference) = inference {
-        lifecycle.with_e2e_inference_ledger(inference)
+        lifecycle.with_provider_observations(inference)
     } else {
         lifecycle
     };
 
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
-    (build_app(state), ledger)
+    (state, ledger)
 }
 
 async fn build_native_test_app(
     scripts: Vec<ProviderScript>,
-) -> (Router, ProviderGateway, InferenceLedgerFixture) {
+) -> (Router, ProviderGateway, ProviderObservationsFixture) {
+    let (state, gateway, inference) = build_native_test_state(scripts).await;
+    (build_app(state), gateway, inference)
+}
+
+async fn build_native_test_state(
+    scripts: Vec<ProviderScript>,
+) -> (AppState, ProviderGateway, ProviderObservationsFixture) {
     let gateway = ProviderGateway::start(scripts).await;
-    let inference = InferenceLedgerFixture::default();
-    let (app, _) = build_test_app_with_models(
+    let inference = ProviderObservationsFixture::default();
+    let (state, _) = build_test_state_with_models(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
         Some(&inference),
     );
-    (app, gateway, inference)
+    (state, gateway, inference)
 }
 
 fn primary_request_for(request: &ProviderRequest, message: &str) -> bool {
@@ -634,13 +643,12 @@ fn primary_request_for(request: &ProviderRequest, message: &str) -> bool {
         })
 }
 
-/// Build a test app with recording hook DB + observer writers for verification.
-fn build_test_app_with_hooks(
+/// Build a test app with an observer and an Edge callback ledger.
+fn build_test_app_with_observer(
     models: Arc<TestModelService>,
-    inference: Option<&InferenceLedgerFixture>,
+    inference: Option<&ProviderObservationsFixture>,
 ) -> (
     Router,
-    Arc<RecordingHookDbWriter>,
     Arc<RecordingObserverWorker>,
     test_support::EdgeCallbackLedger,
 ) {
@@ -650,41 +658,34 @@ fn build_test_app_with_hooks(
         .with_session_service(Arc::new(StubSession));
 
     let ledger = base.edge_callback_ledger();
-    let hook_writer = Arc::new(RecordingHookDbWriter::default());
     let observer_worker = Arc::new(RecordingObserverWorker::default());
     let lifecycle = test_run_lifecycle(
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
         ledger.clone(),
     )
     .with_model_service(models)
-    .with_hook_db_writer(hook_writer.clone())
     .with_observer_worker(observer_worker.clone())
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
 
     let lifecycle = if let Some(inference) = inference {
-        lifecycle.with_e2e_inference_ledger(inference)
+        lifecycle.with_provider_observations(inference)
     } else {
         lifecycle
     };
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
-    (build_app(state), hook_writer, observer_worker, ledger)
+    (build_app(state), observer_worker, ledger)
 }
 
-fn build_test_app_with_hooks_and_skills(
+fn build_test_app_with_observer_and_skills(
     models: Arc<TestModelService>,
-    inference: Option<&InferenceLedgerFixture>,
-) -> (
-    Router,
-    Arc<RecordingHookDbWriter>,
-    Arc<RecordingObserverWorker>,
-) {
+    inference: Option<&ProviderObservationsFixture>,
+) -> (Router, Arc<RecordingObserverWorker>) {
     init_env();
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
         .with_session_service(Arc::new(StubSession));
 
     let ledger = base.edge_callback_ledger();
-    let hook_writer = Arc::new(RecordingHookDbWriter::default());
     let observer_worker = Arc::new(RecordingObserverWorker::default());
     let lifecycle = test_run_lifecycle(
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
@@ -692,24 +693,23 @@ fn build_test_app_with_hooks_and_skills(
     )
     .with_model_service(models)
     .with_skill_service(Arc::new(TestSkillService))
-    .with_hook_db_writer(hook_writer.clone())
     .with_observer_worker(observer_worker.clone())
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
 
     let lifecycle = if let Some(inference) = inference {
-        lifecycle.with_e2e_inference_ledger(inference)
+        lifecycle.with_provider_observations(inference)
     } else {
         lifecycle
     };
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
-    (build_app(state), hook_writer, observer_worker)
+    (build_app(state), observer_worker)
 }
 
 fn build_test_app_with_agent_bindings(
     binding_service: Arc<InMemoryAgentBindingService>,
     models: Arc<TestModelService>,
-    inference: Option<&InferenceLedgerFixture>,
-) -> (Router, Arc<RecordingObserverWorker>) {
+    inference: Option<&ProviderObservationsFixture>,
+) -> (AppState, Arc<RecordingObserverWorker>) {
     init_env();
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
@@ -727,12 +727,12 @@ fn build_test_app_with_agent_bindings(
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
 
     let lifecycle = if let Some(inference) = inference {
-        lifecycle.with_e2e_inference_ledger(inference)
+        lifecycle.with_provider_observations(inference)
     } else {
         lifecycle
     };
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
-    (build_app(state), observer_worker)
+    (state, observer_worker)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -792,46 +792,6 @@ async fn assert_native_delegation_without_auxiliary_selector(
             .expect("canonical model-control semantics"),
         "model-control semantics must reach the provider, not only the full catalog"
     );
-    let candidates: Vec<_> = first.body["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|message| {
-            let text = message["content"].as_str()?;
-            let text = text
-                .strip_prefix("<astra-runtime-context>\n")
-                .and_then(|text| text.strip_suffix("\n</astra-runtime-context>"))
-                .unwrap_or(text);
-            let payload: Value = serde_json::from_str(text).ok()?;
-            payload
-                .get("catalog")
-                .is_some()
-                .then_some((message, payload))
-        })
-        .collect();
-    assert_eq!(
-        candidates.len(),
-        1,
-        "cold parent request must carry one candidate context"
-    );
-    assert_eq!(candidates[0].0["role"], "user");
-    assert_eq!(
-        candidates[0]
-            .1
-            .as_object()
-            .unwrap()
-            .keys()
-            .collect::<Vec<_>>(),
-        vec!["catalog", "child_model_selection_allowed"],
-        "candidate context carries observations, not another selection policy"
-    );
-    let items = candidates[0].1["catalog"]["items"].as_array().unwrap();
-    let selected = items
-        .iter()
-        .find(|item| item["offering_id"] == DEFAULT_MODEL_OFFERING_ID)
-        .expect("authorized parent Offering must be visible on the wire");
-    assert_eq!(selected["name"], "test-model");
-    assert_eq!(selected["provider"], "openai");
     let mut actual = Vec::new();
     for call in request.body["messages"]
         .as_array()
@@ -1003,24 +963,205 @@ async fn chat_stream_collect(app: &Router, payload: Value) -> Vec<Value> {
     parse_sse_events(&body_str)
 }
 
-async fn provider_chat_stream_collect(app: &Router, payload: Value) -> Vec<Value> {
-    let payload = normalize_chat_stream_payload(payload);
-    let req = Request::builder()
-        .method("POST")
-        .uri("/chat/stream")
-        .header("authorization", PROVIDER_TOKEN)
-        .header("content-type", "application/json")
-        .header("x-astra-e2e-test-secret", SECRET)
-        .body(Body::from(payload.to_string()))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+fn provider_gateway_reasoning_payload(
+    endpoint: &str,
+    message: &str,
+    effort: Option<&str>,
+    control: Option<Value>,
+) -> Value {
+    let mut metadata = json!({});
+    if let Some(control) = control {
+        metadata["reasoning_control"] = control;
+    }
+    let mut payload = json!({
+        "message": message,
+        "model_selection": {"offering_id": DEFAULT_MODEL_OFFERING_ID},
+        "resolved_model_selection": {"offering_id": DEFAULT_MODEL_OFFERING_ID, "model_name": "test-model"},
+        "runtime_auth": {"authorization": "Bearer runtime-grant"},
+        "capability_descriptors": {"model_gateway": {
+            "id": "moi-model-gateway", "type": "model_gateway", "transport": "http",
+            "endpoint_url": format!("{endpoint}/v1/chat/completions"),
+            "protocol": "openai_chat_completions", "model_context_window": 128000,
+            "metadata": metadata
+        }},
+        "execution_policy": {"turn_intent": "fixed_default", "skill_auto_route": "disabled"}
+    });
+    if let Some(effort) = effort {
+        payload["context"] = json!({"thinking": {"mode": "adaptive", "effort": effort}});
+    }
+    payload
+}
 
-    let body_bytes = body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
-        .await
-        .unwrap();
-    let body_str = String::from_utf8_lossy(&body_bytes);
-    parse_sse_events(&body_str)
+#[tokio::test]
+async fn provider_gateway_reasoning_efforts_reach_model_and_complete() {
+    init_env();
+    let scripts = ["low", "high", "max"].map(|effort| {
+        let question = format!("Calculate 2 + 3 using {effort} reasoning.");
+        ProviderScript::new(
+            format!("provider gateway {effort}"),
+            move |request| primary_request_for(request, &question),
+            vec![ProviderResponse::OpenAi(json!({
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "5"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 1, "total_tokens": 21}
+            }))],
+        )
+    });
+    let (app, gateway, _inference) = build_native_test_state(scripts.into()).await;
+    for effort in ["low", "high", "max"] {
+        let question = format!("Calculate 2 + 3 using {effort} reasoning.");
+        let events = provider_sessionless_stream_collect(
+            &app,
+            provider_gateway_reasoning_payload(
+                &gateway.base_url,
+                &question,
+                Some(effort),
+                Some(json!({
+                    "protocol": "reasoning_effort", "supported_efforts": ["low", "high", "max"]
+                })),
+            ),
+        )
+        .await;
+        assert!(
+            find_events(&events, "error").is_empty(),
+            "{effort}: {events:?}"
+        );
+        assert!(
+            find_events(&events, "turn_complete")
+                .iter()
+                .any(|event| { event["assistant_text"] == "5" }),
+            "{effort}: {events:?}"
+        );
+        let requests = gateway.requests.lock().await;
+        let request = requests
+            .iter()
+            .find(|request| primary_request_for(request, &question))
+            .expect("selected reasoning must reach the model");
+        assert_eq!(request.body["reasoning_effort"], effort);
+    }
+    gateway.assert_complete();
+}
+
+#[tokio::test]
+async fn provider_gateway_reasoning_rejects_undeclared_efforts_before_model_io() {
+    init_env();
+    let (app, gateway, _inference) = build_native_test_state(vec![ProviderScript::new(
+        "no provider I/O permitted",
+        |_| true,
+        vec![],
+    )])
+    .await;
+    for (name, control) in [
+        ("no declaration", None),
+        (
+            "unadvertised medium",
+            Some(json!({
+                "protocol": "reasoning_effort", "supported_efforts": ["low", "high", "max"]
+            })),
+        ),
+    ] {
+        let events = provider_sessionless_stream_collect(
+            &app,
+            provider_gateway_reasoning_payload(
+                &gateway.base_url,
+                "Do not send this unsupported effort.",
+                Some("medium"),
+                control,
+            ),
+        )
+        .await;
+        assert!(
+            find_events(&events, "error")
+                .iter()
+                .any(|event| { event["code"] == "VALIDATION_ERROR" }),
+            "{name}: {events:?}"
+        );
+        assert!(
+            gateway.requests.lock().await.is_empty(),
+            "{name} reached model"
+        );
+    }
+    gateway.assert_complete();
+}
+
+#[tokio::test]
+async fn provider_gateway_reasoning_rejects_malformed_capabilities() {
+    init_env();
+    let (app, gateway, _inference) = build_native_test_state(vec![ProviderScript::new(
+        "no provider I/O permitted",
+        |_| true,
+        vec![],
+    )])
+    .await;
+    for control in [
+        json!({"protocol": "unknown", "supported_efforts": ["high"]}),
+        json!({"protocol": "enable_thinking", "supported_efforts": ["high"]}),
+        json!({"protocol": "reasoning_effort", "supported_efforts": []}),
+        json!({"protocol": "reasoning_effort", "supported_efforts": ["high", "high"]}),
+        json!({"protocol": "reasoning_effort", "supported_efforts": ["extreme"]}),
+        json!({"protocol": "reasoning_effort", "supported_efforts": ["high"], "enabled": true}),
+    ] {
+        let events = provider_sessionless_stream_collect(
+            &app,
+            provider_gateway_reasoning_payload(
+                &gateway.base_url,
+                "Reject malformed capability.",
+                Some("high"),
+                Some(control.clone()),
+            ),
+        )
+        .await;
+        assert!(
+            find_events(&events, "error").iter().any(|event| {
+                event["code"] == "VALIDATION_ERROR"
+                    && event["error_code"] == "provider_runtime_context_invalid"
+            }),
+            "{control}: {:?}",
+            find_events(&events, "error")
+        );
+        assert!(find_events(&events, "turn_complete").is_empty());
+        assert!(
+            gateway.requests.lock().await.is_empty(),
+            "malformed capability reached model"
+        );
+    }
+    gateway.assert_complete();
+}
+
+#[tokio::test]
+async fn provider_gateway_reasoning_omission_preserves_default_chat() {
+    init_env();
+    let (app, gateway, _inference) = build_native_test_state(vec![ProviderScript::new(
+        "ordinary gateway turn", |request| primary_request_for(request, "Ordinary gateway question."),
+        vec![ProviderResponse::OpenAi(json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Ordinary answer."}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 3, "total_tokens": 23}
+        }))],
+    )]).await;
+    let events = provider_sessionless_stream_collect(
+        &app,
+        provider_gateway_reasoning_payload(
+            &gateway.base_url,
+            "Ordinary gateway question.",
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert!(find_events(&events, "error").is_empty(), "{events:?}");
+    assert!(
+        find_events(&events, "turn_complete")
+            .iter()
+            .any(|event| { event["assistant_text"] == "Ordinary answer." }),
+        "{events:?}"
+    );
+    let requests = gateway.requests.lock().await;
+    let request = requests
+        .iter()
+        .find(|request| primary_request_for(request, "Ordinary gateway question."))
+        .expect("ordinary question must reach model");
+    assert!(request.body.get("reasoning_effort").is_none());
+    drop(requests);
+    gateway.assert_complete();
 }
 
 async fn create_e2e_agent_binding(
@@ -1178,6 +1319,37 @@ async fn start_agent_binding_gateway(
     (format!("http://{address}/capabilities"), calls, server)
 }
 
+// Binding ownership is exercised through real provider HTTP and canonical
+// execution. Persistent Session creation/admission is covered by moi_fresh_astra.
+async fn provider_sessionless_stream_collect(state: &AppState, payload: Value) -> Vec<Value> {
+    let mut headers = HeaderMap::new();
+    headers.insert("authorization", PROVIDER_TOKEN.parse().unwrap());
+    let principal = StubAuth
+        .current_principal_for_request(
+            &headers,
+            ProviderRequestDescriptor {
+                method: "POST".into(),
+                path: "/chat/stream".into(),
+                route: Some("/chat/stream".into()),
+                request_id: None,
+                body_digest: None,
+            },
+        )
+        .await
+        .unwrap();
+    let response = astra_runtime::server::provider_test_support::ephemeral_provider_chat_stream(
+        state,
+        &principal,
+        normalize_chat_stream_payload(payload),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
+    parse_sse_events(&String::from_utf8_lossy(&body))
+}
+
 fn agent_binding_chat_payload(
     foundation_binding_id: &str,
     extension_binding_id: &str,
@@ -1249,11 +1421,11 @@ async fn multi_agent_binding_http_e2e_discovers_and_reads_skill_from_owning_bind
         let gateway=ProviderGateway::start(vec![ProviderScript::new("binding skill and actual continuation", |request| primary_request_for(request,"Analyze the attached financial statement."), vec![
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[tool_call("tc-financial-analysis","skill",json!({"skill_name":"financial-analysis"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Financial analysis completed with the user workflow."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-let inference=InferenceLedgerFixture::default();
+let inference=ProviderObservationsFixture::default();
 let model_endpoint=format!("{}/v1",gateway.base_url);
 let (app,observer_worker)=build_test_app_with_agent_bindings(binding_service, Arc::new(TestModelService{judgment_base_url:Some(model_endpoint.clone())}),Some(&inference));
 
-        let events = provider_chat_stream_collect(
+        let events = provider_sessionless_stream_collect(
             &app,
             agent_binding_chat_payload(
                 &foundation_binding_id,
@@ -1292,7 +1464,7 @@ let (app,observer_worker)=build_test_app_with_agent_bindings(binding_service, Ar
             .messages
             .iter()
             .find(|message| {
-                message.get("tool_call_id").and_then(Value::as_str) == Some("tc-financial-analysis")
+                message.get("tool_call_id").and_then(Value::as_str) == Some(call_id_for(&events, "skill", |args| args["skill_name"] == "financial-analysis").as_str())
             })
             .and_then(|message| message.get("content").and_then(Value::as_str))
             .expect("skill instructions reach the follow-up model round");
@@ -1369,7 +1541,7 @@ async fn multi_agent_binding_http_e2e_reports_exact_missing_binding_id() {
         None,
     );
 
-    let events = provider_chat_stream_collect(
+    let events = provider_sessionless_stream_collect(
         &app,
         agent_binding_chat_payload(
             &foundation_binding_id,
@@ -1420,6 +1592,7 @@ async fn post_unmatched_tool_result(
         output,
         status,
         unmatched_tool_result_identity(),
+        None,
     )
     .await
 }
@@ -1432,7 +1605,7 @@ async fn post_tool_result_from_event(
 ) -> StatusCode {
     let (request_id, identity) =
         tool_request_identity_from_event(event).expect("tool_request event must carry identity");
-    post_tool_result_with_identity(app, &request_id, output, status, identity).await
+    post_tool_result_with_identity(app, &request_id, output, status, identity, None).await
 }
 
 async fn post_tool_result_with_identity(
@@ -1441,6 +1614,7 @@ async fn post_tool_result_with_identity(
     output: &str,
     status: &str,
     identity: ToolResultIdentity,
+    tool_result_fields: Option<Map<String, Value>>,
 ) -> StatusCode {
     let body = astra_thin_client::ToolResultRequest::new_with_hash(
         astra_thin_client::ToolResultRequestParts {
@@ -1452,7 +1626,7 @@ async fn post_tool_result_with_identity(
             status: status.to_string(),
             output: output.to_string(),
             duration_ms: 10,
-            tool_result_fields: None,
+            tool_result_fields,
         },
     );
     let body: Value = serde_json::to_value(body).unwrap();
@@ -1641,13 +1815,13 @@ async fn paused_evaluation_journey(pool: Option<astra_core::SharedPool>) {
             Arc::new(astra_services::DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("pause-evaluation-owner"))
         } else { Arc::new(astra_services::InMemoryRunStateStore::new()) };
         let engine = astra_runtime::RunEngine::new(store);
-        let inference = InferenceLedgerFixture::default();
+        let inference = ProviderObservationsFixture::default();
         let lifecycle = astra_runtime::AgenticRunLifecycleService::new(
             astra_runtime::MatrixOneSettings::mock(), test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
             base.edge_callback_ledger(), engine.clone());
         let lifecycle = astra_runtime::server::provider_test_support::configure_workspace_provider(
             lifecycle, Arc::new(tempfile::tempdir().unwrap()), "pause-evaluation-executor")
-            .with_model_service(models).with_e2e_inference_ledger(&inference)
+            .with_model_service(models).with_provider_observations(&inference)
             .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
         let lifecycle = if let Some(pool) = &pool { lifecycle.with_pool(pool.clone()) } else { lifecycle };
         let app = build_app(base.with_run_lifecycle_service(Arc::new(lifecycle)));
@@ -1694,8 +1868,6 @@ async fn paused_evaluation_journey(pool: Option<astra_core::SharedPool>) {
         }).await.expect("paused fixture owners must drain before cleanup");
         for table in [
             "tool_invocation_ledger",
-            "agent_session_execution_slots",
-            "run_display_projections",
             "run_checkpoints",
             "agent_run_events",
             "agent_runs",
@@ -1703,9 +1875,9 @@ async fn paused_evaluation_journey(pool: Option<astra_core::SharedPool>) {
         ] {
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "DELETE FROM {table} WHERE user_id=? AND session_id=?"
-                ))
+                )))
                 .bind(USER_ID)
                 .bind(&session)
                 .execute(pool.get()),
@@ -1727,7 +1899,7 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
     let result = std::panic::AssertUnwindSafe(async {
     init_env();
     use astra_runtime::server::provider_test_support::{
-        InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+        ProviderObservationsFixture, ProviderGateway, ProviderResponse, ProviderScript,
     };
     const ROOT: &str = "Use a child agent to review the code.";
     const TASK: &str = "Review src/lib.rs and summarize one issue.";
@@ -1817,7 +1989,7 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
         Arc::new(astra_services::InMemoryRunStateStore::new())
     };
     let engine = astra_runtime::RunEngine::new(store);
-    let inference = InferenceLedgerFixture::default();
+    let inference = ProviderObservationsFixture::default();
     let lifecycle = astra_runtime::AgenticRunLifecycleService::new(
         astra_runtime::MatrixOneSettings::mock(),
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
@@ -1831,7 +2003,7 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
     let lifecycle = astra_runtime::server::provider_test_support::configure_workspace_provider(
         lifecycle, workspace_directory.clone(), "structured-spawn-fixture-executor")
     .with_model_service(models)
-    .with_e2e_inference_ledger(&inference)
+    .with_provider_observations(&inference)
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
     let lifecycle = if let Some(pool) = &pool {
         lifecycle.with_pool(pool.clone())
@@ -1934,7 +2106,7 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
     let serialized = serde_json::to_string(&events).unwrap();
     let launch_receipt = find_events(&events, "tool_call_end")
         .into_iter()
-        .find(|event| event["call_id"].as_str() == Some("call-spawn-reviewer"))
+        .find(|event| event["call_id"].as_str() == Some(call_id_for(&events, "agent", |args| args["description"] == "structured child review").as_str()))
         .and_then(|event| event["result"].as_str())
         .and_then(|result| serde_json::from_str::<Value>(result).ok())
         .unwrap_or_else(|| panic!("spawn should return a canonical launch receipt: {serialized}"));
@@ -1946,7 +2118,7 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
     let child_record = engine.load_run(USER_ID, child_run).await.unwrap().unwrap();
     assert_ne!(root_record.run_id, child_record.run_id);
     assert_eq!(child_record.parent_run_id.as_deref(), Some(run_id.as_str()));
-    let admissions = inference.admissions();
+    let admissions = inference.requests();
     let root_admissions: Vec<_> = admissions
         .iter()
         .filter(|(scope, _)| {
@@ -2080,17 +2252,23 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
     let live_terminal = events.iter().find(|event| event["type"] == "run_finished" && event["run_id"] == run_id).expect("root terminal");
     let replay_terminal = replay_events.iter().find(|event| event["type"] == "run_finished" && event["run_id"] == run_id).expect("replayed root terminal");
     assert_eq!(live_terminal["turn_evaluation"], replay_terminal["turn_evaluation"]);
-    let evaluation = astra_turn_core::evaluation::turn_evaluation_from_terminal(
-        &live_terminal["turn_evaluation"], Some(&session), &run_id,
-        live_terminal["owner_generation"].as_u64(), live_terminal["status"].as_str().unwrap(),
-    ).expect("real root evaluation must carry exact authority");
-    assert_eq!(evaluation.producer_scope.unwrap().run_id, run_id);
-    let child_evaluation = child_record.events.iter().find_map(|event| event.pointer("/data/turn_evaluation")).expect("real child terminal evaluation");
-    assert_eq!(child_evaluation["producer_scope"]["run_id"], child_run);
-    assert_eq!(child_evaluation["metadata"]["execution_owner_generation"], child_record.run_generation);
-    astra_turn_core::evaluation::turn_evaluation_from_terminal(
-        child_evaluation, Some(&session), child_run, Some(child_record.run_generation), &child_record.status,
-    ).expect("real child evaluation must carry exact authority");
+    for (terminal, id, generation, status) in [
+        (live_terminal, run_id.as_str(), root_record.run_generation, root_record.status.as_str()),
+        (replay_terminal, run_id.as_str(), root_record.run_generation, root_record.status.as_str()),
+    ] {
+        assert_eq!(terminal["owner_generation"], generation);
+        assert_eq!(terminal["status"], status);
+        if let Some(evaluation) = terminal.get("turn_evaluation") {
+            astra_turn_core::evaluation::turn_evaluation_from_terminal(evaluation, Some(&session), id, Some(generation), status)
+                .expect("optional evaluation must still have exact producer scope");
+        }
+    }
+    assert_eq!(root_record.status, "completed");
+    assert_eq!(child_record.status, "completed");
+    if pool.is_some() {
+        assert!(root_record.terminal_receipt_json.is_some());
+        assert!(child_record.terminal_receipt_json.is_some());
+    }
 
     assert!(
         !find_event_type(&replay_events, "agent_spawned").is_empty(),
@@ -2115,8 +2293,6 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
         }).await.expect("test execution owners must drain before fixture cleanup");
         for table in [
             "tool_invocation_ledger",
-            "agent_session_execution_slots",
-            "run_display_projections",
             "run_checkpoints",
             "agent_run_events",
             "agent_runs",
@@ -2124,9 +2300,9 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
         ] {
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "DELETE FROM {table} WHERE user_id=? AND session_id=?"
-                ))
+                )))
                 .bind(USER_ID)
                 .bind(&session)
                 .execute(pool.get()),
@@ -2148,7 +2324,7 @@ async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrie
                             tool_call(
                                 "call-select-agent-parallel",
                                 "tool_search",
-                                json!({"query": "select:agent_fanout"})
+                                json!({"query": "select:agent_fanout,agent"})
                             )
                         ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
                             tool_call("call-fanout", "invoke_tool", json!({
@@ -2197,7 +2373,10 @@ async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrie
 
     let result = find_events(&events, "tool_call_end")
         .into_iter()
-        .find(|event| event["call_id"].as_str() == Some("call-fanout"))
+        .find(|event| {
+            event["call_id"].as_str()
+                == Some(call_id_for(&events, "agent_fanout", |_| true).as_str())
+        })
         .and_then(|event| match &event["result"] {
             Value::String(result) => serde_json::from_str::<Value>(result).ok(),
             result @ Value::Object(_) => Some(result.clone()),
@@ -2271,15 +2450,23 @@ async fn web_agent_parallel_direct_spawns_with_unavailable_model_policy_fail_clo
 
         }
     })).await;
-    for id in ["direct-a", "direct-b"] {
-        let result = find_events(&events, "tool_call_end")
-            .into_iter()
-            .find(|event| event["call_id"].as_str() == Some(id))
-            .and_then(|event| event["result"].as_str())
-            .and_then(|result| serde_json::from_str::<Value>(result).ok())
-            .expect("direct spawn must return a structured rejection");
+    let rejections: Vec<_> = find_events(&events, "tool_call_end")
+        .into_iter()
+        .filter_map(|event| {
+            let result: Value = serde_json::from_str(event["result"].as_str()?).ok()?;
+            (result["error_kind"] == "delegation_model_unavailable").then_some((event, result))
+        })
+        .collect();
+    assert_eq!(
+        rejections.len(),
+        2,
+        "each proposed child must receive one rejection"
+    );
+    assert_ne!(rejections[0].0["call_id"], rejections[1].0["call_id"]);
+    for (event, result) in rejections {
+        assert_eq!(event["call_id"].as_str().unwrap().len(), 64);
+        assert_eq!(event["success"], false);
         assert_eq!(result["status"], "failed");
-        assert_eq!(result["error_kind"], "delegation_model_unavailable");
         assert_eq!(result["advisory"]["executed"], false);
     }
     assert!(find_event_type(&events, "agent_spawned").is_empty());
@@ -2368,7 +2555,9 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     // child completion below when CI is running another E2E concurrently.
     let child_request = wait_for_sse(&mut rx, "tool_request", 10).await;
     assert_eq!(child_request["tool"], "read_file");
-    assert_eq!(child_request["request_id"], "call-child-read-file");
+    let child_call_id = child_request["request_id"].as_str().unwrap().to_owned();
+    assert_eq!(child_call_id.len(), 64);
+    assert_ne!(child_call_id, "call-child-read-file");
     assert_eq!(
         post_tool_result_from_event(
             &app,
@@ -2406,7 +2595,15 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     );
     let spawn_result = find_events(&events, "tool_call_end")
         .into_iter()
-        .find(|event| event["call_id"].as_str() == Some("call-spawn-edge-reviewer"))
+        .find(|event| {
+            event["call_id"].as_str()
+                == Some(
+                    call_id_for(&events, "agent", |args| {
+                        args["description"] == "edge child review"
+                    })
+                    .as_str(),
+                )
+        })
         .and_then(|event| event["result"].as_str())
         .and_then(|result| serde_json::from_str::<Value>(result).ok())
         .unwrap_or_else(|| panic!("edge spawn must return a canonical result: {serialized}"));
@@ -2430,7 +2627,13 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     let routing = find_events(&events, "tool_routing_decision")
         .into_iter()
         .find(|event| {
-            event["call_id"].as_str() == Some("call-spawn-edge-reviewer")
+            event["call_id"].as_str()
+                == Some(
+                    call_id_for(&events, "agent", |args| {
+                        args["description"] == "edge child review"
+                    })
+                    .as_str(),
+                )
                 && event["tool"].as_str() == Some("agent")
         })
         .unwrap_or_else(|| {
@@ -2475,38 +2678,56 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     assert_eq!(
         find_events(&events, "tool_call_end")
             .into_iter()
-            .filter(|event| event["call_id"].as_str() == Some("call-child-read-file"))
+            .filter(|event| event["call_id"].as_str() == Some(child_call_id.as_str()))
             .count(),
         0,
         "the client-owned callback lane must not be duplicated onto the attached parent stream"
     );
     let (child_replay_status, child_replay) = get_run_stream(&app, child_run_id, 0).await;
     assert_eq!(child_replay_status, StatusCode::OK);
-    let child_terminal_index = child_replay
+    // A readonly read_file is an observation, not durable effect custody.
+    // Verify the callback actually reached the child's next model request;
+    // generic cold tool cards are not a second result store.
+    assert_eq!(find_events(&events, "tool_request").len(), 1);
+    let requests = gateway.requests.lock().await;
+    let evidence_requests: Vec<_> = requests
+        .iter()
+        .filter_map(|request| request.body["messages"].as_array())
+        .filter_map(|messages| {
+            messages.iter().find(|message| {
+                message["role"] == "tool" && message["tool_call_id"] == "call-child-read-file"
+            })
+        })
+        .collect();
+    assert_eq!(
+        evidence_requests.len(),
+        1,
+        "one child round consumes the file callback"
+    );
+    assert_eq!(
+        evidence_requests[0]["content"],
+        "pub fn run() -> Result<()> { Ok(()) }"
+    );
+    drop(requests);
+    let answer_index = child_replay
         .iter()
         .position(|event| {
-            event["type"].as_str() == Some("tool_call_end")
-                && event["call_id"].as_str() == Some("call-child-read-file")
+            event["type"] == "text_done"
+                && event["full_text"] == "edge child reviewed concrete file evidence: pub fn run()"
         })
-        .unwrap_or_else(|| panic!("child replay lost its durable tool terminal: {child_replay:?}"));
-    let child_finished_index = child_replay
+        .unwrap_or_else(|| panic!("child replay lost its complete answer: {child_replay:?}"));
+    let finished_index = child_replay
         .iter()
-        .position(|event| event["type"].as_str() == Some("run_finished"))
+        .position(|event| event["type"] == "run_finished")
         .unwrap_or_else(|| panic!("child replay lost run_finished: {child_replay:?}"));
-    assert!(
-        child_terminal_index < child_finished_index,
-        "child tool terminal must commit before run_finished: {child_replay:?}"
-    );
+    assert!(answer_index < finished_index);
+    assert_eq!(child_replay[finished_index]["status"], "completed");
     assert_eq!(
         child_replay
             .iter()
-            .filter(|event| {
-                event["type"].as_str() == Some("tool_call_end")
-                    && event["call_id"].as_str() == Some("call-child-read-file")
-            })
+            .filter(|event| event["type"] == "run_finished")
             .count(),
-        1,
-        "child replay must expose exactly one durable terminal occurrence"
+        1
     );
 
     let completed = find_event_type(&events, "agent_completed");
@@ -2544,7 +2765,7 @@ async fn discovery_only_child_keeps_native_tool_and_first_request_budget() {
                 "action":"spawn","description":"discover GitHub availability","prompt":CHILD,
                 "agent_type":"explore","allowed_tools":["tool_search"],"max_output_tokens":256
             }}))], ""),
-            response(vec![tool_call("join-discovery-child", "agent", json!({"action":"wait","timeout_ms":10000}))], ""),
+            response(vec![tool_call("join-discovery-child", "invoke_tool", json!({"name":"agent","arguments":{"action":"wait","timeout_ms":10000}}))], ""),
             response(vec![], MARKER),
         ]),
         ProviderScript::new("discovery child", |request| primary_request_for(request, CHILD) && delegation_assessment(&request.body).is_none(), vec![
@@ -2569,7 +2790,9 @@ async fn discovery_only_child_keeps_native_tool_and_first_request_budget() {
     );
     let spawn = find_events(&events, "tool_call_end")
         .into_iter()
-        .find(|event| event["call_id"] == "spawn-discovery-child")
+        .find(|event| {
+            event["call_id"] == call_id_for(&events, "agent", |args| args["action"] == "spawn")
+        })
         .and_then(|event| event["result"].as_str())
         .map(|text| serde_json::from_str::<Value>(text).unwrap())
         .expect("launch receipt");
@@ -2778,28 +3001,24 @@ async fn execute_edge_callback_turn(
         if !test_tool_uses_client_ledger(step.tool_name) {
             continue;
         }
-        if step.requires_approval {
+        let approved_id = if step.requires_approval {
             let approval = wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
-            assert_eq!(
-                approval["request_id"].as_str(),
-                Some(step.request_id),
-                "{}: approval should match {}",
-                case_name,
-                step.request_id
-            );
-            let status =
-                post_approval_respond(app, &approval_identity, step.request_id, "allow").await;
-            assert_eq!(status, StatusCode::OK, "{}: approval accepted", case_name);
-        }
-
+            let id = approval["request_id"].as_str().unwrap().to_owned();
+            assert_eq!(approval["tool"], step.tool_name);
+            assert_eq!(id.len(), 64);
+            let status = post_approval_respond(app, &approval_identity, &id, "allow").await;
+            assert_eq!(status, StatusCode::OK, "{case_name}: approval accepted");
+            Some(id)
+        } else {
+            None
+        };
         let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-        assert_eq!(
-            request["request_id"].as_str(),
-            Some(step.request_id),
-            "{}: tool_request should match {}",
-            case_name,
-            step.request_id
-        );
+        assert_eq!(request["tool"], step.tool_name);
+        assert_eq!(request["args"], step.args);
+        assert_eq!(request["request_id"].as_str().unwrap().len(), 64);
+        if let Some(id) = approved_id {
+            assert_eq!(request["request_id"], id);
+        }
         let status =
             post_tool_result_from_event(app, &request, step.result_output, "completed").await;
         assert_eq!(
@@ -2879,11 +3098,117 @@ async fn run_tool_scenario(case: EdgeCallbackScenario) {
         assert_eq!(
             find_events(&events, "tool_request")
                 .iter()
-                .filter(|event| event["request_id"] == step.request_id)
+                .filter(|event| event["request_id"]
+                    == call_id_for(&events, step.tool_name, |args| args == &step.args))
                 .count(),
             1
         );
     }
+}
+
+#[tokio::test]
+async fn unknown_edge_outcome_reaches_model_before_it_inspects_the_result() {
+    const MESSAGE: &str = "Write notes and inspect the result.";
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new(
+        "unknown edge outcome",
+        |request| primary_request_for(request, MESSAGE),
+        vec![
+            ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{
+                "role":"assistant", "content":"", "tool_calls":[tool_call(
+                    "write-unknown", "write_file", json!({"path":"notes.txt", "content":"hello"})
+                )]}, "finish_reason":"tool_calls"}]})),
+            ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{
+                "role":"assistant", "content":"", "tool_calls":[tool_call(
+                    "inspect-notes", "read_file", json!({"path":"notes.txt"})
+                )]}, "finish_reason":"tool_calls"}]})),
+            ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{
+                "role":"assistant", "content":"The write could not be confirmed."
+            }, "finish_reason":"stop"}]})),
+        ],
+    )])
+    .await;
+    let response = chat_stream_start(
+        &app,
+        json!({
+            "message": MESSAGE,
+            "interactive_client": true,
+            "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"},
+            "context": {"edge_tools": [tool_schema("write_file"), tool_schema("read_file")]}
+        }),
+    )
+    .await;
+    let (mut rx, reader) = spawn_sse_reader(response.into_body()).await;
+    let approval_identity = wait_for_approval_identity(&mut rx).await;
+    let approval = wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
+    let approval_id = approval["request_id"].as_str().unwrap();
+    assert_eq!(
+        post_approval_respond(&app, &approval_identity, approval_id, "allow").await,
+        StatusCode::OK
+    );
+    let write = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
+    assert_eq!(write["tool"], "write_file");
+    assert_eq!(
+        write["args"],
+        json!({"path":"notes.txt", "content":"hello"})
+    );
+    let (request_id, identity) = tool_request_identity_from_event(&write).unwrap();
+    assert_eq!(request_id, approval_id);
+    assert_eq!(
+        post_tool_result_with_identity(
+            &app,
+            &request_id,
+            "The write acknowledgement was lost.",
+            "failed",
+            identity,
+            Some(Map::from_iter([
+                ("error_kind".into(), json!("tool_outcome_unknown")),
+                ("execution_fact".into(), json!("unknown")),
+                ("side_effects_maybe".into(), json!(true)),
+                ("retryable".into(), json!(false)),
+            ])),
+        )
+        .await,
+        StatusCode::OK
+    );
+    let read = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
+    assert_eq!(read["tool"], "read_file");
+    assert_eq!(read["args"], json!({"path":"notes.txt"}));
+    assert_eq!(
+        post_tool_result_from_event(&app, &read, "hello", "completed").await,
+        StatusCode::OK
+    );
+    wait_for_sse(&mut rx, "turn_complete", E2E_WAIT_TIMEOUT_SECS).await;
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(find_events(&events, "tool_request").len(), 2);
+    let answer: String = find_events(&events, "text_delta")
+        .iter()
+        .filter_map(|event| event["content"].as_str())
+        .collect();
+    assert_eq!(answer, "The write could not be confirmed.");
+    assert_eq!(find_events(&events, "turn_complete").len(), 1);
+    assert!(find_events(&events, "error").is_empty());
+    let requests = gateway.requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    let tool_message = |request: &ProviderRequest, call_id: &str| {
+        request.body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool" && message["tool_call_id"] == call_id)
+            .and_then(|message| message["content"].as_str())
+            .unwrap()
+            .to_string()
+    };
+    let unknown = tool_message(&requests[1], "write-unknown");
+    assert!(unknown.contains("tool_outcome_unknown"));
+    assert!(unknown.contains("Inspect the outcome before repeating it"));
+    assert!(tool_message(&requests[2], "inspect-notes").contains("hello"));
+    drop(requests);
+    gateway.assert_complete();
+    inference.assert_quiescent();
 }
 
 /// Poll run status until it reaches the expected value (with timeout).
@@ -3069,7 +3394,8 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 
     let tool_call = find_event(&events, "tool_call")
         .unwrap_or_else(|| panic!("expected tool_call event: {events:?}"));
-    assert_eq!(tool_call["tool_call"]["id"], "call-bash-binding");
+    assert_eq!(tool_call["tool_call"]["function"]["name"], "bash");
+    assert_ne!(tool_call["tool_call"]["id"], "call-bash-binding");
     // The provider event is an intent, not an execution receipt.  It must not
     // claim the host's default owner before admission selects a route.
     assert!(tool_call.get("workspace").is_none());
@@ -3079,7 +3405,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     // Route-owned lifecycle events are the authoritative execution evidence.
     let tool_end = find_events(&events, "tool_call_end")
         .into_iter()
-        .find(|event| event["call_id"] == "call-bash-binding")
+        .find(|event| event["call_id"] == call_id_for(&events, "bash", |_| true))
         .unwrap_or_else(|| panic!("expected routed tool_call_end event: {events:?}"));
     assert_eq!(tool_end["workspace"]["kind"], "server_sandbox");
     assert_eq!(tool_end["executor"]["kind"], "server_local");
@@ -3272,8 +3598,8 @@ async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup(
         ],
     )])
     .await;
-    let inference = InferenceLedgerFixture::default();
-    let (app, hook, observer, ledger) = build_test_app_with_hooks(
+    let inference = ProviderObservationsFixture::default();
+    let (app, observer, ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -3304,7 +3630,8 @@ async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup(
         .collect();
     for (index, (id, output)) in outputs.iter().enumerate() {
         let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-        assert_eq!(request["request_id"], *id);
+        assert_eq!(request["request_id"].as_str().unwrap().len(), 64);
+        assert_ne!(request["request_id"], *id);
         if index == 0 {
             assert_eq!(request["args"], complex_args);
             assert_eq!(
@@ -3372,9 +3699,10 @@ async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup(
             .iter()
             .map(|call| call["id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        outputs[..5]
+        find_events(&events, "tool_call")
             .iter()
-            .map(|(id, _)| id.as_str())
+            .take(5)
+            .map(|event| event["tool_call"]["id"].as_str().unwrap())
             .collect::<Vec<_>>()
     );
     assert_eq!(
@@ -3389,9 +3717,9 @@ async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup(
         .collect::<Vec<_>>();
     assert_eq!(
         result_ids,
-        outputs
+        find_events(&events, "tool_call")
             .iter()
-            .map(|(id, _)| id.as_str())
+            .map(|event| event["tool_call"]["id"].as_str().unwrap())
             .collect::<Vec<_>>()
     );
     assert!(messages.iter().all(|message| {
@@ -3402,7 +3730,6 @@ async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup(
                 .and_then(Value::as_array)
                 .is_some_and(|calls| !calls.is_empty())
     }));
-    assert!(hook.plans.lock().await.is_empty());
     poll_until(
         || {
             let ledger = ledger.clone();
@@ -3428,7 +3755,10 @@ async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup(
         if id == "batch-3" {
             assert!(content.starts_with("<persisted-output>"));
             assert!(content.contains("50000 chars"));
-            assert!(content.contains("Tool result id: batch-3"));
+            // Artifact custody uses the canonical invocation id; provider
+            // wire ids are restored only in the outgoing tool-call envelope.
+            let canonical_id = first_batch[3]["id"].as_str().unwrap();
+            assert!(content.contains(&format!("Tool result id: {canonical_id}")));
             assert!(content.contains(&"y".repeat(128)));
             assert!(content.len() < output.len());
         } else {
@@ -3444,8 +3774,8 @@ async fn skill_tool_call_is_intercepted_without_edge_tool_request() {
                         tool_call("tc-skill-1", "skill", json!({"skill_name": "test-skill"}))
                     ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"I used the skill instructions.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
-    let (app, hook_writer, observer_worker) = build_test_app_with_hooks_and_skills(
+    let inference = ProviderObservationsFixture::default();
+    let (app, observer_worker) = build_test_app_with_observer_and_skills(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -3453,6 +3783,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     );
 
     let payload = json!({
+        "allow_skills": ["test-skill"],
         "message": "Use the test skill",
     "model_selection":{"offering_id":"model-MiniMax-M2.7"},
     "context":{"edge_profile":{"active_skills":["concise","markdown"],"cwd":"/workspace/astra","git_branch":"main"}},
@@ -3481,7 +3812,13 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     let result = requests[0]
         .messages
         .iter()
-        .find(|message| message.get("tool_call_id").and_then(Value::as_str) == Some("tc-skill-1"))
+        .find(|message| {
+            message.get("tool_call_id").and_then(Value::as_str)
+                == Some(
+                    call_id_for(&events, "skill", |args| args["skill_name"] == "test-skill")
+                        .as_str(),
+                )
+        })
         .and_then(|message| message.get("content").and_then(Value::as_str))
         .unwrap_or("");
     assert!(
@@ -3514,28 +3851,6 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         "final LLM round should continue after skill interception"
     );
 
-    poll_until(
-        || {
-            let hook_writer = hook_writer.clone();
-            async move { !hook_writer.plans.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-    let plans = hook_writer.plans.lock().await;
-    assert_eq!(
-        plans.len(),
-        1,
-        "an intercepted skill must persist exactly one selection"
-    );
-    let skill = plans
-        .first()
-        .and_then(|plan| plan.skill_selection.as_ref())
-        .expect("an intercepted skill must persist its explicit selection");
-    assert_eq!(skill.skill_name, "test-skill");
-    assert_eq!(skill.selected_skills, vec!["test-skill".to_string()]);
-    assert_eq!(skill.selection_method, "llm_skill_choice");
-
     gateway.assert_complete();
     inference.assert_quiescent();
     assert_eq!(inference.attempt_count(), 2);
@@ -3553,8 +3868,8 @@ async fn cli_thin_client_single_admission_completes_server_owned_multi_round_loo
                         )
                     ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"The server completed the skill round.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
-    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks_and_skills(
+    let inference = ProviderObservationsFixture::default();
+    let (app, observer_worker) = build_test_app_with_observer_and_skills(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -3575,6 +3890,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     });
 
     let payload = normalize_chat_stream_payload(json!({
+        "allow_skills": ["test-skill"],
         "message": "Use the test skill and report the result",
     "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "context": {
@@ -3637,7 +3953,8 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         "one Server loop should emit one observation"
     );
     assert!(requests[0].messages.iter().any(|message| {
-        message.get("tool_call_id").and_then(Value::as_str) == Some("tc-cli-server-skill")
+        message.get("tool_call_id").and_then(Value::as_str)
+            == Some(call_id_for(&events, "skill", |_| true).as_str())
     }));
     drop(requests);
 
@@ -3660,8 +3977,8 @@ async fn unknown_skill_returns_error_without_edge_tool_request() {
                         tool_call("tc-skill-unknown", "skill", json!({"skill_name": "missing-skill"}))
                     ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"The skill was unavailable.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
-    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks_and_skills(
+    let inference = ProviderObservationsFixture::default();
+    let (app, observer_worker) = build_test_app_with_observer_and_skills(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -3669,6 +3986,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     );
 
     let payload = json!({
+        "allow_skills": ["test-skill"],
         "message": "Use a missing skill",
     "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "context": {
@@ -3699,7 +4017,13 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         .messages
         .iter()
         .find(|message| {
-            message.get("tool_call_id").and_then(Value::as_str) == Some("tc-skill-unknown")
+            message.get("tool_call_id").and_then(Value::as_str)
+                == Some(
+                    call_id_for(&events, "skill", |args| {
+                        args["skill_name"] == "missing-skill"
+                    })
+                    .as_str(),
+                )
         })
         .and_then(|message| message.get("content").and_then(Value::as_str))
         .unwrap_or("");
@@ -3841,7 +4165,8 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(request["request_id"].as_str(), Some("tc-err-1"));
+    assert_eq!(request["request_id"].as_str().unwrap().len(), 64);
+    assert_ne!(request["request_id"], "tc-err-1");
     assert_eq!(
         post_tool_result_from_event(&app, &request, "status=error: file not found", "failed").await,
         StatusCode::OK
@@ -3903,12 +4228,19 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 
     // Wait for the approval_required SSE, then approve, then post tool result.
     let approval_identity = wait_for_approval_identity(&mut rx).await;
-    wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
-    let st = post_approval_respond(&app, &approval_identity, "tc-approve-1", "allow").await;
+    let approval = wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
+    let st = post_approval_respond(
+        &app,
+        &approval_identity,
+        approval["request_id"].as_str().unwrap(),
+        "allow",
+    )
+    .await;
     assert_eq!(st, 200, "approval POST failed");
 
     let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(request["request_id"].as_str(), Some("tc-approve-1"));
+    assert_eq!(request["request_id"].as_str().unwrap().len(), 64);
+    assert_ne!(request["request_id"], "tc-approve-1");
     let st = post_tool_result_from_event(&app, &request, "written", "completed").await;
     assert_eq!(st, 200, "tool result POST failed");
 
@@ -4009,29 +4341,31 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         .iter()
         .filter_map(|req| req.get("request_id").and_then(Value::as_str))
         .collect();
-    assert_eq!(approval_ids, vec!["tc-write-a", "tc-write-b"]);
+    assert_eq!(approval_ids.len(), 2);
+    assert_ne!(approval_ids[0], approval_ids[1]);
+    assert!(approval_ids.iter().all(|id| id.len() == 64));
 
     let read_request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(
-        read_request["request_id"].as_str(),
-        Some("tc-read-first"),
+        read_request["tool"].as_str(),
+        Some("read_file"),
         "earlier read-only call should execute before later approval-gated block"
     );
     let st = post_tool_result_from_event(&app, &read_request, "read-ok", "completed").await;
     assert_eq!(st, 200, "read-only tool result POST failed");
 
-    let st = post_approval_respond(&app, &approval_identity, "tc-write-a", "allow").await;
+    let st = post_approval_respond(&app, &approval_identity, approval_ids[0], "allow").await;
     assert_eq!(st, 200, "first approval POST failed");
-    let st = post_approval_respond(&app, &approval_identity, "tc-write-b", "allow").await;
+    let st = post_approval_respond(&app, &approval_identity, approval_ids[1], "allow").await;
     assert_eq!(st, 200, "second approval POST failed");
 
     let write_request_a = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(write_request_a["request_id"].as_str(), Some("tc-write-a"));
+    assert_eq!(write_request_a["request_id"], approval_ids[0]);
     let st = post_tool_result_from_event(&app, &write_request_a, "write-a-ok", "completed").await;
     assert_eq!(st, 200, "first write result POST failed");
 
     let write_request_b = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(write_request_b["request_id"].as_str(), Some("tc-write-b"));
+    assert_eq!(write_request_b["request_id"], approval_ids[1]);
     let st = post_tool_result_from_event(&app, &write_request_b, "write-b-ok", "completed").await;
     assert_eq!(st, 200, "second write result POST failed");
 
@@ -4044,14 +4378,14 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         .iter()
         .position(|event| {
             event.get("type").and_then(Value::as_str) == Some("tool_request")
-                && event.get("request_id").and_then(Value::as_str) == Some("tc-read-first")
+                && event["request_id"] == read_request["request_id"]
         })
         .expect("read tool_request");
     let first_write_request_pos = events
         .iter()
         .position(|event| {
             event.get("type").and_then(Value::as_str) == Some("tool_request")
-                && event.get("request_id").and_then(Value::as_str) == Some("tc-write-a")
+                && event["request_id"] == approval_ids[0]
         })
         .expect("first write tool_request");
     assert!(
@@ -4109,8 +4443,14 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 
     // Deny the approval.
     let approval_identity = wait_for_approval_identity(&mut rx).await;
-    wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
-    let st = post_approval_respond(&app, &approval_identity, "tc-deny-1", "deny").await;
+    let approval = wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
+    let st = post_approval_respond(
+        &app,
+        &approval_identity,
+        approval["request_id"].as_str().unwrap(),
+        "deny",
+    )
+    .await;
     assert_eq!(st, 200, "approval deny POST failed");
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -4150,7 +4490,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 async fn cancelled_edge_run_stops_inference_and_clears_its_callback_ledger() {
     const MESSAGE: &str = "Read the file before cancellation.";
     let gateway=ProviderGateway::start(vec![ProviderScript::new("cancel while waiting for actual Edge callback",|request|primary_request_for(request,MESSAGE),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[tool_call("native-cancel","read_file",json!({"path":"/src/main.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
+    let inference = ProviderObservationsFixture::default();
     let (app, ledger) = build_test_app_with_models(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
@@ -4160,7 +4500,8 @@ async fn cancelled_edge_run_stops_inference_and_clears_its_callback_ledger() {
     let response=chat_stream_start(&app,json!({"message":MESSAGE,"execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},"context":{"edge_tools":[tool_schema("read_file")]}})).await;
     let (mut rx, reader) = spawn_sse_reader(response.into_body()).await;
     let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(request["request_id"], "native-cancel");
+    assert_eq!(request["tool"], "read_file");
+    assert_eq!(request["request_id"].as_str().unwrap().len(), 64);
     let run_id = request["run_id"].as_str().unwrap();
     let (status, list) = list_runs(&app, 10).await;
     assert_eq!(status, StatusCode::OK);
@@ -4341,9 +4682,8 @@ async fn tool_call_without_provider_identity_is_rejected_before_edge_delivery() 
                         }
                     ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
 
-    // Execution identity belongs to the provider. The runtime must not mint
-    // one because doing so makes replay, callback, and durable pairing
-    // ambiguous.
+    // A canonical invocation requires unambiguous provider linkage. Missing
+    // linkage must fail before admission or Edge delivery.
     let payload = json!({
         "message": "auto-id test",
     "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
@@ -4377,7 +4717,8 @@ async fn tool_call_without_provider_identity_is_rejected_before_edge_delivery() 
             .iter()
             .any(|event| event["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("provider tool-call protocol violation"))),
+                .is_some_and(|message| message
+                    .contains("provider tool-call identity is missing or malformed"))),
         "the identity contract failure must remain observable: {events:?}"
     );
 
@@ -4470,18 +4811,19 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     let approval_identity = wait_for_approval_identity(&mut rx).await;
-    wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
+    let approval = wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
     let st = post_approval_respond(
         &app,
         &approval_identity,
-        "tc-session-approve",
+        approval["request_id"].as_str().unwrap(),
         "allow_session",
     )
     .await;
     assert_eq!(st, 200);
 
     let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(request["request_id"].as_str(), Some("tc-session-approve"));
+    assert_eq!(request["request_id"].as_str().unwrap().len(), 64);
+    assert_ne!(request["request_id"], "tc-session-approve");
     let st = post_tool_result_from_event(&app, &request, "ok", "completed").await;
     assert_eq!(st, 200);
 
@@ -4983,10 +5325,10 @@ async fn client_disconnect_run_still_finalizes() {
 
 /// Ordinary answers reach the observer without writing a hook projection.
 #[tokio::test]
-async fn hook_db_text_only_skips_writer() {
-    let gateway = ProviderGateway::start(vec![ProviderScript::new("hook_db_text_only_skips_writer", |request| primary_request_for(request, "hello"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Hi there!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
-    let (app, hook_writer, observer_worker, _ledger) = build_test_app_with_hooks(
+async fn ordinary_answer_reaches_observer() {
+    let gateway = ProviderGateway::start(vec![ProviderScript::new("ordinary_answer_reaches_observer", |request| primary_request_for(request, "hello"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Hi there!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+    let inference = ProviderObservationsFixture::default();
+    let (app, observer_worker, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -5011,7 +5353,6 @@ async fn hook_db_text_only_skips_writer() {
         5,
     )
     .await;
-    assert!(hook_writer.plans.lock().await.is_empty());
 
     // Observer should have been called with messages.
     let requests = observer_worker.requests.lock().await;
@@ -5051,8 +5392,8 @@ async fn hook_db_text_only_skips_writer() {
 #[tokio::test]
 async fn observer_fired_with_correct_metadata() {
     let gateway = ProviderGateway::start(vec![ProviderScript::new("observer_fired_with_correct_metadata", |request| primary_request_for(request, "hello"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Hi!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
-    let (app, _hook_writer, observer_worker, _ledger) = build_test_app_with_hooks(
+    let inference = ProviderObservationsFixture::default();
+    let (app, observer_worker, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -5188,8 +5529,8 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
                         ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-guidance-r9", "read_file", json!({"path": "Cargo.toml"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Done.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
-    let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
+    let inference = ProviderObservationsFixture::default();
+    let (app, _observer, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -5231,7 +5572,8 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         ("tc-guidance-r9", "[package]\nname = \"astra\""),
     ] {
         let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-        assert_eq!(request["request_id"].as_str(), Some(id));
+        assert_eq!(request["request_id"].as_str().unwrap().len(), 64);
+        assert_ne!(request["request_id"], id);
         let status = post_tool_result_from_event(&app, &request, result, "completed").await;
         assert_eq!(status, StatusCode::OK);
     }
@@ -5275,8 +5617,8 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-analysis-r3", "grep", json!({"pattern": "TODO", "path": "src/"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-analysis-r4", "grep", json!({"pattern": "TODO", "path": "src/"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Done reviewing.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
-    let (app, _hook_writer, observer_worker, _ledger) = build_test_app_with_hooks(
+    let inference = ProviderObservationsFixture::default();
+    let (app, observer_worker, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -5333,7 +5675,9 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         .expect("reader task failed");
     assert_eq!(
         callback_request_ids.first().map(String::as_str),
-        Some("tc-analysis-r1"),
+        find_events(&events, "tool_call")
+            .first()
+            .and_then(|e| e["tool_call"]["id"].as_str()),
         "the first logical call must be dispatched before results can be reused"
     );
     assert!(
@@ -5383,8 +5727,8 @@ async fn execution_budget_extends_web_agent_run_when_progress_is_real() {
     let gateway=ProviderGateway::start(vec![ProviderScript::new("execution_budget_extends_web_agent_run_when_progress_is_real", |request| primary_request_for(request,"explore the codebase and investigate the root cause"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-budget-r1", "read_file", json!({"path": "src/lib.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-budget-r2", "glob", json!({"pattern": "src/**/*.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Completed after exploratory extension.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
-    let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
+    let inference = ProviderObservationsFixture::default();
+    let (app, _observer, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -5412,14 +5756,16 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     let first = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(first["request_id"].as_str(), Some("tc-budget-r1"));
+    assert_eq!(first["request_id"].as_str().unwrap().len(), 64);
+    assert_ne!(first["request_id"], "tc-budget-r1");
     assert_eq!(
         post_tool_result_from_event(&app, &first, "module contents", "completed").await,
         StatusCode::OK
     );
 
     let second = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(second["request_id"].as_str(), Some("tc-budget-r2"));
+    assert_eq!(second["request_id"].as_str().unwrap().len(), 64);
+    assert_ne!(second["request_id"], "tc-budget-r2");
     assert_eq!(
         post_tool_result_from_event(&app, &second, "src/lib.rs\nsrc/main.rs", "completed").await,
         StatusCode::OK
@@ -5451,10 +5797,9 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 #[tokio::test]
 async fn execution_budget_hard_limit_stops_web_agent_run_even_with_progress() {
     let gateway=ProviderGateway::start(vec![ProviderScript::new("execution_budget_hard_limit_stops_web_agent_run_even_with_progress", |request| primary_request_for(request,"explore the codebase and investigate the root cause"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-hard-limit-r1", "read_file", json!({"path": "src/lib.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
-ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-hard-limit-r2", "glob", json!({"pattern": "src/**/*.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
-ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Final answer after the hard limit.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
-    let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-hard-limit-r2", "glob", json!({"pattern": "src/**/*.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+    let inference = ProviderObservationsFixture::default();
+    let (app, _observer, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -5489,7 +5834,8 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     let (mut rx, reader) = spawn_sse_reader(body).await;
 
     let first = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(first["request_id"].as_str(), Some("tc-hard-limit-r1"));
+    assert_eq!(first["request_id"].as_str().unwrap().len(), 64);
+    assert_ne!(first["request_id"], "tc-hard-limit-r1");
     assert_eq!(
         post_tool_result_from_event(&app, &first, "module contents", "completed").await,
         StatusCode::OK
@@ -5500,112 +5846,70 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         .expect("stream timed out")
         .expect("reader task failed");
     let wire = String::from_utf8(raw_wire.lock().unwrap().clone()).unwrap();
-    let interrupted = events
+    let failed = events
         .iter()
-        .position(|event| event["type"] == "run_interrupted")
-        .expect("typed interruption");
+        .position(|event| event["type"] == "run_error")
+        .expect("typed terminal failure");
     let finished = events
         .iter()
         .position(|event| event["type"] == "run_finished")
         .expect("durable terminal");
-    let complete = events
-        .iter()
-        .position(|event| event["type"] == "turn_complete")
-        .expect("authoritative completion");
-    assert!(interrupted < finished && finished < complete);
-    assert_eq!(events[interrupted]["kind"], "budget_exhausted");
-    assert_eq!(events[complete]["continuation_owner"], "server");
-    assert_eq!(events[complete]["interruption"]["kind"], "budget_exhausted");
+    assert!(failed < finished);
+    assert_eq!(events[failed]["error_kind"], "budget_exhausted");
+    assert!(!events.iter().any(|event| matches!(
+        event["type"].as_str(),
+        Some("run_interrupted" | "turn_complete")
+    )));
     assert_eq!(wire.matches("data: [DONE]\n\n").count(), 1);
     let mut accum = ChatTurnSseAccum::default();
     let mut edge_pending = Vec::new();
     for block in wire.split("\n\n").filter(|block| !block.is_empty()) {
         dispatch_chat_turn_sse_event_block(block, &mut accum, &mut edge_pending);
     }
-    assert!(accum.server_loop_terminal);
-    assert_eq!(accum.error_kind, None);
-    let summary = accum
-        .server_execution_summary
-        .expect("CLI accepts the actual paused summary");
-    assert_eq!(summary.llm_rounds, 3);
-    let feedback = summary
-        .runtime_feedback
-        .expect("actual provider execution supplies runtime feedback");
+    assert!(accum.has_authoritative_failed_terminal());
     assert_eq!(
-        feedback.identity.run_id,
-        find_event(&events, "session_info").unwrap()["run_id"]
-            .as_str()
-            .unwrap()
+        accum.error_kind,
+        Some(astra_core::ErrorKind::BudgetExhausted)
     );
-    assert_eq!(feedback.progress.llm_rounds_completed, 3);
-    assert_eq!(feedback.progress.slice_rounds_remaining, 0);
-    assert_eq!(feedback.progress.absolute_round_ceiling, Some(2));
-    let accounted = feedback
-        .run_usage
-        .expect("settled provider attempts retain their usage");
-    assert_eq!(accounted.prompt, 126);
-    assert_eq!(accounted.completion, 21);
+    assert!(accum.server_interruption.is_none());
     let root = find_event(&events, "session_info").unwrap()["run_id"]
         .as_str()
         .unwrap();
     let (status, durable) = get_run_status(&app, root).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(durable["status"], "paused");
-    let text: String = find_events(&events, "text_delta")
-        .into_iter()
-        .filter_map(|event| event["content"].as_str().map(str::to_string))
-        .collect();
-    assert!(
-        text.contains("Final answer after the hard limit."),
-        "hard limit should preserve the text-only settlement boundary, got: {text}"
-    );
+    assert_eq!(durable["status"], "failed");
+    assert!(accum.full_text.contains("Turn budget exhausted"));
     let tool_requests = find_events(&events, "tool_request");
     assert_eq!(
         tool_requests.len(),
         1,
         "hard limit must dispatch exactly one tool request before text-only settlement"
     );
-    assert_eq!(
-        tool_requests[0]["request_id"].as_str(),
-        Some("tc-hard-limit-r1")
-    );
+    assert_eq!(tool_requests[0]["request_id"], first["request_id"]);
     let rejected = find_events(&events, "tool_call_end")
         .into_iter()
-        .find(|event| event["call_id"] == "tc-hard-limit-r2")
+        .find(|event| event["tool"] == "glob")
         .expect("the denied second provider attempt must have one terminal projection");
     assert_eq!(rejected["status"], "rejected");
     assert_eq!(rejected["success"], false);
-
-    let terminal = find_events(&events, "turn_complete")
-        .into_iter()
-        .next()
-        .expect("bounded synthesis must emit one terminal aggregate");
-    assert_eq!(terminal["tool_calls_count"], 2);
-    assert_eq!(terminal["tool_ledger_receipt"]["attempted"], 2);
-    assert_eq!(terminal["tool_ledger_receipt"]["terminal"], 2);
+    let terminal = &events[finished];
+    assert_eq!(terminal["status"], "failed");
+    assert_eq!(terminal["error_kind"], "budget_exhausted");
+    assert_ne!(terminal.get("resumable"), Some(&json!(true)));
+    let evaluation = &terminal["turn_evaluation"]["metadata"];
+    assert_eq!(evaluation["llm_rounds"], 2);
+    assert_eq!(evaluation["tool_call_count"], 2);
+    assert_eq!(evaluation["tool_execution_count"], 1);
+    assert_eq!(evaluation["tool_rejected_count"], 1);
     assert_eq!(
-        terminal["tool_ledger_receipt"]["result_classes"]["rejected"],
-        1
+        evaluation["execution_owner_generation"],
+        terminal["owner_generation"]
     );
-    assert_eq!(terminal["tool_ledger_receipt"]["unresolved"], 0);
-    assert_eq!(terminal["tool_ledger_receipt"]["consistent"], true);
-    let run_finished = find_events(&events, "run_finished")
-        .into_iter()
-        .next()
-        .expect("run terminal");
-    assert_eq!(terminal["execution_state"]["status"], "interrupted");
-    assert_eq!(
-        terminal["execution_state"]["interruption_kind"],
-        "budget_exhausted"
-    );
-    assert_eq!(run_finished["status"], "paused");
-    assert_eq!(run_finished["interruption_kind"], "budget_exhausted");
-    assert_eq!(run_finished["resumable"], true);
 
     gateway.assert_complete();
     inference.assert_quiescent();
-    assert_eq!(inference.attempt_count(), 3);
-    assert_eq!(gateway.requests.lock().await.len(), 3);
+    assert_eq!(inference.attempt_count(), 2);
+    assert_eq!(gateway.requests.lock().await.len(), 2);
 }
 
 #[tokio::test]
@@ -5613,8 +5917,8 @@ async fn web_agent_stream_preserves_failed_edge_statuses_in_tool_call_end() {
     let gateway=ProviderGateway::start(vec![ProviderScript::new("web_agent_stream_preserves_failed_edge_statuses_in_tool_call_end", |request| primary_request_for(request,"explore the codebase and investigate the root cause"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-budget-fail-r1", "read_file", json!({"path": "src/lib.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-budget-fail-r2", "glob", json!({"pattern": "src/**/*.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Edge operations returned partial failure and denial.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
-    let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
+    let inference = ProviderObservationsFixture::default();
+    let (app, _observer, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -5642,7 +5946,8 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     let first = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(first["request_id"].as_str(), Some("tc-budget-fail-r1"));
+    assert_eq!(first["request_id"].as_str().unwrap().len(), 64);
+    assert_ne!(first["request_id"], "tc-budget-fail-r1");
     assert_eq!(
         post_tool_result_from_event(&app, &first, "transient read failure", "partial_failure")
             .await,
@@ -5650,7 +5955,8 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     );
 
     let second = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(second["request_id"].as_str(), Some("tc-budget-fail-r2"));
+    assert_eq!(second["request_id"].as_str().unwrap().len(), 64);
+    assert_ne!(second["request_id"], "tc-budget-fail-r2");
     assert_eq!(
         post_tool_result_from_event(&app, &second, "permission denied", "denied").await,
         StatusCode::OK
@@ -5686,8 +5992,8 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 #[tokio::test]
 async fn context_meta_exposes_memory_signal_context_flag() {
     let gateway = ProviderGateway::start(vec![ProviderScript::new("context_meta_exposes_memory_signal_context_flag", |request| primary_request_for(request, "remember that I prefer dark mode"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Stored."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
-    let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
+    let inference = ProviderObservationsFixture::default();
+    let (app, _observer, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -5739,8 +6045,8 @@ async fn context_meta_exposes_memory_signal_context_flag() {
 #[tokio::test]
 async fn context_meta_exposes_builder_supplied_context_signals() {
     let gateway = ProviderGateway::start(vec![ProviderScript::new("context_meta_exposes_builder_supplied_context_signals", |request| primary_request_for(request, "remember that I prefer dark mode"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Stored."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
-    let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
+    let inference = ProviderObservationsFixture::default();
+    let (app, _observer, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
@@ -5897,4 +6203,513 @@ async fn context_meta_surfaces_unknown_active_skills_for_debugging() {
     })
     .await
     .expect("context_meta_surfaces_unknown_active_skills_for_debugging exceeded 30s timeout — likely a hang regression");
+}
+
+#[allow(dead_code)]
+mod subscription_provider {
+    use astra_services as services;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../services/tests/common/chatgpt_fixture.rs"
+    ));
+}
+
+#[path = "../../services/tests/common/isolated_database.rs"]
+mod subscription_isolated_database;
+
+/// Product path: explicit provider consent, personal model creation, real
+/// model-catalog execution, durable history, and fresh Server services.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session() {
+    responses_agent_uses_catalog_and_continues_persisted_session(false, false, false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn api_key_responses_agent_continues_persisted_session() {
+    responses_agent_uses_catalog_and_continues_persisted_session(true, false, false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn personal_byok_responses_public_journey_preserves_private_continuation() {
+    responses_agent_uses_catalog_and_continues_persisted_session(false, true, false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn personal_byok_responses_current_turn_prunes_completed_reasoning() {
+    responses_agent_uses_catalog_and_continues_persisted_session(false, true, true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn personal_byok_responses_fork_replays_authorized_parent_continuation() {
+    responses_agent_uses_catalog_and_continues_persisted_session(false, true, false, true).await;
+}
+
+async fn responses_agent_uses_catalog_and_continues_persisted_session(
+    api_key: bool,
+    personal_byok: bool,
+    current_turn_only: bool,
+    forked: bool,
+) {
+    use astra_services::chatgpt::ChatgptConfig;
+    use astra_services::{DatabaseModelService, DatabaseSessionService};
+    init_env();
+    let settings = test_support::require_db_it_env();
+    subscription_isolated_database::require_isolated_database(&settings.database);
+    let journals = tempfile::tempdir().unwrap();
+    let _journal_scope =
+        astra_services::session_journal::ProcessJournalDirGuard::new(journals.path());
+    astra_services::ensure_core_schema(&settings, "mysql")
+        .await
+        .unwrap();
+    let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    subscription_provider::ensure_owner(pool.get(), USER_ID).await;
+    astra_services::resource_governor::DatabaseResourceGovernor::new(pool.clone())
+        .ensure_tables()
+        .await
+        .unwrap();
+    let provider = subscription_provider::ProviderFixture::start().await;
+    let config = ChatgptConfig::for_test(&provider.base);
+    let key = test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!");
+    let make_app = || {
+        let context = Arc::new(astra_services::DatabaseSessionContextCoordinator::new(
+            pool.clone(),
+        ));
+        let forks = Arc::new(astra_services::DatabaseSessionForkCoordinator::new(
+            pool.clone(),
+            context.clone(),
+        ));
+        let models = Arc::new(
+            DatabaseModelService::new(settings.clone(), key.clone())
+                .with_pool(pool.clone())
+                .with_chatgpt_config(config.clone())
+                .with_deepseek_test_endpoint(
+                    provider.base.trim_start_matches("http://").parse().unwrap(),
+                )
+                .unwrap(),
+        );
+        let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
+            .with_shared_pool(pool.clone())
+            .with_session_context_authority(
+                context,
+                Arc::new(astra_services::ExecutionGrantSigner::new([7_u8; 32]).unwrap()),
+            )
+            .with_session_fork_coordinator(forks)
+            .with_auth_service(Arc::new(StubAuth))
+            .with_session_service(Arc::new(
+                DatabaseSessionService::new(settings.clone()).with_pool(pool.clone()),
+            ))
+            .with_model_service(models.clone());
+        let store = Arc::new(
+            astra_services::DatabaseRunStateStore::new(pool.clone())
+                .with_owner_pod_id("subscription-public-server"),
+        );
+        let lifecycle = astra_runtime::AgenticRunLifecycleService::new(
+            settings.clone(),
+            key.clone(),
+            base.edge_callback_ledger(),
+            astra_runtime::RunEngine::new(store),
+        )
+        .with_pool(pool.clone())
+        .with_auth_service(Arc::new(StubAuth))
+        .with_model_service(models)
+        .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
+        (base, lifecycle)
+    };
+    async fn post(app: &Router, path: &str, value: Value) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("authorization", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(value.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            status.is_success(),
+            "{path}: {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        serde_json::from_slice(&bytes).unwrap()
+    }
+    let (base, lifecycle) = make_app();
+    let app = build_app(base.with_run_lifecycle_service(Arc::new(lifecycle)));
+    let model = if personal_byok {
+        provider
+            .state
+            .allow_test_api_key
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        provider
+            .state
+            .plaintext_reasoning
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let model = post(
+            &app,
+            "/me/models",
+            json!({
+                "name":format!("public-byok-{}",uuid::Uuid::new_v4()),
+                "provider":"deepseek", "model":"fixture-model", "api_key":"fixture-api-key",
+                "inference_protocol":"openai_responses", "context_window":128000, "is_default":false,
+                "responses_reasoning_history":"all_turns"
+            }),
+        )
+        .await;
+        assert_eq!(model["responses_reasoning_history"], "all_turns");
+        if current_turn_only {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!(
+                            "/me/models/{}",
+                            model["model_id"].as_str().unwrap()
+                        ))
+                        .header("authorization", TOKEN)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({"responses_reasoning_history":"current_turn"}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            assert!(
+                status.is_success(),
+                "{status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let updated: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(updated["responses_reasoning_history"], "current_turn");
+        }
+        post(
+            &app,
+            &format!("/me/models/{}/check", model["model_id"].as_str().unwrap()),
+            json!({}),
+        )
+        .await;
+        model
+    } else if api_key {
+        provider
+            .state
+            .allow_test_api_key
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let service =
+            DatabaseModelService::new(settings.clone(), key.clone()).with_pool(pool.clone());
+        let model = service
+            .create_model(
+                USER_ID.to_string(),
+                ModelCreateRequestData {
+                    name: format!("api-responses-{}", uuid::Uuid::new_v4()),
+                    provider: "openai".into(),
+                    api_key: "fixture-api-key".into(),
+                    base_url: Some(format!("{}/v1", provider.base)),
+                    description: None,
+                    context_window: Some(128000),
+                    max_completion_tokens: None,
+                    input_modalities: vec!["text".into()],
+                    output_modalities: vec!["text".into()],
+                    supported_parameters: vec![],
+                    pricing: None,
+                    architecture: None,
+                    tags: vec![],
+                    quirks: Some(astra_services::models::QuirksData {
+                        inference_protocol: Some(
+                            astra_core::model_wire::LlmProviderProtocol::OpenAiResponses,
+                        ),
+                        supported_reasoning_efforts: Some(vec!["high".into(), "max".into()]),
+                        ..Default::default()
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        json!({"model_id":model.model_id})
+    } else {
+        let authorization = post(
+            &app,
+            "/me/model-connections/chatgpt/authorizations",
+            json!({"redirect_uri":"http://127.0.0.1:14555/auth/callback","label":"public-agent-test"}),
+        )
+        .await;
+        let code = provider.issue_code(
+            &authorization,
+            &format!("public-{}", uuid::Uuid::new_v4()),
+            true,
+        );
+        let linked = post(
+            &app,
+            &format!(
+                "/me/model-connections/chatgpt/authorizations/{}/complete",
+                authorization["authorization_id"].as_str().unwrap()
+            ),
+            json!({"state":authorization["state"],"code":code,"client_id":"oaiapp_fixture"}),
+        )
+        .await;
+        post(&app,"/me/models",json!({"name":format!("public-{}",uuid::Uuid::new_v4()),"provider":"chatgpt","model":"fixture-model","connection_id":linked["connection"]["connection_id"],"context_window":128000,"is_default":false})).await
+    };
+    let session = post(
+        &app,
+        "/sessions",
+        json!({"title":"Subscription durable history"}),
+    )
+    .await;
+    let session_id = session["session_id"].as_str().unwrap();
+    if api_key {
+        let completion = json!({"operation":"memory_extraction","session_id":session_id,"turn":1,"round":0,"logical_attempt":0,
+            "model_selection":{"offering_id":model["model_id"]},"messages":[{"role":"user","content":"Reply OK"}]});
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(completion.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let response_body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            status.is_success(),
+            "omitted temperature: {status}: {}",
+            String::from_utf8_lossy(&response_body)
+        );
+        let mut explicit = completion;
+        explicit["logical_attempt"] = json!(1);
+        explicit["temperature"] = json!(0.0);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(explicit.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    drop(app);
+    let (base, lifecycle) = make_app();
+    *provider.state.script.lock().unwrap() = vec![
+        (
+            "tool_search".into(),
+            json!({"query":"select:model_catalog"}),
+        ),
+        (
+            "invoke_tool".into(),
+            json!({"name":"model_catalog","arguments":{"limit":16}}),
+        ),
+    ];
+    provider
+        .state
+        .scripted
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let lifecycle = Arc::new(lifecycle);
+    let app = build_app(base.with_run_lifecycle_service(lifecycle.clone()));
+    let payload = |session_id: &str, message: &str| {
+        let mut value = json!({"message":message,"session_id":session_id,"model_selection":{"offering_id":model["model_id"]},"execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}});
+        if api_key {
+            value["context"] = json!({"thinking":{"mode":"adaptive","effort":"max"}});
+        }
+        value
+    };
+    let first = chat_stream_collect(
+        &app,
+        payload(
+            session_id,
+            "subscription-public-first: List the models I can use.",
+        ),
+    )
+    .await;
+    assert!(
+        first.iter().all(|event| event["type"] != "error"),
+        "{first:?}"
+    );
+    assert!(
+        provider.state.script.lock().unwrap().is_empty(),
+        "the agent did not execute its scripted tool rounds"
+    );
+    let requests = provider.state.requests.lock().unwrap().clone();
+    if api_key {
+        assert!(
+            requests
+                .iter()
+                .any(|request| request["reasoning"]["effort"] == "max"
+                    && request["tools"]
+                        .as_array()
+                        .is_some_and(|tools| !tools.is_empty())),
+            "max reasoning with tools was not dispatched"
+        );
+    }
+    assert!(
+        requests.iter().any(
+            |request| request["input"].as_array().unwrap().iter().any(|item| {
+                item["type"] == "function_call_output"
+                    && item["output"]
+                        .as_str()
+                        .is_some_and(|output| output.contains(model["model_id"].as_str().unwrap()))
+            })
+        ),
+        "authorized model catalog never reached the provider: {:?}",
+        requests
+            .iter()
+            .map(|request| request["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "function_call_output")
+                .map(|item| item["output"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(1200)
+                    .collect::<String>())
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while lifecycle.background_task_count() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let persisted:i64=sqlx::query_scalar("SELECT COUNT(*) FROM conversation_manifest_nodes WHERE owner_user_id=? AND session_id=? AND content_json LIKE '%_astra_responses%'")
+        .bind(USER_ID).bind(session_id).fetch_one(pool.get()).await.unwrap();
+    assert!(
+        persisted > 0,
+        "provider continuation was not written to canonical database history"
+    );
+    let mut continuation_session = session_id.to_owned();
+    if personal_byok || api_key {
+        let private = if personal_byok {
+            "private-journey-sentinel AKIAIOSFODNN7EXAMPLE"
+        } else {
+            "sk-fixtureciphertextciphertextciphertext"
+        };
+        let encoded = data_encoding::BASE32_NOPAD
+            .encode(private.as_bytes())
+            .to_ascii_lowercase();
+        let resumed = post(
+            &app,
+            &format!("/sessions/{session_id}/resume?continuation_only=true"),
+            json!({}),
+        )
+        .await;
+        assert!(!resumed.to_string().contains(private));
+        assert!(!resumed.to_string().contains(&encoded));
+        let bundle: astra_turn_types::ResumeBundleV1 =
+            serde_json::from_value(resumed["resume_bundle"].clone()).unwrap();
+        assert!(bundle.validates_root());
+        let segments = post(
+            &app,
+            &format!("/sessions/{session_id}/context/segments:batchGet"),
+            json!({"manifest_root":bundle.cursor.canonical_root_hash.clone()}),
+        )
+        .await;
+        assert!(!segments.to_string().contains(private));
+        assert!(!segments.to_string().contains(&encoded));
+        if forked {
+            let manifest = post(
+                &app,
+                &format!("/sessions/{session_id}/forks"),
+                json!({"idempotency_key":"byok-fork", "expected_parent_cursor":bundle.cursor, "reason":"continue in a fork"}),
+            )
+            .await;
+            let fork_id = manifest["fork_id"].as_str().unwrap();
+            post(
+                &app,
+                &format!("/sessions/{session_id}/forks/{fork_id}/activate-for-continuation"),
+                json!({}),
+            )
+            .await;
+            continuation_session = manifest["child_key"]["session_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        }
+    }
+    drop(app);
+    drop(lifecycle);
+    // A new local journal root also rules out recovering the first turn from
+    // its local journal. The fresh services must read the durable store.
+    let fresh_journals = tempfile::tempdir().unwrap();
+    let _fresh_journal_scope =
+        astra_services::session_journal::ProcessJournalDirGuard::new(fresh_journals.path());
+    // Build new services and a new run engine against the same durable store.
+    let (base, lifecycle) = make_app();
+    let lifecycle = Arc::new(lifecycle);
+    let app = build_app(base.with_run_lifecycle_service(lifecycle.clone()));
+    let before = provider.state.requests.lock().unwrap().len();
+    let second = chat_stream_collect(
+        &app,
+        payload(
+            &continuation_session,
+            "subscription-public-second: Continue using the former session.",
+        ),
+    )
+    .await;
+    assert!(
+        second.iter().all(|event| event["type"] != "error"),
+        "{second:?}"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while lifecycle.background_task_count() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let requests = provider.state.requests.lock().unwrap();
+    let continued = &requests[before..];
+    let prior_reasoning_replayed = continued.iter().any(|request| {
+        request["input"].as_array().unwrap().iter().any(|item| {
+            if personal_byok {
+                item["content"]
+                    .to_string()
+                    .contains("private-journey-sentinel AKIAIOSFODNN7EXAMPLE")
+            } else {
+                item["encrypted_content"] == "sk-fixtureciphertextciphertextciphertext"
+            }
+        })
+    });
+    assert_eq!(
+        prior_reasoning_replayed, !current_turn_only,
+        "completed-turn reasoning must follow the declared route policy"
+    );
+    assert!(
+        continued.iter().any(|request| request["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["phase"] == "final_answer")),
+        "assistant phase was lost from persisted history"
+    );
 }

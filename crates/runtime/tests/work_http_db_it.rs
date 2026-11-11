@@ -34,10 +34,6 @@ use astra_services::{
         WorkRevision, WorkSubjectRef,
     },
 };
-#[cfg(feature = "e2e-hooks")]
-use astra_services::{DatabaseWorkspaceRecordStore, WorkspaceRecordEntry, WorkspaceRecordStore};
-#[cfg(feature = "e2e-hooks")]
-use astra_tools::patch_materialization::observe_git_worktree_revision;
 use astra_turn_types::{
     ActorContextV1, ActorKindV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
     CanonicalDeltaModeV1, CanonicalTurnDeltaV1, CoordinatorMutationV1, SessionCursorV1,
@@ -339,17 +335,14 @@ fn assert_field_absent(value: &Value, forbidden: &str) {
 
 async fn cleanup_owner(pool: &SharedPool, owner_id: &str) {
     for (table, owner_column) in [
-        ("session_transcript_projection_heads", "user_id"),
         ("session_transcript_items", "user_id"),
         ("session_context_operation_receipts", "owner_user_id"),
         ("session_context_authority_events", "owner_user_id"),
         ("session_fork_events", "owner_user_id"),
         ("session_forks", "owner_user_id"),
-        ("conversation_manifest_segments", "owner_user_id"),
         ("conversation_manifest_pins", "owner_user_id"),
         ("conversation_manifest_nodes", "owner_user_id"),
         ("session_context_heads", "owner_user_id"),
-        ("conversation_segments", "owner_user_id"),
         ("session_handoff_events", "owner_user_id"),
         ("session_handoffs", "owner_user_id"),
         ("session_attachments", "owner_user_id"),
@@ -359,8 +352,8 @@ async fn cleanup_owner(pool: &SharedPool, owner_id: &str) {
         ("work_branch_creation_operations", "owner_id"),
         ("work_branch_control_operations", "owner_id"),
         ("work_branch_deletion_operations", "owner_id"),
-        ("agent_session_execution_slots", "user_id"),
         ("tool_invocation_ledger", "user_id"),
+        ("agent_run_openings", "user_id"),
         ("agent_runs", "user_id"),
         ("work_item_attempts", "owner_id"),
         ("work_recovery_points", "owner_id"),
@@ -370,9 +363,6 @@ async fn cleanup_owner(pool: &SharedPool, owner_id: &str) {
         ("session_artifact_content_chunks", "user_id"),
         ("session_artifact_references", "user_id"),
         ("session_artifacts", "user_id"),
-        ("work_patch_commit_operations", "owner_id"),
-        ("work_patch_materialization_operations", "owner_id"),
-        ("work_patch_artifacts", "owner_id"),
         ("work_runtime_event_outbox", "owner_id"),
         ("work_runtime_event_outbox_slots", "owner_id"),
         ("work_events", "owner_id"),
@@ -385,214 +375,24 @@ async fn cleanup_owner(pool: &SharedPool, owner_id: &str) {
         ("work_proposal_sequences", "owner_id"),
         ("work_branch_subjects", "owner_id"),
         ("work_branches", "owner_id"),
-        ("work_item_edges", "owner_id"),
         ("work_item_revisions", "owner_id"),
         ("work_items", "owner_id"),
         ("work_graph_revisions", "owner_id"),
         ("work_graph_sequences", "owner_id"),
         ("work_criterion_sets", "owner_id"),
         ("work_criterion_revisions", "owner_id"),
-        ("work_criteria", "owner_id"),
         ("work_goal_revisions", "owner_id"),
         ("works", "owner_id"),
         ("agent_sessions", "user_id"),
         ("workspace_records", "owner_id"),
     ] {
         let statement = format!("DELETE FROM {table} WHERE {owner_column} = ?");
-        sqlx::query(&statement)
+        sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(owner_id)
             .execute(pool.get())
             .await
             .unwrap_or_else(|error| panic!("clean {table}: {error}"));
     }
-}
-
-#[cfg(feature = "e2e-hooks")]
-async fn post_work_patch_export(
-    app: Router,
-    user_id: &str,
-    work_id: &str,
-    branch_id: &str,
-    payload: Value,
-) -> (StatusCode, Value) {
-    let request = Request::builder()
-        .method("POST")
-        .uri(format!(
-            "/v1/works/{work_id}/branches/{branch_id}/patch-artifacts"
-        ))
-        .header("authorization", format!("Bearer {user_id}"))
-        .header(WORK_API_MAJOR_HEADER, "1")
-        .header("content-type", "application/json")
-        .body(body::Body::from(
-            serde_json::to_vec(&payload).expect("patch export request JSON"),
-        ))
-        .expect("request");
-    let response = app.oneshot(request).await.expect("response");
-    let status = response.status();
-    let bytes = body::to_bytes(response.into_body(), 64 * 1024)
-        .await
-        .expect("patch export response is bounded");
-    (
-        status,
-        serde_json::from_slice(&bytes).expect("JSON response"),
-    )
-}
-
-#[cfg(feature = "e2e-hooks")]
-async fn get_work_patch_content(
-    app: Router,
-    user_id: &str,
-    work_id: &str,
-    branch_id: &str,
-    patch_artifact_id: &str,
-) -> (StatusCode, HeaderMap, Vec<u8>) {
-    let request = Request::builder()
-        .uri(format!(
-            "/v1/works/{work_id}/branches/{branch_id}/patch-artifacts/{patch_artifact_id}/content"
-        ))
-        .header("authorization", format!("Bearer {user_id}"))
-        .header(WORK_API_MAJOR_HEADER, "1")
-        .body(body::Body::empty())
-        .expect("patch content request");
-    let response = app.oneshot(request).await.expect("response");
-    let status = response.status();
-    let headers = response.headers().clone();
-    let bytes = body::to_bytes(response.into_body(), 16 * 1024 * 1024 + 1)
-        .await
-        .expect("patch content response respects its hard limit");
-    (status, headers, bytes.to_vec())
-}
-
-#[cfg(feature = "e2e-hooks")]
-async fn get_work_patch_artifacts(
-    app: Router,
-    user_id: &str,
-    work_id: &str,
-    branch_id: &str,
-    query: &str,
-) -> (StatusCode, Value) {
-    let request = Request::builder()
-        .uri(format!(
-            "/v1/works/{work_id}/branches/{branch_id}/patch-artifacts{query}"
-        ))
-        .header("authorization", format!("Bearer {user_id}"))
-        .header(WORK_API_MAJOR_HEADER, "1")
-        .body(body::Body::empty())
-        .expect("patch artifact page request");
-    let response = app.oneshot(request).await.expect("response");
-    let status = response.status();
-    let bytes = body::to_bytes(response.into_body(), 64 * 1024)
-        .await
-        .expect("patch artifact metadata page is bounded");
-    (
-        status,
-        serde_json::from_slice(&bytes).expect("patch artifact page JSON"),
-    )
-}
-
-#[cfg(feature = "e2e-hooks")]
-async fn get_work_patch_materializations(
-    app: Router,
-    user_id: &str,
-    work_id: &str,
-    branch_id: &str,
-    query: &str,
-) -> (StatusCode, Value) {
-    let request = Request::builder()
-        .uri(format!(
-            "/v1/works/{work_id}/branches/{branch_id}/patch-materializations{query}"
-        ))
-        .header("authorization", format!("Bearer {user_id}"))
-        .header(WORK_API_MAJOR_HEADER, "1")
-        .body(body::Body::empty())
-        .expect("patch materialization page request");
-    let response = app.oneshot(request).await.expect("response");
-    let status = response.status();
-    let bytes = body::to_bytes(response.into_body(), 128 * 1024)
-        .await
-        .expect("patch materialization page is bounded");
-    (
-        status,
-        serde_json::from_slice(&bytes).expect("patch materialization page JSON"),
-    )
-}
-
-#[cfg(feature = "e2e-hooks")]
-async fn post_work_patch_commit(
-    app: Router,
-    user_id: &str,
-    work_id: &str,
-    branch_id: &str,
-    payload: Value,
-) -> (StatusCode, Value) {
-    let request = Request::builder()
-        .method("POST")
-        .uri(format!(
-            "/v1/works/{work_id}/branches/{branch_id}/patch-commits"
-        ))
-        .header("authorization", format!("Bearer {user_id}"))
-        .header(WORK_API_MAJOR_HEADER, "1")
-        .header("content-type", "application/json")
-        .body(body::Body::from(
-            serde_json::to_vec(&payload).expect("patch commit request JSON"),
-        ))
-        .expect("patch commit request");
-    let response = app.oneshot(request).await.expect("response");
-    let status = response.status();
-    let bytes = body::to_bytes(response.into_body(), 64 * 1024)
-        .await
-        .expect("patch commit response is bounded");
-    (
-        status,
-        serde_json::from_slice(&bytes).expect("patch commit JSON"),
-    )
-}
-
-#[cfg(feature = "e2e-hooks")]
-async fn get_work_patch_commits(
-    app: Router,
-    user_id: &str,
-    work_id: &str,
-    branch_id: &str,
-    suffix: &str,
-) -> (StatusCode, Value) {
-    let request = Request::builder()
-        .uri(format!(
-            "/v1/works/{work_id}/branches/{branch_id}/patch-commits{suffix}"
-        ))
-        .header("authorization", format!("Bearer {user_id}"))
-        .header(WORK_API_MAJOR_HEADER, "1")
-        .body(body::Body::empty())
-        .expect("patch commit read request");
-    let response = app.oneshot(request).await.expect("response");
-    let status = response.status();
-    let bytes = body::to_bytes(response.into_body(), 128 * 1024)
-        .await
-        .expect("patch commit read response is bounded");
-    (
-        status,
-        serde_json::from_slice(&bytes).expect("patch commit read JSON"),
-    )
-}
-
-#[cfg(feature = "e2e-hooks")]
-async fn delete_work_patch_commit(
-    app: Router,
-    user_id: &str,
-    work_id: &str,
-    branch_id: &str,
-    operation_id: &str,
-) -> StatusCode {
-    let request = Request::builder()
-        .method("DELETE")
-        .uri(format!(
-            "/v1/works/{work_id}/branches/{branch_id}/patch-commits/{operation_id}"
-        ))
-        .header("authorization", format!("Bearer {user_id}"))
-        .header(WORK_API_MAJOR_HEADER, "1")
-        .body(body::Body::empty())
-        .expect("abort patch commit request");
-    app.oneshot(request).await.expect("response").status()
 }
 
 async fn get_work(app: Router, user_id: &str, work_id: &str) -> (StatusCode, Value, usize) {
@@ -1660,534 +1460,6 @@ async fn post_work_is_atomic_owner_scoped_and_exactly_idempotent_under_race() {
     cleanup_owner(&pool, &other_owner_id).await;
 }
 
-#[cfg(feature = "e2e-hooks")]
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn patch_export_is_server_owned_exact_and_idempotent() {
-    let directory = Arc::new(tempfile::tempdir().expect("managed workspace base"));
-    let lifecycle = Arc::new(
-        astra_runtime::server::provider_test_support::configure_workspace_provider(
-            astra_runtime::AgenticRunLifecycleService::new(
-                MatrixOneSettings::from_env(),
-                Arc::new(
-                    astra_runtime::FernetTokenEncryptor::new(
-                        "cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=",
-                    )
-                    .unwrap(),
-                ),
-                Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-                astra_runtime::RunEngine::new(Arc::new(
-                    astra_services::InMemoryRunStateStore::new(),
-                )),
-            ),
-            directory,
-            "patch-http-executor",
-        ),
-    );
-    let Some((app, pool)) = setup_with_run_lifecycle(lifecycle.clone()).await else {
-        return;
-    };
-    let owner_id = id("patch-export-owner");
-    let other_owner_id = id("patch-export-other");
-    cleanup_owner(&pool, &owner_id).await;
-    cleanup_owner(&pool, &other_owner_id).await;
-    let (status, created) = post_work(
-        app.clone(),
-        &owner_id,
-        serde_json::json!({
-            "request_id": "start-patch-export-work",
-            "goal": "Export one exact reviewable patch.",
-            "criteria": [{
-                "criterion_id": "patch-review",
-                "kind": "human_review",
-                "statement": "The exported patch is reviewable."
-            }]
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "create Work: {created}");
-    let work_id = created["overview"]["work_id"].as_str().expect("work id");
-    let branch_id = created["overview"]["delivery_branch"]["branch_id"]
-        .as_str()
-        .expect("delivery branch");
-    let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner = WorkOwnerId::parse(&owner_id).expect("owner");
-    let work = WorkId::parse(work_id).expect("work");
-    let branch = WorkBranchId::parse(branch_id).expect("branch");
-    let binding = repository
-        .load_branch_runtime_binding(&owner, &work, &branch)
-        .await
-        .expect("branch runtime binding");
-
-    let workspace_record =
-        astra_runtime::server::provider_test_support::provision_workspace_fixture(
-            &lifecycle,
-            binding.session_id.as_str(),
-        )
-        .expect("managed workspace");
-    let workspace = std::path::PathBuf::from(&workspace_record.root_or_volume_ref);
-    let git = |args: &[&str]| {
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(workspace.as_path())
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "Astra Test")
-            .env("GIT_AUTHOR_EMAIL", "astra@example.invalid")
-            .env("GIT_COMMITTER_NAME", "Astra Test")
-            .env("GIT_COMMITTER_EMAIL", "astra@example.invalid")
-            .status()
-            .expect("Git fixture command");
-        assert!(status.success(), "Git fixture command failed: {args:?}");
-    };
-    git(&["init", "--quiet"]);
-    std::fs::write(workspace.as_path().join("file.txt"), "before\n").expect("seed file");
-    git(&["add", "file.txt"]);
-    git(&["commit", "--quiet", "-m", "initial"]);
-    std::fs::write(workspace.as_path().join("file.txt"), "after\n").expect("source change");
-    let result_revision = observe_git_worktree_revision(workspace.as_path())
-        .await
-        .expect("observe source result");
-    let subject_ref = WorkSubjectRef::parse(format!("workspace/{}", binding.session_id.as_str()))
-        .expect("subject ref");
-    let subject = repository
-        .set_branch_subject(WorkBranchSubjectChange {
-            owner_id: owner.clone(),
-            work_id: work.clone(),
-            branch_id: branch.clone(),
-            expected_branch_revision: binding.branch_revision,
-            graph_revision: binding.graph_revision,
-            subject_ref: subject_ref.clone(),
-            subject_revision: result_revision.clone(),
-            source_ref: WorkChangeRef::parse(id("patch-subject")).expect("subject source"),
-        })
-        .await
-        .expect("record exact branch subject");
-    DatabaseWorkspaceRecordStore::new(pool.clone())
-        .upsert_workspace_record(WorkspaceRecordEntry::new(
-            owner_id.clone(),
-            Some(binding.session_id.as_str().to_string()),
-            None,
-            workspace_record,
-        ))
-        .await
-        .expect("persist Server-owned workspace");
-    let export_request = serde_json::json!({
-        "request_id": "export-patch-once",
-        "expected_branch_revision": subject.branch_revision.get(),
-        "expected_graph_revision": subject.graph_revision.get(),
-    });
-    let first = post_work_patch_export(
-        app.clone(),
-        &owner_id,
-        work_id,
-        branch_id,
-        export_request.clone(),
-    )
-    .await;
-    assert_eq!(first.0, StatusCode::OK, "export patch: {}", first.1);
-    assert_eq!(first.1["source_ref"], "export-patch-once");
-    assert_eq!(first.1["result_subject_revision"], result_revision.as_str());
-    assert_field_absent(&first.1, "session_id");
-    assert_field_absent(&first.1, "payload_artifact_id");
-    assert_field_absent(&first.1, "source_subject_record_revision");
-    assert_field_absent(&first.1, "subject_ref");
-    let patch_artifact_id = first.1["patch_artifact_id"]
-        .as_str()
-        .expect("patch artifact id");
-    let (content_status, content_headers, content) = get_work_patch_content(
-        app.clone(),
-        &owner_id,
-        work_id,
-        branch_id,
-        patch_artifact_id,
-    )
-    .await;
-    assert_eq!(content_status, StatusCode::OK);
-    assert_eq!(
-        content_headers
-            .get("content-type")
-            .and_then(|value| value.to_str().ok()),
-        Some("text/x-diff; charset=utf-8")
-    );
-    assert_eq!(
-        content_headers
-            .get("etag")
-            .and_then(|value| value.to_str().ok()),
-        Some(format!("\"{}\"", first.1["payload_hash"].as_str().unwrap()).as_str())
-    );
-    assert_eq!(
-        content.len() as u64,
-        first.1["payload_bytes"].as_u64().unwrap()
-    );
-    let patch_text = std::str::from_utf8(&content).expect("UTF-8 patch content");
-    assert!(patch_text.contains("-before\n"));
-    assert!(patch_text.contains("+after\n"));
-
-    let hidden_content = get_work_patch_content(
-        app.clone(),
-        &other_owner_id,
-        work_id,
-        branch_id,
-        patch_artifact_id,
-    )
-    .await;
-    assert_eq!(hidden_content.0, StatusCode::NOT_FOUND);
-    let wrong_branch_content = get_work_patch_content(
-        app.clone(),
-        &owner_id,
-        work_id,
-        "another-branch",
-        patch_artifact_id,
-    )
-    .await;
-    assert_eq!(wrong_branch_content.0, StatusCode::NOT_FOUND);
-    let replay = post_work_patch_export(
-        app.clone(),
-        &owner_id,
-        work_id,
-        branch_id,
-        export_request.clone(),
-    )
-    .await;
-    assert_eq!(replay, first, "same request and basis must converge");
-
-    std::fs::write(workspace.as_path().join("file.txt"), "second\n")
-        .expect("advance workspace for a second exact export");
-    let second_result_revision = observe_git_worktree_revision(workspace.as_path())
-        .await
-        .expect("observe second source result");
-    let second_subject = repository
-        .set_branch_subject(WorkBranchSubjectChange {
-            owner_id: owner.clone(),
-            work_id: work.clone(),
-            branch_id: branch.clone(),
-            expected_branch_revision: subject.branch_revision,
-            graph_revision: subject.graph_revision,
-            subject_ref: subject_ref.clone(),
-            subject_revision: second_result_revision.clone(),
-            source_ref: WorkChangeRef::parse(id("second-patch-subject"))
-                .expect("second subject source"),
-        })
-        .await
-        .expect("record second exact branch subject");
-    let second_export_request = serde_json::json!({
-        "request_id": "export-second-patch",
-        "expected_branch_revision": second_subject.branch_revision.get(),
-        "expected_graph_revision": second_subject.graph_revision.get(),
-    });
-    let second = post_work_patch_export(
-        app.clone(),
-        &owner_id,
-        work_id,
-        branch_id,
-        second_export_request.clone(),
-    )
-    .await;
-    assert_eq!(second.0, StatusCode::OK, "second export: {}", second.1);
-
-    let (first_page_status, first_page) =
-        get_work_patch_artifacts(app.clone(), &owner_id, work_id, branch_id, "?limit=1").await;
-    assert_eq!(
-        first_page_status,
-        StatusCode::OK,
-        "first page: {first_page}"
-    );
-    assert_eq!(first_page["artifacts"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        first_page["artifacts"][0]["patch_artifact_id"],
-        second.1["patch_artifact_id"]
-    );
-    let cursor = &first_page["next_cursor"];
-    assert_eq!(
-        cursor["patch_artifact_id"],
-        first_page["artifacts"][0]["patch_artifact_id"]
-    );
-    let continuation_query = format!(
-        "?before_created_at={}&before_patch_artifact_id={}&limit=1",
-        cursor["created_at"].as_str().unwrap(),
-        cursor["patch_artifact_id"].as_str().unwrap(),
-    );
-    let (second_page_status, second_page) = get_work_patch_artifacts(
-        app.clone(),
-        &owner_id,
-        work_id,
-        branch_id,
-        &continuation_query,
-    )
-    .await;
-    assert_eq!(
-        second_page_status,
-        StatusCode::OK,
-        "second page: {second_page}"
-    );
-    assert_eq!(
-        second_page["artifacts"][0]["patch_artifact_id"],
-        first.1["patch_artifact_id"]
-    );
-    assert!(second_page["next_cursor"].is_null());
-    let invalid_cursor = get_work_patch_artifacts(
-        app.clone(),
-        &owner_id,
-        work_id,
-        branch_id,
-        "?before_patch_artifact_id=patch-only",
-    )
-    .await;
-    assert_eq!(invalid_cursor.0, StatusCode::BAD_REQUEST);
-    let hidden_page =
-        get_work_patch_artifacts(app.clone(), &other_owner_id, work_id, branch_id, "").await;
-    assert_eq!(hidden_page.0, StatusCode::NOT_FOUND);
-
-    let materialization_id = id("patch-materialization");
-    sqlx::query(
-        "INSERT INTO work_patch_materialization_operations
-         (owner_id, work_id, operation_id, request_id, request_digest,
-          patch_artifact_id, source_branch_id, target_branch_id,
-          target_branch_revision, target_graph_revision,
-          target_subject_record_revision, subject_ref,
-          base_subject_revision, result_subject_revision, payload_hash,
-          provider_ref, policy_decision_ref, operation_state, operation_phase,
-          completed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 'aborted', 'complete', NOW(6))",
-    )
-    .bind(&owner_id)
-    .bind(work_id)
-    .bind(&materialization_id)
-    .bind(id("materialization-request"))
-    .bind("0".repeat(64))
-    .bind(patch_artifact_id)
-    .bind(branch_id)
-    .bind(branch_id)
-    .bind(subject.branch_revision.get())
-    .bind(subject.graph_revision.get())
-    .bind(subject.subject_record_revision.get())
-    .bind(subject_ref.as_str())
-    .bind(first.1["base_subject_revision"].as_str().unwrap())
-    .bind(first.1["result_subject_revision"].as_str().unwrap())
-    .bind(first.1["payload_hash"].as_str().unwrap())
-    .bind("server-git-worktree-v1")
-    .bind(id("materialization-policy"))
-    .execute(pool.get())
-    .await
-    .expect("insert durable materialization read fixture");
-    let materialization_query = format!("?source_branch_id={branch_id}&limit=1");
-    let (materialization_status, materialization_page) = get_work_patch_materializations(
-        app.clone(),
-        &owner_id,
-        work_id,
-        branch_id,
-        &materialization_query,
-    )
-    .await;
-    assert_eq!(materialization_status, StatusCode::OK);
-    assert_eq!(materialization_page["source_branch_id"], branch_id);
-    assert_eq!(
-        materialization_page["operations"][0]["operation_id"],
-        materialization_id
-    );
-    assert_field_absent(&materialization_page["operations"][0], "subject_ref");
-    assert_field_absent(
-        &materialization_page["operations"][0],
-        "target_subject_record_revision",
-    );
-    assert_field_absent(&materialization_page["operations"][0], "executor_token");
-    let hidden_materializations = get_work_patch_materializations(
-        app.clone(),
-        &other_owner_id,
-        work_id,
-        branch_id,
-        &materialization_query,
-    )
-    .await;
-    assert_eq!(hidden_materializations.0, StatusCode::NOT_FOUND);
-    let incomplete_materialization_cursor = get_work_patch_materializations(
-        app.clone(),
-        &owner_id,
-        work_id,
-        branch_id,
-        &format!("?source_branch_id={branch_id}&before_operation_id={materialization_id}"),
-    )
-    .await;
-    assert_eq!(incomplete_materialization_cursor.0, StatusCode::BAD_REQUEST);
-
-    let commit_request = serde_json::json!({
-        "request_id": "commit-reviewed-patch-once",
-        "patch_artifact_id": second.1["patch_artifact_id"],
-        "expected_target_branch_revision": second_subject.branch_revision.get(),
-        "expected_target_graph_revision": second_subject.graph_revision.get(),
-        "message": "Commit the reviewed patch"
-    });
-    let admitted_commit = post_work_patch_commit(
-        app.clone(),
-        &owner_id,
-        work_id,
-        branch_id,
-        commit_request.clone(),
-    )
-    .await;
-    assert_eq!(
-        admitted_commit.0,
-        StatusCode::ACCEPTED,
-        "admit patch commit: {}",
-        admitted_commit.1
-    );
-    assert_eq!(admitted_commit.1["state"], "pending");
-    assert_eq!(admitted_commit.1["phase"], "awaiting_dispatch");
-    assert_field_absent(&admitted_commit.1, "subject_ref");
-    assert_field_absent(&admitted_commit.1, "target_subject_record_revision");
-    assert_field_absent(&admitted_commit.1, "author_name");
-    assert_field_absent(&admitted_commit.1, "author_email");
-    let commit_operation_id = admitted_commit.1["operation_id"]
-        .as_str()
-        .expect("commit operation id");
-    assert_eq!(
-        post_work_patch_commit(
-            app.clone(),
-            &owner_id,
-            work_id,
-            branch_id,
-            commit_request.clone(),
-        )
-        .await,
-        admitted_commit,
-        "same authenticated command must replay one durable operation"
-    );
-    let hidden_commit = post_work_patch_commit(
-        app.clone(),
-        &other_owner_id,
-        work_id,
-        branch_id,
-        commit_request.clone(),
-    )
-    .await;
-    assert_eq!(hidden_commit.0, StatusCode::NOT_FOUND);
-    let (commit_page_status, commit_page) =
-        get_work_patch_commits(app.clone(), &owner_id, work_id, branch_id, "?limit=1").await;
-    assert_eq!(commit_page_status, StatusCode::OK);
-    assert_eq!(commit_page["operations"][0], admitted_commit.1);
-    let loaded_commit = get_work_patch_commits(
-        app.clone(),
-        &owner_id,
-        work_id,
-        branch_id,
-        &format!("/{commit_operation_id}"),
-    )
-    .await;
-    assert_eq!(loaded_commit, (StatusCode::OK, admitted_commit.1.clone()));
-    assert_eq!(
-        get_work_patch_commits(app.clone(), &other_owner_id, work_id, branch_id, "")
-            .await
-            .0,
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        get_work_patch_commits(
-            app.clone(),
-            &owner_id,
-            work_id,
-            branch_id,
-            &format!("?before_operation_id={commit_operation_id}"),
-        )
-        .await
-        .0,
-        StatusCode::BAD_REQUEST
-    );
-    let mut forged_identity = commit_request;
-    forged_identity
-        .as_object_mut()
-        .expect("commit request object")
-        .insert(
-            "author_email".into(),
-            serde_json::json!("forged@example.test"),
-        );
-    assert_eq!(
-        post_work_patch_commit(app.clone(), &owner_id, work_id, branch_id, forged_identity,)
-            .await
-            .0,
-        StatusCode::BAD_REQUEST
-    );
-    assert_eq!(
-        delete_work_patch_commit(
-            app.clone(),
-            &owner_id,
-            work_id,
-            branch_id,
-            commit_operation_id,
-        )
-        .await,
-        StatusCode::NO_CONTENT
-    );
-    let aborted_commit = get_work_patch_commits(
-        app.clone(),
-        &owner_id,
-        work_id,
-        branch_id,
-        &format!("/{commit_operation_id}"),
-    )
-    .await;
-    assert_eq!(aborted_commit.0, StatusCode::OK);
-    assert_eq!(aborted_commit.1["state"], "aborted");
-    assert_eq!(aborted_commit.1["phase"], "complete");
-
-    std::fs::write(workspace.as_path().join("file.txt"), "unobserved\n")
-        .expect("advance workspace without canonical observation");
-    let stale = post_work_patch_export(
-        app.clone(),
-        &owner_id,
-        work_id,
-        branch_id,
-        second_export_request,
-    )
-    .await;
-    assert_eq!(stale.0, StatusCode::CONFLICT);
-    assert_eq!(stale.1["code"], "work_patch_export_basis_conflict");
-    let hidden = post_work_patch_export(
-        app.clone(),
-        &other_owner_id,
-        work_id,
-        branch_id,
-        export_request,
-    )
-    .await;
-    assert_eq!(hidden.0, StatusCode::NOT_FOUND);
-
-    let payload_artifact_id: String = sqlx::query_scalar(
-        "SELECT payload_artifact_id FROM work_patch_artifacts
-         WHERE owner_id = ? AND work_id = ? AND patch_artifact_id = ?",
-    )
-    .bind(&owner_id)
-    .bind(work_id)
-    .bind(patch_artifact_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("internal patch payload identity");
-    sqlx::query(
-        "UPDATE session_artifacts SET content_json = JSON_SET(content_json, '$.sha256', ?)
-         WHERE user_id = ? AND artifact_id = ?",
-    )
-    .bind("0".repeat(64))
-    .bind(&owner_id)
-    .bind(payload_artifact_id)
-    .execute(pool.get())
-    .await
-    .expect("tamper backing payload fixture");
-    let tampered =
-        get_work_patch_content(app, &owner_id, work_id, branch_id, patch_artifact_id).await;
-    assert_eq!(tampered.0, StatusCode::SERVICE_UNAVAILABLE);
-    let tampered_error: Value =
-        serde_json::from_slice(&tampered.2).expect("typed tamper error response");
-    assert_eq!(
-        tampered_error["code"],
-        "work_patch_artifact_content_unavailable"
-    );
-    assert_eq!(tampered_error["retryable"], false);
-    assert_eq!(tampered_error["action_hints"], serde_json::json!([]));
-
-    cleanup_owner(&pool, &owner_id).await;
-    cleanup_owner(&pool, &other_owner_id).await;
-}
-
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn work_catalog_is_owner_scoped_keyset_bounded_and_server_classified() {
@@ -2286,6 +1558,11 @@ async fn work_catalog_is_owner_scoped_keyset_bounded_and_server_classified() {
     let now = chrono::Utc::now().to_rfc3339();
     DatabaseRunStateStore::new(pool.clone())
         .insert_run(DurableRunRecord {
+            opening: Default::default(),
+            opening_hash: None,
+            context_admission_hash: None,
+            terminal_receipt_json: None,
+            terminal_at: None,
             run_id: active_run_id.clone(),
             user_id: owner_id.clone(),
             session_id: binding.session_id.as_str().to_string(),
@@ -2303,8 +1580,8 @@ async fn work_catalog_is_owner_scoped_keyset_bounded_and_server_classified() {
             owner_lease_expires_at: None,
             run_generation: 0,
             last_event_idx: -1,
-            checkpoint_version: None,
-            checkpoint_json: None,
+            last_guidance_event_idx: -1,
+            current_checkpoint: None,
             error_code: None,
             error_message: None,
 
@@ -3515,6 +2792,9 @@ async fn work_branch_control_is_durable_owner_scoped_and_cas_guarded() {
             .await,
         Err(astra_services::SessionContextCoordinatorError::Fenced)
     ));
+    assert!(
+        recovered["control_basis"]["writer_epoch"].as_u64().unwrap() > source_lease.writer_epoch
+    );
 
     let (abandoned_status, abandoned) = post_work_control(
         app.clone(),
@@ -3923,25 +3203,6 @@ async fn work_transcript_is_bounded_committed_owner_scoped_and_causally_honest()
     let session_id = binding.session_id.as_str();
     let first_cursor = commit_test_conversation_turn(&pool, &owner_id, session_id, None, 1).await;
 
-    sqlx::query(
-        "INSERT INTO session_transcript_projection_heads
-         (user_id, session_id, completed_turn, journal_event_seq, conversation_seq,
-          canonical_root_hash, projection_schema, compaction_generation,
-          config_version_id, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-    )
-    .bind(&owner_id)
-    .bind(session_id)
-    .bind(i64::from(first_cursor.completed_turn))
-    .bind(i64::try_from(first_cursor.journal_event_seq).unwrap())
-    .bind(i64::try_from(first_cursor.conversation_seq).unwrap())
-    .bind(&first_cursor.canonical_root_hash)
-    .bind(i64::from(first_cursor.projection_schema))
-    .bind(i64::try_from(first_cursor.compaction_generation).unwrap())
-    .bind(&first_cursor.config_version_id)
-    .execute(pool.get())
-    .await
-    .expect("insert transcript projection head");
     let large_content = "x".repeat(9_000);
     let large_payload = serde_json::json!({"detail": "y".repeat(17_000)}).to_string();
     for (item_seq, content, payload, committed_turn) in [
@@ -4014,9 +3275,9 @@ async fn work_transcript_is_bounded_committed_owner_scoped_and_causally_honest()
     let (stale_status, stale, _) =
         get_work_transcript(app.clone(), &owner_id, work_id, branch_id, "?limit=10").await;
     assert_eq!(stale_status, StatusCode::OK);
-    assert_eq!(stale["sync"], "projection_stale");
+    assert_eq!(stale["sync"], "current");
     assert_eq!(stale["canonical_head"]["completed_turn"], 2);
-    assert_eq!(stale["transcript_cursor"]["completed_turn"], 1);
+    assert_eq!(stale["transcript_cursor"]["completed_turn"], 2);
     assert_eq!(
         stale["canonical_head"]["canonical_root_hash"],
         second_cursor.canonical_root_hash
@@ -5849,18 +5110,9 @@ async fn existing_session_promotion_is_atomic_idle_only_and_exactly_idempotent()
         .expect("existing session fixture");
     }
     sqlx::query(
-        "INSERT INTO agent_session_execution_slots (user_id, session_id, run_id)
-         VALUES (?, ?, 'active-run')",
-    )
-    .bind(&owner_id)
-    .bind(&busy_session_id)
-    .execute(pool.get())
-    .await
-    .expect("active run fixture");
-    sqlx::query(
         "INSERT INTO agent_runs
-         (run_id, user_id, session_id, root_run_id, ancestor_path, depth, status)
-         VALUES ('active-run', ?, ?, 'active-run', 'active-run', 0, 'running')",
+         (run_id, user_id, session_id, root_run_id, ancestor_path, depth, status, owner_pod_id, owner_lease_expires_at)
+         VALUES ('active-run', ?, ?, 'active-run', 'active-run', 0, 'running', 'live-work-owner', DATE_ADD(NOW(6), INTERVAL 60 SECOND))",
     )
     .bind(&owner_id)
     .bind(&busy_session_id)
@@ -5868,14 +5120,17 @@ async fn existing_session_promotion_is_atomic_idle_only_and_exactly_idempotent()
     .await
     .expect("active durable run fixture");
     sqlx::query(
-        "INSERT INTO agent_session_execution_slots (user_id, session_id, run_id)
-         VALUES (?, ?, 'missing-durable-run')",
+        "INSERT INTO tool_invocation_ledger
+         (user_id, session_id, run_id, turn_chain_id, invocation_id, identity_key,
+          fingerprint_json, decision_json, state, dispatch_certainty, attempt_count)
+         VALUES (?, ?, 'missing-durable-run', 'orphan-turn', 'orphan-call', 'orphan-effect',
+                 '{}', '{}', 'outcome_unknown', 'unknown', 1)",
     )
     .bind(&owner_id)
     .bind(&orphan_run_session_id)
     .execute(pool.get())
     .await
-    .expect("orphan execution slot fixture");
+    .expect("orphan unresolved effect fixture");
 
     let request = serde_json::json!({
         "request_id": "promote-current-session",
@@ -5943,25 +5198,14 @@ async fn existing_session_promotion_is_atomic_idle_only_and_exactly_idempotent()
     assert_eq!(second_status, StatusCode::CONFLICT);
     assert_eq!(second["code"], "work_session_already_bound");
 
-    sqlx::query(
-        "INSERT INTO agent_session_execution_slots (user_id, session_id, run_id)
-         VALUES (?, ?, 'later-run')",
-    )
-    .bind(&owner_id)
-    .bind(&session_id)
-    .execute(pool.get())
-    .await
-    .expect("later active run fixture");
+    astra_runtime::RunEngine::new(Arc::new(DatabaseRunStateStore::new(pool.clone())))
+        .start_run("later-run", &owner_id, &session_id)
+        .await
+        .expect("later active Run fixture");
     let (busy_replay_status, busy_replay) =
         post_work_session_binding(app.clone(), &owner_id, &session_id, request.clone()).await;
     assert_eq!(busy_replay_status, StatusCode::CREATED);
     assert_eq!(busy_replay, left.1, "exact replay survives a later run");
-    sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?")
-        .bind(&owner_id)
-        .bind(&session_id)
-        .execute(pool.get())
-        .await
-        .expect("remove later active run fixture");
     sqlx::query("UPDATE agent_sessions SET status = 'closed' WHERE user_id = ? AND session_id = ?")
         .bind(&owner_id)
         .bind(&session_id)
@@ -6036,7 +5280,7 @@ async fn existing_session_promotion_is_atomic_idle_only_and_exactly_idempotent()
     let running_created = repository
         .create_genesis_in_running_session(running_genesis, "active-run")
         .await
-        .expect("the exact slot-owning run may establish Work");
+        .expect("the exact live coordinator may establish Work");
     assert_eq!(
         running_created.delivery_branch.parts().session_id.as_str(),
         busy_session_id

@@ -903,6 +903,27 @@ describe("useAstraChat", () => {
     expect(result.current.runStatus).toBe("running");
   });
 
+  test.each(["completed", "failed", "cancelled"])(
+    "Run %s removes missing tool endings without changing observed results",
+    (status) => {
+      const { client, streamChatMock } = createMockClient();
+      mockStreamEvents(streamChatMock, [
+        { type: "tool_call_start", call_id: "missing", tool: "bash" },
+        { type: "tool_call_start", call_id: "observed", tool: "bash" },
+        { type: "tool_call_end", call_id: "observed", tool: "bash", status: "error", success: false, result: "real failure" },
+        { type: "run_finished", run_id: "r1", status },
+      ] as StreamEvent[]);
+      const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
+      act(() => result.current.sendMessage("Hello"));
+      expect(result.current.runStatus).toBe(status);
+      expect(result.current.isStreaming).toBe(false);
+      expect(result.current.toolCalls).toHaveLength(1);
+      expect(result.current.toolCalls[0]).toMatchObject({
+        callId: "observed", status: "error", result: "real failure",
+      });
+    },
+  );
+
   test("run_finished finalizes assistant message", () => {
     const { client, streamChatMock } = createMockClient();
     mockStreamEvents(streamChatMock, [
@@ -920,6 +941,20 @@ describe("useAstraChat", () => {
     expect(lastMsg.streaming).toBe(false);
     expect(lastMsg.content).toBe("done");
     expect(result.current.isStreaming).toBe(false);
+  });
+
+  test.each([true, false, undefined])("keeps the root cancellation Context fact (%s)", observation => {
+    const { client, streamChatMock } = createMockClient();
+    mockStreamEvents(streamChatMock, [
+      { type: "run_started", run_id: "root" },
+      { type: "run_finished", run_id: "child", status: "cancelled", context_not_saved: !observation },
+      { type: "run_finished", run_id: "root", status: "cancelled", context_not_saved: observation },
+    ]);
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
+    act(() => result.current.sendMessage("hello"));
+    expect(result.current.messages.at(-1)?.contextNotSaved).toBe(observation ?? null);
+    expect(result.current.runId).toBe("root");
+    expect(result.current.runStatus).toBe("cancelled");
   });
 
   test("stop() aborts stream and finalizes", () => {

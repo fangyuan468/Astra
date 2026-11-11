@@ -77,6 +77,9 @@ const TOOL_RESULTS_SUBDIR: &str = "tool-results";
 /// call id is unique only within a run, so physical authority includes both
 /// identities.
 const RUN_SCOPED_RESULTS_SUBDIR: &str = "runs";
+const ARTIFACT_MANIFESTS_SUBDIR: &str = "manifests";
+/// Descriptor metadata has a separate bound from the pageable result payload.
+const MAX_ARTIFACT_MANIFEST_BYTES: usize = 64 * 1024;
 
 static NEXT_IMMUTABLE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -348,6 +351,23 @@ struct RunBoundArtifactHandle {
     sha256: String,
 }
 
+enum ArtifactReference {
+    Inline(astra_services::session_journal::ToolResultArtifactDescriptor),
+    Stored {
+        kind: astra_services::session_journal::ToolResultDocumentKind,
+        digest: String,
+    },
+}
+
+impl ArtifactReference {
+    fn is_result(&self) -> bool {
+        match self {
+            Self::Inline(descriptor) => descriptor.document_kind.is_result(),
+            Self::Stored { kind, .. } => kind.is_result(),
+        }
+    }
+}
+
 /// FNV-1a 64-bit hash — stable and deterministic across processes and Rust versions.
 fn fnv1a_64(data: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -520,9 +540,31 @@ fn persist_tool_document(
             "run_id is not a valid durable identifier",
         )));
     }
+    let persisted_bytes = content.as_bytes();
+    let byte_len = u64::try_from(persisted_bytes.len()).map_err(|_| {
+        ToolResultPersistenceError::Io(io::Error::other(
+            "persisted tool result exceeds supported byte length",
+        ))
+    })?;
+    let content_sha256 = format!("{:x}", Sha256::digest(persisted_bytes));
+    let descriptor = astra_services::session_journal::ToolResultArtifactDescriptor {
+        document_kind,
+        version: astra_services::session_journal::TOOL_RESULT_ARTIFACT_DESCRIPTOR_VERSION,
+        call_id: tool_call_id.to_string(),
+        run_id: run_id.to_string(),
+        byte_len,
+        content_sha256: content_sha256.clone(),
+    };
+    let (manifest, digest) = encoded_artifact_manifest(&descriptor);
+    if manifest.len() > MAX_ARTIFACT_MANIFEST_BYTES {
+        return Err(ToolResultPersistenceError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tool-result manifest exceeds the descriptor size limit",
+        )));
+    }
     let authoritative_path =
         run_scoped_document_path(session_dir, run_id, tool_call_id, document_kind);
-    match write_immutable_result(&authoritative_path, content.as_bytes()) {
+    match write_immutable_result(&authoritative_path, persisted_bytes) {
         Ok(()) => {}
         Err(ImmutableWriteError::IdentityConflict) => {
             return Err(ToolResultPersistenceError::IdentityConflict {
@@ -535,24 +577,18 @@ fn persist_tool_document(
             return Err(ToolResultPersistenceError::Io(error));
         }
     }
-
-    let persisted_bytes = content.as_bytes();
-    let byte_len = u64::try_from(persisted_bytes.len()).map_err(|_| {
-        ToolResultPersistenceError::Io(io::Error::other(
-            "persisted tool result exceeds supported byte length",
-        ))
-    })?;
-    let content_sha256 = format!("{:x}", Sha256::digest(persisted_bytes));
-    let artifact_uri = session_tool_result_artifact_uri_for_descriptor(
-        &astra_services::session_journal::ToolResultArtifactDescriptor {
-            document_kind,
-            version: astra_services::session_journal::TOOL_RESULT_ARTIFACT_DESCRIPTOR_VERSION,
-            call_id: tool_call_id.to_string(),
-            run_id: run_id.to_string(),
-            byte_len,
-            content_sha256: content_sha256.clone(),
-        },
-    );
+    match write_immutable_result(&artifact_manifest_path(session_dir, &digest), &manifest) {
+        Ok(()) => {}
+        Err(ImmutableWriteError::IdentityConflict) => {
+            return Err(ToolResultPersistenceError::IdentityConflict {
+                run_id: run_id.to_string(),
+                call_id: tool_call_id.to_string(),
+                document_kind,
+            });
+        }
+        Err(ImmutableWriteError::Io(error)) => return Err(ToolResultPersistenceError::Io(error)),
+    }
+    let artifact_uri = session_tool_result_artifact_uri_for_descriptor(&descriptor);
     Ok(PersistedWrite {
         replacement: build_replacement(tool_call_id, tool_name, content, &artifact_uri),
         byte_len,
@@ -642,11 +678,9 @@ fn write_immutable_result_with(
 
     let published = match std::fs::hard_link(&temp_path, path) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => match std::fs::read(path) {
-            Ok(existing) if existing == content => Ok(()),
-            Ok(_) => Err(ImmutableWriteError::IdentityConflict),
-            Err(error) => Err(ImmutableWriteError::Io(error)),
-        },
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            verify_immutable_replay(path, content)
+        }
         Err(error) => Err(ImmutableWriteError::Io(error)),
     };
     if let Err(error) = published {
@@ -661,6 +695,29 @@ fn write_immutable_result_with(
     let sync = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
     cleanup.map_err(ImmutableWriteError::Io)?;
     sync.map_err(ImmutableWriteError::Io)
+}
+
+fn verify_immutable_replay(path: &Path, content: &[u8]) -> Result<(), ImmutableWriteError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(ImmutableWriteError::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ImmutableWriteError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "immutable tool document is not a regular owner-scoped file",
+        )));
+    }
+    if metadata.len() != content.len() as u64 {
+        return Err(ImmutableWriteError::IdentityConflict);
+    }
+    let mut existing = Vec::new();
+    std::fs::File::open(path)
+        .map_err(ImmutableWriteError::Io)?
+        .take((content.len() as u64).saturating_add(1))
+        .read_to_end(&mut existing)
+        .map_err(ImmutableWriteError::Io)?;
+    if existing != content {
+        return Err(ImmutableWriteError::IdentityConflict);
+    }
+    Ok(())
 }
 
 /// Read and verify the complete bytes named by a typed journal descriptor.
@@ -750,7 +807,7 @@ fn valid_artifact_descriptor(
 /// identities directly. The opaque payload carries the complete immutable
 /// descriptor; a call id alone is not a physical artifact identity.
 #[must_use]
-pub fn parse_session_tool_result_artifact_uri(
+fn parse_inline_artifact_uri(
     value: &str,
 ) -> Option<astra_services::session_journal::ToolResultArtifactDescriptor> {
     let encoded = value.strip_prefix(SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX)?;
@@ -774,15 +831,91 @@ pub fn parse_session_tool_result_artifact_uri(
     valid_artifact_descriptor(&descriptor).then_some(descriptor)
 }
 
-/// Parse the descriptor from a runtime-generated model projection.  This is a
+fn parse_artifact_reference(value: &str) -> Option<ArtifactReference> {
+    let token = value.strip_prefix(SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX)?;
+    if let Some((kind, digest)) = token.split_once('_')
+        && matches!(kind, "result" | "guidance")
+    {
+        let kind = match kind {
+            "result" => astra_services::session_journal::ToolResultDocumentKind::Result,
+            "guidance" => astra_services::session_journal::ToolResultDocumentKind::RuntimeGuidance,
+            _ => return None,
+        };
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+        {
+            return None;
+        }
+        return Some(ArtifactReference::Stored {
+            kind,
+            digest: digest.to_string(),
+        });
+    }
+    // Published inline descriptors remain readable in durable histories.
+    parse_inline_artifact_uri(value).map(ArtifactReference::Inline)
+}
+
+fn artifact_manifest_path(session_dir: &Path, digest: &str) -> PathBuf {
+    tool_results_dir(session_dir)
+        .join(ARTIFACT_MANIFESTS_SUBDIR)
+        .join(format!("{digest}.json"))
+}
+
+/// Resolve a reference only inside the already-authorized owner/session store.
+/// A stored descriptor is immutable and must match the digest and document kind
+/// in the reference before the existing byte-verifying reader can use it.
+fn resolve_session_tool_result_artifact_uri(
+    session_dir: &Path,
+    value: &str,
+) -> Result<Option<astra_services::session_journal::ToolResultArtifactDescriptor>, String> {
+    let reference = parse_artifact_reference(value)
+        .ok_or_else(|| "artifact must be a valid artifact://session/tool-result/<opaque_token> handle; urn:astra:observation:* and urn:astra:evidence:* values are evidence citations, not artifact handles—omit artifact for live introspect or use the returned artifact://session/tool-result/<opaque_token> handle".to_string())?;
+    let (kind, digest) = match reference {
+        ArtifactReference::Inline(descriptor) => return Ok(Some(descriptor)),
+        ArtifactReference::Stored { kind, digest } => (kind, digest),
+    };
+    let path = artifact_manifest_path(session_dir, &digest);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("failed to inspect tool-result manifest: {error}")),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("tool-result manifest is not a regular owner-scoped file".to_string());
+    }
+    if metadata.len() > MAX_ARTIFACT_MANIFEST_BYTES as u64 {
+        return Err("tool-result manifest exceeds the descriptor size limit".to_string());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path)
+        .map_err(|error| format!("failed to open tool-result manifest: {error}"))?
+        .take(MAX_ARTIFACT_MANIFEST_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read tool-result manifest: {error}"))?;
+    if bytes.len() > MAX_ARTIFACT_MANIFEST_BYTES {
+        return Err("tool-result manifest exceeds the descriptor size limit".to_string());
+    }
+    if format!("{:x}", Sha256::digest(&bytes)) != digest {
+        return Err("tool-result manifest digest does not match its reference".to_string());
+    }
+    let descriptor: astra_services::session_journal::ToolResultArtifactDescriptor =
+        serde_json::from_slice(&bytes)
+            .map_err(|error| format!("invalid tool-result manifest: {error}"))?;
+    if !valid_artifact_descriptor(&descriptor) || descriptor.document_kind != kind {
+        return Err("tool-result manifest identity does not match its reference".to_string());
+    }
+    Ok(Some(descriptor))
+}
+
+/// Parse a result reference from a runtime-generated model projection. This is a
 /// strict codec for the two persisted-output grammars emitted by this module;
 /// it is not a classifier over arbitrary model text.  Typed message metadata
 /// remains the preferred path, while this parser protects older in-memory
 /// projections that have not yet been round-tripped through `Message`.
 #[must_use]
-pub fn parse_tool_result_artifact_projection(
-    content: &str,
-) -> Option<astra_services::session_journal::ToolResultArtifactDescriptor> {
+pub fn parse_tool_result_artifact_projection(content: &str) -> Option<&str> {
     let body = content
         .trim()
         .strip_prefix(PERSISTED_TAG_OPEN)?
@@ -796,10 +929,10 @@ pub fn parse_tool_result_artifact_projection(
         } else {
             continue;
         };
-        if let Some(descriptor) = parse_session_tool_result_artifact_uri(uri)
-            && descriptor.document_kind.is_result()
+        if let Some(reference) = parse_artifact_reference(uri)
+            && reference.is_result()
         {
-            return Some(descriptor);
+            return Some(uri);
         }
     }
     None
@@ -985,17 +1118,14 @@ pub fn resolve_session_tool_result_artifact_request(
             ));
         }
     };
-    let descriptor = match parse_session_tool_result_artifact_uri(artifact) {
-        Some(descriptor) => descriptor,
-        None => {
+    let descriptor = match resolve_session_tool_result_artifact_uri(session_dir, artifact) {
+        Ok(Some(descriptor)) => descriptor,
+        Ok(None) => {
             return Some(Err(
-                "artifact must be a valid artifact://session/tool-result/<opaque_token> handle; "
-                    .to_string()
-                    + "urn:astra:observation:* and urn:astra:evidence:* values are evidence citations, "
-                    + "not artifact handles—omit artifact for live introspect or use the returned "
-                    + "artifact://session/tool-result/<opaque_token> handle",
+                "tool-result artifact was not found in the active session".to_string(),
             ));
         }
+        Err(error) => return Some(Err(error)),
     };
     let offset = match args.get("offset") {
         Some(value) => match value.as_u64().and_then(|value| usize::try_from(value).ok()) {
@@ -1017,7 +1147,9 @@ pub fn resolve_session_tool_result_artifact_request(
             let Some(window) = window else {
                 return Err("tool-result artifact was not found in the active session".to_string());
             };
-            let handle = session_tool_result_artifact_uri_for_descriptor(&descriptor);
+            // Keep the caller's reference: old durable inline handles may not
+            // have a compact manifest, and reading must not manufacture one.
+            let handle = artifact;
             let continuation = if window.is_complete() {
                 "Complete.".to_string()
             } else {
@@ -1055,20 +1187,22 @@ pub fn tool_results_dir(session_dir: &Path) -> PathBuf {
 pub fn session_tool_result_artifact_uri_for_descriptor(
     descriptor: &astra_services::session_journal::ToolResultArtifactDescriptor,
 ) -> String {
-    let payload = RunBoundArtifactHandle {
-        kind: descriptor.document_kind,
-        v: descriptor.version,
-        run: descriptor.run_id.clone(),
-        call: descriptor.call_id.clone(),
-        len: descriptor.byte_len,
-        sha256: descriptor.content_sha256.clone(),
+    let (_, digest) = encoded_artifact_manifest(descriptor);
+    let kind = if descriptor.document_kind.is_result() {
+        "result"
+    } else {
+        "guidance"
     };
-    let encoded = serde_json::to_vec(&payload)
-        .expect("tool-result artifact handle serialization must be infallible");
-    format!(
-        "{SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(encoded)
-    )
+    format!("{SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX}{kind}_{digest}")
+}
+
+fn encoded_artifact_manifest(
+    descriptor: &astra_services::session_journal::ToolResultArtifactDescriptor,
+) -> (Vec<u8>, String) {
+    let bytes = serde_json::to_vec(descriptor)
+        .expect("tool-result artifact descriptor serialization must be infallible");
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    (bytes, digest)
 }
 
 // ---------------------------------------------------------------------------
@@ -1253,17 +1387,14 @@ mod tests {
         ] {
             assert!(!replacement.contains(forbidden));
         }
-        let results = tool_results_dir(dir.path());
-        let entries: Vec<_> = std::fs::read_dir(&results)
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
         assert_eq!(
-            entries.len(),
-            1,
-            "only the run namespace should be published"
+            resolve_session_tool_result_artifact_uri(
+                dir.path(),
+                &session_tool_result_artifact_uri_for_descriptor(&persisted.descriptor)
+            )
+            .unwrap(),
+            Some(persisted.descriptor.clone())
         );
-        assert_eq!(entries[0].file_name(), RUN_SCOPED_RESULTS_SUBDIR);
         assert_eq!(
             read_verified_persisted_result(dir.path(), &persisted.descriptor, content.len() as u64)
                 .unwrap(),
@@ -1294,7 +1425,7 @@ mod tests {
         let handle = session_tool_result_artifact_uri_for_descriptor(&typed.descriptor);
         assert!(typed.replacement.contains(&handle));
         assert_eq!(
-            parse_session_tool_result_artifact_uri(&handle),
+            resolve_session_tool_result_artifact_uri(dir.path(), &handle).unwrap(),
             Some(typed.descriptor.clone())
         );
         assert_eq!(
@@ -1365,7 +1496,7 @@ mod tests {
         );
         let handle = session_tool_result_artifact_uri_for_descriptor(&guidance.descriptor);
         assert_eq!(
-            parse_session_tool_result_artifact_uri(&handle),
+            resolve_session_tool_result_artifact_uri(dir.path(), &handle).unwrap(),
             Some(guidance.descriptor.clone())
         );
         let first = resolve_session_tool_result_artifact_request(
@@ -1427,7 +1558,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(replay.descriptor, guidance.descriptor);
-        // Ordinary result handles retain their original wire shape and paths.
+        // Durable typed result metadata retains its result document identity.
         assert!(
             serde_json::to_value(&result.descriptor)
                 .unwrap()
@@ -1435,12 +1566,10 @@ mod tests {
                 .is_none()
         );
         let result_handle = session_tool_result_artifact_uri_for_descriptor(&result.descriptor);
-        let encoded = result_handle
-            .strip_prefix(SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX)
-            .unwrap();
-        let payload: Value =
-            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded).unwrap()).unwrap();
-        assert!(payload.get("kind").is_none());
+        assert_eq!(
+            resolve_session_tool_result_artifact_uri(dir.path(), &result_handle).unwrap(),
+            Some(result.descriptor)
+        );
     }
 
     #[test]
@@ -1731,7 +1860,11 @@ mod tests {
 
         for projection in [&stored.replacement, &compact.replacement] {
             assert_eq!(
-                parse_tool_result_artifact_projection(projection),
+                resolve_session_tool_result_artifact_uri(
+                    dir.path(),
+                    parse_tool_result_artifact_projection(projection).unwrap()
+                )
+                .unwrap(),
                 Some(stored.descriptor.clone()),
                 "neutral projection must retain the exact artifact identity"
             );
@@ -1820,17 +1953,19 @@ mod tests {
     #[test]
     fn artifact_handles_are_opaque_and_round_trip_every_provider_call_id() {
         let provider_id = "call/with spaces: provider-owned 😀";
-        let descriptor = astra_services::session_journal::ToolResultArtifactDescriptor {
-            document_kind: Default::default(),
-            version: astra_services::session_journal::TOOL_RESULT_ARTIFACT_DESCRIPTOR_VERSION,
-            call_id: provider_id.to_string(),
-            run_id: "run/with spaces: runtime-owned 😀".to_string(),
-            byte_len: 42,
-            content_sha256: "a".repeat(64),
-        };
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run/with spaces: runtime-owned 😀",
+            provider_id,
+            "read_file",
+            "provider evidence",
+        )
+        .unwrap()
+        .descriptor;
         let uri = session_tool_result_artifact_uri_for_descriptor(&descriptor);
         assert_eq!(
-            parse_session_tool_result_artifact_uri(&uri),
+            resolve_session_tool_result_artifact_uri(dir.path(), &uri).unwrap(),
             Some(descriptor.clone())
         );
         assert!(!uri.contains(provider_id));
@@ -1844,12 +1979,279 @@ mod tests {
             "artifact://session/tool-result/call_abc-123",
             "file:///tmp/result.txt",
         ] {
-            assert_eq!(
-                parse_session_tool_result_artifact_uri(invalid),
-                None,
+            assert!(
+                resolve_session_tool_result_artifact_uri(dir.path(), invalid).is_err(),
                 "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn compact_manifest_rejects_oversized_files_before_decoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let persisted = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-bounded",
+            "call-bounded",
+            "read_file",
+            "evidence",
+        )
+        .unwrap();
+        let reference = session_tool_result_artifact_uri_for_descriptor(&persisted.descriptor);
+        let (_, digest) = encoded_artifact_manifest(&persisted.descriptor);
+        std::fs::File::create(artifact_manifest_path(dir.path(), &digest))
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+        let error = resolve_session_tool_result_artifact_request(
+            dir.path(),
+            &serde_json::json!({"artifact":reference,"max_bytes":1}),
+        )
+        .unwrap()
+        .unwrap_err();
+        assert!(error.contains("manifest exceeds"), "{error}");
+    }
+
+    #[test]
+    fn compact_manifest_publication_rejects_oversized_descriptors() {
+        let dir = tempfile::tempdir().unwrap();
+        let Err(error) = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-bounded",
+            &"call".repeat(32 * 1024),
+            "read_file",
+            "evidence",
+        ) else {
+            panic!("oversized descriptor must not publish a reference");
+        };
+        assert!(
+            matches!(error, ToolResultPersistenceError::Io(ref error)
+            if error.kind() == io::ErrorKind::InvalidInput),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn immutable_manifest_replay_recovers_after_nonregular_path_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let stored = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-recovery",
+            "call-recovery",
+            "read_file",
+            "recoverable evidence",
+        )
+        .unwrap();
+        let (_, digest) = encoded_artifact_manifest(&stored.descriptor);
+        let path = artifact_manifest_path(dir.path(), &digest);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let error = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-recovery",
+            "call-recovery",
+            "read_file",
+            "recoverable evidence",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, ToolResultPersistenceError::Io(ref error)
+            if error.kind() == io::ErrorKind::InvalidData),
+            "{error}"
+        );
+        std::fs::remove_dir(path).unwrap();
+        let replay = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-recovery",
+            "call-recovery",
+            "read_file",
+            "recoverable evidence",
+        )
+        .unwrap();
+        assert_eq!(replay.descriptor, stored.descriptor);
+        let result = resolve_session_tool_result_artifact_request(
+            dir.path(),
+            &serde_json::json!({"artifact":session_tool_result_artifact_uri_for_descriptor(&replay.descriptor)}),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(result.contains("recoverable evidence"), "{result}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_replay_rejects_symlinks_for_payload_and_manifest() {
+        for manifest in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let persisted = persist_tool_result_with_descriptor(
+                dir.path(),
+                "run-replay",
+                "call-replay",
+                "read_file",
+                "evidence",
+            )
+            .unwrap();
+            let path = if manifest {
+                let (_, digest) = encoded_artifact_manifest(&persisted.descriptor);
+                artifact_manifest_path(dir.path(), &digest)
+            } else {
+                run_scoped_result_path(dir.path(), "run-replay", "call-replay")
+            };
+            let target = dir.path().join("replay-target");
+            let expected = std::fs::read(&path).unwrap();
+            std::fs::rename(&path, &target).unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            let error = persist_tool_result_with_descriptor(
+                dir.path(),
+                "run-replay",
+                "call-replay",
+                "read_file",
+                "evidence",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, ToolResultPersistenceError::Io(ref error)
+                if error.kind() == io::ErrorKind::InvalidData),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(target).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn compact_reference_recovers_persisted_evidence_in_its_own_session() {
+        let owner = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let content = "Bounded evidence 日本語 😀\n".repeat(50);
+        let persisted = persist_tool_result_with_descriptor(
+            owner.path(),
+            "run-reference",
+            "call-reference",
+            "read_file",
+            &content,
+        )
+        .unwrap();
+        let manifest = serde_json::to_vec(&persisted.descriptor).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&manifest));
+        let reference = format!("{SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX}result_{digest}");
+        let request = serde_json::json!({"artifact":reference,"max_bytes":65536});
+        let recovered = resolve_session_tool_result_artifact_request(owner.path(), &request)
+            .unwrap()
+            .expect("a compact reference must recover its immutable result");
+        assert!(recovered.contains(&content), "{recovered}");
+        let denied = resolve_session_tool_result_artifact_request(other.path(), &request)
+            .unwrap()
+            .expect_err("another session cannot resolve the reference");
+        assert!(
+            denied.contains("not found in the active session"),
+            "{denied}"
+        );
+    }
+
+    #[test]
+    fn compact_reference_rejects_corrupt_or_missing_manifest_without_rebinding() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-first",
+            "call-shared",
+            "read_file",
+            "FIRST",
+        )
+        .unwrap();
+        let second = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-second",
+            "call-shared",
+            "read_file",
+            "SECOND",
+        )
+        .unwrap();
+        let first_ref = session_tool_result_artifact_uri_for_descriptor(&first.descriptor);
+        let second_ref = session_tool_result_artifact_uri_for_descriptor(&second.descriptor);
+        for (reference, expected) in [(&first_ref, "FIRST"), (&second_ref, "SECOND")] {
+            let output = resolve_session_tool_result_artifact_request(
+                dir.path(),
+                &serde_json::json!({"artifact":reference}),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(output.contains(expected), "{output}");
+        }
+        let (_, digest) = encoded_artifact_manifest(&first.descriptor);
+        let path = artifact_manifest_path(dir.path(), &digest);
+        std::fs::write(&path, serde_json::to_vec(&second.descriptor).unwrap()).unwrap();
+        let error = resolve_session_tool_result_artifact_request(
+            dir.path(),
+            &serde_json::json!({"artifact":first_ref}),
+        )
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "tool-result manifest digest does not match its reference"
+        );
+        std::fs::remove_file(path).unwrap();
+        let error = resolve_session_tool_result_artifact_request(
+            dir.path(),
+            &serde_json::json!({"artifact":first_ref}),
+        )
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "tool-result artifact was not found in the active session"
+        );
+        assert_eq!(
+            read_verified_persisted_result(dir.path(), &first.descriptor, 1024).unwrap(),
+            "FIRST"
+        );
+    }
+
+    #[test]
+    fn published_inline_reference_pages_without_a_compact_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "legacy evidence 日本語 😀\n".repeat(10);
+        let stored = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-old",
+            "call-old",
+            "read_file",
+            &content,
+        )
+        .unwrap();
+        let descriptor = &stored.descriptor;
+        let legacy = RunBoundArtifactHandle {
+            kind: descriptor.document_kind,
+            v: descriptor.version,
+            run: descriptor.run_id.clone(),
+            call: descriptor.call_id.clone(),
+            len: descriptor.byte_len,
+            sha256: descriptor.content_sha256.clone(),
+        };
+        let reference = format!(
+            "{SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&legacy).unwrap())
+        );
+        let (_, digest) = encoded_artifact_manifest(descriptor);
+        std::fs::remove_file(artifact_manifest_path(dir.path(), &digest)).unwrap();
+        let first = resolve_session_tool_result_artifact_request(
+            dir.path(),
+            &serde_json::json!({"artifact":reference,"max_bytes":16}),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            first.contains(&reference),
+            "legacy pagination must retain its available reference: {first}"
+        );
+        let tail = resolve_session_tool_result_artifact_request(
+            dir.path(),
+            &serde_json::json!({"artifact":reference,"offset":16,"max_bytes":65536}),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(tail.contains("日本語 😀"), "{tail}");
     }
 
     #[test]
@@ -2083,15 +2485,11 @@ mod tests {
             &"evidence\n".repeat(500),
         )
         .unwrap();
-        assert_eq!(
-            persisted
-                .replacement
-                .matches("artifact://session/tool-result/")
-                .count(),
-            1
-        );
-        let descriptor = parse_tool_result_artifact_projection(&persisted.replacement)
+        let reference = parse_tool_result_artifact_projection(&persisted.replacement)
             .expect("compact projection must use the canonical handle grammar");
+        let descriptor = resolve_session_tool_result_artifact_uri(dir.path(), reference)
+            .unwrap()
+            .unwrap();
         assert_eq!(descriptor, persisted.descriptor);
         assert_eq!(
             read_verified_persisted_result(dir.path(), &descriptor, 64 * 1024).unwrap(),

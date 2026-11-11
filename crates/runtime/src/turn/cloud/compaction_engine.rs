@@ -7,12 +7,19 @@
 use astra_config::runtime_config::CompressionConfig;
 use astra_turn_core::compaction_types::CompactionTier;
 pub use astra_turn_core::compression_types::{PipelineOutcome, TokenBudget};
-use astra_turn_core::context_assembly_trace::CompressionMethod;
 use serde_json::Value;
 
 use super::compaction::{
     compact_duplicate_tool_outputs, compact_middle_messages, truncate_old_tool_results,
 };
+
+/// Fixed mechanical policy; provider summaries have a separate owner.
+enum CompressionMethod {
+    DuplicateToolOutputElimination,
+    ToolResultTruncation,
+    TieredCompaction,
+    ReactiveCompact,
+}
 
 pub struct CompactionEngine {
     triggers: [f64; 4],
@@ -90,9 +97,6 @@ impl CompactionEngine {
                     "reactive_compact",
                     compact_middle_messages(&mut candidate, 4, true),
                 ),
-                CompressionMethod::LlmSummarization => {
-                    unreachable!("model summaries are owned outside mechanical compaction")
-                }
             };
             if result.estimated_tokens_freed == 0 {
                 continue;

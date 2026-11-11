@@ -255,7 +255,6 @@ fn matrixone_pool_options(settings: &MatrixOneSettings) -> MySqlPoolOptions {
         ))
 }
 
-pub mod build_info;
 pub mod client_installation;
 pub mod history_work;
 pub mod history_work_baseline;
@@ -274,13 +273,14 @@ pub mod work_unit;
 /// identities as normal statements, so this preserves one write contract on
 /// both versions without disabling prepared-statement caching globally.
 pub fn matrixone_statement_with_null_shape(
-    sql: &str,
+    sql: impl sqlx::SqlSafeStr,
     nullable_values_present: impl IntoIterator<Item = bool>,
-) -> String {
-    let mut statement = String::with_capacity(sql.len() + 48);
-    statement.push_str(sql);
+) -> sqlx::SqlStr {
+    let sql = sql.into_sql_str();
+    let mut statement = String::with_capacity(sql.as_str().len() + 48);
+    statement.push_str(sql.as_str());
     statement.push_str(&matrixone_null_shape_comment(nullable_values_present));
-    statement
+    sqlx::SqlSafeStr::into_sql_str(sqlx::AssertSqlSafe(statement))
 }
 
 /// Return the MatrixOne prepared-statement discriminator used by dynamic SQL
@@ -303,7 +303,7 @@ pub fn matrixone_null_shape_comment(
 /// `IN (?, ...)` predicate across joins. A derived `UNION ALL` relation keeps
 /// every value bound and returns the complete result on both 4.1.4 and 4.2.
 pub fn push_matrixone_bound_string_set<'args>(
-    query: &mut QueryBuilder<'args, MySql>,
+    query: &mut QueryBuilder<MySql>,
     values: impl IntoIterator<Item = &'args str>,
 ) {
     query.push("(");
@@ -838,6 +838,64 @@ mod connection_quota_tests {
             0,
             "the last SharedPool wrapper releases the reserved quota"
         );
+    }
+
+    #[test]
+    fn concurrent_shared_pool_close_releases_only_its_own_quota_once() {
+        let _guard = crate::sync_poison::recover_mutex_lock(&TEST_MUTEX);
+        reset_quota();
+        const SENTINEL: u64 = 7;
+        const POOL_MAX: u32 = 10;
+        try_allocate_with_cap(SENTINEL, 100).unwrap();
+        try_allocate_with_cap(u64::from(POOL_MAX), 100).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let settings = MatrixOneSettings {
+                db_pool_max_connections: POOL_MAX,
+                ..MatrixOneSettings::default()
+            };
+            let pool = MySqlPoolOptions::new()
+                .min_connections(0)
+                .connect_lazy(&settings.database_url_with_password())
+                .unwrap();
+            let shared = SharedPool {
+                pool: Arc::new(pool),
+                settings,
+                quota_released: Arc::new(AtomicBool::new(false)),
+            };
+            let start = Arc::new(tokio::sync::Barrier::new(4));
+            let mut tasks = Vec::new();
+            for _ in 0..3 {
+                let clone = shared.clone();
+                let start = start.clone();
+                tasks.push(tokio::spawn(async move {
+                    start.wait().await;
+                    clone.close().await;
+                    clone
+                }));
+            }
+            start.wait().await;
+            let mut clones = Vec::new();
+            for task in tasks {
+                clones.push(task.await.unwrap());
+            }
+            assert_eq!(
+                GLOBAL_CONNECTION_ALLOCATED.load(Ordering::Acquire),
+                SENTINEL
+            );
+            shared.close().await;
+            drop((clones, shared));
+            assert_eq!(
+                GLOBAL_CONNECTION_ALLOCATED.load(Ordering::Acquire),
+                SENTINEL
+            );
+        });
+        release_global_connections(SENTINEL);
+        assert_eq!(GLOBAL_CONNECTION_ALLOCATED.load(Ordering::Acquire), 0);
     }
 }
 
@@ -1643,3 +1701,6 @@ mod tests {
 }
 pub mod trace_types;
 pub use trace_types::*;
+
+/// Shared incremental SSE event framing.
+pub mod sse_blocks;

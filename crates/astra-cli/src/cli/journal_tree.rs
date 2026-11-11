@@ -81,7 +81,7 @@ pub struct DelegationNode {
     /// Root's own known terminal completion tokens (excludes children).
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub self_completion_tokens: u64,
-    /// Tool invocations on this sub-run.
+    /// Known executed tool invocations, including children for the root.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub tool_calls: u32,
     /// Nested sub-runs.
@@ -132,6 +132,9 @@ pub(crate) fn fold_events_into_tree(
     let mut by_run_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for ev in events {
+        if journal_digest::is_root_terminal(ev) {
+            root.tool_calls = root.tool_calls.saturating_add(ev.tool_count.unwrap_or(0));
+        }
         match ev.event_type {
             JournalEventType::Turn | JournalEventType::LlmRound => {
                 if root.started_at.is_none() && !ev.ts.is_empty() {
@@ -406,6 +409,66 @@ mod tests {
         assert_eq!(root.started_at.as_deref(), Some("2026-04-30T10:00:00Z"));
         assert_eq!(root.ended_at.as_deref(), Some("2026-04-30T10:00:05Z"));
         assert!(root.children.is_empty());
+    }
+
+    #[test]
+    fn tree_counts_root_terminals_without_round_or_child_duplicates() {
+        let mut turn = turn_event("t1", 100, 10, "sonnet");
+        turn.tool_count = Some(541);
+        let mut round = turn.clone();
+        round.event_type = astra_services::session_journal::JournalEventType::LlmRound;
+        let mut failed = turn_event("t2", 20, 2, "sonnet");
+        failed.event_type = astra_services::session_journal::JournalEventType::TurnError;
+        failed.tool_count = Some(9);
+        failed.producer_scope =
+            Some(serde_json::from_value(json!({"run_id":"root-run", "agent_id":"root"})).unwrap());
+        let mut child = failed.clone();
+        child.tool_count = Some(4);
+        child.producer_scope = Some(
+            serde_json::from_value(json!({
+                "run_id":"run-A", "parent_run_id":"root-run", "agent_id":"worker"
+            }))
+            .unwrap(),
+        );
+        let events = vec![
+            round,
+            turn,
+            failed,
+            sub_started("t3", "run-A", "coder", "task"),
+            child,
+            sub_completed("t4", "run-A", 50, 5, 4),
+        ];
+        let (root, _, skipped) = fold_events_into_tree("sess-1", &events);
+        assert_eq!(skipped, 0);
+        assert_eq!(root.tool_calls, 554);
+        assert_eq!(root.children[0].tool_calls, 4);
+        assert!(render_text(&root).contains("tool_calls=554\n"));
+    }
+
+    #[test]
+    fn tree_preserves_explicit_zero_even_with_tool_detail() {
+        let mut turn = turn_event("t1", 0, 0, "sonnet");
+        turn.tool_count = Some(0);
+        turn.tool_calls =
+            Some(serde_json::from_value(json!([{"name":"read_file", "ok":true, "ms":1}])).unwrap());
+        let (root, _, _) = fold_events_into_tree("sess-1", &[turn]);
+        assert_eq!(root.tool_calls, 0);
+    }
+
+    #[test]
+    fn tree_saturates_root_and_delegated_tool_counts() {
+        let mut turn = turn_event("t1", 0, 0, "sonnet");
+        turn.tool_count = Some(u32::MAX);
+        let mut second_turn = turn.clone();
+        second_turn.turn = Some(2);
+        let events = vec![
+            turn,
+            second_turn,
+            sub_started("t2", "run-A", "coder", "task"),
+            sub_completed("t3", "run-A", 0, 0, 1),
+        ];
+        let (root, _, _) = fold_events_into_tree("sess-1", &events);
+        assert_eq!(root.tool_calls, u32::MAX);
     }
 
     #[test]

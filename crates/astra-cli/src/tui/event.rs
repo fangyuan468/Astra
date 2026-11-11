@@ -28,11 +28,9 @@ pub(crate) enum TuiEvent {
     /// into the composer would turn presentation bytes into a control
     /// protocol and could collide with real user input.
     RuntimeNotificationTurn,
-    /// Literal, owner-bound next-turn input; never a composer key event.
-    SessionContinuation {
-        target: crate::tui::event_loop::SessionContinuationTarget,
-        content: String,
-    },
+    /// A wake for the existing FIFO. The input stays owned by that queue
+    /// until the captured attachment and input gates are checked again.
+    QueuedSubmission(crate::tui::event_loop::QueuedSubmissionContext),
 }
 
 pub(crate) struct TuiEventStream {

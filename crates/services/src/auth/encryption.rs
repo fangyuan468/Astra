@@ -1,4 +1,7 @@
-use base64::{Engine as _, engine::general_purpose::URL_SAFE};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
+};
 use fernet::Fernet;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -63,6 +66,81 @@ impl FernetTokenEncryptor {
         mac.update(&[0]);
         mac.update(value.as_bytes());
         format!("{:x}", mac.finalize().into_bytes())
+    }
+
+    fn provider_session_scope_mac(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        provider_id: &str,
+        scope_id: &str,
+    ) -> HmacSha256 {
+        let mut mac =
+            HmacSha256::new_from_slice(&self.digest_key).expect("HMAC accepts a 32-byte key");
+        mac.update(b"astra.provider-session-scope.v1\0");
+        for value in [user_id, session_id, provider_id, scope_id] {
+            mac.update(&(value.len() as u64).to_be_bytes());
+            mac.update(value.as_bytes());
+        }
+        mac
+    }
+
+    /// Sign the immutable provider scope of one session with the server key.
+    pub fn sign_provider_session_scope(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        provider_id: &str,
+        scope_id: &str,
+    ) -> String {
+        URL_SAFE_NO_PAD.encode(
+            self.provider_session_scope_mac(user_id, session_id, provider_id, scope_id)
+                .finalize()
+                .into_bytes(),
+        )
+    }
+
+    /// Verify a scope proof without trusting its storage or its caller.
+    pub fn verify_provider_session_scope(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        provider_id: &str,
+        scope_id: &str,
+        proof: &str,
+    ) -> bool {
+        if proof.len() != 43 {
+            return false;
+        }
+        let Ok(signature) = URL_SAFE_NO_PAD.decode(proof) else {
+            return false;
+        };
+        self.provider_session_scope_mac(user_id, session_id, provider_id, scope_id)
+            .verify_slice(&signature)
+            .is_ok()
+    }
+
+    /// Verify a stored digest without exposing a secret-dependent prefix match.
+    pub fn verify_keyed_digest(&self, domain: &str, value: &str, expected: &str) -> bool {
+        if expected.len() != 64 {
+            return false;
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, pair) in expected.as_bytes().chunks_exact(2).enumerate() {
+            let Ok(pair) = std::str::from_utf8(pair) else {
+                return false;
+            };
+            let Ok(value) = u8::from_str_radix(pair, 16) else {
+                return false;
+            };
+            bytes[index] = value;
+        }
+        let mut mac =
+            HmacSha256::new_from_slice(&self.digest_key).expect("HMAC accepts a 32-byte key");
+        mac.update(domain.as_bytes());
+        mac.update(&[0]);
+        mac.update(value.as_bytes());
+        mac.verify_slice(&bytes).is_ok()
     }
 }
 
@@ -137,6 +215,91 @@ mod tests {
             first.keyed_digest("provider-header", "workspace-1"),
             other.keyed_digest("provider-header", "workspace-1")
         );
+    }
+
+    #[test]
+    fn provider_session_scope_proof_binds_every_identity_component() {
+        let key = make_encryptor("scope-key-one");
+        let other_key = make_encryptor("scope-key-two");
+        let proof = key.sign_provider_session_scope("user", "session", "provider", "workspace");
+        assert!(key.verify_provider_session_scope(
+            "user",
+            "session",
+            "provider",
+            "workspace",
+            &proof
+        ));
+        assert!(!key.verify_provider_session_scope("user", "session", "provider", "other", &proof));
+        assert!(!key.verify_provider_session_scope(
+            "user",
+            "other",
+            "provider",
+            "workspace",
+            &proof
+        ));
+        assert!(!key.verify_provider_session_scope(
+            "other",
+            "session",
+            "provider",
+            "workspace",
+            &proof
+        ));
+        assert!(!key.verify_provider_session_scope(
+            "user",
+            "session",
+            "other",
+            "workspace",
+            &proof
+        ));
+        assert!(!other_key.verify_provider_session_scope(
+            "user",
+            "session",
+            "provider",
+            "workspace",
+            &proof
+        ));
+        assert!(!key.verify_provider_session_scope(
+            "user",
+            "session",
+            "provider",
+            "workspace",
+            "invalid"
+        ));
+        assert!(!key.verify_provider_session_scope(
+            "user",
+            "session",
+            "provider",
+            "workspace",
+            &"!".repeat(43)
+        ));
+        assert!(!key.verify_provider_session_scope(
+            "user",
+            "session",
+            "provider",
+            "workspace",
+            &proof[..42]
+        ));
+        let mut altered = proof.clone().into_bytes();
+        altered[0] = if altered[0] == b'A' { b'B' } else { b'A' };
+        assert!(!key.verify_provider_session_scope(
+            "user",
+            "session",
+            "provider",
+            "workspace",
+            std::str::from_utf8(&altered).unwrap()
+        ));
+        let ambiguous = key.sign_provider_session_scope("us", "ersession", "provider", "workspace");
+        assert_ne!(proof, ambiguous);
+    }
+
+    #[test]
+    fn keyed_digest_verification_requires_matching_domain_value_and_digest() {
+        let key = make_encryptor("digest-verification-key");
+        let digest = key.keyed_digest("domain-one", "value");
+        assert!(key.verify_keyed_digest("domain-one", "value", &digest));
+        assert!(!key.verify_keyed_digest("domain-two", "value", &digest));
+        assert!(!key.verify_keyed_digest("domain-one", "different", &digest));
+        assert!(!key.verify_keyed_digest("domain-one", "value", "not-a-digest"));
     }
 
     #[test]

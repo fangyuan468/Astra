@@ -35,68 +35,24 @@ fn is_background_task_tool_shell_invocation(command: &str, tool: &str) -> bool {
     })
 }
 
-/// Reject bash commands that try to read background-task output files
-/// directly off disk (`/tmp/astra/bg_tasks/...` or `${TMPDIR}/astra/bg_tasks/...`).
-/// The model must use `task_output` for this — disk reads bypass the
-/// snapshot protocol, return stale partial bytes mid-write, and miss
-/// the registry's terminal-status accounting. Reading these files via
-/// bash is the canonical "I'm polling" anti-pattern from the trace
-/// where a model burned 12 LLM rounds tail'ing the stderr file.
-pub fn background_task_output_dir_read_error(command: &str) -> Option<String> {
-    if !command.contains("bg_tasks") {
-        return None;
-    }
-    let lower = command.to_ascii_lowercase();
-    let bg_path_marker = "/astra/bg_tasks/";
-    if !lower.contains(bg_path_marker) {
-        return None;
-    }
-    Some(
-        "Error: bash cannot read background task output files directly. \
-         Call the `task_output` tool with the task_id (e.g. `bg-shell-1`) instead. \
-         For a terminal failure, use its `pattern` argument to search an exact test or error \
-         with bounded context. \
-         The runtime delivers a <task_notification> when the task terminates; \
-         polling the on-disk files via bash returns stale partial bytes and \
-         bypasses terminal-status reporting."
-            .into(),
-    )
-}
-
 pub fn background_task_tool_pseudo_call_error(command: &str) -> Option<String> {
-    let tool = ["task_output", "task_list", "task_stop"]
+    let tool = ["task_output", "task_list", "task_input", "task_stop"]
         .into_iter()
         .find(|tool| is_background_task_tool_shell_invocation(command, tool))?;
     Some(format!(
         "Error: `{tool}` is a background-task tool, not a bash command. \
          Call the `{tool}` tool directly through the tool interface. \
-         Use `task_output` with the background task id, for example `bg-shell-1`, \
+         Use `task_output` with the exact background task id returned by bash \
          as the `task_id` argument when you need output. \
          Do not rerun the original bash command just to check background progress."
     ))
 }
 
-/// Canonical bash pre-execution validator for the background-task contract.
-///
-/// Returns `Err(message)` for the two anti-patterns that *must* be blocked
-/// at the validator layer in every bash entry point:
-///
-/// 1. Pseudo-tool invocations (`task_output(...)`, `task_list`, `task_stop ...`)
-///    — the model thinks these are shell programs. Blocking here turns the
-///    mistake into an immediate corrective error instead of a `command not
-///    found` round-trip.
-/// 2. Direct disk reads of background-task stdout/stderr files
-///    (`tail /tmp/astra/bg_tasks/...`). The trace this guards against had a
-///    model burn 12 LLM rounds tail'ing a stderr file instead of calling
-///    `task_output`.
-///
-/// All bash entry points (in-process and edge) MUST funnel through this
-/// helper. Adding a new check requires editing one place, not two.
+/// Correct tool-as-program mistakes and protect private runtime artifacts.
+/// Ordinary authorized log inspection is allowed; observation frequency is
+/// the model's decision within the normal execution budgets.
 pub fn validate_bash_background_task_contract(command: &str) -> Result<(), String> {
     if let Some(err) = background_task_tool_pseudo_call_error(command) {
-        return Err(err);
-    }
-    if let Some(err) = background_task_output_dir_read_error(command) {
         return Err(err);
     }
     if let Some(err) =
@@ -181,12 +137,11 @@ pub(crate) fn classify_bash_command(command: &str) -> BashCommandClass {
     // Flatten all pipeline segments so `cargo fmt && cargo clippy` picks the
     // *slowest* class among its parts (Lint > Build). This matches user intent:
     // the chain is only as fast as its slowest step.
-    let mut worst = BashCommandClass::Unknown;
-    for segment in split_command_segments(command) {
-        let class = classify_single_segment(segment);
-        worst = max_class(worst, class);
-    }
-    worst
+    split_command_segments(command)
+        .into_iter()
+        .map(classify_single_segment)
+        .reduce(max_class)
+        .unwrap_or(BashCommandClass::Unknown)
 }
 
 /// Split on `&&`, `||`, `;`, and `|` — any control operator that sequences
@@ -195,7 +150,7 @@ pub(crate) fn classify_bash_command(command: &str) -> BashCommandClass {
 fn split_command_segments(command: &str) -> Vec<&str> {
     // Keep it simple: split on the common operators. `|` inside quoted args
     // (`grep 'a|b'`) would misclassify but wouldn't break: worst case a
-    // benign fragment gets classified as Unknown and is ignored.
+    // benign fragment gets a conservative Unknown timeout.
     command
         .split(';')
         .flat_map(|s| s.split("&&"))
@@ -373,11 +328,11 @@ fn is_env_name(s: &str) -> bool {
 }
 
 fn max_class(a: BashCommandClass, b: BashCommandClass) -> BashCommandClass {
-    // Order by worst-case duration: Package/Test > Lint > Build > Fast > Unknown.
-    // Unknown ranks below Fast so a classified segment always wins over noise.
+    // Order by worst-case duration: Package/Test > Lint > Build/Unknown > Fast.
+    // An unknown executable retains its own default even after a fast prefix.
     fn rank(c: BashCommandClass) -> u8 {
         match c {
-            BashCommandClass::Unknown => 0,
+            BashCommandClass::Unknown => 2,
             BashCommandClass::Fast => 1,
             BashCommandClass::Build => 2,
             BashCommandClass::Lint => 3,
@@ -394,33 +349,10 @@ pub(crate) fn default_bash_timeout_for(command: &str) -> f64 {
     classify_bash_command(command).default_timeout_secs()
 }
 
-/// Resolve the timeout used by the workspace Edge Bash executor when callers
-/// omit `timeout`. Server-side admission uses the same value so it reserves
-/// enough time to execute and settle the command without rejecting short
-/// commands against the generic server ceiling.
+/// Use the same compound-aware timeout default for local and remote Bash.
+/// Explicit invocation and run limits are applied by the caller.
 pub fn workspace_edge_bash_timeout_secs(command: &str) -> f64 {
-    let cmd_base = command.split_whitespace().next().unwrap_or("");
-    match cmd_base {
-        // Instant commands that perform no meaningful I/O.
-        "echo" | "printf" | "true" | "false" | "pwd" | "whoami" | "date" | "basename"
-        | "dirname" | "which" | "env" | "hostname" | "uname" | "id" | "tty" | "nproc" | "arch"
-        | "yes" => 5.0,
-        // Single-file and directory reads.
-        "cat" | "head" | "tail" | "wc" | "stat" | "file" | "ls" | "readlink" | "realpath"
-        | "md5sum" | "sha256sum" | "du" | "df" | "touch" | "mkdir" | "cp" | "mv" | "rm" | "ln"
-        | "chmod" | "chown" => 10.0,
-        // Search and traversal commands.
-        "grep" | "rg" | "find" | "fd" | "ag" | "awk" | "sed" | "sort" | "uniq" | "cut" | "tr"
-        | "diff" | "comm" | "xargs" | "tree" | "jq" | "yq" | "column" | "tee" => 15.0,
-        // Build, test, package, and container commands retain the established
-        // bounded 120-second Edge default; callers can explicitly request
-        // more when the run budget permits.
-        "cargo" | "make" | "go" | "mvn" | "gradle" | "pytest" | "pnpm" | "yarn" | "npm" | "pip"
-        | "uv" | "cmake" | "tox" | "bazel" | "ninja" | "docker" | "podman" | "docker-compose"
-        | "nerdctl" | "buildah" => 120.0,
-        // Network and unrecognized commands retain the bounded fallback.
-        _ => 30.0,
-    }
+    default_bash_timeout_for(command)
 }
 const GREP_DEFAULT_HEAD_LIMIT: usize = 100;
 const GLOB_DEFAULT_HEAD_LIMIT: usize = 100;
@@ -465,6 +397,12 @@ enum SearchSortMode {
 enum StreamKind {
     Stdout,
     Stderr,
+}
+
+struct StreamLimits<'a> {
+    stdout: usize,
+    stderr: usize,
+    shell_command: Option<&'a str>,
 }
 
 pub(crate) struct ReadOnlyCommandOutput {
@@ -914,7 +852,7 @@ pub fn resolve_bash_workdir(
     }
     if !resolved.starts_with(&canonical_root) {
         return Err(format!(
-            "SANDBOX_DENIED: bash `workdir` `{requested}` is outside workspace root '{}'; no command was run",
+            "SANDBOX_DENIED: bash `workdir` `{requested}` is outside workspace root '{}'; no command was run. A Git worktree created by a shell command is not the selected session workspace. Use the worktree tool to enter an isolated workspace when available.",
             workspace_root.display()
         ));
     }
@@ -938,7 +876,7 @@ pub fn resolve_bash_workdir(
             })?;
         let relative = resolved.strip_prefix(&canonical_root).map_err(|_| {
             format!(
-                "SANDBOX_DENIED: bash `workdir` `{requested}` is outside workspace root '{}'; no command was run",
+                "SANDBOX_DENIED: bash `workdir` `{requested}` is outside workspace root '{}'; no command was run. A Git worktree created by a shell command is not the selected session workspace. Use the worktree tool to enter an isolated workspace when available.",
                 workspace_root.display()
             )
         })?;
@@ -1072,16 +1010,6 @@ pub(crate) fn parse_bash_timeout_secs_for(args: &Value, command: &str) -> f64 {
     default_bash_timeout_for(command).clamp(BASH_TIMEOUT_MIN_SECS, BASH_TIMEOUT_MAX_SECS)
 }
 
-/// Whether a completed Bash call lacks authoritative process ownership.
-/// Command spelling cannot prove that descendants are unable to mutate later.
-/// Missing ownership after execution is handled by the stronger unsettled
-/// boundary; absence here does not establish that no process ran.
-pub fn bash_scope_requires_attribution_quarantine(
-    ownership: Option<astra_sandbox::ScopeOwnership>,
-) -> bool {
-    ownership.is_some_and(|ownership| !ownership.is_authoritative())
-}
-
 /// Execute a bash command with bounded partial-output capture.
 pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     execute_bash_with_environment(ctx, args, &[]).await
@@ -1117,8 +1045,18 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
     environment: &[(String, String)],
     workdir: &PreparedBashWorkdir,
 ) -> ToolResult {
-    let explicit_verification =
-        crate::workspace_observation::is_explicit_workspace_verification_request("bash", args);
+    if args.get("stdin").and_then(Value::as_bool) == Some(true)
+        || args.get("yield_time_ms").is_some()
+    {
+        return ToolResult::error(
+            "Error: interactive shell controls require a session-owned shell; no command was run"
+                .into(),
+        )
+        .with_failure_evidence(astra_core::ToolFailureEvidence::from_error_kind(
+            astra_core::ErrorKind::ToolUnavailable,
+        ))
+        .with_execution_not_started();
+    }
     let needs_observation = args
         .get("command")
         .and_then(Value::as_str)
@@ -1168,35 +1106,8 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
     {
         return crate::cancelled_tool_result("bash", false);
     }
-    let before = if needs_observation && !nested_in_run_script {
-        let root = ctx.workspace_root.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::workspace_observation::WorkspaceFingerprint::capture(&root)
-        })
-        .await
-        .ok()
-        .flatten()
-    } else {
-        None
-    };
-    let verification_fingerprint_unavailable = explicit_verification && before.is_none();
-
-    if ctx
-        .cancel_token
-        .as_ref()
-        .is_some_and(|token| token.is_cancelled())
-    {
-        return crate::cancelled_tool_result("bash", false);
-    }
-
     let mut result = execute_bash_inner(ctx, args, environment, workdir).await;
     attach_bash_workdir_evidence(&mut result, &ctx.workspace_root, workdir, args);
-    let scope_settled = result
-        .metadata
-        .as_ref()
-        .and_then(|fields| fields.get(INTERNAL_SCOPE_SETTLED_FIELD))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let scope_ownership = result
         .metadata
         .as_ref()
@@ -1221,187 +1132,21 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
         fields.remove(INTERNAL_SCOPE_QUARANTINED_FIELD);
         fields.remove(INTERNAL_EXECUTION_STARTED_FIELD);
     }
-    let detached = result
-        .metadata
-        .as_ref()
-        .and_then(|fields| fields.get("background_task_id"))
-        .and_then(Value::as_str)
-        .is_some();
     let coordination_unsettled = _observation_lease
         .as_ref()
         .is_some_and(|lease| !lease.coordination_integrity_valid());
     if coordination_unsettled {
         crate::workspace_observation::mark_workspace_observation_unsettled(&ctx.workspace_root);
     }
-    if let Some(before) = before.filter(|_| !detached) {
-        let root = ctx.workspace_root.clone();
-        let after = tokio::task::spawn_blocking(move || {
-            crate::workspace_observation::WorkspaceFingerprint::capture(&root)
-        })
-        .await
-        .ok()
-        .flatten();
-        let after_captured = after.is_some();
-        let comparison = before.compare_with(after.as_ref());
-        let workspace_changed =
-            comparison == crate::workspace_observation::WorkspaceFingerprintComparison::Changed;
-        // The pre-execution check cannot authorize a receipt after a slow
-        // fingerprint capture: binding/lease integrity must still hold at the
-        // exact mint boundary.
-        let receipt_authority_valid_at_mint = !coordination_unsettled
-            && _observation_lease.as_ref().is_none_or(
-                crate::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
-            );
-        let verification_receipt_valid = explicit_verification
-            && !result.is_error
-            && result
-                .metadata
-                .as_ref()
-                .and_then(|fields| fields.get("exit_code"))
-                .and_then(Value::as_i64)
-                == Some(0)
-            && receipt_authority_valid_at_mint
-            && scope_settled
-            && !scope_quarantined
-            && after_captured
-            && comparison
-                == crate::workspace_observation::WorkspaceFingerprintComparison::Unchanged
-            && scope_ownership.is_some_and(|ownership| ownership.is_authoritative());
-        if verification_receipt_valid {
-            result
-                .metadata
-                .get_or_insert_with(serde_json::Map::new)
-                .extend(crate::workspace_observation::explicit_workspace_verification_receipt());
-        } else if explicit_verification {
-            if verification_fingerprint_unavailable || !after_captured {
-                result = result.with_failure_evidence(
-                    crate::workspace_observation::
-                        explicit_workspace_verification_unavailable_evidence(),
-                );
-                result
-                    .metadata
-                    .get_or_insert_with(serde_json::Map::new)
-                    .insert(
-                        "workspace_observation_retry_scope".to_string(),
-                        Value::String("workspace_generation".to_string()),
-                    );
-                result.output.push_str("\n\n");
-                result.output.push_str(
-                    crate::workspace_observation::EXPLICIT_WORKSPACE_VERIFICATION_UNAVAILABLE_MESSAGE,
-                );
-            } else {
-                result.is_error = true;
-                result.output.push_str(
-                    "\n\nError: verify-mode command did not produce an authoritative unchanged-workspace observation receipt.",
-                );
-            }
-        }
-        if receipt_authority_valid_at_mint && scope_settled && workspace_changed {
-            if let Some(ownership) = scope_ownership {
-                result
-                    .metadata
-                    .get_or_insert_with(serde_json::Map::new)
-                    .extend(
-                        crate::workspace_observation::changed_receipt_with_ownership(
-                            ownership.as_str(),
-                        ),
-                    );
-                if !ownership.is_authoritative() {
-                    crate::workspace_observation::quarantine_after_weak_receipt(
-                        &ctx.workspace_root,
-                        Some(ownership.as_str()),
-                    );
-                }
-            } else {
-                crate::workspace_observation::quarantine_after_weak_receipt(
-                    &ctx.workspace_root,
-                    None,
-                );
-            }
-        }
-    }
-    if explicit_verification
-        && !result.is_error
-        && !result.metadata.as_ref().is_some_and(|fields| {
-            fields
-                .get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-                .is_some_and(
-                    crate::workspace_observation::is_explicit_workspace_verification_receipt,
-                )
-        })
+    if coordination_unsettled
+        || scope_quarantined
+        || (execution_started && scope_ownership.is_none())
     {
-        if verification_fingerprint_unavailable {
-            result = result.with_failure_evidence(
-                crate::workspace_observation::explicit_workspace_verification_unavailable_evidence(
-                ),
-            );
-            result
-                .metadata
-                .get_or_insert_with(serde_json::Map::new)
-                .insert(
-                    "workspace_observation_retry_scope".to_string(),
-                    Value::String("workspace_generation".to_string()),
-                );
-            result.output.push_str("\n\n");
-            result.output.push_str(
-                crate::workspace_observation::EXPLICIT_WORKSPACE_VERIFICATION_UNAVAILABLE_MESSAGE,
-            );
-        } else {
-            result.is_error = true;
-            result.output.push_str(
-                "\n\nError: verify-mode command did not produce an authoritative unchanged-workspace observation receipt.",
-            );
-        }
+        result.is_error = true;
+        result.output.push_str("\n\nThe command's final outcome could not be confirmed; a child process may still be running. Inspect the current state before retrying.");
+        result = result.with_execution_outcome_unknown();
     }
-    finalize_bash_scope_quarantine(
-        &ctx.workspace_root,
-        execution_started,
-        scope_quarantined,
-        scope_ownership,
-        args.get("command")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-    );
     result
-}
-
-fn finalize_bash_scope_quarantine(
-    workspace_root: &Path,
-    execution_started: bool,
-    scope_quarantined: bool,
-    scope_ownership: Option<astra_sandbox::ScopeOwnership>,
-    command: &str,
-) {
-    if execution_started
-        && scope_ownership.is_none()
-        && !crate::workspace_observation::bash_command_is_detachable_safe(command)
-    {
-        crate::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
-        return;
-    }
-    // Preserve current-chain evidence before making the weak-ownership
-    // quarantine sticky. Quarantining first would make the post fingerprint
-    // disappear and erase the only truthful evidence this call can provide.
-    if scope_quarantined {
-        if scope_ownership.is_some() {
-            crate::workspace_observation::quarantine_after_weak_receipt(
-                workspace_root,
-                scope_ownership.as_ref().map(|ownership| ownership.as_str()),
-            );
-        } else {
-            crate::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
-        }
-    }
-    // A foreground process group is useful current-call evidence, but it
-    // cannot rule out a descendant that escaped with `setsid` and writes
-    // later. Quarantine future fingerprint attribution even when the
-    // immediate pre/post state is clean.
-    if bash_scope_requires_attribution_quarantine(scope_ownership) {
-        crate::workspace_observation::quarantine_after_weak_receipt(
-            workspace_root,
-            scope_ownership.as_ref().map(|ownership| ownership.as_str()),
-        );
-    }
 }
 
 async fn execute_bash_inner(
@@ -1423,8 +1168,6 @@ async fn execute_bash_inner(
         }
     };
     let timeout_secs = parse_bash_timeout_secs_for(args, command);
-    let explicit_verification =
-        crate::workspace_observation::is_explicit_workspace_verification_request("bash", args);
 
     if let Err(reason) = validate_prepared_bash_command(command, workdir) {
         return ToolResult::error(reason);
@@ -1484,23 +1227,6 @@ async fn execute_bash_inner(
                     ));
                 }
             };
-        if explicit_verification && !owner.can_authoritatively_observe() {
-            let mut rejected = ToolResult::error(
-                "Error: bash mode=verify is unavailable: this executor cannot prove that all child processes have settled. No command was run. Use a typed workspace observer for file state; it does not replace a required script or test result."
-                    .into(),
-            );
-            rejected.metadata = Some(serde_json::Map::from_iter([
-                ("disposition".into(), Value::String("rejected".into())),
-                ("execution_started".into(), Value::Bool(false)),
-                ("side_effects_maybe".into(), Value::Bool(false)),
-                (
-                    "error_kind".into(),
-                    Value::String("tool_unavailable".into()),
-                ),
-                ("retryable".into(), Value::Bool(false)),
-            ]));
-            return rejected;
-        }
         if let Err(error) = owner.install(&mut command) {
             return ToolResult::error(format!(
                 "Error: unable to install Bash invocation owner: {error}"
@@ -1514,6 +1240,10 @@ async fn execute_bash_inner(
         return ToolResult::error(error);
     }
     cmd.kill_on_drop(true);
+    // A sandbox process may inherit a stale carrier. This call supplies the
+    // only TRACEPARENT the command is allowed to see.
+    cmd.env_remove("TRACEPARENT");
+    cmd.env_remove("TRACESTATE");
     cmd.envs(environment.iter().map(|(key, value)| (key, value)));
     // Never let a caller-controlled shell startup hook execute in the tool
     // process.
@@ -1523,12 +1253,15 @@ async fn execute_bash_inner(
     let raw_stdout_limit = output_limit.saturating_mul(2).max(16_384);
     let raw_stderr_limit = output_limit.clamp(8_192, 32_768);
 
-    let output = match run_owned_bash_command_with_partial(
+    let mut output = match run_owned_bash_command_with_partial(
         &mut cmd,
         foreground_owner,
         timeout,
-        raw_stdout_limit,
-        raw_stderr_limit,
+        StreamLimits {
+            stdout: raw_stdout_limit,
+            stderr: raw_stderr_limit,
+            shell_command: Some(command),
+        },
         ctx.cancel_token.as_deref(),
         "bash command",
     )
@@ -1538,6 +1271,21 @@ async fn execute_bash_inner(
         Err(e) => return attach_source_preimage(ToolResult::error(e), source_preimages),
     };
 
+    let display_budget = output_limit
+        .min(astra_core::runtime_limits::DEFAULT_TOOL_RESULT_INLINE_CHARS)
+        .saturating_sub(1024);
+    let presentation_truncated = output.stdout_capped
+        || output.stderr_capped
+        || output.stdout.len().saturating_add(output.stderr.len()) > display_budget;
+    if presentation_truncated {
+        let budget = display_budget / 2;
+        for stream in [&mut output.stdout, &mut output.stderr] {
+            let safe =
+                astra_text_utils::credential_redaction::redact_credentials_for_display(stream).0;
+            *stream =
+                astra_text_utils::credential_redaction::truncate_redacted_head_tail(&safe, budget);
+        }
+    }
     let mut result = String::new();
     if !output.stdout.is_empty() {
         result.push_str(&output.stdout);
@@ -1558,6 +1306,17 @@ async fn execute_bash_inner(
     // partial value in stdout/stderr for a later pass to miss.
     result = astra_text_utils::credential_redaction::redact_credentials_for_display(&result).0;
 
+    let exit_note = (output.exit_code != 0 && !output.timed_out && !output.cancelled)
+        .then(|| format!("[exit code: {}]", output.exit_code));
+    // Keep diagnostics and terminal facts visible without writing unrequested
+    // output into the workspace. The producer has no task reader here.
+    let finish_presentation = |text: String| {
+        astra_text_utils::credential_redaction::truncate_redacted_head_tail(
+            &text,
+            output_limit.min(astra_core::runtime_limits::DEFAULT_TOOL_RESULT_INLINE_CHARS),
+        )
+    };
+
     let mut cap_notes = Vec::new();
     if output.stdout_capped {
         cap_notes.push("stdout capped");
@@ -1565,21 +1324,24 @@ async fn execute_bash_inner(
     if output.stderr_capped {
         cap_notes.push("stderr capped");
     }
+    if presentation_truncated && cap_notes.is_empty() {
+        cap_notes.push("display capped");
+    }
     if !cap_notes.is_empty() {
         if !result.is_empty() {
             result.push_str("\n\n");
         }
         result.push_str(&format!(
-            "[bash output capped before completion: {}]",
-            cap_notes.join(", ")
+            "[bash output truncated: {}; additional output is unavailable]",
+            cap_notes.join(", "),
         ));
     }
 
-    if output.exit_code != 0 && !output.timed_out && !output.cancelled {
+    if let Some(exit_note) = exit_note {
         if !result.is_empty() {
             result.push_str("\n\n");
         }
-        result.push_str(&format!("[exit code: {}]", output.exit_code));
+        result.push_str(&exit_note);
     }
 
     if output.timed_out {
@@ -1593,14 +1355,9 @@ async fn execute_bash_inner(
         }
         return attach_scope_settled(
             attach_source_preimage(
-                ToolResult::error(
-                    astra_text_utils::credential_redaction::truncate_redacted_output(
-                        result,
-                        output_limit,
-                    ),
-                )
-                .with_exit_semantics(ExitSemantics::TimedOut)
-                .with_exit_code(output.exit_code),
+                ToolResult::error(finish_presentation(result))
+                    .with_exit_semantics(ExitSemantics::TimedOut)
+                    .with_exit_code(output.exit_code),
                 source_preimages,
             ),
             output.scope_settled,
@@ -1618,14 +1375,25 @@ async fn execute_bash_inner(
         }
         return attach_scope_settled(
             attach_source_preimage(
-                ToolResult::error(
-                    astra_text_utils::credential_redaction::truncate_redacted_output(
-                        result,
-                        output_limit,
-                    ),
-                )
-                .with_exit_semantics(ExitSemantics::Cancelled)
-                .with_exit_code(output.exit_code),
+                ToolResult::error(finish_presentation(result))
+                    .with_exit_semantics(ExitSemantics::Cancelled)
+                    .with_exit_code(output.exit_code),
+                source_preimages,
+            ),
+            output.scope_settled,
+            output.scope_ownership,
+            output.scope_quarantined,
+            output.descendants_terminated,
+        );
+    }
+
+    if output.scope_quarantined {
+        result.push_str("\n[bash output did not finish draining; output may be incomplete]");
+        return attach_scope_settled(
+            attach_source_preimage(
+                ToolResult::error(finish_presentation(result))
+                    .with_exit_semantics(ExitSemantics::ExecutionError)
+                    .with_exit_code(output.exit_code),
                 source_preimages,
             ),
             output.scope_settled,
@@ -1644,8 +1412,7 @@ async fn execute_bash_inner(
     );
     if output.exit_code != 0 || result_class.is_tool_error() {
         let exit_code = output.exit_code;
-        let output_text =
-            astra_text_utils::credential_redaction::truncate_redacted_output(result, output_limit);
+        let output_text = finish_presentation(result);
         if exit_semantics.is_tool_error() || result_class.is_tool_error() {
             return attach_scope_settled(
                 attach_source_preimage(
@@ -1682,10 +1449,8 @@ async fn execute_bash_inner(
             result.push('\n');
         }
         result.push_str(
-            "\n⚠ Live descendant processes were terminated when this foreground bash call ended; \
-             they are not running now. This includes programs that daemonize themselves, even \
-             when the command contains no `&`. This executor provides no process-persistence \
-             guarantee.",
+            "\n⚠ Live processes observed in this Bash execution scope were terminated when the call ended. \
+             Processes that escaped the scope may still run. This executor provides no process-persistence guarantee.",
         );
     }
 
@@ -1706,15 +1471,10 @@ async fn execute_bash_inner(
     } else {
         attach_scope_settled(
             attach_source_preimage(
-                ToolResult::text(
-                    astra_text_utils::credential_redaction::truncate_redacted_output(
-                        result,
-                        output_limit,
-                    ),
-                )
-                .with_exit_semantics(ExitSemantics::Success)
-                .with_result_class(result_class)
-                .with_exit_code(output.exit_code),
+                ToolResult::text(finish_presentation(result))
+                    .with_exit_semantics(ExitSemantics::Success)
+                    .with_result_class(result_class)
+                    .with_exit_code(output.exit_code),
                 source_preimages,
             ),
             output.scope_settled,
@@ -1767,8 +1527,8 @@ fn attach_scope_settled(
     if descendants_terminated {
         let metadata = result.metadata.as_mut().expect("scope metadata inserted");
         metadata.insert("background_children_reaped".to_string(), Value::Bool(true));
-        metadata.insert("descendant_persistence".to_string(), Value::Bool(false));
     }
+
     result
 }
 
@@ -3897,7 +3657,8 @@ fn append_context_flags(cmd: &mut Command, before: Option<usize>, after: Option<
 /// Kill the child's entire process group (SIGKILL via `killpg(2)`) then
 /// reap. Needed so orphaned grandchildren don't hold the stdio pipes open
 /// past the kill.
-fn exit_code_from_status(status: &ExitStatus) -> i32 {
+/// Return the conventional shell exit code, including signal termination.
+pub fn exit_code_from_status(status: &ExitStatus) -> i32 {
     if let Some(code) = status.code() {
         return code;
     }
@@ -3923,8 +3684,11 @@ async fn run_readonly_command_with_partial(
         cmd,
         None,
         timeout,
-        max_stdout_bytes,
-        max_stderr_bytes,
+        StreamLimits {
+            stdout: max_stdout_bytes,
+            stderr: max_stderr_bytes,
+            shell_command: None,
+        },
         cancel_token,
         command_kind,
     )
@@ -3935,8 +3699,7 @@ async fn run_owned_bash_command_with_partial(
     cmd: &mut Command,
     owner: astra_sandbox::BashInvocationOwner,
     timeout: Duration,
-    max_stdout_bytes: usize,
-    max_stderr_bytes: usize,
+    limits: StreamLimits<'_>,
     cancel_token: Option<&CancellationToken>,
     command_kind: &str,
 ) -> Result<ReadOnlyCommandOutput, String> {
@@ -3944,8 +3707,7 @@ async fn run_owned_bash_command_with_partial(
         cmd,
         Some(owner),
         timeout,
-        max_stdout_bytes,
-        max_stderr_bytes,
+        limits,
         cancel_token,
         command_kind,
     )
@@ -3956,11 +3718,16 @@ async fn run_command_with_partial(
     cmd: &mut Command,
     mut invocation_owner: Option<astra_sandbox::BashInvocationOwner>,
     timeout: Duration,
-    max_stdout_bytes: usize,
-    max_stderr_bytes: usize,
+    limits: StreamLimits<'_>,
     cancel_token: Option<&CancellationToken>,
     command_kind: &str,
 ) -> Result<ReadOnlyCommandOutput, String> {
+    let StreamLimits {
+        stdout: max_stdout_bytes,
+        stderr: max_stderr_bytes,
+        shell_command,
+    } = limits;
+    let retain_tail = shell_command.is_some();
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     // Put the child into its own process group so `kill -9 -<pgid>` on
@@ -4025,11 +3792,11 @@ async fn run_command_with_partial(
     let stderr_task = tokio::spawn(read_stream(stderr, StreamKind::Stderr, tx));
 
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut stdout_text = String::new();
-    let mut stderr_text = String::new();
-    let mut stdout_capped = false;
-    let mut stderr_capped = false;
-    let mut exit_code = None;
+    let mut stdout =
+        astra_text_utils::live_redaction::OutputPreview::new(max_stdout_bytes, retain_tail);
+    let mut stderr =
+        astra_text_utils::live_redaction::OutputPreview::new(max_stderr_bytes, retain_tail);
+    let mut exit_status = None;
     let mut timed_out = false;
     let mut cancelled = false;
     let mut scope_quarantined = false;
@@ -4037,15 +3804,7 @@ async fn run_command_with_partial(
     let mut scope_ownership;
 
     loop {
-        drain_command_chunks(
-            &mut rx,
-            &mut stdout_text,
-            &mut stderr_text,
-            max_stdout_bytes,
-            &mut stdout_capped,
-            max_stderr_bytes,
-            &mut stderr_capped,
-        );
+        drain_command_chunks(&mut rx, &mut stdout, &mut stderr);
 
         // Capture the group leader id before try_wait reaps it.  A shell can
         // exit successfully while a background child still runs; kill that
@@ -4066,7 +3825,7 @@ async fn run_command_with_partial(
                 descendants_terminated =
                     settlement.is_some_and(|settlement| settlement.descendants_terminated);
                 sigkill_process_group_id(leader_pid);
-                exit_code = Some(exit_code_from_status(&status));
+                exit_status = Some(status);
                 break;
             }
             Ok(None) => {
@@ -4117,25 +3876,17 @@ async fn run_command_with_partial(
                     scope_ownership = None;
                     scope_quarantined = true;
                 }
-                drain_command_chunks(
-                    &mut rx,
-                    &mut stdout_text,
-                    &mut stderr_text,
-                    max_stdout_bytes,
-                    &mut stdout_capped,
-                    max_stderr_bytes,
-                    &mut stderr_capped,
-                );
+                drain_command_chunks(&mut rx, &mut stdout, &mut stderr);
+                // Wait failed and the child was terminated, so a joined pipe
+                // is not proof that its final sensitive value was complete.
+                let (stdout_bytes, stdout_capped, _) = stdout.finish(true);
+                let (stderr_bytes, stderr_capped, _) = stderr.finish(true);
+                let stdout_text = String::from_utf8_lossy(&stdout_bytes).into_owned();
+                let mut stderr_text = String::from_utf8_lossy(&stderr_bytes).into_owned();
                 if !stderr_text.is_empty() && !stderr_text.ends_with('\n') {
                     stderr_text.push('\n');
                 }
                 stderr_text.push_str(&error_msg);
-                if stdout_capped {
-                    truncate_partial_line(&mut stdout_text);
-                }
-                if stderr_capped {
-                    truncate_partial_line(&mut stderr_text);
-                }
                 return Ok(ReadOnlyCommandOutput {
                     stdout: stdout_text,
                     stderr: stderr_text,
@@ -4158,35 +3909,38 @@ async fn run_command_with_partial(
     // wait for that descendant indefinitely: the tool boundary must return a
     // typed timeout/cancellation result, and an unsettled stream cannot
     // support a trusted workspace receipt.
-    if !join_command_streams_bounded(stdout_task, stderr_task).await {
+    let streams_settled = join_command_streams_bounded(stdout_task, stderr_task).await;
+    if !streams_settled {
         scope_ownership = None;
         scope_quarantined = true;
     }
-    drain_command_chunks(
-        &mut rx,
-        &mut stdout_text,
-        &mut stderr_text,
-        max_stdout_bytes,
-        &mut stdout_capped,
-        max_stderr_bytes,
-        &mut stderr_capped,
-    );
-
-    if stdout_capped {
-        truncate_partial_line(&mut stdout_text);
-    }
-    if stderr_capped {
-        truncate_partial_line(&mut stderr_text);
-    }
-    if timed_out || cancelled {
-        truncate_partial_line(&mut stdout_text);
-        truncate_partial_line(&mut stderr_text);
-    }
+    drain_command_chunks(&mut rx, &mut stdout, &mut stderr);
+    let incomplete = timed_out
+        || cancelled
+        || !streams_settled
+        || exit_status.as_ref().is_some_and(|status| {
+            status.code().is_none()
+                || shell_command.is_some_and(|command| {
+                    matches!(
+                        crate::exit_semantics::classify_exit(
+                            command,
+                            exit_code_from_status(status)
+                        ),
+                        crate::exit_semantics::ExitSemantics::Signaled
+                            | crate::exit_semantics::ExitSemantics::PipelineTruncated
+                    )
+                })
+        });
+    let (stdout_bytes, stdout_capped, _) = stdout.finish(incomplete);
+    let (stderr_bytes, stderr_capped, _) = stderr.finish(incomplete);
 
     Ok(ReadOnlyCommandOutput {
-        stdout: stdout_text,
-        stderr: stderr_text,
-        exit_code: exit_code.unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+        exit_code: exit_status
+            .as_ref()
+            .map(exit_code_from_status)
+            .unwrap_or(-1),
         timed_out,
         cancelled,
         stdout_capped,
@@ -4267,8 +4021,8 @@ async fn terminate_owned_tokio_child(
 /// tool call open forever. A bounded join is also an ownership signal: when
 /// it expires, the caller must not publish a trusted workspace receipt.
 async fn join_command_streams_bounded(
-    mut stdout_task: tokio::task::JoinHandle<()>,
-    mut stderr_task: tokio::task::JoinHandle<()>,
+    mut stdout_task: tokio::task::JoinHandle<std::io::Result<()>>,
+    mut stderr_task: tokio::task::JoinHandle<std::io::Result<()>>,
 ) -> bool {
     let joined = tokio::time::timeout(COMMAND_STREAM_JOIN_TIMEOUT, async {
         let stdout_result = (&mut stdout_task).await;
@@ -4276,31 +4030,39 @@ async fn join_command_streams_bounded(
         (stdout_result, stderr_result)
     })
     .await;
-    if matches!(joined, Ok((Ok(()), Ok(())))) {
-        return true;
+    match joined {
+        Ok((Ok(Ok(())), Ok(Ok(())))) => true,
+        Ok(_) => false,
+        Err(_) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            false
+        }
     }
-
-    stdout_task.abort();
-    stderr_task.abort();
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
-    false
 }
 
 async fn read_stream<R>(
     mut stream: R,
     kind: StreamKind,
     tx: tokio::sync::mpsc::Sender<(StreamKind, String)>,
-) where
+) -> std::io::Result<()>
+where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut buffer = [0u8; 8192];
+    let mut utf8_pending = Vec::new();
     loop {
         match stream.read(&mut buffer).await {
-            Ok(0) => break,
+            Ok(0) => {
+                let text = decode_stream_utf8(&mut utf8_pending, &[], true);
+                if !text.is_empty() {
+                    let _ = tx.send((kind, text)).await;
+                }
+                break;
+            }
             Ok(read) => {
-                let text = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                if tx.send((kind, text)).await.is_err() {
+                let text = decode_stream_utf8(&mut utf8_pending, &buffer[..read], false);
+                if !text.is_empty() && tx.send((kind, text)).await.is_err() {
                     tracing::warn!(
                         stream_kind = ?kind,
                         "command output channel closed; {} bytes of output lost",
@@ -4309,55 +4071,57 @@ async fn read_stream<R>(
                     break;
                 }
             }
-            Err(_) => break,
+            Err(error) => return Err(error),
         }
     }
+    Ok(())
+}
+
+fn decode_stream_utf8(pending: &mut Vec<u8>, bytes: &[u8], eof: bool) -> String {
+    let mut data = std::mem::take(pending);
+    data.extend_from_slice(bytes);
+    let mut display = String::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        match std::str::from_utf8(&data[offset..]) {
+            Ok(text) => {
+                display.push_str(text);
+                break;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                display.push_str(
+                    std::str::from_utf8(&data[offset..offset + valid]).expect("UTF-8 valid prefix"),
+                );
+                offset += valid;
+                if let Some(invalid) = error.error_len() {
+                    display.push('\u{FFFD}');
+                    offset += invalid;
+                } else {
+                    if eof {
+                        display.push_str(&String::from_utf8_lossy(&data[offset..]));
+                    } else {
+                        pending.extend_from_slice(&data[offset..]);
+                        debug_assert!(pending.len() <= 3);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    display
 }
 
 fn drain_command_chunks(
     rx: &mut tokio::sync::mpsc::Receiver<(StreamKind, String)>,
-    stdout_text: &mut String,
-    stderr_text: &mut String,
-    max_stdout_bytes: usize,
-    stdout_capped: &mut bool,
-    max_stderr_bytes: usize,
-    stderr_capped: &mut bool,
+    stdout: &mut astra_text_utils::live_redaction::OutputPreview,
+    stderr: &mut astra_text_utils::live_redaction::OutputPreview,
 ) {
-    while drain_one_command_chunk(
-        rx,
-        stdout_text,
-        stderr_text,
-        max_stdout_bytes,
-        stdout_capped,
-        max_stderr_bytes,
-        stderr_capped,
-    ) {}
-}
-
-fn drain_one_command_chunk(
-    rx: &mut tokio::sync::mpsc::Receiver<(StreamKind, String)>,
-    stdout_text: &mut String,
-    stderr_text: &mut String,
-    max_stdout_bytes: usize,
-    stdout_capped: &mut bool,
-    max_stderr_bytes: usize,
-    stderr_capped: &mut bool,
-) -> bool {
-    let Ok((kind, chunk)) = rx.try_recv() else {
-        return false;
-    };
-    match kind {
-        StreamKind::Stdout => append_capped(stdout_text, &chunk, max_stdout_bytes, stdout_capped),
-        StreamKind::Stderr => append_capped(stderr_text, &chunk, max_stderr_bytes, stderr_capped),
-    }
-    true
-}
-
-fn truncate_partial_line(output: &mut String) {
-    if let Some(last_newline) = output.rfind('\n') {
-        output.truncate(last_newline);
-    } else if !output.is_empty() {
-        output.clear();
+    while let Ok((kind, chunk)) = rx.try_recv() {
+        match kind {
+            StreamKind::Stdout => stdout.append(chunk.as_bytes()),
+            StreamKind::Stderr => stderr.append(chunk.as_bytes()),
+        }
     }
 }
 
@@ -4571,6 +4335,23 @@ mod tests {
     }
 
     #[test]
+    fn fast_prefix_never_shortens_an_unknown_executable() {
+        for command in [
+            "./custom-command",
+            "cd /workspace && ./custom-command",
+            "pwd; ./custom-command",
+            "echo 'a && b' && ./custom-command",
+        ] {
+            assert_eq!(
+                workspace_edge_bash_timeout_secs(command),
+                DEFAULT_BASH_TIMEOUT_SECS,
+                "{command}"
+            );
+        }
+        assert_eq!(workspace_edge_bash_timeout_secs("echo ready && pwd"), 15.0);
+    }
+
+    #[test]
     fn grep_compacts_single_line_json_matches_before_output_limit() {
         let long_json_line = format!("artifact.json:1:{}", "{\"key\":\"value\"}".repeat(200));
 
@@ -4697,7 +4478,7 @@ mod tests {
 
     #[tokio::test]
     #[serial(source_preimage_env)]
-    async fn bash_inferred_change_surfaces_recovery_advisory_to_model() {
+    async fn bash_inferred_change_reports_a_snapshot_without_attributing_it() {
         let store = tempdir().unwrap();
         unsafe { std::env::set_var("_ASTRA_SOURCE_PREIMAGE_ROOT", store.path()) };
         let workspace = tempdir().unwrap();
@@ -4708,9 +4489,9 @@ mod tests {
 
         assert!(!result.is_error);
         assert!(
-            result.output.contains("source preimage advisory")
-                && result.output.contains("receipt_id="),
-            "changed inferred sources need a model-visible recovery path: {}",
+            result.output.contains("pre-command copy")
+                && result.output.contains("cause is unknown"),
+            "snapshot differences must not be attributed to the shell: {}",
             result.output
         );
         assert_eq!(
@@ -5874,20 +5655,45 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[test]
-    fn weak_scope_quarantine_uses_process_authority() {
-        assert!(bash_scope_requires_attribution_quarantine(Some(
-            astra_sandbox::ScopeOwnership::ForegroundProcessGroup
-        )));
-        assert!(!bash_scope_requires_attribution_quarantine(Some(
-            astra_sandbox::ScopeOwnership::InvocationCgroup
-        )));
-        // Executed scopes with missing authority are fenced by their producer.
-        assert!(!bash_scope_requires_attribution_quarantine(None));
+    fn validate_execute_bash_preserves_static_redirect_targets() {
+        let dir = tempdir().expect("workspace");
+        let root = dir.path();
+        let command = format!(
+            "mkdir -p '{0}/results' && printf data > '{0}/results/output.json'",
+            root.display()
+        );
+        assert!(
+            validate_execute_bash_command_in_workspace_from(&command, root, root).is_ok(),
+            "static redirects and directory creation inside the workspace must be allowed"
+        );
+
+        let outside = tempdir().expect("outside workspace");
+        let command = format!(
+            "mkdir -p '{0}/results' && printf data > '{1}/output.json'",
+            root.display(),
+            outside.path().display()
+        );
+        assert!(
+            validate_execute_bash_command_in_workspace_from(&command, root, root).is_err(),
+            "a static redirect outside the workspace must still be rejected"
+        );
+        for operator in ["<&-", ">&-"] {
+            for program in ["touch", "mkdir", "cp seed.txt"] {
+                let command = format!(
+                    "{program} {operator} '{}/outside.txt'",
+                    outside.path().display()
+                );
+                assert!(
+                    validate_execute_bash_command_in_workspace_from(&command, root, root).is_err(),
+                    "descriptor closure must not hide a command argument: {command}"
+                );
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn weak_attribution_quarantine_does_not_disable_later_bash_calls() {
+    async fn weak_process_group_does_not_disable_later_bash_calls() {
         let dir = tempdir().expect("workspace");
         let initialized = std::process::Command::new("git")
             .args(["init", dir.path().to_str().expect("workspace path")])
@@ -5909,8 +5715,8 @@ printf 'probe.txt:1:needle\n'
         assert!(!first.is_error, "first command failed: {}", first.output);
         assert_eq!(
             crate::workspace_observation::workspace_observation_is_quarantined(dir.path()),
-            Some(true),
-            "the compound command should exercise weak-ownership quarantine on macOS"
+            Some(false),
+            "ordinary process-group execution must not quarantine later work"
         );
         assert_eq!(
             crate::workspace_observation::workspace_ownership_is_unsettled(dir.path()),
@@ -5948,41 +5754,14 @@ printf 'probe.txt:1:needle\n'
         );
     }
 
-    /// Regression: bash must refuse to read background task stdout/stderr
-    /// files directly off disk. The trace this guards against had a model
-    /// burn 12 LLM rounds running `tail /tmp/astra/bg_tasks/default/bg-shell-1.stderr`
-    /// instead of calling `task_output` — that's the canonical polling
-    /// anti-pattern. The denial is path-aware (it allows unrelated
-    /// commands that happen to mention "bg_tasks") and unconditional on
-    /// the read tool (tail/cat/head/less/grep all fail equivalently
-    /// because the validator doesn't care HOW you'd read it).
     #[test]
-    fn validate_execute_bash_rejects_background_task_output_dir_reads() {
+    fn authorized_background_log_reads_are_not_a_polling_policy_error() {
         for command in [
-            "tail -20 /tmp/astra/bg_tasks/default/bg-shell-1.stderr",
-            "cat /tmp/astra/bg_tasks/default/bg-shell-1.stdout",
-            "head -50 /tmp/astra/bg_tasks/some-session/bg-shell-2.stderr",
-            "less /tmp/astra/bg_tasks/default/bg-shell-1.stdout",
-            "wc -l /tmp/astra/bg_tasks/default/bg-shell-1.stderr",
-            "grep error /tmp/astra/bg_tasks/default/bg-shell-1.stderr",
-            "tail -f /var/folders/abc/T/astra/bg_tasks/sess-1/bg-shell-1.stdout",
+            "tail -20 /tmp/astra/bg_tasks/default/task.stderr",
+            "cat /tmp/astra/bg_tasks/default/task.stdout",
         ] {
-            let error = validate_execute_bash_command(command).expect_err(command);
-            assert!(
-                error.contains("background task output files"),
-                "{command}: {error}"
-            );
-            assert!(error.contains("task_output"), "{command}: {error}");
-            assert!(error.contains("pattern"), "{command}: {error}");
+            assert!(validate_execute_bash_command(command).is_ok(), "{command}");
         }
-        assert!(
-            validate_execute_bash_command("echo bg_tasks is not a path here").is_ok(),
-            "the literal word 'bg_tasks' without the astra path prefix must not trigger"
-        );
-        assert!(
-            validate_execute_bash_command("ls /tmp/astra/").is_ok(),
-            "directories above bg_tasks/ remain freely listable"
-        );
     }
 
     /// Runtime-owned tool-result artifacts are not workspace files. Blocking
@@ -6494,6 +6273,96 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
+    async fn foreground_bash_reports_truncation_and_exit_without_writing_workspace_files() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "seq 1 40000; printf 'password=example-secret\\nerror: TAIL_SENTINEL\\nOpen http://127.0.0.1:3000'; seq 1 40000 >&2; printf 'error: STDERR_SENTINEL\\n' >&2; exit 7"}),
+        )
+        .await;
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(result.metadata.as_ref().unwrap()["exit_code"], 7);
+        assert!(
+            result.output.contains("truncated") || result.output.contains("TRUNCATED"),
+            "{}",
+            result.output
+        );
+        assert!(result.output.contains("TAIL_SENTINEL"), "{result:?}");
+        assert!(result.output.contains("STDERR_SENTINEL"), "{result:?}");
+        assert!(result.output.contains("127.0.0.1:3000"), "{result:?}");
+        assert!(!result.output.contains("example-secret"), "{result:?}");
+        assert!(!dir.path().join("astra-bash-outputs").exists());
+    }
+
+    #[tokio::test]
+    async fn foreground_bash_timeout_preserves_partial_output_and_terminal_fact() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "printf 'started\\n'; sleep 2", "timeout": 0.2}),
+        )
+        .await;
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["exit_semantics"],
+            "timed_out"
+        );
+        assert!(result.output.contains("started"));
+        assert!(!dir.path().join("astra-bash-outputs").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_bash_signal_does_not_expose_an_incomplete_credential() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("signal_helper.py"),
+        "import os, signal\nos.write(1, b'SIGNAL_FIXTURE_STARTED\\npassword=abc')\nos.kill(os.getpid(), signal.SIGKILL)\n",
+        ).unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        for prefix in ["", "seq 1 20000; "] {
+            let command = format!("{prefix}python3 signal_helper.py");
+            let result = execute_bash(&ctx, &serde_json::json!({"command":command})).await;
+            assert!(result.is_error, "{result:?}");
+            assert_eq!(result.metadata.as_ref().unwrap()["exit_code"], 137);
+            assert!(
+                result.output.contains("SIGNAL_FIXTURE_STARTED"),
+                "{result:?}"
+            );
+            assert!(!result.output.contains("password=abc"), "{result:?}");
+        }
+        let truncated = execute_bash(
+            &ctx,
+            &serde_json::json!({"command":"printf 'PIPELINE_STARTED\\n'; set -o pipefail; yes password=abc | head -c 12"}),
+        )
+        .await;
+        assert!(
+            truncated.output.contains("PIPELINE_STARTED"),
+            "{truncated:?}"
+        );
+        assert_eq!(
+            truncated.metadata.as_ref().unwrap()["exit_semantics"],
+            "pipeline_truncated"
+        );
+        assert!(!truncated.output.contains("password=abc"), "{truncated:?}");
+    }
+
+    #[test]
+    fn stream_utf8_decoder_preserves_split_characters_and_lossy_invalid_bytes() {
+        let mut pending = Vec::new();
+        let mut first = vec![b'a'; 8191];
+        first.push(0xe4);
+        assert_eq!(
+            decode_stream_utf8(&mut pending, &first, false),
+            "a".repeat(8191)
+        );
+        assert_eq!(decode_stream_utf8(&mut pending, &[0xb8, 0xad], false), "中");
+        assert_eq!(decode_stream_utf8(&mut pending, &[0xff], true), "\u{FFFD}");
+    }
+
+    #[tokio::test]
     async fn foreground_only_bash_rejects_unadvertised_managed_background_fields() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
@@ -6509,6 +6378,32 @@ printf 'probe.txt:1:needle\n'
         assert!(result.is_error);
         assert!(result.output.contains("foreground-only"));
         assert!(!result.output.contains("should-not-run"));
+    }
+
+    #[tokio::test]
+    async fn foreground_only_bash_rejects_unowned_interactive_controls() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let accepted = execute_bash(
+            &ctx,
+            &serde_json::json!({"command":"printf ok", "stdin":false}),
+        )
+        .await;
+        assert!(
+            !accepted.is_error && accepted.output.contains("ok"),
+            "{accepted:?}"
+        );
+        for args in [
+            serde_json::json!({"command":"touch marker","stdin":true}),
+            serde_json::json!({"command":"touch marker","yield_time_ms":0}),
+        ] {
+            let result = execute_bash(&ctx, &args).await;
+            assert!(result.is_error, "{result:?}");
+            let metadata = result.metadata.unwrap();
+            assert_eq!(metadata["execution_fact"], "not_executed");
+            assert_eq!(metadata["error_kind"], "tool_unavailable");
+            assert!(!dir.path().join("marker").exists());
+        }
     }
 
     #[tokio::test]
@@ -6839,146 +6734,67 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
-    async fn bash_verify_mode_requires_an_unchanged_authoritative_workspace() {
+    async fn bash_command_reports_result_without_a_workspace_scan() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
-
         let result = execute_bash(
             &ctx,
-            &serde_json::json!({"command": "printf verified", "mode": "verify"}),
+            &serde_json::json!({"command": "printf changed > changed.txt"}),
         )
         .await;
-        let receipt = result
-            .metadata
-            .as_ref()
-            .and_then(|fields| fields.get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD));
-        if !result.is_error {
-            assert!(receipt.is_some_and(
-                crate::workspace_observation::is_explicit_workspace_verification_receipt,
-            ));
-        } else {
-            assert!(result.output.contains("No command was run"));
-            assert_eq!(result.metadata.as_ref().unwrap()["disposition"], "rejected");
-            assert!(receipt.is_none());
-        }
-    }
-
-    #[tokio::test]
-    async fn bash_verify_mode_rejects_a_workspace_mutation() {
-        let dir = tempdir().unwrap();
-        let ctx = crate::ToolContext::test(dir.path());
-
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({"command": "printf changed > changed.txt", "mode": "verify"}),
-        )
-        .await;
-
-        assert!(
-            result.is_error,
-            "a verify command may not mutate: {result:?}"
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(result.metadata.as_ref().unwrap()["exit_code"], 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("changed.txt")).unwrap(),
+            "changed"
         );
-        if result.output.contains("No command was run") {
-            assert!(!dir.path().join("changed.txt").exists());
-            assert_eq!(result.metadata.as_ref().unwrap()["disposition"], "rejected");
-        } else {
-            assert!(dir.path().join("changed.txt").is_file());
-        }
-        assert!(result.metadata.as_ref().is_none_or(|fields| {
-            !fields
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .unwrap()
                 .get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-                .is_some_and(
-                    crate::workspace_observation::is_explicit_workspace_verification_receipt,
-                )
-        }));
+                .is_none()
+        );
     }
 
     #[tokio::test]
-    async fn bash_verify_mode_rejects_nonzero_exit() {
+    async fn bash_reports_nonzero_exit_without_observation() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
 
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({"command": "exit 7", "mode": "verify"}),
-        )
-        .await;
+        let result = execute_bash(&ctx, &serde_json::json!({"command": "exit 7"})).await;
 
         assert!(result.is_error);
         assert!(result.metadata.as_ref().is_none_or(|fields| {
             !fields
                 .get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-                .is_some_and(
-                    crate::workspace_observation::is_explicit_workspace_verification_receipt,
-                )
+                .is_some()
         }));
     }
 
     #[tokio::test]
-    async fn bash_verify_mode_rejects_domain_negative_exit_one() {
+    async fn bash_reports_domain_negative_exit_without_observation() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
 
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({"command": "false", "mode": "verify"}),
-        )
-        .await;
+        let result = execute_bash(&ctx, &serde_json::json!({"command": "false"})).await;
 
-        assert!(
-            result.is_error,
-            "verify mode requires exit zero: {result:?}"
+        assert_eq!(result.metadata.as_ref().unwrap()["exit_code"], 1);
+        assert_ne!(
+            result.exit_semantics,
+            Some(crate::exit_semantics::ExitSemantics::Success)
         );
         assert!(result.metadata.as_ref().is_none_or(|fields| {
             !fields
                 .get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-                .is_some_and(
-                    crate::workspace_observation::is_explicit_workspace_verification_receipt,
-                )
+                .is_some()
         }));
     }
 
-    #[test]
-    fn started_core_bash_without_settled_ownership_quarantines_before_delayed_daemon_write() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let delayed_root = workspace.path().to_path_buf();
-        let delayed_daemon = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            std::fs::write(delayed_root.join("core-daemon-late.txt"), "late")
-                .expect("delayed daemon write");
-        });
-
-        finalize_bash_scope_quarantine(
-            workspace.path(),
-            true,
-            false,
-            None,
-            "setsid sh -c 'write later'",
-        );
-
-        assert_eq!(
-            crate::workspace_observation::workspace_ownership_is_unsettled(workspace.path()),
-            Some(true),
-            "a trusted started marker with no settled owner must quarantine even without an immediate delta"
-        );
-        delayed_daemon.join().expect("delayed daemon");
-        assert!(
-            crate::workspace_observation::WorkspaceFingerprint::capture(workspace.path()).is_none(),
-            "the daemon's delayed write cannot be attributed to a later core invocation"
-        );
-    }
-
     #[tokio::test]
-    async fn bash_timeout_keeps_partial_workspace_receipt_when_scope_settles() {
+    async fn bash_timeout_preserves_partial_files_without_attributing_a_snapshot() {
         let dir = tempdir().unwrap();
-        let scope_guaranteed = astra_sandbox::apply_process_scope().ownership_guaranteed();
-        let expected_ownership = if scope_guaranteed {
-            Some(crate::workspace_observation::INVOCATION_CGROUP_OWNERSHIP)
-        } else if cfg!(unix) {
-            Some(crate::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
-        } else {
-            None
-        };
         let ctx = crate::ToolContext::test(dir.path());
 
         let result = execute_bash(
@@ -6993,28 +6809,9 @@ printf 'probe.txt:1:needle\n'
         assert!(result.is_error, "timed out bash should remain an error");
         assert!(dir.path().join("partial.txt").is_file());
         let fields = result.metadata.as_ref();
-        assert_eq!(
-            fields
-                .and_then(|fields| fields.get(crate::workspace_observation::OBSERVED_FIELD))
-                .and_then(serde_json::Value::as_bool),
-            expected_ownership.map(|_| true),
-            "partial mutation receipt must be published only after settled ownership"
-        );
-        assert_eq!(
-            fields
-                .and_then(|fields| fields.get(crate::workspace_observation::OWNERSHIP_FIELD))
-                .and_then(serde_json::Value::as_str),
-            expected_ownership,
-        );
-        if expected_ownership
-            == Some(crate::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
-        {
-            assert_eq!(
-                crate::workspace_observation::workspace_observation_is_quarantined(dir.path()),
-                Some(true),
-                "weak current-chain receipt must be published before future captures are quarantined"
-            );
-        }
+        assert!(fields.is_none_or(|fields| {
+            !fields.contains_key(crate::workspace_observation::RECEIPT_FIELD)
+        }));
     }
 
     #[tokio::test]
@@ -7064,16 +6861,8 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
-    async fn bash_cancellation_keeps_partial_workspace_receipt_when_scope_settles() {
+    async fn bash_cancellation_preserves_partial_files_without_attributing_a_snapshot() {
         let dir = tempdir().unwrap();
-        let scope_guaranteed = astra_sandbox::apply_process_scope().ownership_guaranteed();
-        let expected_ownership = if scope_guaranteed {
-            Some(crate::workspace_observation::INVOCATION_CGROUP_OWNERSHIP)
-        } else if cfg!(unix) {
-            Some(crate::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
-        } else {
-            None
-        };
         let token = Arc::new(CancellationToken::new());
         let trigger = token.clone();
         let marker = dir.path().join("cancelled.txt");
@@ -7102,19 +6891,9 @@ printf 'probe.txt:1:needle\n'
         assert!(result.is_error, "cancelled bash should remain an error");
         assert!(marker.is_file());
         let fields = result.metadata.as_ref();
-        assert_eq!(
-            fields
-                .and_then(|fields| fields.get(crate::workspace_observation::OBSERVED_FIELD))
-                .and_then(serde_json::Value::as_bool),
-            expected_ownership.map(|_| true),
-            "partial cancellation receipt must be published only after settled ownership"
-        );
-        assert_eq!(
-            fields
-                .and_then(|fields| fields.get(crate::workspace_observation::OWNERSHIP_FIELD))
-                .and_then(serde_json::Value::as_str),
-            expected_ownership,
-        );
+        assert!(fields.is_none_or(|fields| {
+            !fields.contains_key(crate::workspace_observation::RECEIPT_FIELD)
+        }));
     }
 
     #[tokio::test]
@@ -7182,7 +6961,7 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
-    async fn readonly_partial_capture_preserves_complete_lines_without_secret_fragments() {
+    async fn readonly_partial_capture_redacts_credentials_and_keeps_partial_lines() {
         for cancel in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let token = CancellationToken::new();
@@ -7220,8 +6999,10 @@ printf 'probe.txt:1:needle\n'
             waiter.await.unwrap();
             assert_eq!(result.cancelled, cancel);
             assert_eq!(result.timed_out, !cancel);
-            assert_eq!(result.stdout, "complete");
-            assert_eq!(result.stderr, "warning");
+            assert!(result.stdout.starts_with("complete\nAWS_SECRET_KEY="));
+            assert!(result.stdout.contains("[REDACTED:"));
+            assert!(!result.stdout.contains("abcdefghijklmnopqrstuvwxyz"));
+            assert_eq!(result.stderr, "warning\nunfinished-secret");
         }
     }
 
@@ -7453,6 +7234,27 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[test]
+    fn workspace_timeout_uses_the_same_resolver_for_compound_commands() {
+        for command in [
+            "make check",
+            "cd /workspace && make check",
+            "FOO=1 cargo test",
+            "cargo test | tee /tmp/result",
+            "echo ready",
+        ] {
+            assert_eq!(
+                workspace_edge_bash_timeout_secs(command),
+                default_bash_timeout_for(command),
+                "{command}"
+            );
+        }
+        assert!(
+            workspace_edge_bash_timeout_secs("cd /workspace && make check")
+                >= workspace_edge_bash_timeout_secs("make check")
+        );
+    }
+
+    #[test]
     fn default_timeouts_are_sensible_and_monotonic() {
         use super::BashCommandClass::*;
         // Fast < Build < Lint <= Test, Package
@@ -7471,15 +7273,15 @@ printf 'probe.txt:1:needle\n'
 
     #[test]
     fn workspace_edge_timeout_preserves_executor_defaults_for_server_admission() {
-        assert_eq!(workspace_edge_bash_timeout_secs("echo hello"), 5.0);
-        assert_eq!(workspace_edge_bash_timeout_secs("ls -la"), 10.0);
+        assert_eq!(workspace_edge_bash_timeout_secs("echo hello"), 15.0);
+        assert_eq!(workspace_edge_bash_timeout_secs("ls -la"), 15.0);
         assert_eq!(workspace_edge_bash_timeout_secs("rg --files"), 15.0);
-        assert_eq!(workspace_edge_bash_timeout_secs("cargo test --lib"), 120.0);
-        assert_eq!(workspace_edge_bash_timeout_secs("./review.sh"), 30.0);
+        assert_eq!(workspace_edge_bash_timeout_secs("cargo test --lib"), 600.0);
+        assert_eq!(workspace_edge_bash_timeout_secs("./review.sh"), 120.0);
         assert_eq!(
             workspace_edge_bash_timeout_secs("cd /tmp && git show HEAD:README.md"),
-            30.0,
-            "compound commands retain the executor's first-command fallback"
+            15.0,
+            "compound commands use the shared classifier rather than a first-word fallback"
         );
     }
 
@@ -7626,13 +7428,15 @@ printf 'probe.txt:1:needle\n'
 
         assert!(!result.is_error, "{}", result.output);
         assert!(
-            result.output.contains("daemonize themselves"),
+            result
+                .output
+                .contains("Live processes observed in this Bash execution scope were terminated"),
             "{}",
             result.output
         );
         let metadata = result.metadata.expect("typed descendant settlement");
         assert_eq!(metadata["background_children_reaped"], true);
-        assert_eq!(metadata["descendant_persistence"], false);
+        assert!(!metadata.contains_key("descendant_persistence"));
     }
 
     #[tokio::test]

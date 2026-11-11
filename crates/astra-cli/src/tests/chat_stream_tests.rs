@@ -42,9 +42,9 @@ fn basic_chat_context<'a>(
         mcp_manager: None,
         agent_spawner: None,
         root_agent_id: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
 
@@ -55,11 +55,666 @@ fn basic_chat_context<'a>(
 
 // ── chat_stream (SSE agentic loop) ────────────────────────────────────
 
+#[tokio::test]
+#[serial_test::serial]
+async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
+    use astra_turn_core::interruption::{
+        InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
+    };
+    let interruption = InterruptionRecord::new(
+        InterruptionKind::ExecutionIncomplete,
+        ResumeAction::ContinueImmediately,
+        InterruptionStateSummary::default(),
+    );
+    #[derive(Clone, Copy)]
+    enum Terminal {
+        Failed,
+        Interrupted,
+        Mismatched,
+        Completed,
+        CallbackFailed,
+        CallbackFailedWithExpired,
+        AdmissionRejected,
+        AdmissionAndCallbackFailed,
+        CancelledDuringCallback,
+        ConflictingIdentities,
+    }
+    use Terminal::*;
+    for (terminal_kind, reported_count, root_callbacks, child_callbacks) in [
+        (Interrupted, Some(4), 0, 0),
+        (Failed, Some(4), 0, 0),
+        (Interrupted, None, 0, 0),
+        (Failed, None, 0, 0),
+        (Failed, Some(4), 1, 0),
+        (Failed, None, 1, 0),
+        (Interrupted, Some(4), 1, 0),
+        (Interrupted, None, 1, 0),
+        // A lower-bound count must not repair the original receipt mismatch.
+        (Mismatched, Some(1), 2, 0),
+        // Child callbacks use the same transport, but belong to a different run.
+        (Completed, Some(2), 1, 3),
+        (Failed, None, 1, 3),
+        (Interrupted, None, 1, 3),
+        (CallbackFailed, None, 0, 2),
+        (CallbackFailedWithExpired, None, 0, 2),
+        (AdmissionRejected, Some(1), 1, 1),
+        (AdmissionAndCallbackFailed, None, 0, 2),
+        (CancelledDuringCallback, None, 1, 1),
+        (ConflictingIdentities, None, 1, 3),
+    ] {
+        let callback_failed = matches!(
+            terminal_kind,
+            CallbackFailed
+                | CallbackFailedWithExpired
+                | AdmissionAndCallbackFailed
+                | ConflictingIdentities
+        );
+        let admission_rejected = matches!(
+            terminal_kind,
+            AdmissionRejected | AdmissionAndCallbackFailed
+        );
+        let cancel_during_callback = matches!(terminal_kind, CancelledDuringCallback);
+        let conflicting_identities = matches!(terminal_kind, ConflictingIdentities);
+        let cancellation = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+        let callback_cancel = cancellation.clone();
+        let expired_child = matches!(terminal_kind, CallbackFailedWithExpired);
+        let classified = matches!(terminal_kind, Failed);
+        let mismatched_summary = matches!(terminal_kind, Mismatched);
+        let completed = matches!(terminal_kind, Completed | AdmissionRejected);
+        let request_count = root_callbacks + child_callbacks;
+        let callback_count =
+            request_count - u32::from(admission_rejected || cancel_during_callback);
+        let temp = tempfile::tempdir().unwrap();
+        let _journal_guard = ProcessJournalDirGuard::new(temp.path());
+        let path = temp.path().join("evidence.txt");
+        std::fs::write(
+            &path,
+            "first evidence\nsecond evidence\nthird evidence\nfourth evidence\n",
+        )
+        .unwrap();
+        let child_marker = temp.path().join("cancelled-child-must-not-write");
+        let callback_done = std::sync::Arc::new(tokio::sync::Notify::new());
+        let terminal = if classified {
+            serde_json::json!({"type":"run_finished","run_id":"partial-run","owner_generation":1,"status":"failed", "error_kind":"network", "error_code":"network", "error":"connection lost"})
+        } else if mismatched_summary {
+            serde_json::json!({"type":"run_finished","run_id":"partial-run","owner_generation":1,"status":"paused"})
+        } else {
+            serde_json::json!({"type":"run_finished","run_id":"partial-run","owner_generation":1,"status":"failed", "error_code":"execution_incomplete","error_kind":null,"error":interruption.user_message,"interruption":interruption.to_json()})
+        };
+        let mut usage = serde_json::json!({"type":"usage","usage_scope":"run_total","input_tokens":12,"output_tokens":3});
+        if let Some(count) = reported_count {
+            usage["tool_call_count"] = serde_json::json!(count);
+        }
+        let prefix = format!(
+            "data: {}\n\n",
+            serde_json::json!({"type":"session_info","session_id":"partial-session","run_id":"partial-run"})
+        );
+        let request = serde_json::json!({
+            "type":"tool_request", "session_id":"partial-session", "run_id":"partial-run",
+            "turn_chain_id":"partial-chain", "request_id":"read-1", "schema_admitted_by_server":true,
+            "execution_timeout_ms":300_000, "command_timeout_cap_ms":30_000,
+            "execution_deadline_unix_ms":4_102_444_800_000_u64,
+            "tool":"read_file", "args":{"path":path.to_str().unwrap()}
+        });
+        let mut prefix = prefix;
+        for index in 0..request_count {
+            let mut request = request.clone();
+            request["request_id"] = serde_json::json!(format!("read-{index}"));
+            if index >= root_callbacks {
+                request["run_id"] = serde_json::json!("child-run");
+                request["session_id"] = serde_json::json!(if callback_failed
+                    || admission_rejected
+                    || cancel_during_callback
+                {
+                    "partial-session"
+                } else {
+                    "child-session"
+                });
+            }
+            request["args"]["start_line"] = serde_json::json!(index + 1);
+            request["args"]["end_line"] = serde_json::json!(index + 1);
+            if expired_child && index == 1 {
+                request["execution_deadline_unix_ms"] = serde_json::json!(1);
+            }
+            if admission_rejected && index + 1 == request_count {
+                request["tool"] = serde_json::json!("unavailable_tool");
+                request["args"] = serde_json::json!({});
+            }
+            if cancel_during_callback {
+                if index == 0 {
+                    request["tool"] = serde_json::json!("bash");
+                    request["args"] = serde_json::json!({"command":"printf first"});
+                } else {
+                    request["tool"] = serde_json::json!("write_file");
+                    request["args"] =
+                        serde_json::json!({"path":child_marker, "content":"must not execute"});
+                }
+            }
+            if conflicting_identities {
+                request["request_id"] =
+                    serde_json::json!(["root-x", "child-y", "child-y", "root-x"][index as usize]);
+                request["run_id"] = serde_json::json!(
+                    ["partial-run", "child-a", "child-b", "child-c"][index as usize]
+                );
+            }
+            prefix.push_str(&format!("data: {request}\n\n"));
+        }
+        let mut suffix = [
+            serde_json::json!({"type":"text_done","full_text":"Partial result.","partial":true}),
+            usage,
+            terminal,
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+        if mismatched_summary {
+            let wire = sse_text_response_with_execution_summary(
+                "Partial result.",
+                "partial-session",
+                2,
+                2,
+                &["read_file"],
+                1,
+                ("partial-run", 1),
+            );
+            let mut summary = wire
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|event| event["type"] == "turn_complete")
+                .unwrap();
+            summary["tool_calls_count"] = serde_json::json!(1);
+            summary["observation_tool_calls_count"] = serde_json::json!(1);
+            summary["execution_state"] = serde_json::json!({"status":"interrupted","interruption_kind":"execution_incomplete"});
+            summary["interruption"] = interruption.to_json();
+            suffix.push_str(&format!("data: {summary}\n\n"));
+        }
+        if completed {
+            let count = reported_count.unwrap();
+            suffix = sse_text_response_with_execution_summary(
+                "Partial result.",
+                "partial-session",
+                count,
+                count,
+                if count == 0 { &[] } else { &["read_file"] },
+                1,
+                ("partial-run", 1),
+            );
+        }
+        let callback_bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bodies_for_route = callback_bodies.clone();
+        let callbacks_received = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let notify = callback_done.clone();
+        let received_for_route = callbacks_received.clone();
+        let app =
+            Router::new()
+                .route(
+                    "/chat/stream",
+                    post(move || {
+                        let prefix = prefix.clone();
+                        let suffix = suffix.clone();
+                        let notify = notify.clone();
+                        async move {
+                            use futures_util::StreamExt;
+                            let chunks = futures_util::stream::once(async move {
+                                Ok::<_, std::io::Error>(prefix)
+                            })
+                            .chain(futures_util::stream::once(async move {
+                                if callback_count > 0 && !callback_failed {
+                                    tokio::time::timeout(
+                                        std::time::Duration::from_secs(5),
+                                        notify.notified(),
+                                    )
+                                    .await
+                                    .unwrap();
+                                }
+                                if callback_failed {
+                                    std::future::pending::<()>().await;
+                                }
+                                Ok::<_, std::io::Error>(suffix)
+                            }));
+                            (TEST_SSE_HEADERS, axum::body::Body::from_stream(chunks))
+                        }
+                    }),
+                )
+                .route(
+                    "/tools/result",
+                    post(move |Json(body): Json<serde_json::Value>| {
+                        let callback_cancel = callback_cancel.clone();
+                        let bodies = bodies_for_route.clone();
+                        let notify = callback_done.clone();
+                        let callbacks_received = received_for_route.clone();
+                        async move {
+                            bodies.lock().unwrap().push(body);
+                            // Cancel while the first callback is in flight, before its HTTP acknowledgement.
+                            if cancel_during_callback {
+                                callback_cancel.cancel();
+                            }
+                            if callbacks_received.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                + 1
+                                == callback_count
+                            {
+                                notify.notify_one();
+                            }
+                            (
+                                if callback_failed {
+                                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                                } else {
+                                    axum::http::StatusCode::OK
+                                },
+                                Json(serde_json::json!({"ok":!callback_failed})),
+                            )
+                        }
+                    }),
+                );
+        let app = app.route(
+            "/chat/runs/{run_id}",
+            axum::routing::delete(|| async {
+                Json(serde_json::json!({"run_id":"partial-run", "status":"cancelled"}))
+            }),
+        );
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let registry = astra_runtime::skills::empty_unified_registry();
+        let context = basic_chat_context(&api, &registry, "review results");
+        let mut pm = PermissionManager::new(true);
+        let mut params = ChatTurnParams::basic_cli(&context, "fake-token", None, &mut pm);
+        if cancel_during_callback {
+            params.cancel_token = Some(cancellation.clone());
+        }
+        let result = stream_chat_sse(params).await;
+        if conflicting_identities {
+            let failure = result.unwrap_err();
+            assert_eq!(failure.partial.tool_calls_count, 0);
+            assert!(failure.partial.tool_call_records.is_empty());
+            assert!(callback_bodies.lock().unwrap().is_empty());
+            let events = session_journal::read_journal("partial-session").unwrap();
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event.tool_calls.as_ref().is_none_or(Vec::is_empty))
+            );
+            continue;
+        }
+        if cancel_during_callback {
+            let failure = result.unwrap_err();
+            assert_eq!(failure.partial.tool_calls_count, 1);
+            assert_eq!(failure.partial.tool_call_records.len(), 1);
+            assert_eq!(failure.partial.tool_call_records[0].name, "bash");
+            assert!(!child_marker.exists());
+            assert_eq!(callback_bodies.lock().unwrap().len(), 1);
+            let events = session_journal::read_journal("partial-session").unwrap();
+            let observations = events
+                .iter()
+                .filter(|event| event.event_type == JournalEventType::SyncMarker)
+                .collect::<Vec<_>>();
+            assert_eq!(observations.len(), 1);
+            assert_eq!(
+                observations[0].producer_scope.as_ref().unwrap().run_id,
+                "child-run"
+            );
+            let records = observations[0].tool_calls.as_ref().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].name, "write_file");
+            assert!(!records[0].was_executed());
+            assert!(observations[0].tool_count.is_none());
+            assert!(observations[0].tool_outcomes.is_none());
+            continue;
+        }
+        if admission_rejected {
+            let bodies = callback_bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 1, "surface refusal sends no callback");
+            assert_eq!(bodies[0]["request_id"], "read-0");
+            if !callback_failed {
+                assert_eq!(bodies[0]["run_id"], "partial-run");
+                let events = session_journal::read_journal("partial-session").unwrap();
+                let observations = events
+                    .iter()
+                    .filter(|event| event.event_type == JournalEventType::SyncMarker)
+                    .collect::<Vec<_>>();
+                assert_eq!(observations.len(), 1);
+                let observation = observations[0];
+                let records = observation.tool_calls.as_ref().unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].tool_call_id.as_deref(), Some("read-1"));
+                assert!(!records[0].was_executed());
+                assert!(records[0].execution_completion.is_none());
+                assert_eq!(
+                    observation.producer_scope.as_ref().unwrap().run_id,
+                    "child-run"
+                );
+                assert!(observation.tool_count.is_none());
+                assert!(observation.tool_outcomes.is_none());
+            }
+        }
+        if callback_failed {
+            let failure = result.unwrap_err();
+            assert_eq!(failure.partial.tool_calls_count, 0);
+            assert!(failure.partial.tool_call_records.is_empty());
+            let events = session_journal::read_journal("partial-session").unwrap();
+            let observation = events
+                .iter()
+                .find(|event| event.event_type == JournalEventType::SyncMarker)
+                .unwrap();
+            assert_eq!(
+                observation.producer_scope.as_ref().unwrap().run_id,
+                "child-run"
+            );
+            assert!(observation.tool_count.is_none());
+            assert!(observation.tool_outcomes.is_none());
+            let records = observation.tool_calls.as_ref().unwrap();
+            assert_eq!(records.len(), 2);
+            assert!(records[0].ok);
+            let unexecuted_child = expired_child || admission_rejected;
+            assert_eq!(records[1].ok, !unexecuted_child);
+            assert_eq!(records[1].was_executed(), !unexecuted_child);
+            assert!(
+                records[1]
+                    .result_full
+                    .as_ref()
+                    .unwrap()
+                    .contains(if expired_child {
+                        "deadline expired"
+                    } else if admission_rejected {
+                        "unavailable_tool"
+                    } else {
+                        "second evidence"
+                    })
+            );
+            // The first executed result was posted; the sibling observation is retained once.
+            assert_eq!(
+                callbacks_received.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            let mut root_error = session_journal::JournalEvent::turn_error(
+                Some("partial-session"),
+                1,
+                None,
+                "request",
+                "callback failed",
+                1,
+            )
+            .with_producer_scope(Some("partial-run"));
+            crate::cli::stream::streaming_types::apply_partial_turn_data_to_error_event(
+                &mut root_error,
+                &failure.partial,
+            );
+            session_journal::JournalWriter::new("partial-session")
+                .unwrap()
+                .append(&root_error)
+                .unwrap();
+            let diff = crate::cli::journal_diff::compute_diff("partial-session", "partial-session")
+                .unwrap();
+            let executed = if unexecuted_child { 1 } else { 2 };
+            assert_eq!(diff.a_tool_calls_executed, executed);
+            assert_eq!(diff.a_tool_sequence, vec!["read_file"; executed as usize]);
+            assert!(!diff.a_tool_sequence_complete);
+            let digest = crate::cli::journal_digest::build_digest(
+                "partial-session",
+                crate::cli::journal_digest::DigestFocus::All,
+            )
+            .unwrap();
+            assert_eq!(digest.aggregates.total_tool_calls, 0);
+            continue;
+        }
+        if classified {
+            let failure = result.unwrap_err();
+            assert_eq!(failure.partial.partial_text, "Partial result.");
+            assert_eq!(
+                failure.partial.tool_calls_count,
+                reported_count.unwrap_or(0).max(root_callbacks)
+            );
+            assert_eq!(
+                failure.partial.tool_call_records.len(),
+                root_callbacks as usize
+            );
+            if root_callbacks > 0 {
+                assert!(failure.partial.tool_call_records[0].ok);
+            }
+            assert!(failure.partial.tool_outcomes.is_none());
+            assert!(failure.partial.failed_run_terminal.is_some());
+            let sid = "failed-root-projection";
+            let mut event = session_journal::JournalEvent::turn_error(
+                Some(sid),
+                1,
+                None,
+                "request",
+                "connection lost",
+                1,
+            );
+            crate::cli::stream::streaming_types::apply_partial_turn_data_to_error_event(
+                &mut event,
+                &failure.partial,
+            );
+            session_journal::JournalWriter::new(sid)
+                .unwrap()
+                .append(&event)
+                .unwrap();
+            let digest = crate::cli::journal_digest::build_digest(
+                sid,
+                crate::cli::journal_digest::DigestFocus::All,
+            )
+            .unwrap();
+            assert_eq!(
+                digest.aggregates.total_tool_calls,
+                u64::from(root_callbacks)
+            );
+            assert_eq!(
+                digest.aggregates.total_fresh_tool_calls,
+                u64::from(root_callbacks)
+            );
+            continue;
+        }
+        let result = result.unwrap();
+        assert_eq!(result.full_text, "Partial result.");
+        assert_eq!(
+            result.tool_calls_count,
+            reported_count.unwrap_or(0).max(root_callbacks)
+        );
+        if completed {
+            assert!(result.interruption.is_none());
+            assert_eq!(
+                result.canonical_tool_outcomes().unwrap().requested,
+                reported_count.unwrap()
+            );
+            assert_eq!(result.tool_call_records.len(), root_callbacks as usize);
+            continue;
+        }
+        assert!(result.canonical_tool_outcomes().is_none());
+        if mismatched_summary {
+            assert_eq!(result.llm_rounds, Some(1));
+        }
+        assert_eq!(result.tool_call_records.len(), root_callbacks as usize);
+        if root_callbacks > 0 {
+            assert!(result.tool_call_records[0].ok);
+        }
+        assert!(result.tool_record_coverage_partial);
+        assert!(result.interruption.is_some());
+        let mut event = session_journal::JournalEvent::turn(
+            None,
+            1,
+            None,
+            "request",
+            &result.full_text,
+            result.tool_calls_count,
+            0,
+            0,
+            0,
+        )
+        .with_tool_calls(result.tool_call_records.clone());
+        result.apply_canonical_tool_outcomes(&mut event);
+        assert!(event.tool_outcomes.is_none());
+        assert!(event.tool_count.is_none());
+    }
+}
+
+#[tokio::test]
+async fn server_admission_cancelled_during_bearer_resolution_never_dispatches_a_new_attempt() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Debug)]
+    struct AdmissionBearer {
+        calls: AtomicUsize,
+        blocked_attempt: usize,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl astra_thin_client::client::BearerProvider for AdmissionBearer {
+        fn token(
+            &self,
+        ) -> futures_util::future::BoxFuture<'_, Result<String, astra_thin_client::ThinClientError>>
+        {
+            Box::pin(async move {
+                // The production entrypoint first authenticates GET /models;
+                // block the subsequent admission, not that preflight read.
+                if self.calls.fetch_add(1, Ordering::SeqCst) == self.blocked_attempt + 1 {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                Ok("synthetic-admission-token".into())
+            })
+        }
+    }
+
+    // Also cover a retry: cancelling authentication must not dispatch another
+    // attempt or erase evidence that the first attempt was already sent.
+    for blocked_attempt in [0, 1] {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let observed = dispatches.clone();
+        let app = Router::new().route(
+            "/chat/stream",
+            post(move || {
+                let observed = observed.clone();
+                async move {
+                    let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                    let status = if blocked_attempt == 1 && attempt == 0 {
+                        axum::http::StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    };
+                    (
+                        status,
+                        [("retry-after", "0")],
+                        "synthetic admission response",
+                    )
+                }
+            }),
+        );
+        let base = spawn_mock(app).await;
+        let bearer = Arc::new(AdmissionBearer {
+            calls: AtomicUsize::new(0),
+            blocked_attempt,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let api = astra_thin_client::ThinClient::new(&base, None)
+            .unwrap()
+            .with_bearer_provider(bearer.clone());
+        let registry = astra_runtime::skills::empty_unified_registry();
+        let context = basic_chat_context(&api, &registry, "synthetic request");
+        let mut pm = PermissionManager::new(true);
+        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let mut params = ChatTurnParams::basic_cli(&context, "synthetic-token", None, &mut pm);
+        params.cancel_token = Some(cancel.clone());
+        let mut stream = Box::pin(stream_chat_sse(params));
+        tokio::select! {
+            result = &mut stream => panic!("admission finished before bearer release: {result:?}"),
+            entered = tokio::time::timeout(std::time::Duration::from_secs(10), bearer.entered.notified()) => {
+                entered.expect("admission must reach its bearer preparation");
+            }
+        }
+        assert_eq!(dispatches.load(Ordering::SeqCst), blocked_attempt);
+        assert_eq!(bearer.calls.load(Ordering::SeqCst), blocked_attempt + 2);
+        cancel.cancel();
+        bearer.release.notify_one();
+        // Keep polling the same production future, just as interactive
+        // cancellation does while looking for the physical response identity.
+        let failure = tokio::time::timeout(std::time::Duration::from_secs(5), stream)
+            .await
+            .expect("cancelled admission must finish")
+            .unwrap_err();
+        assert_eq!(dispatches.load(Ordering::SeqCst), blocked_attempt);
+        assert_eq!(
+            failure.partial.server_admission_not_dispatched,
+            blocked_attempt == 0
+        );
+        assert!(!failure.partial.admission_rejected);
+    }
+}
+
+#[tokio::test]
+async fn server_admission_dispatch_evidence_comes_from_the_actual_request_boundary() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    for (cancel_before_dispatch, cancel_before_retry) in
+        [(true, false), (false, false), (false, true)]
+    {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let observed = dispatches.clone();
+        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let cancel_at_server = cancel.clone();
+        let app = Router::new().route(
+            "/chat/stream",
+            post(move || {
+                let observed = observed.clone();
+                let cancel = cancel_at_server.clone();
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    let status = if cancel_before_retry {
+                        cancel.cancel();
+                        axum::http::StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    };
+                    // No identity or typed pre-admission rejection: admission is
+                    // ambiguous even though this response has already finished.
+                    (status, [("retry-after", "0")], "synthetic upstream failure")
+                }
+            }),
+        );
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let registry = astra_runtime::skills::empty_unified_registry();
+        let context = basic_chat_context(&api, &registry, "synthetic request");
+        let mut pm = PermissionManager::new(true);
+        if cancel_before_dispatch {
+            cancel.cancel();
+        }
+        let mut params = ChatTurnParams::basic_cli(&context, "synthetic-token", None, &mut pm);
+        params.cancel_token = Some(cancel);
+        let failure = stream_chat_sse(params).await.unwrap_err();
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            usize::from(!cancel_before_dispatch)
+        );
+        assert_eq!(
+            failure.partial.server_admission_not_dispatched,
+            cancel_before_dispatch
+        );
+        assert!(!failure.partial.admission_rejected);
+    }
+}
+
 /// Build a canonical SSE response for the mock chat-turn endpoint. Exposed
 /// to sibling test modules (e.g. `resume_tests`) so they don't have to
 /// duplicate the payload literal.
 pub(super) fn sse_text_response(text: &str, session_id: &str) -> String {
-    sse_text_response_with_execution_summary(text, session_id, 0, 0, &[], 1)
+    sse_text_response_with_execution_summary(
+        text,
+        session_id,
+        0,
+        0,
+        &[],
+        1,
+        (&format!("run-{session_id}"), 1),
+    )
 }
 
 fn with_root_communication(body: String, session_id: &str) -> String {
@@ -92,16 +747,18 @@ fn with_root_communication(body: String, session_id: &str) -> String {
     stream + &body
 }
 
-fn sse_text_response_with_execution_summary(
+pub(super) fn sse_text_response_with_execution_summary(
     text: &str,
     session_id: &str,
     tool_calls_count: u32,
     observation_tool_calls_count: u32,
     tools_used: &[&str],
     llm_rounds: u32,
+    server_turn: (&str, u32),
 ) -> String {
+    let (run_id, session_turn) = server_turn;
     let tool_ledger_receipt = astra_turn_core::tool_ledger_receipt::ToolLedgerReceipt::new(
-        format!("run-{session_id}"),
+        run_id,
         1,
         tool_calls_count,
         tool_calls_count,
@@ -115,11 +772,11 @@ fn sse_text_response_with_execution_summary(
         true,
     );
     format!(
-        "data: {{\"type\":\"session_info\",\"session_id\":\"{session_id}\",\"run_id\":\"run-{session_id}\"}}\n\n\
+        "data: {{\"type\":\"session_info\",\"session_id\":\"{session_id}\",\"run_id\":\"{run_id}\"}}\n\n\
              data: {{\"type\":\"text_delta\",\"content\":\"{text}\"}}\n\n\
              data: {{\"type\":\"text_done\",\"full_text\":\"{text}\"}}\n\n\
              data: {{\"type\":\"usage\",\"input_tokens\":10,\"output_tokens\":5}}\n\n\
-             data: {{\"type\":\"run_finished\",\"run_id\":\"run-{session_id}\",\"status\":\"completed\",\"owner_generation\":1}}\n\n\
+             data: {{\"type\":\"run_finished\",\"run_id\":\"{run_id}\",\"status\":\"completed\",\"owner_generation\":1}}\n\n\
              data: {}\n\n\
              data: [DONE]\n\n",
         serde_json::json!({
@@ -135,13 +792,13 @@ fn sse_text_response_with_execution_summary(
                 "schema_version": astra_turn_core::context_feedback::RuntimeFeedbackFrame::SCHEMA_VERSION,
                 "identity": {
                     "session_id": session_id,
-                    "run_id": format!("run-{session_id}"),
+                    "run_id": run_id,
                     "agent_id": "root",
                     "model_id": "mock-model",
                     "topology": "cli_server"
                 },
                 "progress": {
-                    "session_turn": 1,
+                    "session_turn": session_turn,
                     "agentic_round_index": llm_rounds.saturating_sub(1),
                     "llm_rounds_completed": llm_rounds,
                     "slice_round_limit": 60,
@@ -212,9 +869,9 @@ async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
         unified_skill_registry: &unified_skill_registry,
         agent_spawner: None,
         root_agent_id: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         stream_event_tx: None,
         stream_json_emitter: None,
         #[cfg(feature = "harness")]
@@ -305,6 +962,195 @@ async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
     assert_eq!(follow_up["session_id"], request["session_id"]);
 }
 
+/// Exercise the real SSE adapter and ordered TUI bridge together. Injecting
+/// RunInterrupted directly into a widget would miss the notice-only regression.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn stream_chat_sse_projects_rate_limit_notice_without_answer_deltas() {
+    use crate::tui::{TuiAppEvent, create_channels, create_controlled_per_turn_bridge};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = ProcessJournalDirGuard::new(temp.path());
+    for (text, tools, interrupted) in [
+        ("", 2, true),
+        ("", 0, true),
+        ("Partial findings from the tools.", 2, true),
+        ("The requested work is complete.", 2, false),
+    ] {
+        let notice = format!(
+            "The model provider is temporarily rate limited. {tools} tool call(s) completed. Please wait ~30s before retrying."
+        );
+        let session_id = format!("sess-rate-limit-{tools}-{}-{interrupted}", text.len());
+        let run_id = format!("run-{session_id}");
+        let tools_used: &[&str] = if tools == 0 { &[] } else { &["introspect"] };
+        let source = sse_text_response_with_execution_summary(
+            text,
+            &session_id,
+            tools,
+            tools,
+            tools_used,
+            2,
+            (&run_id, 1),
+        );
+        let mut body = String::new();
+        for block in source.split("\n\n") {
+            let Some(data) = block.strip_prefix("data: ") else {
+                continue;
+            };
+            if data == "[DONE]" {
+                body.push_str("data: [DONE]\n\n");
+                continue;
+            }
+            let mut event: serde_json::Value = serde_json::from_str(data).unwrap();
+            let event_type = event["type"].as_str().unwrap().to_string();
+            if text.is_empty() && matches!(event_type.as_str(), "text_delta" | "text_done") {
+                continue;
+            }
+            if interrupted && event_type == "run_finished" {
+                body.push_str(&format!(
+                    "data: {}\n\n",
+                    serde_json::json!({
+                        "type": "run_interrupted", "run_id": run_id,
+                        "kind": "rate_limited", "resumable": true,
+                        "message": notice,
+                    })
+                ));
+                event["status"] = serde_json::json!("paused");
+            }
+            if interrupted && event_type == "turn_complete" {
+                event["execution_state"] = serde_json::json!({
+                    "status": "interrupted", "interruption_kind": "rate_limited",
+                });
+                event["interruption"] = serde_json::json!({
+                    "kind": "rate_limited", "resumable": true,
+                    "resume_action": {"wait_and_retry": {"delay_seconds": 30}},
+                    "user_message": notice, "has_checkpoint": false,
+                    "tool_calls_completed": tools, "turns_completed": 2,
+                    "remaining_turns": 22,
+                    "error_detail": "synthetic private provider diagnostic",
+                });
+            }
+            body.push_str(&format!("data: {event}\n\n"));
+            if event_type == "session_info" {
+                for index in 0..tools {
+                    for tool_event in [
+                        serde_json::json!({
+                            "type": "tool_call_start", "call_id": format!("call-{index}"),
+                            "tool": "introspect", "arguments": {"scope": "current_turn"},
+                            "transport": "server_local", "executor": {"kind": "server_local"},
+                        }),
+                        serde_json::json!({
+                            "type": "tool_call_end", "call_id": format!("call-{index}"),
+                            "tool": "introspect", "status": "ok", "duration_ms": 10,
+                            "result": format!("completed result {index}"),
+                            "transport": "server_local", "executor": {"kind": "server_local"},
+                        }),
+                    ] {
+                        body.push_str(&format!("data: {tool_event}\n\n"));
+                    }
+                }
+            }
+        }
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let app = Router::new().route(
+            "/chat/stream",
+            post(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                let body = body.clone();
+                async move { (TEST_SSE_HEADERS, body) }
+            }),
+        );
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let registry = astra_runtime::skills::empty_unified_registry();
+        let (tui_tx, mut tui_rx) = create_channels();
+        let (stream_tx, control) = create_controlled_per_turn_bridge(tui_tx);
+        let mut context = basic_chat_context(&api, &registry, "Inspect the current turn");
+        context.stream_event_tx = Some(stream_tx);
+        let mut pm = PermissionManager::new(true);
+        let result = stream_chat_sse(ChatTurnParams::basic_cli(
+            &context,
+            "synthetic-token",
+            Some(&session_id),
+            &mut pm,
+        ))
+        .await
+        .unwrap();
+        control.close_and_drain();
+
+        let mut notices = 0;
+        let mut answer = String::new();
+        let mut completed_tools = Vec::new();
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), tui_rx.recv())
+                .await
+                .expect("interrupted stream must drain")
+                .expect("TUI channel must stay open until the drain marker");
+            match event {
+                TuiAppEvent::RunInterrupted { user_message } => {
+                    assert_eq!(user_message, notice);
+                    notices += 1;
+                }
+                TuiAppEvent::Token { text, .. } => answer.push_str(&text),
+                TuiAppEvent::ToolCompleted {
+                    tool_use_id,
+                    status,
+                    output,
+                    ..
+                } => completed_tools.push((tool_use_id, status, output)),
+                TuiAppEvent::TurnProjectionDrained => break,
+                _ => {}
+            }
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "no automatic replay");
+        assert_eq!(result.tool_calls_count, tools);
+        assert_eq!(
+            result.final_state,
+            if interrupted {
+                "interrupted"
+            } else {
+                "completed"
+            }
+        );
+        assert_eq!(notices, usize::from(interrupted));
+        assert_eq!(answer, text, "no synthetic answer or repeated partial text");
+        assert_eq!(completed_tools.len(), tools as usize);
+        for index in 0..tools {
+            assert_eq!(
+                completed_tools[index as usize],
+                (
+                    format!("call-{index}"),
+                    "completed".into(),
+                    Some(format!("completed result {index}"))
+                )
+            );
+        }
+        if interrupted {
+            let interruption = result.interruption.as_ref().unwrap();
+            assert_eq!(interruption["kind"], "rate_limited");
+            assert_eq!(interruption["resumable"], true);
+            assert_eq!(
+                interruption["resume_action"]["wait_and_retry"]["delay_seconds"],
+                30
+            );
+            assert_eq!(
+                result.full_text,
+                if text.is_empty() {
+                    notice.as_str()
+                } else {
+                    text
+                }
+            );
+        }
+    }
+}
+
 fn mock_mcp_server_binary() -> std::path::PathBuf {
     crate::mcp_client::ensure_mock_mcp_server_binary()
 }
@@ -367,8 +1213,6 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
         resume_restricted_tools: &[],
         tool_health_entries: &[],
         workspace_observation_quarantine: None,
-        session_lessons: &[],
-        memory_selection_reports: &[],
 
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
@@ -378,6 +1222,7 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: Some(request_lease.clone()),
         plan_assemble_line_release: None,
         stream_event_tx: Some(event_tx),
@@ -399,9 +1244,9 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
 
         git_worktree_journal: None,
         session_state_journal: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
@@ -551,8 +1396,6 @@ async fn stream_chat_sse_simple_text_response() {
         resume_restricted_tools: &[],
         tool_health_entries: &[],
         workspace_observation_quarantine: None,
-        session_lessons: &[],
-        memory_selection_reports: &[],
 
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
@@ -562,6 +1405,7 @@ async fn stream_chat_sse_simple_text_response() {
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
@@ -583,9 +1427,9 @@ async fn stream_chat_sse_simple_text_response() {
 
         git_worktree_journal: None,
         session_state_journal: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
@@ -677,8 +1521,6 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         resume_restricted_tools: &[],
         tool_health_entries: &[],
         workspace_observation_quarantine: None,
-        session_lessons: &[],
-        memory_selection_reports: &[],
 
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
@@ -688,6 +1530,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: Some(event_tx),
@@ -709,9 +1552,9 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
 
         git_worktree_journal: None,
         session_state_journal: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
@@ -782,6 +1625,7 @@ async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
                         2,
                         &["agent", "tool_search"],
                         4,
+                        ("run-sess-server-loop", 1),
                     ),
                 )
             }
@@ -827,8 +1671,6 @@ async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
             resume_restricted_tools: &[],
             tool_health_entries: &[],
             workspace_observation_quarantine: None,
-            session_lessons: &[],
-            memory_selection_reports: &[],
 
             latest_turn_quality_feedback: None,
             unified_skill_registry: &unified_skill_registry,
@@ -838,6 +1680,7 @@ async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
             execution_time_budget: None,
             run_control: None,
             incremental_state: None,
+            executor_observer: None,
             request_session_execution_lease: None,
             plan_assemble_line_release: None,
             stream_event_tx: None,
@@ -859,9 +1702,9 @@ async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
 
             git_worktree_journal: None,
             session_state_journal: None,
-            bg_task_commands: None,
+            background_tasks: None,
             bg_task_list_cache: None,
-            bash_detach_slot: None,
+            foreground_wait_control: None,
             turn_index: DEFAULT_TURN_INDEX,
             pipeline_state: None,
             compaction_state: None,
@@ -933,8 +1776,6 @@ async fn stream_chat_sse_api_error_propagated() {
         resume_restricted_tools: &[],
         tool_health_entries: &[],
         workspace_observation_quarantine: None,
-        session_lessons: &[],
-        memory_selection_reports: &[],
 
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
@@ -944,6 +1785,7 @@ async fn stream_chat_sse_api_error_propagated() {
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
@@ -965,9 +1807,9 @@ async fn stream_chat_sse_api_error_propagated() {
 
         git_worktree_journal: None,
         session_state_journal: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
@@ -1052,8 +1894,6 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
             resume_restricted_tools: &[],
             tool_health_entries: &[],
             workspace_observation_quarantine: None,
-            session_lessons: &[],
-            memory_selection_reports: &[],
 
             latest_turn_quality_feedback: None,
             unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
@@ -1063,6 +1903,7 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
             execution_time_budget: None,
             run_control: None,
             incremental_state: None,
+            executor_observer: None,
             request_session_execution_lease: None,
             plan_assemble_line_release: None,
             stream_event_tx: None,
@@ -1084,9 +1925,9 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
 
             git_worktree_journal: None,
             session_state_journal: None,
-            bg_task_commands: None,
+            background_tasks: None,
             bg_task_list_cache: None,
-            bash_detach_slot: None,
+            foreground_wait_control: None,
             turn_index: DEFAULT_TURN_INDEX,
             pipeline_state: None,
             compaction_state: None,
@@ -1128,7 +1969,7 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
-async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
+async fn stream_chat_sse_rejects_transaction_before_tool_execution() {
     let temp = tempfile::tempdir().unwrap();
     let _guard = ProcessJournalDirGuard::new(temp.path());
     #[derive(Clone)]
@@ -1173,7 +2014,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
                                     }
                                 }),
                                 sse_text_response_with_execution_summary(
-                                    "Done!", "sess-tx-e2e", 1, 0, &["bash"], 1,
+                                    "Done!", "sess-tx-e2e", 1, 0, &["bash"], 1, ("run-sess-tx-e2e", 1),
                                 ),
                             );
                         (TEST_SSE_HEADERS, body)
@@ -1225,8 +2066,6 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         resume_restricted_tools: &[],
         tool_health_entries: &[],
         workspace_observation_quarantine: None,
-        session_lessons: &[],
-        memory_selection_reports: &[],
 
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
@@ -1236,6 +2075,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
@@ -1257,9 +2097,9 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
 
         git_worktree_journal: None,
         session_state_journal: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
@@ -1290,44 +2130,8 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
     let tool_results = state.tool_results.lock().await;
     assert_eq!(tool_results.len(), 1);
     assert_eq!(tool_results[0]["request_id"].as_str(), Some("tr-tx-1"));
+    assert_eq!(tool_results[0]["status"].as_str(), Some("failed"));
     drop(tool_results);
-
-    let boundary_events: Vec<_> = session_journal::read_journal("sess-tx-e2e")
-        .unwrap()
-        .into_iter()
-        .filter(|event| {
-            matches!(
-                event.event_type,
-                JournalEventType::ExecutionBoundaryOpened
-                    | JournalEventType::ExecutionBoundaryCommitted
-            )
-        })
-        .collect();
-    assert_eq!(boundary_events.len(), 2);
-    assert_eq!(
-        boundary_events[0].event_type,
-        JournalEventType::ExecutionBoundaryOpened
-    );
-    assert_eq!(
-        boundary_events[1].event_type,
-        JournalEventType::ExecutionBoundaryCommitted
-    );
-
-    let opened = boundary_events[0]
-        .metadata
-        .as_ref()
-        .and_then(|meta| meta.get("execution_boundary"))
-        .expect("opened boundary metadata");
-    assert_eq!(opened["kind"].as_str(), Some("tool_batch"));
-    assert_eq!(opened["transaction_id"].as_str(), Some("tx-e2e"));
-
-    let committed = boundary_events[1]
-        .metadata
-        .as_ref()
-        .and_then(|meta| meta.get("execution_boundary"))
-        .expect("committed boundary metadata");
-    assert_eq!(committed["kind"].as_str(), Some("tool_batch"));
-    assert_eq!(committed["transaction_id"].as_str(), Some("tx-e2e"));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1394,8 +2198,6 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
         resume_restricted_tools: &[],
         tool_health_entries: &[],
         workspace_observation_quarantine: None,
-        session_lessons: &[],
-        memory_selection_reports: &[],
 
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
@@ -1405,6 +2207,7 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
@@ -1426,9 +2229,9 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
 
         git_worktree_journal: None,
         session_state_journal: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
@@ -1561,8 +2364,6 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
         resume_restricted_tools: &[],
         tool_health_entries: &[],
         workspace_observation_quarantine: None,
-        session_lessons: &[],
-        memory_selection_reports: &[],
 
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
@@ -1572,6 +2373,7 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
@@ -1593,9 +2395,9 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
 
         git_worktree_journal: None,
         session_state_journal: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         turn_index: 3,
         pipeline_state: None,
         compaction_state: None,
@@ -1695,7 +2497,7 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
                     format!(
                         "data: {{\"type\":\"session_info\",\"session_id\":\"sess-mcp\",\"run_id\":\"run-sess-mcp\"}}\n\ndata: {request}\n\n{}",
                         sse_text_response_with_execution_summary(
-                            "MCP done!", "sess-mcp", 1, 1, &[&tn], 1,
+                            "MCP done!", "sess-mcp", 1, 1, &[&tn], 1, ("run-sess-mcp", 1),
                         ),
                     )
                 } else { format!(
@@ -1744,22 +2546,27 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
             mcp_manager: Some(mcp_arc.clone()),
             agent_spawner: None,
             root_agent_id: None,
-            bg_task_commands: None,
+            background_tasks: None,
             bg_task_list_cache: None,
-            bash_detach_slot: None,
+            foreground_wait_control: None,
             #[cfg(feature = "harness")]
             harness_sink: None,
 
             #[cfg(feature = "harness")]
             benchmark_profile: None,
         };
-        let result = Box::pin(stream_chat_sse(ChatTurnParams::basic_cli(
+        let stream = stream_chat_sse(ChatTurnParams::basic_cli(
             &context,
             "fake-token",
             None,
             &mut pm,
-        )))
-        .await;
+        ));
+        assert_eq!(
+            std::mem::size_of_val(&stream),
+            std::mem::size_of::<usize>(),
+            "the shared stream entrypoint must bound every caller's embedded future"
+        );
+        let result = stream.await;
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
         let callbacks = callbacks.lock().await;
         if callback_admitted {
@@ -1771,9 +2578,12 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
                     result.expect_err("completed callback cannot authorize an unfinished run");
                 assert_eq!(failure.partial.partial_text, "MCP done!");
                 assert_eq!(failure.partial.tool_call_records.len(), 1);
-                let outcomes = failure.partial.tool_outcomes.unwrap();
-                assert_eq!(outcomes.executed, 1);
-                assert_eq!(outcomes.succeeded, 1);
+                assert_eq!(failure.partial.tool_calls_count, 1);
+                assert!(failure.partial.tool_call_records[0].ok);
+                assert!(
+                    failure.partial.tool_outcomes.is_none(),
+                    "a callback is not a complete Server ledger"
+                );
                 assert!(
                     !failure
                         .partial
@@ -2162,12 +2972,16 @@ async fn basic_cli_catalog_rejection_preserves_typed_preflight_evidence() {
             let mut context = basic_chat_context(&api, &registry, "synthetic preflight");
             context.model = selected;
             let mut pm = PermissionManager::new(true);
+            let observer = crate::cli::chat_stream::CliExecutorObserver::default();
             let failure = execute_basic_cli_turn(
                 &context,
                 "synthetic-token",
                 None,
                 &mut pm,
-                BasicCliTurnOptions::default(),
+                BasicCliTurnOptions {
+                    executor_observer: Some(observer.clone()),
+                    ..Default::default()
+                },
             )
             .await
             .expect_err("catalog rejected");
@@ -2183,6 +2997,10 @@ async fn basic_cli_catalog_rejection_preserves_typed_preflight_evidence() {
             assert_eq!(
                 crate::cli::turn::turn_auth_retry::should_retry_after_auth_refresh(&failure),
                 status == 401
+            );
+            assert!(
+                observer.get().is_none(),
+                "catalog denial is before the executor factory"
             );
             assert!(failure.partial.run_id.is_none());
             assert!(failure.partial.tool_call_records.is_empty());
@@ -2237,6 +3055,142 @@ async fn unsupported_workspace_host_rejects_public_turn_before_admission_http() 
     );
     assert_eq!(requests[0].method.as_str(), "GET");
     assert_eq!(requests[0].url.path(), "/models");
+    assert_eq!(
+        failure.partial.error_code.as_deref(),
+        Some("workspace_host_unsupported")
+    );
+    assert!(failure.partial.server_admission_not_dispatched);
+    assert_eq!(
+        failure.partial.failure_kind,
+        Some(astra_core::ErrorKind::ToolUnavailable)
+    );
+    assert_eq!(
+        failure.partial.error_metadata.as_ref().unwrap()["retryable"],
+        false
+    );
+    assert!(!failure.partial.admission_rejected);
+    assert_eq!(failure.partial.prompt_tokens, 0);
+    assert_eq!(failure.partial.completion_tokens, 0);
+    assert_eq!(failure.partial.tool_calls_count, 0);
     assert!(failure.partial.run_id.is_none());
     assert!(failure.partial.tool_call_records.is_empty());
+}
+
+#[tokio::test]
+async fn basic_cli_catalog_auth_retry_observes_only_the_successful_factory() {
+    use crate::cli::turn::{execute_basic_cli_turn, turn_facade::BasicCliTurnOptions};
+    use axum::response::IntoResponse as _;
+    use axum::routing::get;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let catalogs = Arc::new(AtomicUsize::new(0));
+    let catalog_count = catalogs.clone();
+    let chats = Arc::new(AtomicUsize::new(0));
+    let chat_count = chats.clone();
+    let app = Router::new()
+        .route(
+            "/models",
+            get(move || {
+                let count = catalog_count.clone();
+                async move {
+                    if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            axum::http::StatusCode::UNAUTHORIZED,
+                            "synthetic expired token",
+                        )
+                            .into_response()
+                    } else {
+                        axum::Json(crate::test_utils::mock_model_catalog_json(&["test-model"]))
+                            .into_response()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/chat/stream",
+            post(move || {
+                let count = chat_count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    (
+                        TEST_SSE_HEADERS,
+                        sse_text_response("retry result", "sess-observer-retry"),
+                    )
+                }
+            }),
+        );
+    let base = super::spawn_mock_app(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    let registry = astra_runtime::skills::empty_unified_registry();
+    let context = basic_chat_context(&api, &registry, "synthetic retry");
+    let mut pm = PermissionManager::new(true);
+    let observer = crate::cli::chat_stream::CliExecutorObserver::default();
+    let options = BasicCliTurnOptions {
+        executor_observer: Some(observer.clone()),
+        ..Default::default()
+    };
+    // Utility/child constructors have no observer unless the outer request explicitly supplies it.
+    assert!(
+        ChatTurnParams::basic_cli(&context, "synthetic", None, &mut pm)
+            .executor_observer
+            .is_none()
+    );
+    let failure = execute_basic_cli_turn(
+        &context,
+        "synthetic-expired",
+        None,
+        &mut pm,
+        options.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert!(crate::cli::turn::turn_auth_retry::should_retry_after_auth_refresh(&failure));
+    assert!(observer.get().is_none());
+    // The same cloned options used by auth refresh must still publish the real successful factory.
+    let result = execute_basic_cli_turn(&context, "synthetic-refreshed", None, &mut pm, options)
+        .await
+        .unwrap();
+    assert_eq!(result.full_text, "retry result");
+    assert!(observer.get().is_some());
+    assert_eq!(chats.load(Ordering::SeqCst), 1);
+    assert_eq!(catalogs.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn basic_cli_post_catalog_auth_failure_never_authorizes_replay() {
+    use crate::cli::turn::{execute_basic_cli_turn, turn_facade::BasicCliTurnOptions};
+    let app = Router::new().route(
+        "/chat/stream",
+        post(|| async {
+            (
+                axum::http::StatusCode::UNAUTHORIZED,
+                "synthetic post-catalog auth denial",
+            )
+        }),
+    );
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    let registry = astra_runtime::skills::empty_unified_registry();
+    let context = basic_chat_context(&api, &registry, "no replay");
+    let observer = crate::cli::chat_stream::CliExecutorObserver::default();
+    let mut pm = PermissionManager::new(true);
+    let failure = execute_basic_cli_turn(
+        &context,
+        "synthetic",
+        None,
+        &mut pm,
+        BasicCliTurnOptions {
+            executor_observer: Some(observer.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        observer.get().is_some(),
+        "this failure occurs after executor creation"
+    );
+    assert!(!crate::cli::turn::turn_auth_retry::should_retry_after_auth_refresh(&failure));
 }

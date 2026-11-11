@@ -1,6 +1,6 @@
 # Optional judgment backends
 
-Memory relevance, lesson dismissal, request classification, and skill selection can use a
+Explicit Memory-judgment comparisons, request classification, and skill selection can use a
 registered TypeSafe System One Offering or an ordinary LLM explicitly selected with
 `judgment_model`. This selects a model for judgments, not the main agent model. Astra never
 silently reuses the main agent model when this binding is absent or unavailable.
@@ -37,10 +37,11 @@ needed.
    Only one entry may declare this default. Missing or false declarations
    leave the existing binding unchanged. All model entries load before the
    optional default is bound. Failed or unconfirmed health checks leave the
-   binding unchanged and report a warning without blocking the remaining models
-   or `make dev-seed`; they never claim that judgment was enabled. Registry
-   errors and rejected binding writes still return an error. After restoring
-   upstream availability, rerun model load rather than the destructive seed.
+   binding unchanged and report a warning without blocking the remaining models;
+   they never claim that judgment was enabled. A failed model or rejected binding
+   makes the load command exit nonzero, including when invoked by `make dev-seed`.
+   After restoring upstream availability, rerun model load rather than the
+   destructive seed.
 3. To switch an already active model manually, run
    `astra admin config set judgment_model jev-1.13.0`.
    Inspect it with `astra admin config get judgment_model`. Exact names are
@@ -213,7 +214,8 @@ without modifying the provider adapter or mislabeling their purpose.
 Current message/candidate truncation budgets are preserved. Provider errors,
 timeouts or malformed answers retain the existing lexical relevance fallback
 and no-dismissal fallback. The latter does not delete persistent memory: this
-path removes injected session lessons only. No extra LLM retry is added.
+comparison exercises dismissal judgments only. CLI no longer automatically loads,
+dismisses or injects cross-session lessons. No extra LLM retry is added.
 
 TypeSafe streaming, tools, ordinary chat, extraction, reasoning and arbitrary
 wire overrides are rejected before dispatch. Shared memory/reasoning defaults

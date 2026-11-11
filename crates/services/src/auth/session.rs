@@ -13,13 +13,35 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, MySql, QueryBuilder, Row, query};
+use std::sync::Arc;
 use uuid::Uuid;
 
+pub const PROVIDER_SCOPE_PROOF_KEY: &str = "__astra_provider_scope_proof_v1";
 const MAX_SESSION_ACTIVITY_ROWS: u32 = 200;
-const SESSION_LIST_CURSOR_FILTER_SQL: &str = " AND (COALESCE(updated_at, created_at) < ";
-const SESSION_LIST_CURSOR_TIE_SQL: &str = " OR (COALESCE(updated_at, created_at) = ";
-const SESSION_LIST_ORDER_SQL: &str =
-    " ORDER BY COALESCE(updated_at, created_at) DESC, session_id DESC LIMIT ";
+const SESSION_LIST_CURSOR_FILTER_SQL: &str = " AND (activity_at < ";
+const SESSION_LIST_CURSOR_TIE_SQL: &str = " OR (activity_at = ";
+const SESSION_LIST_ORDER_SQL: &str = " ORDER BY activity_at DESC, session_id DESC LIMIT ";
+
+/// Session recency includes metadata and established Context head activity,
+/// including Controller writes. It does not read immutable conversation history.
+/// Keep one row per owner/session and preserve metadata-only sessions.
+pub(crate) fn push_session_activity_source(query: &mut QueryBuilder<MySql>, user_id: &str) {
+    query.push(
+        "(SELECT s.*, COALESCE(h.completed_turn, 0) AS context_completed_turn,
+                    GREATEST(COALESCE(s.updated_at, s.created_at),
+                              COALESCE(h.updated_at, s.created_at)) AS activity_at
+          FROM agent_sessions s
+          LEFT JOIN session_context_heads h
+            ON h.isolation_domain = 'server' AND h.owner_user_id = s.user_id
+           AND h.session_id = s.session_id AND h.branch_id = ",
+    );
+    query.push_bind(astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID);
+    query.push(
+        " AND h.head_json IS NOT NULL AND h.completed_turn > 0
+          WHERE s.user_id = ",
+    );
+    query.push_bind(user_id).push(") AS s");
+}
 const SESSION_ACTIVITY_SELECT_SQL: &str = "SELECT log_id, action, \
         IFNULL(CAST(details AS CHAR), 'null') AS details_json, \
         DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at \
@@ -157,6 +179,25 @@ pub trait SessionService: Send + Sync {
         ))
     }
 
+    /// Create a Session with the configured creation quota. Database-backed
+    /// implementations reserve daily usage in the Session insert transaction.
+    async fn create_session_with_resource_quota(
+        &self,
+        user_id: String,
+        request: SessionCreateRequestData,
+        governor: &dyn crate::resource_governor::ResourceGovernor,
+    ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
+    {
+        crate::resource_governor::enforce_session_create_quota(
+            &governor.check_session_create(&user_id).await,
+        )?;
+        let session = self
+            .create_session_with_admission_facts(user_id.clone(), request)
+            .await?;
+        governor.record_session_created(&user_id).await;
+        Ok(session)
+    }
+
     async fn list_sessions(
         &self,
         filter: SessionListFilter,
@@ -201,6 +242,27 @@ pub trait SessionService: Send + Sync {
         request: SessionUpdateRequestData,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)>;
 
+    /// Ensure a continuation can use an active session. Implementations may
+    /// avoid rewriting an already active session while preserving its fence.
+    async fn ensure_session_active(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        self.update_session(
+            session_id,
+            user_id,
+            SessionUpdateRequestData {
+                title: None,
+                metadata: None,
+                metadata_patch: None,
+                status: Some("active".into()),
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
     async fn delete_session(
         &self,
         session_id: String,
@@ -227,6 +289,7 @@ pub struct SessionCreateRequestData {
 pub struct ProviderSessionCreationIdentity {
     user_id: String,
     session_id: String,
+    scope: crate::runs::ProviderRunOwner,
 }
 
 impl ProviderSessionCreationIdentity {
@@ -275,6 +338,10 @@ impl ProviderSessionCreationIdentity {
         Ok(Self {
             user_id: principal.user.user_id.clone(),
             session_id: format!("{:x}", hash.finalize()),
+            scope: crate::runs::ProviderRunOwner {
+                provider_id: context.provider_id.clone(),
+                provider_scope_id: context.provider_scope_id.clone(),
+            },
         })
     }
 }
@@ -536,10 +603,24 @@ fn session_activity_entry_from_row(
     })
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DatabaseSessionService {
     matrixone: MatrixOneSettings,
     pool: Option<SharedPool>,
+    scope_encryptor: Option<Arc<super::FernetTokenEncryptor>>,
+}
+
+impl std::fmt::Debug for DatabaseSessionService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseSessionService")
+            .field("matrixone", &self.matrixone)
+            .field("pool", &self.pool)
+            .field(
+                "scope_encryptor_configured",
+                &self.scope_encryptor.is_some(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -564,12 +645,40 @@ impl DatabaseSessionService {
         session_id: String,
         request: SessionCreateRequestData,
         provider_creation: Option<(String, crate::resource_governor::LimitCheck)>,
+        reserve_quota: bool,
+        provider_scope: Option<&crate::runs::ProviderRunOwner>,
     ) -> Result<SessionCreationResult, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let title = request
             .title
             .unwrap_or_else(|| format!("Session {}", Utc::now().format("%Y-%m-%d %H:%M")));
-        let metadata = serde_json::Value::Object(request.metadata.unwrap_or_default()).to_string();
+        let mut metadata = request.metadata.unwrap_or_default();
+        if metadata.contains_key(PROVIDER_SCOPE_PROOF_KEY) {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "reserved session metadata key",
+                "session_metadata_invalid",
+            ));
+        }
+        if let Some(scope) = provider_scope {
+            let encryptor = self.scope_encryptor.as_ref().ok_or_else(|| {
+                error_response_coded(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "provider session scope is not configured",
+                    "provider_session_scope_unavailable",
+                )
+            })?;
+            metadata.insert(
+                PROVIDER_SCOPE_PROOF_KEY.to_string(),
+                serde_json::Value::String(encryptor.sign_provider_session_scope(
+                    &user_id,
+                    &session_id,
+                    &scope.provider_id,
+                    &scope.provider_scope_id,
+                )),
+            );
+        }
+        let metadata = serde_json::Value::Object(metadata).to_string();
 
         let mut connection = CancellationSafePoolConnection::acquire(&pool)
             .await
@@ -602,6 +711,34 @@ impl DatabaseSessionService {
                     .fetch_session_for_user_with_admission_facts(&mut *tx, &session_id, &user_id)
                     .await?
                     .ok_or_else(|| internal_error("failed to read idempotent session"))?;
+                // Replaying the same deterministic creation intent may read
+                // an older unbound Session, but must never backfill its scope.
+                if let Some(scope) = provider_scope
+                    && record.metadata.contains_key(PROVIDER_SCOPE_PROOF_KEY)
+                {
+                    let valid = record
+                        .metadata
+                        .get(PROVIDER_SCOPE_PROOF_KEY)
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|proof| {
+                            self.scope_encryptor.as_ref().is_some_and(|encryptor| {
+                                encryptor.verify_provider_session_scope(
+                                    &user_id,
+                                    &session_id,
+                                    &scope.provider_id,
+                                    &scope.provider_scope_id,
+                                    proof,
+                                )
+                            })
+                        });
+                    if !valid {
+                        return Err(error_response_coded(
+                            StatusCode::FORBIDDEN,
+                            "provider session scope cannot be verified",
+                            "provider_session_scope_unverified",
+                        ));
+                    }
+                }
                 tx.commit().await.map_err(internal_error)?;
                 connection.release();
                 return Ok(SessionCreationResult {
@@ -611,6 +748,16 @@ impl DatabaseSessionService {
                 });
             }
             crate::resource_governor::enforce_session_create_quota(quota)?;
+        }
+
+        if reserve_quota {
+            let quota =
+                crate::resource_governor::DatabaseResourceGovernor::reserve_session_creation(
+                    &mut tx, &user_id,
+                )
+                .await
+                .map_err(internal_error)?;
+            crate::resource_governor::enforce_session_create_quota(&quota)?;
         }
 
         query(
@@ -654,6 +801,7 @@ impl DatabaseSessionService {
         Self {
             matrixone,
             pool: None,
+            scope_encryptor: None,
         }
     }
 
@@ -675,20 +823,25 @@ impl DatabaseSessionService {
         user_id: &str,
     ) -> Result<Option<(SessionRecord, SessionAdmissionFacts)>, (StatusCode, Json<ErrorResponse>)>
     {
-        let row = query(
+        let mut select = QueryBuilder::<MySql>::new(
             "SELECT session_id, user_id, agent_id, title, status, event_count, \
              active_plan_id, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at, \
-             DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s') AS updated_at, \
+             DATE_FORMAT(activity_at, '%Y-%m-%dT%H:%i:%s') AS updated_at, \
              DATE_FORMAT(ended_at, '%Y-%m-%dT%H:%i:%s') AS ended_at, \
              IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json \
-             FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_optional(executor)
-        .await
-        .map_err(internal_error)?;
+             FROM ",
+        );
+        push_session_activity_source(&mut select, user_id);
+        select
+            .push(" WHERE session_id = ")
+            .push_bind(session_id)
+            .push(" LIMIT 1");
+        let row = select
+            .build()
+            .fetch_optional(executor)
+            .await
+            .map_err(internal_error)?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -778,6 +931,11 @@ impl DatabaseSessionService {
         self
     }
 
+    pub fn with_scope_encryptor(mut self, encryptor: Arc<super::FernetTokenEncryptor>) -> Self {
+        self.scope_encryptor = Some(encryptor);
+        self
+    }
+
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
         crate::require_shared_pool(
             self.pool.as_ref(),
@@ -794,9 +952,16 @@ impl SessionService for DatabaseSessionService {
         user_id: String,
         request: SessionCreateRequestData,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-        self.create_session_record(user_id, Uuid::new_v4().to_string(), request, None)
-            .await
-            .map(|result| result.session)
+        self.create_session_record(
+            user_id,
+            Uuid::new_v4().to_string(),
+            request,
+            None,
+            false,
+            None,
+        )
+        .await
+        .map(|result| result.session)
     }
 
     async fn create_session_with_admission_facts(
@@ -805,9 +970,16 @@ impl SessionService for DatabaseSessionService {
         request: SessionCreateRequestData,
     ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
     {
-        self.create_session_record(user_id, Uuid::new_v4().to_string(), request, None)
-            .await
-            .map(|result| (result.session, Some(result.admission_facts)))
+        self.create_session_record(
+            user_id,
+            Uuid::new_v4().to_string(),
+            request,
+            None,
+            false,
+            None,
+        )
+        .await
+        .map(|result| (result.session, Some(result.admission_facts)))
     }
 
     async fn create_provider_session(
@@ -823,8 +995,29 @@ impl SessionService for DatabaseSessionService {
             identity.session_id,
             request,
             Some((payload_hash, quota)),
+            true,
+            Some(&identity.scope),
         )
         .await
+    }
+
+    async fn create_session_with_resource_quota(
+        &self,
+        user_id: String,
+        request: SessionCreateRequestData,
+        _governor: &dyn crate::resource_governor::ResourceGovernor,
+    ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
+    {
+        self.create_session_record(
+            user_id,
+            Uuid::new_v4().to_string(),
+            request,
+            None,
+            true,
+            None,
+        )
+        .await
+        .map(|result| (result.session, Some(result.admission_facts)))
     }
 
     async fn list_sessions(
@@ -840,13 +1033,14 @@ impl SessionService for DatabaseSessionService {
         let mut list_query = QueryBuilder::<MySql>::new(
             "SELECT session_id, user_id, agent_id, title, status, event_count, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at, \
-             DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s') AS updated_at, \
+             DATE_FORMAT(activity_at, '%Y-%m-%dT%H:%i:%s') AS updated_at, \
              DATE_FORMAT(ended_at, '%Y-%m-%dT%H:%i:%s') AS ended_at, \
-             DATE_FORMAT(COALESCE(updated_at, created_at), '%Y-%m-%dT%H:%i:%s.%f') AS cursor_updated_at, \
+             DATE_FORMAT(activity_at, '%Y-%m-%dT%H:%i:%s.%f') AS cursor_updated_at, \
              IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json \
-             FROM agent_sessions WHERE user_id = ",
+             FROM ",
         );
-        list_query.push_bind(&filter.user_id);
+        push_session_activity_source(&mut list_query, &filter.user_id);
+        list_query.push(" WHERE 1 = 1");
         if let Some(agent_id) = &filter.agent_id {
             list_query.push(" AND agent_id = ");
             list_query.push_bind(agent_id);
@@ -1002,6 +1196,20 @@ impl SessionService for DatabaseSessionService {
             ));
         }
 
+        if metadata
+            .as_ref()
+            .is_some_and(|value| value.contains_key(PROVIDER_SCOPE_PROOF_KEY))
+            || metadata_patch
+                .as_ref()
+                .is_some_and(|value| value.contains_key(PROVIDER_SCOPE_PROOF_KEY))
+        {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "reserved session metadata key",
+                "session_metadata_invalid",
+            ));
+        }
+
         if title.is_none() && metadata.is_none() && metadata_patch.is_none() && status.is_none() {
             return Ok(existing);
         }
@@ -1016,9 +1224,24 @@ impl SessionService for DatabaseSessionService {
             .begin()
             .await
             .map_err(internal_error)?;
-        crate::storage::lock_agent_session_write_fence(&mut tx, &session_id, &user_id)
+        match crate::storage::lock_agent_session_write_fence_state(&mut tx, &session_id, &user_id)
             .await
-            .map_err(internal_error)?;
+            .map_err(internal_error)?
+        {
+            crate::storage::AgentSessionWriteFenceState::Writable => {}
+            crate::storage::AgentSessionWriteFenceState::PendingDelete
+            | crate::storage::AgentSessionWriteFenceState::CompletedDelete => {
+                return Err(error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Session {session_id} 不存在"),
+                ));
+            }
+            crate::storage::AgentSessionWriteFenceState::Missing => {
+                return Err(internal_error(
+                    "session lifecycle fence disappeared before it could be locked",
+                ));
+            }
+        }
         let locked = query(
             "SELECT IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json \
              FROM agent_sessions WHERE session_id = ? AND user_id = ? FOR UPDATE",
@@ -1035,24 +1258,52 @@ impl SessionService for DatabaseSessionService {
             )
         })?;
 
+        let raw = locked
+            .try_get::<String, _>("metadata_json")
+            .map_err(internal_error)?;
+        let value: serde_json::Value = serde_json::from_str(&raw).map_err(internal_error)?;
+        let locked_metadata = value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| internal_error("persisted session metadata must be a JSON object"))?;
         let metadata_patch_for_audit = metadata_patch.clone();
         let metadata = match (metadata, metadata_patch) {
-            (Some(metadata), None) => Some(metadata),
+            (Some(mut metadata), None) => {
+                if let Some(proof) = locked_metadata.get(PROVIDER_SCOPE_PROOF_KEY) {
+                    metadata.insert(PROVIDER_SCOPE_PROOF_KEY.to_string(), proof.clone());
+                }
+                Some(metadata)
+            }
             (None, Some(patch)) => {
-                let raw = locked
-                    .try_get::<String, _>("metadata_json")
-                    .map_err(internal_error)?;
-                let value: serde_json::Value =
-                    serde_json::from_str(&raw).map_err(internal_error)?;
-                let mut current = value.as_object().cloned().ok_or_else(|| {
-                    internal_error("persisted session metadata must be a JSON object")
-                })?;
+                let mut current = locked_metadata;
                 apply_metadata_patch(&mut current, patch);
                 Some(current)
             }
             (None, None) => None,
             (Some(_), Some(_)) => unreachable!("validated above"),
         };
+
+        if status.as_deref() == Some(astra_core::STATUS_CANCELLED) {
+            let key = astra_turn_types::SessionKeyV1::owner_session(
+                "server",
+                &user_id,
+                &session_id,
+                astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+            );
+            // Recheck under the same Session/admission fence as this status
+            // write. A stale HTTP observation cannot cancel a newly admitted Run.
+            let blocker =
+                crate::session_context_coordinator::locked_execution_reuse_blocker(&mut tx, &key)
+                    .await
+                    .map_err(|error| internal_error(error.to_string()))?;
+            if blocker.is_some() {
+                return Err(error_response_coded(
+                    StatusCode::CONFLICT,
+                    "Session execution changed; repeat the cancellation command",
+                    "cancellation_recovery_required",
+                ));
+            }
+        }
 
         let mut update_query =
             QueryBuilder::<MySql>::new("UPDATE agent_sessions SET updated_at = NOW()");
@@ -1107,7 +1358,12 @@ impl SessionService for DatabaseSessionService {
         let updated = self
             .fetch_session_for_user(&pool, &session_id, &user_id)
             .await?
-            .ok_or_else(|| internal_error("failed to read updated session"))?;
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Session {session_id} 不存在"),
+                )
+            })?;
         let details = serde_json::json!({
             "title": title,
             "status": status,
@@ -1116,6 +1372,89 @@ impl SessionService for DatabaseSessionService {
         });
         log_session_audit(&pool, &user_id, "session_update", &session_id, details).await;
         Ok(updated)
+    }
+
+    async fn ensure_session_active(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        // Do not lazily create a lifecycle fence for a foreign or missing
+        // session. Recheck under the fence below to handle concurrent delete.
+        let exists: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM agent_sessions WHERE session_id = ? AND user_id = ? \
+             AND delete_requested_at IS NULL",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)?;
+        if exists.is_none() {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                format!("Session {session_id} 不存在"),
+            ));
+        }
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(internal_error)?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(internal_error)?;
+        match crate::storage::lock_agent_session_write_fence_state(&mut tx, &session_id, &user_id)
+            .await
+            .map_err(internal_error)?
+        {
+            crate::storage::AgentSessionWriteFenceState::Writable => {}
+            crate::storage::AgentSessionWriteFenceState::PendingDelete
+            | crate::storage::AgentSessionWriteFenceState::CompletedDelete => {
+                return Err(error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Session {session_id} 不存在"),
+                ));
+            }
+            crate::storage::AgentSessionWriteFenceState::Missing => {
+                return Err(internal_error(
+                    "session lifecycle fence disappeared before it could be locked",
+                ));
+            }
+        }
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM agent_sessions WHERE session_id = ? AND user_id = ? \
+             AND delete_requested_at IS NULL FOR UPDATE",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+        let status = status.ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                format!("Session {session_id} 不存在"),
+            )
+        })?;
+        tx.commit().await.map_err(internal_error)?;
+        connection.release();
+        if status == "active" {
+            return Ok(());
+        }
+        self.update_session(
+            session_id,
+            user_id,
+            SessionUpdateRequestData {
+                title: None,
+                metadata: None,
+                metadata_patch: None,
+                status: Some("active".into()),
+            },
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn delete_session(

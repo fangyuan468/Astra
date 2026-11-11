@@ -291,9 +291,6 @@ struct PrepareChatTurnRequest<'a> {
     /// preparation step adds every mutating tool to `restricted_tools` so the
     /// model only sees read-only + plan-control tools (`exit_plan_mode` etc.).
     plan_mode_active: bool,
-    /// Pre-formatted lessons text from `session_lessons_snapshot()`.
-    /// Injected into `edge_profile` as `lessons_text` for the bridge/assembler.
-    pub lessons_text: Option<&'a str>,
 }
 
 pub(crate) fn turn_policy_from_payload_edge_tools(
@@ -495,14 +492,7 @@ pub(crate) fn server_loop_admission_payload_with_execution_time_budget(
     }
     .to_string();
     let mut context = serde_json::Map::new();
-    for field in [
-        "edge_tools",
-        "edge_profile",
-        "edge_skills",
-        "thinking",
-        "rollback_on_failure",
-        "rollback_boundary",
-    ] {
+    for field in ["edge_tools", "edge_profile", "edge_skills", "thinking"] {
         if let Some(value) = source.remove(field) {
             context.insert(field.to_string(), value);
         }
@@ -686,6 +676,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         ),
         "thinking": thinking_config.to_payload_value(),
     });
+    payload["edge_profile"]
+        [astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_STABLE_TEXTS] =
+        json!([crate::cli::mcp_config::MCP_SETUP_GUIDANCE]);
     if let Some(offering_id) = ctx.offering_id {
         payload["model_selection"] = json!({"offering_id": offering_id});
     }
@@ -1155,26 +1148,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     {
         ep_obj.insert("recent_arg_hints_text".to_string(), json!(hints_text));
     }
-    // ─── Lessons: inject bootstrapped session lessons into edge_profile ───
-    // Fixes the "signal channel blank" bug where lessons were loaded from
-    // Memoria by `ensure_bootstrapped_lessons()` but never injected into the
-    // prompt. Previously lessons only flowed into observability, not into
-    // the LLM context.
-    if let Some(ref lessons) = ctx.lessons_text
-        && let Some(root) = payload.as_object_mut()
-        && let Some(ep) = root.get_mut("edge_profile")
-        && let Some(ep_obj) = ep.as_object_mut()
-    {
-        ep_obj.insert("lessons_text".to_string(), json!(lessons));
-    }
-    let reports = ctx.executor.memory_selection_reports();
-    if !reports.is_empty()
-        && let Some(ep) = payload
-            .get_mut("edge_profile")
-            .and_then(Value::as_object_mut)
-    {
-        ep.insert("memory_selection_reports".into(), json!(reports));
-    }
     // ─── Runtime context: keep it on the typed Server admission lane ───
     if let Some(extra) = ctx.append_system_prompt {
         if let Some(root) = payload.as_object_mut() {
@@ -1188,7 +1161,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     // `server_admission_host.rs`), so we can merge the 5 bridge-generated
     // channels (captured via the `injection_freshness` SSE event into
     // `ChatTurnSseAccum.injection_fingerprints`) with the CLI-owned
-    // `lessons` snapshot.
+    // self-awareness snapshot.
 
     // ─── Context-window estimate / trace collection ───────────────────────
     // The runtime owns the final system prompt, so this starts without it and
@@ -1263,8 +1236,6 @@ fn inject_runtime_turn_overrides(
 
     if is_plan_subtask {
         root.insert("is_plan_subtask".into(), json!(true));
-        root.insert("rollback_on_failure".into(), json!(true));
-        root.insert("rollback_boundary".into(), json!("turn"));
     }
     if let Some(id) = plan_subtask_id.map(str::trim).filter(|s| !s.is_empty()) {
         root.insert("plan_subtask_id".into(), json!(id));
@@ -1277,6 +1248,7 @@ fn inject_runtime_turn_overrides(
 // ─── Fetch: payload → POST → consume_turn_sse ─────────────────────────────────
 
 pub(crate) struct ChatTurnSseFetchRequest<'a> {
+    pub server_admission_dispatched: &'a mut bool,
     pub completion_checks: Option<&'a astra_turn_types::CompletionCheckDeclarations>,
     pub tool_surface_config: &'a astra_config::runtime_config::ToolSurfaceConfig,
     pub api: &'a astra_thin_client::ThinClient,
@@ -1404,6 +1376,7 @@ fn chat_turn_sse_fetch_ui(
 /// The caller must drop [`ChatTurnPrepLineGuard`] when entering SSE consume (`consume_turn_sse`)
 /// or on early error after reading the body, so the stderr status line stays through TTFB.
 struct ChatTurnPostPayloadRequest<'a> {
+    server_admission_dispatched: &'a mut bool,
     api: &'a astra_thin_client::ThinClient,
     token: &'a str,
     quiet: bool,
@@ -1412,6 +1385,7 @@ struct ChatTurnPostPayloadRequest<'a> {
     stream_json_emitter:
         Option<&'a std::sync::Arc<crate::cli::stream::stream_json::StreamJsonEmitter>>,
     execution_time_budget_clock: Option<&'a crate::cli::chat_stream::ExecutionTimeBudgetClock>,
+    cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
     prepare: PrepareChatTurnRequest<'a>,
 }
 
@@ -1433,12 +1407,30 @@ fn validate_workspace_coordination_host()
 // text-only turn or a surface with only read-only tools needs no writer host.
 async fn validate_local_workspace_host_for_tool_surface(
     executor: &ToolExecutor,
-) -> Result<(), String> {
+) -> Result<(), astra_core::ClassifiedError> {
     if executor
         .current_surface_requires_workspace_coordination()
         .await
     {
-        validate_workspace_coordination_host().map_err(|error| error.to_string())?;
+        validate_workspace_coordination_host().map_err(|error| {
+            use astra_tools::workspace_observation::WorkspaceLeaseFailure;
+            match error {
+                WorkspaceLeaseFailure::CoordinationHostUnsupported => {
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ToolUnavailable,
+                        error.to_string(),
+                    )
+                    .with_details_json(
+                        serde_json::json!({
+                            "code": astra_tools::TOOL_ERROR_KIND_WORKSPACE_HOST_UNSUPPORTED,
+                            "retryable": false,
+                        })
+                        .to_string(),
+                    )
+                }
+                other => astra_core::ClassifiedError::from(other.to_string()),
+            }
+        })?;
     }
     Ok(())
 }
@@ -1451,9 +1443,10 @@ async fn chat_turn_post_payload_after_prepare(
         ChatTurnPrepLineGuard,
         Option<crate::cli::stream::stream_json::StreamJsonExchange>,
     ),
-    String,
+    astra_core::ClassifiedError,
 > {
     let ChatTurnPostPayloadRequest {
+        server_admission_dispatched,
         api,
         token,
         quiet,
@@ -1461,6 +1454,7 @@ async fn chat_turn_post_payload_after_prepare(
         stream_event_tx,
         stream_json_emitter,
         execution_time_budget_clock,
+        cancel_token,
         prepare,
     } = request;
     let prep_line = ChatTurnPrepLineGuard::maybe_start(ui.show_prep_line, ui.prep_ui_phase.clone());
@@ -1507,6 +1501,14 @@ async fn chat_turn_post_payload_after_prepare(
         CHAT_TURN_POST_MAX_RETRIES,
         quiet,
         || {
+            // The thin client invokes this after asynchronous credential
+            // preparation, immediately before sending. Retain an already-issued
+            // response for recovery, but never start a new attempt after Stop.
+            if cancel_token.is_some_and(|token| token.is_cancelled()) {
+                return Err(astra_thin_client::ThinClientError::InvalidInput(
+                    "turn cancelled before Server admission dispatch".into(),
+                ));
+            }
             let mut payload = server_payload.clone();
             if let Some(clock) = execution_time_budget_clock {
                 let remaining_seconds = clock.remaining().remaining_seconds;
@@ -1518,6 +1520,9 @@ async fn chat_turn_post_payload_after_prepare(
                 payload["execution_time_budget"]["remaining_seconds"] =
                     serde_json::Value::from(remaining_seconds);
             }
+            // From here a transport error is ambiguous. A later cancelled
+            // retry must not turn that original attempt back into "not sent".
+            *server_admission_dispatched = true;
             Ok(payload)
         },
     );
@@ -1559,8 +1564,9 @@ async fn chat_turn_post_payload_after_prepare(
 
 pub(crate) async fn fetch_chat_turn_sse(
     ctx: ChatTurnSseFetchRequest<'_>,
-) -> Result<TurnResult, String> {
+) -> Result<TurnResult, astra_core::ClassifiedError> {
     let ChatTurnSseFetchRequest {
+        server_admission_dispatched,
         completion_checks,
         tool_surface_config,
         api,
@@ -1621,27 +1627,9 @@ pub(crate) async fn fetch_chat_turn_sse(
 
     let ui = chat_turn_sse_fetch_ui(render_policy, plan_assemble_line_release.as_ref());
 
-    // Compute lessons text from Memoria-bootstrapped session lessons.
-    // Format: "kind:trigger_signal:action" per lesson, pipe-joined.
-    // Mirrors the format used in the Server-admission host's observability path.
-    let lessons_text: Option<String> = {
-        let lessons = executor.session_lessons_snapshot();
-        if lessons.is_empty() {
-            None
-        } else {
-            Some(
-                lessons
-                    .iter()
-                    .map(|l| format!("{}:{}:{}", l.kind.as_str(), l.trigger_signal, l.action))
-                    .collect::<Vec<_>>()
-                    .join("|"),
-            )
-        }
-    };
-    let lessons_text_ref: Option<&str> = lessons_text.as_deref();
-
     let (resp, prep_line, stream_json_exchange) =
         chat_turn_post_payload_after_prepare(ChatTurnPostPayloadRequest {
+            server_admission_dispatched,
             api,
             token,
             quiet: render_policy.is_silent(),
@@ -1649,6 +1637,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             stream_event_tx: stream_event_tx.as_ref(),
             stream_json_emitter: stream_json_emitter.as_ref(),
             execution_time_budget_clock: execution_time_budget,
+            cancel_token,
             prepare: PrepareChatTurnRequest {
                 completion_checks,
                 tool_surface_config,
@@ -1696,7 +1685,6 @@ pub(crate) async fn fetch_chat_turn_sse(
                 append_system_prompt,
                 plan_mode_active: perm_manager.mode()
                     == crate::cli::permission_manager::PermissionMode::Plan,
-                lessons_text: lessons_text_ref,
             },
         })
         .await?;
@@ -1709,7 +1697,8 @@ pub(crate) async fn fetch_chat_turn_sse(
             status.as_u16(),
             body.as_str(),
             compact_or_raw,
-        ));
+        )
+        .into());
     }
 
     // Paired with `Acquire` load in `PlanAssembleLineSpinner`: publish "HTTP response ready"
@@ -1731,7 +1720,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         approval_request_tx,
         ask_user_request_tx,
         skill_resolver,
-        turn_rollback_on_failure: is_plan_subtask,
+        compensate_non_file_on_failure: is_plan_subtask,
         tool_cache,
         incremental_state: incremental_state.clone(),
         request_session_execution_lease,
@@ -1878,6 +1867,7 @@ mod tests {
     #[test]
     fn server_loop_admission_excludes_client_owned_conversation_authority() {
         let prepared = json!({
+            "conversation_authority": {"execution_grant": "client-owned-capability"},
             "completion_checks": {
                 "stop": [{"label": "root", "command": "make check", "working_dir": null,
                     "depends_on": [], "timeout_secs": null, "authoritative": true}],
@@ -1899,11 +1889,7 @@ mod tests {
             "capabilities": ["bash"],
             "enabled_tools": ["web_fetch"],
             "edge_tools": [{"type": "function", "function": {"name": "bash"}}],
-            "edge_profile": {"cwd": "/workspace", "memory_selection_reports": [{
-                "session_id":"session-1", "turn":9, "operation":"relevance", "method":"model",
-                "reason":"completed", "model":"jev-test", "elapsed_ms":12,
-                "selection_order":[0], "candidates":[{"index":0,"selected":true,"probability_bps":9000}]
-            }]},
+            "edge_profile": {"cwd": "/workspace", "git_branch": "review"},
             "edge_skills": [{
                 "name": "review-workspace",
                 "description": "Review the current workspace",
@@ -1927,8 +1913,8 @@ mod tests {
         );
         assert_eq!(admitted["context"]["edge_profile"]["cwd"], "/workspace");
         assert_eq!(
-            admitted["context"]["edge_profile"]["memory_selection_reports"],
-            prepared["edge_profile"]["memory_selection_reports"]
+            admitted["context"]["edge_profile"]["git_branch"],
+            prepared["edge_profile"]["git_branch"]
         );
         assert_eq!(
             admitted["context"]["edge_skills"][0]["name"],
@@ -2272,7 +2258,6 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
-            lessons_text: None,
         })
         .await;
         (prepared.payload, executor.parent_model_reasoning_snapshot())
@@ -2397,6 +2382,45 @@ mod tests {
             "ordinary user turns with runtime context must remain user turns"
         );
         assert!(payload.get("messages").is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_setup_guidance_is_stable_and_survives_admission() {
+        let mut previous = None;
+        for message in ["configure an MCP server", "explain this code"] {
+            let payload = prepare_payload_with_reasoning_for_test(
+                vec![json!({"role": "user", "content": message})],
+                &[],
+                &[],
+                message,
+                None,
+                Some(("mcp-setup-offering", "test-model", None)),
+            )
+            .await
+            .0;
+            let key =
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_STABLE_TEXTS;
+            let texts = payload["edge_profile"][key]
+                .as_array()
+                .expect("CLI setup guidance");
+            assert_eq!(texts.len(), 1);
+            assert!(texts[0].as_str().unwrap().contains("astra mcp --help"));
+            if let Some(previous) = previous.as_ref() {
+                assert_eq!(previous, &texts[0]);
+            }
+            previous = Some(texts[0].clone());
+            let admitted = server_loop_admission_payload_with_execution_time_budget(
+                payload.clone(),
+                message,
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                admitted["context"]["edge_profile"][key],
+                payload["edge_profile"][key]
+            );
+        }
     }
 
     #[tokio::test]
@@ -2529,7 +2553,6 @@ mod tests {
                 observability_hub: None,
                 append_system_prompt: None,
                 plan_mode_active: false,
-                lessons_text: None,
             })
             .await
         };
@@ -2604,8 +2627,8 @@ mod tests {
 
         assert!(payload.get("skill_search").is_none());
         assert_eq!(payload["is_plan_subtask"], json!(true));
-        assert_eq!(payload["rollback_on_failure"], json!(true));
-        assert_eq!(payload["rollback_boundary"], json!("turn"));
+        assert!(payload.get("rollback_on_failure").is_none());
+        assert!(payload.get("rollback_boundary").is_none());
         assert_eq!(payload["plan_subtask_id"], json!("sub-1"));
     }
 
@@ -2691,6 +2714,18 @@ mod tests {
         assert_eq!(
             turns[1].content_preview,
             "user: second · assistant: calling tool · tool: tool output · assistant: final answer"
+        );
+        let collector =
+            astra_turn_core::turn_trace_collector::TurnTraceCollector::new("input", "session");
+        collector.set_history_retained(&turns);
+        let history = collector.finalize().history.unwrap();
+        assert_eq!(
+            history.total_tokens,
+            turns.iter().map(|turn| turn.tokens).sum::<u32>()
+        );
+        assert_eq!(
+            history.turns_retained[1].content_preview,
+            turns[1].content_preview
         );
     }
 
@@ -3161,7 +3196,6 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: true,
-            lessons_text: None,
         })
         .await;
 
@@ -3330,7 +3364,6 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
-            lessons_text: None,
         })
         .await;
 
@@ -3406,10 +3439,11 @@ mod tests {
             schema("read_file"),
         ];
         let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(1);
-        let executor = Arc::new(
-            ToolExecutor::new(temp_dir.path())
-                .with_bg_task_commands(Arc::new(std::sync::Mutex::new(Vec::new()))),
-        );
+        let executor = Arc::new(ToolExecutor::new(temp_dir.path()).with_background_tasks(
+            crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+                temp_dir.path().join("tasks"),
+            ),
+        ));
         let messages = vec![json!({"role": "user", "content": "run make check"})];
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
@@ -3471,7 +3505,6 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
-            lessons_text: None,
         })
         .await;
 
@@ -3494,7 +3527,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_filter_removes_background_controls_without_a_registry_binding() {
+    fn runtime_filter_requires_a_session_owner_for_shell_controls() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut schemas = vec![
             schema("bash"),
@@ -3514,8 +3547,32 @@ mod tests {
             astra_turn_core::tool::schema::tool_names_from_schemas(&schemas),
             std::collections::HashSet::from(["bash".to_string()])
         );
-        assert_eq!(report.visible_tools, vec!["bash".to_string()]);
         assert_eq!(report.visible_count, 1);
+
+        let mut schemas = vec![
+            schema("bash"),
+            schema("task_output"),
+            schema("task_list"),
+            schema("task_stop"),
+        ];
+        let mut report = surface_report_from_visible_schemas(&schemas, 4, 4);
+        let executor = crate::edge_tools::ToolExecutor::new(temp_dir.path()).with_background_tasks(
+            crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+                temp_dir.path().join("tasks"),
+            ),
+        );
+        assert!(runtime_filter_turn_schemas_and_report(
+            &executor,
+            &mut schemas,
+            &mut report
+        ));
+        assert_eq!(
+            astra_turn_core::tool::schema::tool_names_from_schemas(&schemas),
+            std::collections::HashSet::from(
+                ["bash", "task_output", "task_list", "task_stop"].map(str::to_string)
+            )
+        );
+        assert_eq!(report.visible_count, 4);
     }
 
     #[tokio::test]
@@ -3611,7 +3668,6 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
-            lessons_text: None,
         })
         .await;
 
@@ -3769,7 +3825,6 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
-            lessons_text: None,
         })
         .await;
 
@@ -3888,7 +3943,6 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: true,
-            lessons_text: None,
         })
         .await;
 
@@ -4004,7 +4058,6 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
-            lessons_text: None,
         })
         .await;
 
@@ -4102,7 +4155,6 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
-            lessons_text: None,
         })
         .await;
 
@@ -4208,7 +4260,6 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
-            lessons_text: None,
         })
         .await;
 
@@ -4307,7 +4358,6 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
-            lessons_text: None,
         })
         .await;
 

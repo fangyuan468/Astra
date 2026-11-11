@@ -6,13 +6,17 @@ license.workspace = true
 publish = false
 
 [dependencies]
+base64.workspace = true
 fs2.workspace = true
+hyper-util = { version = "0.1", features = ["client-proxy"] }
 async-trait.workspace = true
 axum.workspace = true
 chrono.workspace = true
 dirs.workspace = true
 dotenvy.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -23,6 +27,8 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+sqlx-core.workspace = true
+tokio-tungstenite.workspace = true
 rcgen = "0.13.2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 temp-env = "0.3"

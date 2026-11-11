@@ -2,7 +2,7 @@
 #![cfg(feature = "e2e-hooks")]
 
 use astra_runtime::server::provider_test_support::{
-    InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+    ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
     bind_server_workspace, loop_state, server_host_builder,
 };
 use astra_runtime::server::tool_transport::{
@@ -29,13 +29,13 @@ async fn server_lifecycle_parallel_reads_preserve_actual_results_and_pairing() {
         vec![
             ProviderResponse::OpenAi(json!({"id":"read-request","model":"provider-fixture-model",
                 "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"call-read-evidence","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"evidence.txt\"}"}},{"id":"call-read-second","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"second.txt\"}"}}]},"finish_reason":"tool_calls"}],
-                "usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+                "usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
             ProviderResponse::OpenAi(json!({"id":"read-answer","model":"provider-fixture-model",
                 "choices":[{"index":0,"message":{"role":"assistant","content":"The file contains fixture evidence from the executor."},"finish_reason":"stop"}],
-                "usage":{"prompt_tokens":52,"completion_tokens":11,"total_tokens":63}})),
+                "usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":52,"completion_tokens":11,"total_tokens":63}})),
         ]
     )]).await;
-    let ledger = InferenceLedgerFixture::default();
+    let ledger = ProviderObservationsFixture::default();
     let session = format!("tool-fixture-{}", uuid::Uuid::new_v4());
     let mut host = server_host_builder(
         &gateway,
@@ -105,7 +105,9 @@ async fn server_lifecycle_parallel_reads_preserve_actual_results_and_pairing() {
         "each actual invocation emits one canonical call"
     );
     let call = &emitted[0]["tool_call"];
-    assert_eq!(call["id"], "call-read-evidence");
+    assert_eq!(call["id"].as_str().unwrap().len(), 64);
+    assert_ne!(call["id"], "call-read-evidence");
+    assert_ne!(call["id"], emitted[1]["tool_call"]["id"]);
     assert_eq!(call["function"]["name"], "read_file");
     assert_eq!(call["function"]["arguments"], "{\"path\":\"evidence.txt\"}");
     assert!(call.get("name").is_none());
@@ -200,7 +202,7 @@ async fn server_lifecycle_cancellation_settles_a_live_provider_stream() {
         ProviderResponse::OpenAi(json!({
             "model":"provider-fixture-model",
             "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":id,"type":"function","function":{"name":"read_file","arguments":json!({"path":path}).to_string()}}]},"finish_reason":"tool_calls"}],
-            "usage":{"prompt_tokens":20,"completion_tokens":3,"total_tokens":23}
+            "usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":20,"completion_tokens":3,"total_tokens":23}
         }))
     };
     let release = Arc::new(tokio::sync::Notify::new());
@@ -211,13 +213,13 @@ async fn server_lifecycle_cancellation_settles_a_live_provider_stream() {
             content_type: "text/event-stream",
             chunks: vec![
                 format!("data: {}\n\n", json!({"choices":[{"index":0,"delta":{"content":"partial evidence"}}]})).into_bytes(),
-                format!("data: {}\n\n", json!({"choices":[{"index":0,"delta":{"content":"must not be delivered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7}})).into_bytes(),
+                format!("data: {}\n\n", json!({"choices":[{"index":0,"delta":{"content":"must not be delivered"},"finish_reason":"stop"}],"usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":42,"completion_tokens":7}})).into_bytes(),
                 b"data: [DONE]\n\n".to_vec(),
             ],
             release_before_chunk: Some((1, release.clone())),
         }],
     )]).await;
-    let ledger = InferenceLedgerFixture::default();
+    let ledger = ProviderObservationsFixture::default();
     let session = format!("cancel-fixture-{}", uuid::Uuid::new_v4());
     let mut host = server_host_builder(
         &gateway,
@@ -304,7 +306,7 @@ async fn server_lifecycle_cancellation_settles_a_live_provider_stream() {
     assert_eq!((state.total_prompt, state.total_completion), (40, 6));
     assert_eq!(ledger.attempt_count(), 3);
     assert!(
-        ledger.wait_for_settlements(Duration::from_secs(5)).await,
+        ledger.wait_for_completion(Duration::from_secs(5)).await,
         "detached settlement owner must finish"
     );
     ledger.assert_quiescent();

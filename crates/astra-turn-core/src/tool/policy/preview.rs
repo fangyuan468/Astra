@@ -82,8 +82,10 @@ pub fn render_preview(tool: &str, args: &Value, style: PreviewStyle, desc_budget
         // ── File I/O ────────────────────────────────────────────────
         "read_file" => {
             let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-            let start = args.get("start_line").and_then(Value::as_u64);
-            let end = args.get("end_line").and_then(Value::as_u64);
+            let (start, end) = astra_text_utils::line_range::ordered_bounds(
+                args.get("start_line").and_then(Value::as_u64),
+                args.get("end_line").and_then(Value::as_u64),
+            );
             let short_path = short(path, path_budget(10));
             match (start, end) {
                 (Some(s), Some(e)) => format!("Reading: {short_path}:{s}-{e}"),
@@ -287,24 +289,6 @@ fn session_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: 
                 Some(r) if !r.is_empty() => format!("Sleeping: {duration_ms}ms ({r})"),
                 _ => format!("Sleeping: {duration_ms}ms"),
             }
-        }
-        "history_page" => {
-            let cursor = args
-                .get("before_seq")
-                .or_else(|| args.get("after_seq"))
-                .and_then(Value::as_i64);
-            match cursor {
-                Some(seq) => format!("Session history page near item {seq}"),
-                None => "Session history page".to_string(),
-            }
-        }
-        "history_search" => {
-            let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
-            format!("Searching session history: \"{}\"", trunc(pattern, 18))
-        }
-        "history_around" => {
-            let item_seq = args.get("item_seq").and_then(Value::as_i64).unwrap_or(0);
-            format!("Session history around item {item_seq}")
         }
         _ => format!("Session: {action}"),
     }
@@ -636,6 +620,13 @@ mod tests {
             p(
                 "read_file",
                 json!({"path": "src/main.rs", "start_line": 10, "end_line": 50})
+            ),
+            "Reading: src/main.rs:10-50"
+        );
+        assert_eq!(
+            p(
+                "read_file",
+                json!({"path":"src/main.rs", "start_line":50, "end_line":10})
             ),
             "Reading: src/main.rs:10-50"
         );
@@ -983,35 +974,6 @@ mod tests {
     }
 
     // ─── Schema-canonical field names ──────────────────────────────────
-
-    #[test]
-    fn session_history_actions_render() {
-        assert_eq!(
-            p("session", json!({"action": "history_page"})),
-            "Session history page"
-        );
-        assert_eq!(
-            p(
-                "session",
-                json!({"action": "history_page", "before_seq": 42})
-            ),
-            "Session history page near item 42"
-        );
-        assert_eq!(
-            p(
-                "session",
-                json!({"action": "history_search", "pattern": "failed build"})
-            ),
-            r#"Searching session history: "failed build""#
-        );
-        assert_eq!(
-            p(
-                "session",
-                json!({"action": "history_around", "item_seq": 17})
-            ),
-            "Session history around item 17"
-        );
-    }
 
     #[test]
     fn run_script_shows_first_line() {

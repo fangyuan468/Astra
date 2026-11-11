@@ -8,18 +8,15 @@ use astra_services::runs::{
 use astra_services::work::{
     CriterionCommand, CriterionDefinition, CriterionId, CriterionSetRevision, CriterionStatement,
     DatabaseWorkBranchCatalogService, DatabaseWorkBranchComparisonService,
-    DatabaseWorkBranchCreationService, DatabaseWorkBranchDeletionService,
-    DatabaseWorkPatchCommitService, DatabaseWorkPatchMaterializationService,
-    DatabaseWorkRepository, ForkCursorRef, GoalRevision, GraphRevision, InternalSessionId,
-    NewWorkCriterion, OriginalIntentRef, WorkArchivedBranchCursor, WorkAttentionCursorAdvance,
+    DatabaseWorkBranchCreationService, DatabaseWorkBranchDeletionService, DatabaseWorkRepository,
+    ForkCursorRef, GoalRevision, GraphRevision, InternalSessionId, NewWorkCriterion,
+    OriginalIntentRef, WorkArchivedBranchCursor, WorkAttentionCursorAdvance,
     WorkAttentionCursorKind, WorkBranchId, WorkBranchRetentionChange, WorkBranchRetentionKind,
     WorkBranchRevision, WorkCatalogCursor, WorkCatalogPageLimit, WorkCatalogQuery, WorkChangeRef,
     WorkConflictResource, WorkContentHash, WorkCriteriaProposalAcceptance,
     WorkCriteriaProposalRejection, WorkCriteriaQuery, WorkEventPageLimit, WorkEventQuery,
     WorkEventSeq, WorkGenesis, WorkGenesisParts, WorkGoal, WorkId, WorkItemId, WorkItemRevision,
-    WorkMaterializationProviderRef, WorkObservationQuery, WorkOwnerId, WorkPatchArtifactId,
-    WorkPatchCommitId, WorkPatchCommitPageLimit, WorkPatchCommitProviderRef,
-    WorkPatchMaterializationId, WorkProposalId, WorkRecoveryPointCaptureRequest,
+    WorkObservationQuery, WorkOwnerId, WorkProposalId, WorkRecoveryPointCaptureRequest,
     WorkRecoveryPointCursor, WorkRecoveryPointQuery, WorkRepository, WorkRepositoryError,
     WorkRevision, WorkSubjectRef, WorkTaskGraphQuery,
 };
@@ -61,18 +58,16 @@ use astra_server_types::{
     WorkExecutionSwitchRetryRequestV1, WorkExecutionSwitchStateV1, WorkExecutionTargetPageV1,
     WorkExecutionTargetRequestV1, WorkExecutionTargetV1, WorkExecutionViewV1,
     WorkInteractionKindV1, WorkInteractionResolutionOutcomeV1, WorkObservationResponseV1,
-    WorkPatchArtifactExportRequestV1, WorkPatchArtifactsQueryV1, WorkPatchCommitRequestV1,
-    WorkPatchCommitsQueryV1, WorkPatchMaterializationRequestV1, WorkReadCursorRequestV1,
-    WorkReadCursorResponseV1, WorkRecoveryPointArtifactV1, WorkRecoveryPointCapabilitiesV1,
-    WorkRecoveryPointCaptureRequestV1, WorkRecoveryPointCoverageV1, WorkRecoveryPointCursorV1,
-    WorkRecoveryPointExecutionV1, WorkRecoveryPointPageV1, WorkRecoveryPointQueryV1,
-    WorkRecoveryPointReasonV1, WorkRecoveryPointSessionCursorV1, WorkRecoveryPointStatusV1,
-    WorkRecoveryPointViewV1, WorkRecoveryPointWorkspaceV1, WorkSessionBindingResponseV1,
-    WorkTaskGraphQueryV1, WorkTaskGraphResponseV1, WorkTranscriptItemV1,
-    WorkTranscriptPageResponseV1, WorkTranscriptQueryV1, WorkTurnRequestV1,
-    WorkWorkspaceRecoveryArtifactBeginRequestV1, WorkWorkspaceRecoveryArtifactResponseV1,
-    WorkWorkspaceRecoveryArtifactSealRequestV1, WorkWorkspaceRecoveryBlobV1,
-    WorkWorkspaceRecoveryChunkReceiptV1, WorkWorkspaceRecoveryChunkV1,
+    WorkReadCursorRequestV1, WorkReadCursorResponseV1, WorkRecoveryPointArtifactV1,
+    WorkRecoveryPointCapabilitiesV1, WorkRecoveryPointCaptureRequestV1,
+    WorkRecoveryPointCoverageV1, WorkRecoveryPointCursorV1, WorkRecoveryPointExecutionV1,
+    WorkRecoveryPointPageV1, WorkRecoveryPointQueryV1, WorkRecoveryPointReasonV1,
+    WorkRecoveryPointSessionCursorV1, WorkRecoveryPointStatusV1, WorkRecoveryPointViewV1,
+    WorkRecoveryPointWorkspaceV1, WorkSessionBindingResponseV1, WorkTaskGraphQueryV1,
+    WorkTaskGraphResponseV1, WorkTranscriptItemV1, WorkTranscriptPageResponseV1,
+    WorkTranscriptQueryV1, WorkTurnRequestV1, WorkWorkspaceRecoveryArtifactBeginRequestV1,
+    WorkWorkspaceRecoveryArtifactResponseV1, WorkWorkspaceRecoveryArtifactSealRequestV1,
+    WorkWorkspaceRecoveryBlobV1, WorkWorkspaceRecoveryChunkReceiptV1, WorkWorkspaceRecoveryChunkV1,
 };
 
 const WORK_REQUEST_ID_MAX_BYTES: usize = 256;
@@ -83,9 +78,6 @@ const WORK_TASK_GRAPH_DEFAULT_DEPENDENCY_LIMIT: u16 = 128;
 const WORK_CRITERIA_DEFAULT_LIMIT: u16 = 8;
 const WORK_CATALOG_DEFAULT_LIMIT: u16 = 20;
 const WORK_ARCHIVED_BRANCH_DEFAULT_LIMIT: u16 = 20;
-const WORK_PATCH_ARTIFACT_DEFAULT_LIMIT: u16 = 20;
-const WORK_PATCH_MATERIALIZATION_DEFAULT_LIMIT: u16 = 20;
-const WORK_PATCH_COMMIT_DEFAULT_LIMIT: u16 = 20;
 const WORK_TRANSCRIPT_DEFAULT_LIMIT: u16 = 30;
 const WORK_TRANSCRIPT_MAX_LIMIT: u16 = 50;
 const WORK_TRANSCRIPT_CONTENT_PREVIEW_CHARS: i64 = 2_048;
@@ -251,16 +243,6 @@ fn map_recovery_point_blocker(
             false,
             vec![WorkApiActionHint::RefreshWork],
         ),
-        Blocker::DanglingRunSlot | Blocker::RunStatusMissing => {
-            tracing::error!(work_id, blocker = ?reason, "Work recovery point found corrupt Run slot");
-            work_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "recovery_point_repair_required",
-                WorkApiErrorCategory::Degraded,
-                false,
-                vec![WorkApiActionHint::RetryRead],
-            )
-        }
         Blocker::ActiveRun => work_error(
             StatusCode::CONFLICT,
             "recovery_point_run_active",
@@ -1970,61 +1952,6 @@ fn transcript_row_u64(row: &sqlx::mysql::MySqlRow, field: &str) -> Result<u64, S
     u64::try_from(value).map_err(|_| format!("{field} is negative"))
 }
 
-fn decode_work_transcript_head(
-    row: &sqlx::mysql::MySqlRow,
-) -> Result<WorkConversationHeadV1, String> {
-    let completed_turn = u32::try_from(transcript_row_u64(row, "completed_turn")?)
-        .map_err(|_| "completed_turn exceeds u32".to_string())?;
-    let projection_schema = u32::try_from(transcript_row_u64(row, "projection_schema")?)
-        .map_err(|_| "projection_schema exceeds u32".to_string())?;
-    let canonical_root_hash = row
-        .try_get::<String, _>("canonical_root_hash")
-        .map_err(|error| error.to_string())?;
-    if completed_turn == 0
-        || projection_schema == 0
-        || canonical_root_hash.len() != 64
-        || !canonical_root_hash
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err("transcript cursor is structurally invalid".to_string());
-    }
-    Ok(WorkConversationHeadV1 {
-        completed_turn,
-        journal_event_seq: transcript_row_u64(row, "journal_event_seq")?,
-        conversation_seq: transcript_row_u64(row, "conversation_seq")?,
-        canonical_root_hash,
-        projection_schema,
-        compaction_generation: transcript_row_u64(row, "compaction_generation")?,
-        config_version_id: row
-            .try_get::<Option<String>, _>("config_version_id")
-            .map_err(|error| error.to_string())?,
-    })
-}
-
-fn classify_work_transcript_sync(
-    canonical: Option<&WorkConversationHeadV1>,
-    projected: Option<&WorkConversationHeadV1>,
-) -> WorkBranchSyncStateV1 {
-    match (canonical, projected) {
-        (None, None) => WorkBranchSyncStateV1::Current,
-        (Some(_), None) => WorkBranchSyncStateV1::ProjectionStale,
-        (None, Some(_)) => WorkBranchSyncStateV1::Corrupt,
-        (Some(canonical), Some(projected)) if canonical == projected => {
-            WorkBranchSyncStateV1::Current
-        }
-        (Some(canonical), Some(projected))
-            if projected.completed_turn < canonical.completed_turn
-                && projected.journal_event_seq <= canonical.journal_event_seq
-                && projected.conversation_seq <= canonical.conversation_seq
-                && projected.compaction_generation <= canonical.compaction_generation =>
-        {
-            WorkBranchSyncStateV1::ProjectionStale
-        }
-        (Some(_), Some(_)) => WorkBranchSyncStateV1::Corrupt,
-    }
-}
-
 fn decode_work_transcript_item(row: sqlx::mysql::MySqlRow) -> Result<WorkTranscriptItemV1, String> {
     let item_seq = transcript_row_u64(&row, "item_seq")?;
     let committed_turn = u32::try_from(transcript_row_u64(&row, "canonical_completed_turn")?)
@@ -2066,9 +1993,9 @@ fn decode_work_transcript_item(row: sqlx::mysql::MySqlRow) -> Result<WorkTranscr
     })
 }
 
-/// Return one bounded chronological page from the transcript prefix known to
-/// be complete at `transcript_cursor`. Rows from an active/uncommitted turn
-/// never enter this view; their progress remains available through activity.
+/// Return one bounded page of available committed raw history at the canonical
+/// Context cursor. This view has no separate projection-completeness promise.
+/// Active/uncommitted rows remain excluded; progress is available in activity.
 pub(super) async fn get_work_branch_transcript_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2144,27 +2071,19 @@ pub(super) async fn get_work_branch_transcript_handler(
         binding.session_id.as_str(),
         astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
     );
+    // One conversation cursor owns this read. Raw history is a best-effort
+    // view of available committed items, not another independently certified
+    // projection with its own head, lag and repair protocol.
+    let canonical_head = coordinator
+        .load_head(&key)
+        .await
+        .map_err(map_work_attachment_coordinator_error)?
+        .map(|head| work_conversation_head(head.cursor));
+    let transcript_cursor = canonical_head.clone();
     let mut tx = pool
         .get()
         .begin()
         .await
-        .map_err(|error| work_transcript_projection_degraded(work_id.as_str(), error))?;
-    let projection_row = sqlx::query(
-        "SELECT completed_turn, journal_event_seq, conversation_seq,
-                canonical_root_hash, projection_schema, compaction_generation,
-                config_version_id
-         FROM session_transcript_projection_heads
-         WHERE user_id = ? AND session_id = ?",
-    )
-    .bind(owner_id.as_str())
-    .bind(binding.session_id.as_str())
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|error| work_transcript_projection_degraded(work_id.as_str(), error))?;
-    let transcript_cursor = projection_row
-        .as_ref()
-        .map(decode_work_transcript_head)
-        .transpose()
         .map_err(|error| work_transcript_projection_degraded(work_id.as_str(), error))?;
     let mut items = Vec::new();
     let mut has_more = false;
@@ -2212,19 +2131,7 @@ pub(super) async fn get_work_branch_transcript_handler(
     tx.commit()
         .await
         .map_err(|error| work_transcript_projection_degraded(work_id.as_str(), error))?;
-    // Read canonical authority after the projection snapshot. Projection
-    // promotion is ordered after canonical commit, so this ordering cannot
-    // falsely label a healthy concurrent promotion as "ahead/corrupt".
-    let canonical_head = coordinator
-        .load_head(&key)
-        .await
-        .map_err(map_work_attachment_coordinator_error)?
-        .map(|head| work_conversation_head(head.cursor));
-    let sync = classify_work_transcript_sync(canonical_head.as_ref(), transcript_cursor.as_ref());
-    if sync == WorkBranchSyncStateV1::Corrupt {
-        items.clear();
-        has_more = false;
-    }
+    let sync = WorkBranchSyncStateV1::Current;
     let next_before_item_seq = has_more
         .then(|| items.first().map(|item| item.item_seq))
         .flatten();
@@ -4020,7 +3927,6 @@ pub(super) async fn post_work_branch_turn_handler(
         explain: false,
         interaction_mode: None,
         interactive_client: false,
-        conversation_authority: None,
     };
     let stream_result = state
         .execution
@@ -5215,6 +5121,16 @@ fn parse_workspace_attestation(
     }))
 }
 
+fn workspace_attestation_args(start_marker: &str, end_marker: &str) -> serde_json::Value {
+    let command = format!(
+        "printf '%s\\n' '{start_marker}'; pwd; git rev-parse --show-toplevel; git rev-parse HEAD; git rev-parse HEAD^{{tree}}; git rev-parse --show-object-format=storage; (git symbolic-ref --short -q HEAD || printf '%s\\n' '(detached)'); repo_identity=\"$(git config --get remote.origin.url || true)\"; if [ -z \"$repo_identity\" ]; then repo_identity=\"$(pwd -P)/$(git rev-parse --git-common-dir)\"; fi; printf '%s' \"$repo_identity\" | git hash-object --stdin; git status --porcelain=v1 --untracked-files=all; printf '%s\\n' '{end_marker}'"
+    );
+    serde_json::json!({
+        "command": command,
+        "timeout": WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS,
+    })
+}
+
 async fn attest_edge_workspace(
     state: &AppState,
     record: &astra_services::multi_agent::EdgeAgentRecord,
@@ -5246,14 +5162,7 @@ async fn attest_edge_workspace(
     )
     .map_err(|_| "attestation_identity_invalid")?;
     let (start_marker, end_marker) = attestation_markers(attestation_nonce);
-    let command = format!(
-        "printf '%s\\n' '{start_marker}'; pwd; git rev-parse --show-toplevel; git rev-parse HEAD; git rev-parse HEAD^{{tree}}; git rev-parse --show-object-format=storage; (git symbolic-ref --short -q HEAD || printf '%s\\n' '(detached)'); repo_identity=\"$(git config --get remote.origin.url || true)\"; if [ -z \"$repo_identity\" ]; then repo_identity=\"$(pwd -P)/$(git rev-parse --git-common-dir)\"; fi; printf '%s' \"$repo_identity\" | git hash-object --stdin; git status --porcelain=v1 --untracked-files=all; printf '%s\\n' '{end_marker}'"
-    );
-    let mut args = serde_json::json!({
-        "command": command,
-        "mode": "verify",
-        "timeout": WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS,
-    });
+    let mut args = workspace_attestation_args(&start_marker, &end_marker);
     let (output, connection_generation) = if let Some(connection) = connection.as_ref() {
         // A same-pod socket is still checked before dispatch. The local pool
         // is authoritative for its live generation and must agree with the
@@ -5267,6 +5176,7 @@ async fn attest_edge_workspace(
         if connection.materialization_id.as_deref() != record.materialization_id.as_deref() {
             return Err("edge_materialization_identity_mismatch");
         }
+        let carrier = astra_logging::trace_context::current();
         let result = state
             .edge_connection_pool
             .execute_durably_admitted_invocation_on_connection_with_cancel(
@@ -5284,6 +5194,8 @@ async fn attest_edge_workspace(
                     execution_timeout_ms: None,
                     command_timeout_cap_ms: None,
                     cancel_token: None,
+                    traceparent: carrier.traceparent.as_deref(),
+                    tracestate: carrier.tracestate.as_deref(),
                 },
             )
             .await
@@ -5332,13 +5244,15 @@ async fn attest_edge_workspace(
             execution_deadline_unix_ms: None,
             execution_timeout_ms: None,
             command_timeout_cap_ms: None,
+
+            traceparent: None,
+            tracestate: None,
         };
-        let payload_json =
-            serde_json::to_string(&payload).map_err(|_| "attestation_payload_invalid")?;
+        let payload = serde_json::to_value(&payload).map_err(|_| "attestation_payload_invalid")?;
         let dispatch = &state.execution.edge_dispatch_service;
         let admission = tokio::time::timeout(
             std::time::Duration::from_secs(WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS),
-            dispatch.admit_dispatch(&dispatch_identity, &record.edge_agent_id, &payload_json),
+            dispatch.admit_dispatch(&dispatch_identity, &record.edge_agent_id, &payload),
         )
         .await;
         let result_json = match admission {
@@ -8401,875 +8315,6 @@ pub(super) async fn post_work_branch_comparison_handler(
     Ok(Json(report))
 }
 
-/// Export one immutable, exact-base patch from the branch's Server-owned Git
-/// workspace. Caller revisions are only optimistic concurrency facts; provider
-/// identity, workspace authority, payload identity, and invocation identity are
-/// all resolved by the Server.
-pub(super) async fn post_work_branch_patch_artifact_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((work_id, branch_id)): Path<(String, String)>,
-    payload: Result<Json<WorkPatchArtifactExportRequestV1>, JsonRejection>,
-) -> WorkApiResult<astra_services::work::WorkPatchArtifact> {
-    require_work_api_major(&headers)?;
-    let owner_id = authenticated_work_owner(&state, &headers).await?;
-    let work_id = WorkId::parse(work_id).map_err(|_| invalid_work_patch_artifact_request())?;
-    let branch_id =
-        WorkBranchId::parse(branch_id).map_err(|_| invalid_work_patch_artifact_request())?;
-    let payload = payload
-        .map_err(|_| invalid_work_patch_artifact_request())?
-        .0;
-    if !valid_work_request_id(&payload.request_id) {
-        return Err(invalid_work_patch_artifact_request());
-    }
-    let request_id = WorkChangeRef::parse(payload.request_id)
-        .map_err(|_| invalid_work_patch_artifact_request())?;
-    let expected_branch_revision = WorkBranchRevision::new(payload.expected_branch_revision)
-        .map_err(|_| invalid_work_patch_artifact_request())?;
-    let expected_graph_revision = GraphRevision::new(payload.expected_graph_revision)
-        .map_err(|_| invalid_work_patch_artifact_request())?;
-    let pool = state.shared_pool.ok_or_else(|| {
-        work_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "work_write_unavailable",
-            WorkApiErrorCategory::Availability,
-            true,
-            vec![WorkApiActionHint::RetryWrite],
-        )
-    })?;
-    super::work_patch_export_runtime::export_work_patch(
-        pool,
-        state.execution.run_lifecycle_service.as_ref(),
-        super::work_patch_export_runtime::WorkPatchExportCommand {
-            owner_id,
-            work_id,
-            branch_id,
-            request_id,
-            expected_branch_revision,
-            expected_graph_revision,
-        },
-    )
-    .await
-    .map(Json)
-    .map_err(map_work_patch_export_error)
-}
-
-/// Discover immutable review results without loading their potentially large
-/// diff bodies. Content remains an explicit per-artifact request.
-pub(super) async fn get_work_branch_patch_artifacts_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((work_id, branch_id)): Path<(String, String)>,
-    query: Result<Query<WorkPatchArtifactsQueryV1>, QueryRejection>,
-) -> WorkApiResult<astra_services::work::WorkPatchArtifactPage> {
-    require_work_api_major(&headers)?;
-    let Query(query) = query.map_err(|_| invalid_work_patch_artifact_request())?;
-    let owner_id = authenticated_work_owner(&state, &headers).await?;
-    let work_id = WorkId::parse(work_id).map_err(|_| invalid_work_patch_artifact_request())?;
-    let branch_id =
-        WorkBranchId::parse(branch_id).map_err(|_| invalid_work_patch_artifact_request())?;
-    let before = match (query.before_created_at, query.before_patch_artifact_id) {
-        (None, None) => None,
-        (Some(created_at), Some(patch_artifact_id)) => {
-            Some(astra_services::work::WorkPatchArtifactCursor {
-                created_at,
-                patch_artifact_id: WorkPatchArtifactId::parse(patch_artifact_id)
-                    .map_err(|_| invalid_work_patch_artifact_request())?,
-            })
-        }
-        _ => return Err(invalid_work_patch_artifact_request()),
-    };
-    let limit = astra_services::work::WorkPatchArtifactPageLimit::new(
-        query.limit.unwrap_or(WORK_PATCH_ARTIFACT_DEFAULT_LIMIT),
-    )
-    .map_err(|_| invalid_work_patch_artifact_request())?;
-    let pool = state.shared_pool.ok_or_else(|| {
-        work_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "work_read_unavailable",
-            WorkApiErrorCategory::Availability,
-            true,
-            vec![WorkApiActionHint::RetryRead],
-        )
-    })?;
-    DatabaseWorkRepository::new(pool)
-        .list_patch_artifacts(astra_services::work::WorkPatchArtifactQuery {
-            owner_id,
-            work_id,
-            branch_id,
-            before,
-            limit,
-        })
-        .await
-        .map(Json)
-        .map_err(|error| match error {
-            WorkRepositoryError::NotFound => work_error(
-                StatusCode::NOT_FOUND,
-                "work_branch_not_found",
-                WorkApiErrorCategory::NotFound,
-                false,
-                Vec::new(),
-            ),
-            error => {
-                tracing::warn!(error = %error, "Work patch artifact page degraded");
-                work_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "work_patch_artifacts_unavailable",
-                    WorkApiErrorCategory::Degraded,
-                    true,
-                    vec![WorkApiActionHint::RetryRead],
-                )
-            }
-        })
-}
-
-fn map_work_patch_export_error(
-    error: super::work_patch_export_runtime::WorkPatchExportError,
-) -> (StatusCode, Json<WorkApiErrorV1>) {
-    use super::work_patch_export_runtime::WorkPatchExportError;
-    match error {
-        WorkPatchExportError::NotFound => work_error(
-            StatusCode::NOT_FOUND,
-            "work_branch_not_found",
-            WorkApiErrorCategory::NotFound,
-            false,
-            Vec::new(),
-        ),
-        WorkPatchExportError::BasisConflict => work_error(
-            StatusCode::CONFLICT,
-            "work_patch_export_basis_conflict",
-            WorkApiErrorCategory::Conflict,
-            false,
-            vec![WorkApiActionHint::RefreshWork],
-        ),
-        WorkPatchExportError::IdempotencyConflict => work_error(
-            StatusCode::CONFLICT,
-            "work_patch_export_idempotency_conflict",
-            WorkApiErrorCategory::Conflict,
-            false,
-            vec![WorkApiActionHint::RefreshWork],
-        ),
-        WorkPatchExportError::NoChanges => work_error(
-            StatusCode::CONFLICT,
-            "work_patch_export_has_no_changes",
-            WorkApiErrorCategory::Conflict,
-            false,
-            vec![WorkApiActionHint::RefreshWork],
-        ),
-        WorkPatchExportError::TooLarge => work_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "work_patch_export_too_large",
-            WorkApiErrorCategory::InvalidRequest,
-            false,
-            Vec::new(),
-        ),
-        WorkPatchExportError::PayloadUnsupported => work_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "work_patch_export_payload_unsupported",
-            WorkApiErrorCategory::Degraded,
-            false,
-            Vec::new(),
-        ),
-        WorkPatchExportError::Unavailable(reason) => {
-            tracing::warn!(%reason, "Work patch export degraded");
-            work_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "work_patch_export_unavailable",
-                WorkApiErrorCategory::Availability,
-                true,
-                vec![WorkApiActionHint::RetryWrite],
-            )
-        }
-    }
-}
-
-/// Read immutable patch provenance by Work identity. Internal session storage
-/// identity is deliberately omitted from the serialized domain object.
-pub(super) async fn get_work_branch_patch_artifact_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((work_id, branch_id, patch_artifact_id)): Path<(String, String, String)>,
-) -> WorkApiResult<astra_services::work::WorkPatchArtifact> {
-    require_work_api_major(&headers)?;
-    let owner_id = authenticated_work_owner(&state, &headers).await?;
-    let work_id = WorkId::parse(work_id).map_err(|_| invalid_work_patch_artifact_request())?;
-    let branch_id =
-        WorkBranchId::parse(branch_id).map_err(|_| invalid_work_patch_artifact_request())?;
-    let patch_artifact_id = WorkPatchArtifactId::parse(patch_artifact_id)
-        .map_err(|_| invalid_work_patch_artifact_request())?;
-    let pool = state.shared_pool.ok_or_else(|| {
-        work_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "work_read_unavailable",
-            WorkApiErrorCategory::Availability,
-            true,
-            vec![WorkApiActionHint::RetryRead],
-        )
-    })?;
-    let artifact = DatabaseWorkRepository::new(pool)
-        .load_patch_artifact(&owner_id, &work_id, &patch_artifact_id)
-        .await
-        .map_err(|error| match error {
-            WorkRepositoryError::NotFound => work_error(
-                StatusCode::NOT_FOUND,
-                "work_patch_artifact_not_found",
-                WorkApiErrorCategory::NotFound,
-                false,
-                Vec::new(),
-            ),
-            error => {
-                tracing::warn!(error = %error, "Work patch artifact read degraded");
-                work_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "work_patch_artifact_unavailable",
-                    WorkApiErrorCategory::Degraded,
-                    true,
-                    vec![WorkApiActionHint::RetryRead],
-                )
-            }
-        })?
-        .filter(|artifact| artifact.branch_id == branch_id)
-        .ok_or_else(|| {
-            work_error(
-                StatusCode::NOT_FOUND,
-                "work_patch_artifact_not_found",
-                WorkApiErrorCategory::NotFound,
-                false,
-                Vec::new(),
-            )
-        })?;
-    Ok(Json(artifact))
-}
-
-/// Read reviewable patch bytes through the Work aggregate. The repository
-/// revalidates the backing artifact against its immutable provenance before
-/// any bytes are returned.
-pub(super) async fn get_work_branch_patch_artifact_content_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((work_id, branch_id, patch_artifact_id)): Path<(String, String, String)>,
-) -> Result<Response, (StatusCode, Json<WorkApiErrorV1>)> {
-    require_work_api_major(&headers)?;
-    let owner_id = authenticated_work_owner(&state, &headers).await?;
-    let work_id = WorkId::parse(work_id).map_err(|_| invalid_work_patch_artifact_request())?;
-    let branch_id =
-        WorkBranchId::parse(branch_id).map_err(|_| invalid_work_patch_artifact_request())?;
-    let patch_artifact_id = WorkPatchArtifactId::parse(patch_artifact_id)
-        .map_err(|_| invalid_work_patch_artifact_request())?;
-    let pool = state.shared_pool.ok_or_else(|| {
-        work_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "work_read_unavailable",
-            WorkApiErrorCategory::Availability,
-            true,
-            vec![WorkApiActionHint::RetryRead],
-        )
-    })?;
-    let content = DatabaseWorkRepository::new(pool)
-        .load_patch_artifact_content(&owner_id, &work_id, &branch_id, &patch_artifact_id)
-        .await
-        .map_err(|error| {
-            tracing::warn!(error = %error, "Work patch artifact content read degraded");
-            let (category, retryable, hints) = match error {
-                WorkRepositoryError::Persistence { .. } => (
-                    WorkApiErrorCategory::Availability,
-                    true,
-                    vec![WorkApiActionHint::RetryRead],
-                ),
-                _ => (WorkApiErrorCategory::Degraded, false, Vec::new()),
-            };
-            work_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "work_patch_artifact_content_unavailable",
-                category,
-                retryable,
-                hints,
-            )
-        })?
-        .ok_or_else(|| {
-            work_error(
-                StatusCode::NOT_FOUND,
-                "work_patch_artifact_not_found",
-                WorkApiErrorCategory::NotFound,
-                false,
-                Vec::new(),
-            )
-        })?;
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "text/x-diff; charset=utf-8")
-        .header("content-length", content.artifact.payload_bytes)
-        .header(
-            "etag",
-            format!("\"{}\"", content.artifact.payload_hash.as_str()),
-        )
-        .header("cache-control", "private, max-age=31536000, immutable")
-        .body(axum::body::Body::from(content.data))
-        .map_err(|error| {
-            tracing::warn!(error = %error, "Work patch artifact response construction failed");
-            work_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "work_patch_artifact_content_unavailable",
-                WorkApiErrorCategory::Degraded,
-                true,
-                vec![WorkApiActionHint::RetryRead],
-            )
-        })
-}
-
-fn invalid_work_patch_artifact_request() -> (StatusCode, Json<WorkApiErrorV1>) {
-    work_error(
-        StatusCode::BAD_REQUEST,
-        "invalid_work_patch_artifact_request",
-        WorkApiErrorCategory::InvalidRequest,
-        false,
-        Vec::new(),
-    )
-}
-
-pub(super) async fn post_work_patch_materialization_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((work_id, branch_id)): Path<(String, String)>,
-    payload: Result<Json<WorkPatchMaterializationRequestV1>, JsonRejection>,
-) -> Result<
-    (
-        StatusCode,
-        Json<astra_services::work::WorkPatchMaterializationOperation>,
-    ),
-    (StatusCode, Json<WorkApiErrorV1>),
-> {
-    require_work_api_major(&headers)?;
-    let owner_id = authenticated_work_owner(&state, &headers).await?;
-    let work_id =
-        WorkId::parse(work_id).map_err(|_| invalid_work_patch_materialization_request())?;
-    let branch_id =
-        WorkBranchId::parse(branch_id).map_err(|_| invalid_work_patch_materialization_request())?;
-    let payload = payload
-        .map_err(|_| invalid_work_patch_materialization_request())?
-        .0;
-    if !valid_work_request_id(&payload.request_id) {
-        return Err(invalid_work_patch_materialization_request());
-    }
-    let request_id = WorkChangeRef::parse(payload.request_id)
-        .map_err(|_| invalid_work_patch_materialization_request())?;
-    let request = astra_services::work::WorkPatchMaterializationRequest {
-        owner_id,
-        work_id: work_id.clone(),
-        request_id: request_id.clone(),
-        patch_artifact_id: WorkPatchArtifactId::parse(payload.patch_artifact_id)
-            .map_err(|_| invalid_work_patch_materialization_request())?,
-        target_branch_id: branch_id,
-        expected_target_branch_revision: WorkBranchRevision::new(
-            payload.expected_target_branch_revision,
-        )
-        .map_err(|_| invalid_work_patch_materialization_request())?,
-        expected_target_graph_revision: GraphRevision::new(payload.expected_target_graph_revision)
-            .map_err(|_| invalid_work_patch_materialization_request())?,
-        // The authenticated command is the policy decision. Provider routing
-        // is resolved by the Server from the target branch workspace; neither
-        // authority may be asserted by an untrusted caller.
-        provider_ref: WorkMaterializationProviderRef::parse(
-            astra_services::work::SERVER_GIT_WORKTREE_MATERIALIZATION_PROVIDER_REF,
-        )
-        .expect("static provider identity"),
-        policy_decision_ref: request_id.clone(),
-    };
-    let pool = state.shared_pool.ok_or_else(|| {
-        work_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "work_write_unavailable",
-            WorkApiErrorCategory::Availability,
-            true,
-            vec![WorkApiActionHint::RetryWrite],
-        )
-    })?;
-    let operation = DatabaseWorkPatchMaterializationService::new(pool)
-        .admit(&request)
-        .await
-        .map_err(map_work_patch_materialization_error)?;
-    let status = if operation.state == astra_services::work::WorkPatchMaterializationState::Pending
-    {
-        StatusCode::ACCEPTED
-    } else {
-        StatusCode::OK
-    };
-    Ok((status, Json(operation)))
-}
-
-pub(super) async fn get_work_patch_materializations_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((work_id, branch_id)): Path<(String, String)>,
-    query: Result<Query<astra_server_types::WorkPatchMaterializationsQueryV1>, QueryRejection>,
-) -> WorkApiResult<astra_services::work::WorkPatchMaterializationPage> {
-    require_work_api_major(&headers)?;
-    let Query(query) = query.map_err(|_| invalid_work_patch_materialization_request())?;
-    let owner_id = authenticated_work_owner(&state, &headers).await?;
-    let work_id =
-        WorkId::parse(work_id).map_err(|_| invalid_work_patch_materialization_request())?;
-    let target_branch_id =
-        WorkBranchId::parse(branch_id).map_err(|_| invalid_work_patch_materialization_request())?;
-    let source_branch_id = WorkBranchId::parse(query.source_branch_id)
-        .map_err(|_| invalid_work_patch_materialization_request())?;
-    let before = match (query.before_created_at, query.before_operation_id) {
-        (None, None) => None,
-        (Some(created_at), Some(operation_id)) => {
-            Some(astra_services::work::WorkPatchMaterializationCursor {
-                created_at,
-                operation_id: WorkPatchMaterializationId::parse(operation_id)
-                    .map_err(|_| invalid_work_patch_materialization_request())?,
-            })
-        }
-        _ => return Err(invalid_work_patch_materialization_request()),
-    };
-    let limit = astra_services::work::WorkPatchMaterializationPageLimit::new(
-        query
-            .limit
-            .unwrap_or(WORK_PATCH_MATERIALIZATION_DEFAULT_LIMIT),
-    )
-    .map_err(|_| invalid_work_patch_materialization_request())?;
-    let pool = state.shared_pool.ok_or_else(|| {
-        work_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "work_read_unavailable",
-            WorkApiErrorCategory::Availability,
-            true,
-            vec![WorkApiActionHint::RetryRead],
-        )
-    })?;
-    DatabaseWorkPatchMaterializationService::new(pool)
-        .list_for_source(astra_services::work::WorkPatchMaterializationQuery {
-            owner_id,
-            work_id,
-            target_branch_id,
-            source_branch_id,
-            before,
-            limit,
-        })
-        .await
-        .map(Json)
-        .map_err(map_work_patch_materialization_read_error)
-}
-
-pub(super) async fn get_work_patch_materialization_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((work_id, branch_id, operation_id)): Path<(String, String, String)>,
-) -> WorkApiResult<astra_services::work::WorkPatchMaterializationOperation> {
-    require_work_api_major(&headers)?;
-    let owner_id = authenticated_work_owner(&state, &headers).await?;
-    let work_id =
-        WorkId::parse(work_id).map_err(|_| invalid_work_patch_materialization_request())?;
-    let branch_id =
-        WorkBranchId::parse(branch_id).map_err(|_| invalid_work_patch_materialization_request())?;
-    let operation_id = WorkPatchMaterializationId::parse(operation_id)
-        .map_err(|_| invalid_work_patch_materialization_request())?;
-    let pool = state.shared_pool.ok_or_else(|| {
-        work_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "work_read_unavailable",
-            WorkApiErrorCategory::Availability,
-            true,
-            vec![WorkApiActionHint::RetryRead],
-        )
-    })?;
-    let operation = DatabaseWorkPatchMaterializationService::new(pool)
-        .load(&owner_id, &work_id, &branch_id, &operation_id)
-        .await
-        .map_err(map_work_patch_materialization_read_error)?;
-    Ok(Json(operation))
-}
-
-pub(super) async fn delete_work_patch_materialization_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((work_id, branch_id, operation_id)): Path<(String, String, String)>,
-) -> Result<StatusCode, (StatusCode, Json<WorkApiErrorV1>)> {
-    require_work_api_major(&headers)?;
-    let owner_id = authenticated_work_owner(&state, &headers).await?;
-    let work_id =
-        WorkId::parse(work_id).map_err(|_| invalid_work_patch_materialization_request())?;
-    let branch_id =
-        WorkBranchId::parse(branch_id).map_err(|_| invalid_work_patch_materialization_request())?;
-    let operation_id = WorkPatchMaterializationId::parse(operation_id)
-        .map_err(|_| invalid_work_patch_materialization_request())?;
-    let pool = state.shared_pool.ok_or_else(|| {
-        work_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "work_write_unavailable",
-            WorkApiErrorCategory::Availability,
-            true,
-            vec![WorkApiActionHint::RetryWrite],
-        )
-    })?;
-    let operation = DatabaseWorkPatchMaterializationService::new(pool)
-        .abort(&owner_id, &work_id, &branch_id, &operation_id)
-        .await
-        .map_err(map_work_patch_materialization_error)?;
-    debug_assert_eq!(operation.target_branch_id, branch_id);
-    Ok(StatusCode::NO_CONTENT)
-}
-
-pub(super) async fn post_work_patch_commit_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((work_id, branch_id)): Path<(String, String)>,
-    payload: Result<Json<WorkPatchCommitRequestV1>, JsonRejection>,
-) -> Result<
-    (
-        StatusCode,
-        Json<astra_services::work::WorkPatchCommitOperation>,
-    ),
-    (StatusCode, Json<WorkApiErrorV1>),
-> {
-    require_work_api_major(&headers)?;
-    let (owner_id, user) = authenticated_work_user(&state, &headers).await?;
-    let work_id = WorkId::parse(work_id).map_err(|_| invalid_work_patch_commit_request())?;
-    let branch_id =
-        WorkBranchId::parse(branch_id).map_err(|_| invalid_work_patch_commit_request())?;
-    let payload = payload.map_err(|_| invalid_work_patch_commit_request())?.0;
-    if !valid_work_request_id(&payload.request_id) {
-        return Err(invalid_work_patch_commit_request());
-    }
-    let request_id = WorkChangeRef::parse(payload.request_id)
-        .map_err(|_| invalid_work_patch_commit_request())?;
-    let author_name = user
-        .display_name
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or(user.username);
-    let request = astra_services::work::WorkPatchCommitRequest {
-        owner_id,
-        work_id: work_id.clone(),
-        request_id: request_id.clone(),
-        target_branch_id: branch_id,
-        patch_artifact_id: WorkPatchArtifactId::parse(payload.patch_artifact_id)
-            .map_err(|_| invalid_work_patch_commit_request())?,
-        expected_target_branch_revision: WorkBranchRevision::new(
-            payload.expected_target_branch_revision,
-        )
-        .map_err(|_| invalid_work_patch_commit_request())?,
-        expected_target_graph_revision: GraphRevision::new(payload.expected_target_graph_revision)
-            .map_err(|_| invalid_work_patch_commit_request())?,
-        message: payload.message,
-        author_name,
-        author_email: user.email,
-        provider_ref: WorkPatchCommitProviderRef::parse(
-            astra_services::work::SERVER_GIT_WORKTREE_COMMIT_PROVIDER_REF,
-        )
-        .expect("static commit provider identity"),
-        policy_decision_ref: request_id,
-    };
-    let pool = state.shared_pool.ok_or_else(|| {
-        work_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "work_write_unavailable",
-            WorkApiErrorCategory::Availability,
-            true,
-            vec![WorkApiActionHint::RetryWrite],
-        )
-    })?;
-    let operation = DatabaseWorkPatchCommitService::new(pool)
-        .admit(&request)
-        .await
-        .map_err(map_work_patch_commit_error)?;
-    let status = if operation.state == astra_services::work::WorkPatchCommitState::Pending {
-        StatusCode::ACCEPTED
-    } else {
-        StatusCode::OK
-    };
-    Ok((status, Json(operation)))
-}
-
-pub(super) async fn get_work_patch_commits_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((work_id, branch_id)): Path<(String, String)>,
-    query: Result<Query<WorkPatchCommitsQueryV1>, QueryRejection>,
-) -> WorkApiResult<astra_services::work::WorkPatchCommitPage> {
-    require_work_api_major(&headers)?;
-    let Query(query) = query.map_err(|_| invalid_work_patch_commit_request())?;
-    let owner_id = authenticated_work_owner(&state, &headers).await?;
-    let work_id = WorkId::parse(work_id).map_err(|_| invalid_work_patch_commit_request())?;
-    let target_branch_id =
-        WorkBranchId::parse(branch_id).map_err(|_| invalid_work_patch_commit_request())?;
-    let before = match (query.before_created_at, query.before_operation_id) {
-        (None, None) => None,
-        (Some(created_at), Some(operation_id)) => {
-            Some(astra_services::work::WorkPatchCommitCursor {
-                created_at,
-                operation_id: WorkPatchCommitId::parse(operation_id)
-                    .map_err(|_| invalid_work_patch_commit_request())?,
-            })
-        }
-        _ => return Err(invalid_work_patch_commit_request()),
-    };
-    let limit =
-        WorkPatchCommitPageLimit::new(query.limit.unwrap_or(WORK_PATCH_COMMIT_DEFAULT_LIMIT))
-            .map_err(|_| invalid_work_patch_commit_request())?;
-    let pool = state.shared_pool.ok_or_else(|| {
-        work_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "work_read_unavailable",
-            WorkApiErrorCategory::Availability,
-            true,
-            vec![WorkApiActionHint::RetryRead],
-        )
-    })?;
-    DatabaseWorkPatchCommitService::new(pool)
-        .list_for_target(astra_services::work::WorkPatchCommitQuery {
-            owner_id,
-            work_id,
-            target_branch_id,
-            before,
-            limit,
-        })
-        .await
-        .map(Json)
-        .map_err(map_work_patch_commit_read_error)
-}
-
-pub(super) async fn get_work_patch_commit_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((work_id, branch_id, operation_id)): Path<(String, String, String)>,
-) -> WorkApiResult<astra_services::work::WorkPatchCommitOperation> {
-    require_work_api_major(&headers)?;
-    let owner_id = authenticated_work_owner(&state, &headers).await?;
-    let work_id = WorkId::parse(work_id).map_err(|_| invalid_work_patch_commit_request())?;
-    let branch_id =
-        WorkBranchId::parse(branch_id).map_err(|_| invalid_work_patch_commit_request())?;
-    let operation_id =
-        WorkPatchCommitId::parse(operation_id).map_err(|_| invalid_work_patch_commit_request())?;
-    let pool = state.shared_pool.ok_or_else(|| {
-        work_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "work_read_unavailable",
-            WorkApiErrorCategory::Availability,
-            true,
-            vec![WorkApiActionHint::RetryRead],
-        )
-    })?;
-    DatabaseWorkPatchCommitService::new(pool)
-        .load(&owner_id, &work_id, &branch_id, &operation_id)
-        .await
-        .map(Json)
-        .map_err(map_work_patch_commit_read_error)
-}
-
-pub(super) async fn delete_work_patch_commit_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((work_id, branch_id, operation_id)): Path<(String, String, String)>,
-) -> Result<StatusCode, (StatusCode, Json<WorkApiErrorV1>)> {
-    require_work_api_major(&headers)?;
-    let owner_id = authenticated_work_owner(&state, &headers).await?;
-    let work_id = WorkId::parse(work_id).map_err(|_| invalid_work_patch_commit_request())?;
-    let branch_id =
-        WorkBranchId::parse(branch_id).map_err(|_| invalid_work_patch_commit_request())?;
-    let operation_id =
-        WorkPatchCommitId::parse(operation_id).map_err(|_| invalid_work_patch_commit_request())?;
-    let pool = state.shared_pool.ok_or_else(|| {
-        work_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "work_write_unavailable",
-            WorkApiErrorCategory::Availability,
-            true,
-            vec![WorkApiActionHint::RetryWrite],
-        )
-    })?;
-    DatabaseWorkPatchCommitService::new(pool)
-        .abort(&owner_id, &work_id, &branch_id, &operation_id)
-        .await
-        .map_err(map_work_patch_commit_error)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-fn invalid_work_patch_commit_request() -> (StatusCode, Json<WorkApiErrorV1>) {
-    work_error(
-        StatusCode::BAD_REQUEST,
-        "invalid_work_patch_commit_request",
-        WorkApiErrorCategory::InvalidRequest,
-        false,
-        Vec::new(),
-    )
-}
-
-fn map_work_patch_commit_error(
-    error: astra_services::work::WorkPatchCommitError,
-) -> (StatusCode, Json<WorkApiErrorV1>) {
-    use astra_services::work::WorkPatchCommitError;
-    match error {
-        WorkPatchCommitError::InvalidPage | WorkPatchCommitError::InvalidMessage => {
-            invalid_work_patch_commit_request()
-        }
-        WorkPatchCommitError::NotFound => work_error(
-            StatusCode::NOT_FOUND,
-            "work_patch_commit_not_found",
-            WorkApiErrorCategory::NotFound,
-            false,
-            Vec::new(),
-        ),
-        WorkPatchCommitError::Conflict(_) => work_error(
-            StatusCode::CONFLICT,
-            "work_patch_commit_conflict",
-            WorkApiErrorCategory::Conflict,
-            false,
-            vec![WorkApiActionHint::RefreshWork],
-        ),
-        WorkPatchCommitError::ExecutorConflict => work_error(
-            StatusCode::CONFLICT,
-            "work_patch_commit_busy",
-            WorkApiErrorCategory::Conflict,
-            true,
-            vec![WorkApiActionHint::RetryWrite],
-        ),
-        WorkPatchCommitError::InvalidTransition => work_error(
-            StatusCode::CONFLICT,
-            "work_patch_commit_already_dispatched",
-            WorkApiErrorCategory::Conflict,
-            false,
-            vec![WorkApiActionHint::RefreshWork],
-        ),
-        error @ WorkPatchCommitError::Database(_) => {
-            tracing::warn!(error = %error, "Work patch commit persistence failed");
-            work_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "work_write_unavailable",
-                WorkApiErrorCategory::Availability,
-                true,
-                vec![WorkApiActionHint::RetryWrite],
-            )
-        }
-        error => {
-            tracing::error!(error = %error, "Work patch commit degraded");
-            work_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "work_patch_commit_degraded",
-                WorkApiErrorCategory::Degraded,
-                true,
-                vec![WorkApiActionHint::RetryRead],
-            )
-        }
-    }
-}
-
-fn map_work_patch_commit_read_error(
-    error: astra_services::work::WorkPatchCommitError,
-) -> (StatusCode, Json<WorkApiErrorV1>) {
-    if matches!(
-        error,
-        astra_services::work::WorkPatchCommitError::Database(_)
-    ) {
-        tracing::warn!(error = %error, "Work patch commit read failed");
-        return work_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "work_read_unavailable",
-            WorkApiErrorCategory::Availability,
-            true,
-            vec![WorkApiActionHint::RetryRead],
-        );
-    }
-    map_work_patch_commit_error(error)
-}
-
-fn invalid_work_patch_materialization_request() -> (StatusCode, Json<WorkApiErrorV1>) {
-    work_error(
-        StatusCode::BAD_REQUEST,
-        "invalid_work_patch_materialization_request",
-        WorkApiErrorCategory::InvalidRequest,
-        false,
-        Vec::new(),
-    )
-}
-
-fn map_work_patch_materialization_error(
-    error: astra_services::work::WorkPatchMaterializationError,
-) -> (StatusCode, Json<WorkApiErrorV1>) {
-    use astra_services::work::WorkPatchMaterializationError;
-    match error {
-        WorkPatchMaterializationError::InvalidPage => invalid_work_patch_materialization_request(),
-        WorkPatchMaterializationError::NotFound => work_error(
-            StatusCode::NOT_FOUND,
-            "work_patch_materialization_not_found",
-            WorkApiErrorCategory::NotFound,
-            false,
-            Vec::new(),
-        ),
-        WorkPatchMaterializationError::Conflict(_)
-        | WorkPatchMaterializationError::UnavailableTarget => work_error(
-            StatusCode::CONFLICT,
-            "work_patch_materialization_conflict",
-            WorkApiErrorCategory::Conflict,
-            false,
-            vec![WorkApiActionHint::RefreshWork],
-        ),
-        WorkPatchMaterializationError::VerificationRequired => work_error(
-            StatusCode::CONFLICT,
-            "work_patch_materialization_verification_required",
-            WorkApiErrorCategory::Conflict,
-            false,
-            vec![WorkApiActionHint::RefreshWork],
-        ),
-        WorkPatchMaterializationError::ExecutorConflict => work_error(
-            StatusCode::CONFLICT,
-            "work_patch_materialization_busy",
-            WorkApiErrorCategory::Conflict,
-            true,
-            vec![WorkApiActionHint::RetryWrite],
-        ),
-        WorkPatchMaterializationError::InvalidTransition => work_error(
-            StatusCode::CONFLICT,
-            "work_patch_materialization_already_dispatched",
-            WorkApiErrorCategory::Conflict,
-            false,
-            vec![WorkApiActionHint::RefreshWork],
-        ),
-        error @ WorkPatchMaterializationError::Database(_) => {
-            tracing::warn!(error = %error, "Work patch materialization persistence failed");
-            work_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "work_write_unavailable",
-                WorkApiErrorCategory::Availability,
-                true,
-                vec![WorkApiActionHint::RetryWrite],
-            )
-        }
-        error => {
-            tracing::error!(error = %error, "Work patch materialization degraded");
-            work_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "work_patch_materialization_degraded",
-                WorkApiErrorCategory::Degraded,
-                true,
-                vec![WorkApiActionHint::RetryRead],
-            )
-        }
-    }
-}
-
-fn map_work_patch_materialization_read_error(
-    error: astra_services::work::WorkPatchMaterializationError,
-) -> (StatusCode, Json<WorkApiErrorV1>) {
-    if matches!(
-        error,
-        astra_services::work::WorkPatchMaterializationError::Database(_)
-    ) {
-        tracing::warn!(error = %error, "Work patch materialization read failed");
-        return work_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "work_read_unavailable",
-            WorkApiErrorCategory::Availability,
-            true,
-            vec![WorkApiActionHint::RetryRead],
-        );
-    }
-    map_work_patch_materialization_error(error)
-}
-
-/// Atomically select one exact, already-compared branch as the Work result.
-/// Every mutable input is revision-pinned and evidence is re-derived inside
-/// the same transaction as the delivery pointer CAS.
 pub(super) async fn post_work_action_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -10281,60 +9326,6 @@ pub(super) async fn get_work_events_handler(
 mod tests {
     use super::*;
 
-    fn transcript_head(
-        completed_turn: u32,
-        journal_event_seq: u64,
-        conversation_seq: u64,
-        root: char,
-    ) -> WorkConversationHeadV1 {
-        WorkConversationHeadV1 {
-            completed_turn,
-            journal_event_seq,
-            conversation_seq,
-            canonical_root_hash: root.to_string().repeat(64),
-            projection_schema: 2,
-            compaction_generation: 0,
-            config_version_id: None,
-        }
-    }
-
-    #[test]
-    fn transcript_sync_requires_an_exact_or_monotonic_causal_prefix() {
-        let first = transcript_head(1, 1, 1, 'a');
-        let second = transcript_head(2, 2, 2, 'b');
-        assert_eq!(
-            classify_work_transcript_sync(None, None),
-            WorkBranchSyncStateV1::Current
-        );
-        assert_eq!(
-            classify_work_transcript_sync(Some(&first), None),
-            WorkBranchSyncStateV1::ProjectionStale
-        );
-        assert_eq!(
-            classify_work_transcript_sync(Some(&first), Some(&first)),
-            WorkBranchSyncStateV1::Current
-        );
-        assert_eq!(
-            classify_work_transcript_sync(Some(&second), Some(&first)),
-            WorkBranchSyncStateV1::ProjectionStale
-        );
-
-        let same_turn_different_root = transcript_head(2, 2, 2, 'c');
-        assert_eq!(
-            classify_work_transcript_sync(Some(&second), Some(&same_turn_different_root)),
-            WorkBranchSyncStateV1::Corrupt
-        );
-        assert_eq!(
-            classify_work_transcript_sync(Some(&first), Some(&second)),
-            WorkBranchSyncStateV1::Corrupt
-        );
-        let impossible_prefix = transcript_head(1, 3, 1, 'd');
-        assert_eq!(
-            classify_work_transcript_sync(Some(&second), Some(&impossible_prefix)),
-            WorkBranchSyncStateV1::Corrupt
-        );
-    }
-
     #[test]
     fn execution_identity_is_session_stable_and_directory_scoped() {
         let branch = WorkBranchId::parse("feature-work-branch").expect("branch");
@@ -10377,15 +9368,11 @@ mod tests {
             executor: None,
             transport: None,
             run_event_high_watermark: 4,
-            projection_event_idx: 4,
-            projection_updated_at: "2026-09-17T00:00:00Z".to_string(),
-            projection_hash: "hash".to_string(),
             latest_event_type: Some("ask_user_prompted".to_string()),
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
             total_tool_calls: 0,
             latest_checkpoint: None,
-            has_durable_projection: true,
             recent_events: vec![serde_json::json!({
                 "event_type": "ask_user_prompted",
                 "data": {
@@ -10562,15 +9549,6 @@ mod tests {
                 WorkApiActionHint::ReviewEffects,
                 WorkApiActionHint::RefreshWork
             ]
-        ));
-
-        let (status, Json(error)) = map_recovery_point_blocker("work-1", Blocker::RunStatusMissing);
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(error.code, "recovery_point_repair_required");
-        assert!(!error.retryable);
-        assert!(matches!(
-            error.action_hints.as_slice(),
-            [WorkApiActionHint::RetryRead]
         ));
 
         let (status, Json(error)) = map_recovery_point_blocker("work-1", Blocker::BasisChanged);
@@ -11161,6 +10139,15 @@ mod tests {
         ] {
             assert!(!valid_committed_work_cursor(&invalid));
         }
+    }
+
+    #[test]
+    fn execution_attestation_uses_supported_bash_arguments() {
+        let (start, end) = attestation_markers("test-nonce");
+        let args = workspace_attestation_args(&start, &end);
+        astra_tools::schemas::validate_tool_arguments("bash", &args)
+            .expect("Work switch attestation must pass the Runner's canonical argument validation");
+        assert_eq!(args["timeout"], WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS);
     }
 
     #[test]

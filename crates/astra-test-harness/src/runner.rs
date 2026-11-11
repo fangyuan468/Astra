@@ -118,6 +118,12 @@ pub struct RunOutcome {
     /// can cause an interrupted outcome without being a user cancellation.
     #[serde(default)]
     pub error_kind: Option<String>,
+    /// Stable source code retained independently of the failure category.
+    #[serde(default)]
+    pub error_code: Option<String>,
+    /// True only when the CLI did not dispatch Server admission.
+    #[serde(default)]
+    pub server_admission_not_dispatched: bool,
     /// Counts of tool result classes observed during the run.
     #[serde(default)]
     pub tool_result_class_counts: std::collections::BTreeMap<String, u32>,
@@ -128,6 +134,46 @@ pub struct RunOutcome {
     /// Ordinary reports and dashboard serialization must not expose child text.
     #[serde(skip)]
     pub stream_capture: Option<StreamCapture>,
+}
+
+impl RunOutcome {
+    /// The terminal summary and step-event archive overlap. A partial source
+    /// must not lower the observed total used by budgets and their diagnostics.
+    pub(crate) fn observed_tool_calls(&self) -> u32 {
+        self.total_tool_calls.max(self.tool_calls_count)
+    }
+
+    /// A local failure has no physical execution to bind, inspect, or cancel.
+    pub(crate) fn is_pre_execution_failure(&self) -> bool {
+        self.server_admission_not_dispatched
+            && self.exit_code > 0
+            && self.final_state.as_deref() == Some("failed")
+            && self
+                .error_kind
+                .as_deref()
+                .is_some_and(|kind| !kind.trim().is_empty())
+            && self.run_id.is_none()
+            && self.text.is_empty()
+            && self.total_tool_calls == 0
+            && self.cache_hits == 0
+            && self.interruption_kind.is_none()
+            && self.prompt_tokens == 0
+            && self.completion_tokens == 0
+            && self.cached_input_tokens == 0
+            && self.cache_creation_tokens == 0
+            && self.turn_rounds == 0
+            && self.tool_calls_count == 0
+            && self.tools_used.is_empty()
+            && self
+                .tool_result_class_counts
+                .values()
+                .all(|count| *count == 0)
+            && self.token_usage_coverage.as_ref().is_none_or(|coverage| {
+                coverage.attempts == 0
+                    && coverage.provider_reported == 0
+                    && coverage.unavailable == 0
+            })
+    }
 }
 
 pub(crate) const MAX_STREAM_CAPTURE_BYTES: usize = 1024 * 1024;
@@ -503,6 +549,8 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
                 final_state: None,
                 interruption_kind: None,
                 error_kind: None,
+                error_code: None,
+                server_admission_not_dispatched: false,
                 explain_capture: None,
                 stream_capture: None,
                 tool_result_class_counts: Default::default(),
@@ -560,7 +608,11 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
         model: model.into(),
         exit_code: v.get("exit_code").and_then(|x| x.as_i64()).unwrap_or(0) as i32,
         text,
-        stderr: String::new(),
+        stderr: v
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_owned(),
         session_id: v
             .get("session_id")
             .and_then(|x| x.as_str())
@@ -645,6 +697,14 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
             .get("error_kind")
             .and_then(|x| x.as_str())
             .map(str::to_string),
+        error_code: v
+            .get("error_code")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned),
+        server_admission_not_dispatched: v
+            .get("server_admission_not_dispatched")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
         tool_result_class_counts: v
             .get("tool_result_class_counts")
             .and_then(|x| x.as_object())
@@ -686,6 +746,21 @@ pub(crate) fn parse_strict_cli_outcome(stdout: &str, model: &str) -> Result<RunO
     ]
     .into_iter()
     .all(is_string_or_null);
+    if object
+        .get("error")
+        .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        return Err("terminal outcome has invalid error diagnostic".into());
+    }
+    if object
+        .get("server_admission_not_dispatched")
+        .is_some_and(|value| !value.is_boolean())
+        || object
+            .get("error_code")
+            .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        return Err("terminal outcome has invalid local rejection fields".into());
+    }
     let cache = object
         .get("cache")
         .and_then(serde_json::Value::as_object)
@@ -820,6 +895,22 @@ pub(crate) fn parse_strict_cli_outcome(stdout: &str, model: &str) -> Result<RunO
     if outcome.stderr.starts_with(PROTOCOL_ERROR_MARKER) {
         return Err(outcome.text);
     }
+    if outcome.server_admission_not_dispatched
+        && (!outcome.is_pre_execution_failure()
+            || object["prompt_tokens"].as_u64() != Some(0)
+            || object["cache"]["hit"].as_bool() != Some(false)
+            || object["cache"]["read_tokens"].as_u64() != Some(0)
+            || object["cache"]["creation_tokens"].as_u64() != Some(0)
+            || object
+                .get("token_usage_coverage")
+                .is_some_and(|value| !value.is_null())
+                && outcome.token_usage_coverage.is_none()
+            || object
+                .get("server_terminal_authoritative")
+                .is_some_and(|value| value.as_bool() != Some(false)))
+    {
+        return Err("non-dispatch fact contradicts terminal execution evidence".into());
+    }
     Ok(outcome)
 }
 
@@ -854,6 +945,8 @@ fn invalid_json_envelope(model: &str, payload: &str, reason: &str) -> RunOutcome
         "[astra-test] WARNING: stdout from astra chat --json violated the outcome envelope: {reason}"
     );
     RunOutcome {
+        error_code: None,
+        server_admission_not_dispatched: false,
         model: model.into(),
         exit_code: -1,
         text: format!("invalid JSON outcome envelope: {reason}; payload={preview}"),

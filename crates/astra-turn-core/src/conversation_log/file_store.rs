@@ -179,12 +179,7 @@ fn validate_append_sequence(entries: &[CslEntry], entry: &CslEntry) -> Result<()
 
 #[async_trait]
 impl CslStore for FileCslStore {
-    async fn append(
-        &self,
-        session_id: &str,
-        entry: &CslEntry,
-        _meta: &super::AppendMeta,
-    ) -> Result<(), CslStoreError> {
+    async fn append(&self, session_id: &str, entry: &CslEntry) -> Result<(), CslStoreError> {
         validate_session_id(session_id)?;
         let path = self.log_path(session_id);
         let entry = entry.clone();
@@ -316,13 +311,9 @@ impl CslStore for FileCslStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation_log::{AppendMeta, SessionStateCompact, materialize};
+    use crate::conversation_log::{SessionStateCompact, materialize};
     use serde_json::json;
     use tempfile::TempDir;
-
-    fn meta() -> AppendMeta {
-        AppendMeta::default()
-    }
 
     fn user_msg(content: &str) -> serde_json::Value {
         json!({"role": "user", "content": content})
@@ -361,10 +352,10 @@ mod tests {
         let sid = "sess-1";
 
         let snap = make_snapshot(0, 1, vec![user_msg("hello")]);
-        store.append(sid, &snap, &meta()).await.unwrap();
+        store.append(sid, &snap).await.unwrap();
 
         let delta = make_delta(1, 2, vec![user_msg("turn2"), assistant_msg("resp2")]);
-        store.append(sid, &delta, &meta()).await.unwrap();
+        store.append(sid, &delta).await.unwrap();
 
         let entries = store.load_from_latest_snapshot(sid).await.unwrap();
         assert_eq!(entries.len(), 2);
@@ -425,23 +416,19 @@ mod tests {
 
         // Two snapshots with deltas between.
         store
-            .append(sid, &make_snapshot(0, 1, vec![user_msg("old")]), &meta())
+            .append(sid, &make_snapshot(0, 1, vec![user_msg("old")]))
             .await
             .unwrap();
         store
-            .append(sid, &make_delta(1, 2, vec![user_msg("delta_old")]), &meta())
+            .append(sid, &make_delta(1, 2, vec![user_msg("delta_old")]))
             .await
             .unwrap();
         store
-            .append(
-                sid,
-                &make_snapshot(2, 3, vec![user_msg("compacted")]),
-                &meta(),
-            )
+            .append(sid, &make_snapshot(2, 3, vec![user_msg("compacted")]))
             .await
             .unwrap();
         store
-            .append(sid, &make_delta(3, 4, vec![user_msg("new")]), &meta())
+            .append(sid, &make_delta(3, 4, vec![user_msg("new")]))
             .await
             .unwrap();
 
@@ -471,15 +458,15 @@ mod tests {
         let sid = "sess-3";
 
         store
-            .append(sid, &make_snapshot(0, 1, vec![]), &meta())
+            .append(sid, &make_snapshot(0, 1, vec![]))
             .await
             .unwrap();
         store
-            .append(sid, &make_delta(1, 2, vec![user_msg("a")]), &meta())
+            .append(sid, &make_delta(1, 2, vec![user_msg("a")]))
             .await
             .unwrap();
         store
-            .append(sid, &make_delta(2, 3, vec![user_msg("b")]), &meta())
+            .append(sid, &make_delta(2, 3, vec![user_msg("b")]))
             .await
             .unwrap();
 
@@ -495,23 +482,19 @@ mod tests {
         let sid = "sess-4";
 
         store
-            .append(sid, &make_snapshot(0, 1, vec![user_msg("old")]), &meta())
+            .append(sid, &make_snapshot(0, 1, vec![user_msg("old")]))
             .await
             .unwrap();
         store
-            .append(sid, &make_delta(1, 2, vec![user_msg("mid")]), &meta())
+            .append(sid, &make_delta(1, 2, vec![user_msg("mid")]))
             .await
             .unwrap();
         store
-            .append(
-                sid,
-                &make_snapshot(2, 3, vec![user_msg("new_snap")]),
-                &meta(),
-            )
+            .append(sid, &make_snapshot(2, 3, vec![user_msg("new_snap")]))
             .await
             .unwrap();
         store
-            .append(sid, &make_delta(3, 4, vec![user_msg("latest")]), &meta())
+            .append(sid, &make_delta(3, 4, vec![user_msg("latest")]))
             .await
             .unwrap();
 
@@ -534,7 +517,6 @@ mod tests {
             .append(
                 parent,
                 &make_snapshot(0, 1, vec![user_msg("t1"), assistant_msg("r1")]),
-                &meta(),
             )
             .await
             .unwrap();
@@ -542,7 +524,6 @@ mod tests {
             .append(
                 parent,
                 &make_delta(1, 2, vec![user_msg("t2"), assistant_msg("r2")]),
-                &meta(),
             )
             .await
             .unwrap();
@@ -550,7 +531,6 @@ mod tests {
             .append(
                 parent,
                 &make_delta(2, 3, vec![user_msg("t3"), assistant_msg("r3")]),
-                &meta(),
             )
             .await
             .unwrap();
@@ -584,11 +564,7 @@ mod tests {
         let parent = "tool-parent";
 
         store
-            .append(
-                parent,
-                &make_snapshot(0, 1, vec![user_msg("read file")]),
-                &meta(),
-            )
+            .append(parent, &make_snapshot(0, 1, vec![user_msg("read file")]))
             .await
             .unwrap();
         store
@@ -599,7 +575,6 @@ mod tests {
                     1,
                     vec![tool_result_msg("c1", "fn main() {}"), assistant_msg("done")],
                 ),
-                &meta(),
             )
             .await
             .unwrap();
@@ -620,7 +595,7 @@ mod tests {
         let sid = "accum";
 
         store
-            .append(sid, &make_snapshot(0, 0, vec![]), &meta())
+            .append(sid, &make_snapshot(0, 0, vec![]))
             .await
             .unwrap();
         for i in 1..=10u64 {
@@ -628,7 +603,6 @@ mod tests {
                 .append(
                     sid,
                     &make_delta(i, i as u32, vec![user_msg(&format!("t{i}"))]),
-                    &meta(),
                 )
                 .await
                 .unwrap();
@@ -647,7 +621,7 @@ mod tests {
         let sid = "deltas-only";
 
         let err = store
-            .append(sid, &make_delta(0, 1, vec![user_msg("orphan1")]), &meta())
+            .append(sid, &make_delta(0, 1, vec![user_msg("orphan1")]))
             .await
             .expect_err("orphan deltas must be rejected at append time");
 
@@ -666,7 +640,7 @@ mod tests {
         let parent = "patch-parent";
 
         store
-            .append(parent, &make_snapshot(0, 1, vec![user_msg("hi")]), &meta())
+            .append(parent, &make_snapshot(0, 1, vec![user_msg("hi")]))
             .await
             .unwrap();
         store
@@ -683,7 +657,6 @@ mod tests {
                         ..Default::default()
                     }),
                 },
-                &meta(),
             )
             .await
             .unwrap();
@@ -727,7 +700,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        store.append(sid, &snap, &meta()).await.unwrap();
+        store.append(sid, &snap).await.unwrap();
 
         // ── Turn 2: load CSL → materialize → simulate loop → persist delta ──
         let entries = store.load_from_latest_snapshot(sid).await.unwrap();
@@ -748,7 +721,7 @@ mod tests {
                 ..Default::default()
             }),
         };
-        store.append(sid, &delta, &meta()).await.unwrap();
+        store.append(sid, &delta).await.unwrap();
 
         // ── Turn 3: load → verify turn 2 is visible ──
         let entries = store.load_from_latest_snapshot(sid).await.unwrap();
@@ -776,7 +749,7 @@ mod tests {
                 ..Default::default()
             }),
         };
-        store.append(sid, &delta2, &meta()).await.unwrap();
+        store.append(sid, &delta2).await.unwrap();
 
         // ── Final verify ──
         let entries = store.load_from_latest_snapshot(sid).await.unwrap();
@@ -815,7 +788,6 @@ mod tests {
                     messages: vec![user_msg("t1")],
                     session_state: SessionStateCompact::default(),
                 },
-                &meta(),
             )
             .await
             .unwrap();
@@ -824,7 +796,6 @@ mod tests {
                 .append(
                     sid,
                     &make_delta(i, (i + 1) as u32, vec![user_msg(&format!("t{}", i + 1))]),
-                    &meta(),
                 )
                 .await
                 .unwrap();
@@ -844,13 +815,12 @@ mod tests {
                         ..Default::default()
                     },
                 },
-                &meta(),
             )
             .await
             .unwrap();
         // One more delta after compaction
         store
-            .append(sid, &make_delta(6, 6, vec![user_msg("t6")]), &meta())
+            .append(sid, &make_delta(6, 6, vec![user_msg("t6")]))
             .await
             .unwrap();
 
@@ -892,7 +862,7 @@ mod tests {
             &long_id,
         ];
         for bad_id in cases {
-            let result = store.append(bad_id, &snap, &meta()).await;
+            let result = store.append(bad_id, &snap).await;
             match result {
                 Err(CslStoreError::InvalidSessionId(_)) => {}
                 Err(other) => panic!("'{bad_id}': expected InvalidSessionId, got {other}"),
@@ -912,7 +882,7 @@ mod tests {
             "550e8400-e29b-41d4-a716-446655440000",
             "session_with-dashes.and.dots",
         ] {
-            let result = store.append(good_id, &snap, &meta()).await;
+            let result = store.append(good_id, &snap).await;
             assert!(
                 result.is_ok(),
                 "session_id '{good_id}' should be accepted: {:?}",
@@ -930,7 +900,7 @@ mod tests {
         let sid = "corrupt-trailing";
 
         store
-            .append(sid, &make_snapshot(0, 1, vec![user_msg("good")]), &meta())
+            .append(sid, &make_snapshot(0, 1, vec![user_msg("good")]))
             .await
             .unwrap();
 
@@ -955,7 +925,7 @@ mod tests {
         let sid = "corrupt-middle";
 
         store
-            .append(sid, &make_snapshot(0, 1, vec![user_msg("good")]), &meta())
+            .append(sid, &make_snapshot(0, 1, vec![user_msg("good")]))
             .await
             .unwrap();
 

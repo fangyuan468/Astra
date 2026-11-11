@@ -208,8 +208,8 @@ mod tests {
     fn sync_context_trace_copies_latest_trace_into_workspace() {
         let mut state = SessionState::default();
         let mut obs = astra_runtime::observability::ObservabilitySession::new_simple("sid-trace");
-        obs.context_traces
-            .push(astra_turn_core::context_assembly_trace::ContextAssemblyTrace {
+        obs.context_traces.push(
+            astra_turn_core::context_assembly_trace::ContextAssemblyTrace {
                 turn_id: "turn-3".into(),
                 tools: astra_turn_core::context_assembly_trace::ToolSurfaceTrace {
                     visible_tools: vec![astra_turn_core::context_assembly_trace::VisibleTool {
@@ -221,48 +221,42 @@ mod tests {
                 memory: astra_turn_core::context_assembly_trace::MemoryRetrievalTrace {
                     outcome: astra_turn_types::MemoryRetrievalOutcome::Complete,
                     query: "resume trace persistence".into(),
-                    memories_selected: vec![astra_turn_core::context_assembly_trace::MemorySelection {
-                        memory_id: "m1".into(),
-                        memory_type: "semantic".into(),
-                        content_preview: "trace".into(),
-                        relevance_score: 0.8,
-                        tokens: 10,
-                        source: astra_turn_core::context_assembly_trace::MemorySource::Memoria,
-                    }],
+                    memories_selected: vec![
+                        astra_turn_core::context_assembly_trace::MemorySelection {
+                            memory_id: "m1".into(),
+                            memory_type: "semantic".into(),
+                            content_preview: "trace".into(),
+                            relevance_score: 0.8,
+                            tokens: 10,
+                            source: astra_turn_core::context_assembly_trace::MemorySource::Memoria,
+                        },
+                    ],
                     ..Default::default()
                 },
-                history: astra_turn_core::context_assembly_trace::HistorySelectionTrace {
-                    turns_compressed: vec![astra_turn_core::context_assembly_trace::TurnCompression {
-                        turn_index: 1,
-                        role: "assistant".into(),
-                        original_tokens: 100,
-                        compressed_tokens: 50,
-                        compression_method:
-                            astra_turn_core::context_assembly_trace::CompressionMethod::ReactiveCompact,
-                        information_lost: Vec::new(),
-                    }],
-                    compression_ratio: 0.5,
-                    tokens_before: 100,
-                    tokens_after: 50,
-                    ..Default::default()
-                },
+                history: Some(
+                    astra_turn_core::context_assembly_trace::HistorySelectionTrace {
+                        turns_retained: vec![
+                            astra_turn_core::context_assembly_trace::TurnRetention {
+                                turn_index: 0,
+                                role: "assistant".into(),
+                                tokens: 50,
+                                has_tool_calls: false,
+                                content_preview: "retained input".into(),
+                            },
+                        ],
+                        total_tokens: 50,
+                    },
+                ),
                 token_budget: astra_turn_core::context_assembly_trace::TokenBudgetTrace {
                     max_tokens: 16_000,
                     total_used: 8_200,
                     budget_pressure: 0.76,
                     ..Default::default()
                 },
-                explanations: vec![astra_turn_core::context_assembly_trace::DecisionExplanation {
-                    decision_type:
-                        astra_turn_core::context_assembly_trace::DecisionType::StrategyChoice {
-                            strategy: "symbol_context".into(),
-                        },
-                    reasoning: "Need symbol-aware context.".into(),
-                    alternatives_considered: Vec::new(),
-                    confidence: 0.8,
-                }],
+
                 ..Default::default()
-            });
+            },
+        );
         state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(obs)));
 
         let mut ws = astra_services::session_workspace::WorkspaceMetadata::new("sid-trace", "m");

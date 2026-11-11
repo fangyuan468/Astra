@@ -12,9 +12,9 @@ use tower::util::ServiceExt;
 use uuid::Uuid;
 
 use super::harness::{
-    E2E_PASSWORD, bootstrap, delete_json, get_json, grant_astra_admin_role,
-    load_durable_interaction_event, model_selection, post_empty, post_json, put_json,
-    revoke_astra_admin_role, seed_pending_approval, wait_for_agent_event_types,
+    E2E_PASSWORD, ProviderResponse, ProviderScript, bootstrap, delete_json, get_json,
+    grant_astra_admin_role, load_durable_interaction_event, model_selection, post_empty, post_json,
+    put_json, revoke_astra_admin_role, seed_pending_approval, wait_for_agent_event_types,
 };
 use super::journey_tasks_runs;
 use astra_services::{ADMIN_CONFIG_KEY_REASONING_OFFERING, RunStateStore};
@@ -1300,57 +1300,51 @@ pub async fn run_saas_admin_audit_rbac_smoke() {
     ctx.close().await;
 }
 
-/// User-scoped skills are invisible to other users (§5.4).
-pub async fn run_saas_skills_cross_user_isolation() {
+/// Registry publication remains public; only its publisher can unpublish it.
+pub async fn run_saas_skills_publisher_ownership() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
     let app = &ctx.app;
-    let auth_a = &b.auth_header;
-    let skill_name = format!("saas_skill_iso_{}", ctx.suffix);
-
-    let (st_create, create_j) = post_json(
+    let skill_name = format!("saas_skill_owner_{}", ctx.suffix);
+    let (status, published) = post_json(
         app,
-        "/skills/user",
-        Some(auth_a),
+        "/skills/publish",
+        Some(&b.auth_header),
         json!({
-            "skill_name": skill_name,
-            "visibility": "private"
+            "name": skill_name, "version": "1.0.0", "description": "Review changes",
+            "manifest": {"name": skill_name, "instructions": "Review changes"}
         }),
     )
     .await;
-    assert_eq!(st_create, StatusCode::CREATED, "create skill: {create_j}");
-
-    let (st_list_a, list_a) = get_json(app, "/skills/user", Some(auth_a), &[]).await;
-    assert_eq!(
-        st_list_a,
-        StatusCode::OK,
-        "A list personal skills: {list_a}"
-    );
-    let empty: Vec<Value> = vec![];
-    let skills_a = list_a.as_array().unwrap_or(&empty);
-    assert!(
-        skills_a
-            .iter()
-            .any(|s| s["skill_name"].as_str() == Some(skill_name.as_str())),
-        "A list must include A skill: {list_a}"
-    );
-
-    let (auth_b, _, _, _) = register_fresh_user(app, "skill_iso_b").await;
-
-    let (st_list_b, list_b) = get_json(app, "/skills/user", Some(&auth_b), &[]).await;
-    assert_eq!(
-        st_list_b,
-        StatusCode::OK,
-        "B list personal skills: {list_b}"
-    );
-    let skills_b = list_b.as_array().unwrap_or(&empty);
-    assert!(
-        !skills_b
-            .iter()
-            .any(|s| s["skill_name"].as_str() == Some(skill_name.as_str())),
-        "B list must not include A skill: {list_b}"
-    );
-
+    assert_eq!(status, StatusCode::CREATED, "{published}");
+    let skill_id = published["skill_id"].as_str().unwrap();
+    let (auth_b, _, _, _) = register_fresh_user(app, "skill_owner_b").await;
+    let (status, visible) = get_json(app, &format!("/skills/{skill_id}"), Some(&auth_b), &[]).await;
+    assert_eq!(status, StatusCode::OK, "public registry: {visible}");
+    let (status, denied) = post_json(
+        app,
+        &format!("/skills/{skill_name}/unpublish"),
+        Some(&auth_b),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "foreign publisher: {denied}");
+    let (status, _) = get_json(
+        app,
+        &format!("/skills/{skill_id}"),
+        Some(&b.auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "foreign request must not unpublish");
+    let (status, unpublished) = post_json(
+        app,
+        &format!("/skills/{skill_name}/unpublish"),
+        Some(&b.auth_header),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "owner unpublish: {unpublished}");
     ctx.close().await;
 }
 
@@ -1398,6 +1392,15 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
     let auth = &b.auth_header;
     let session_id = ctx.session_id.as_str();
     let model_offering_id = ctx.model_offering_id.clone();
+    let model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth, vec![ProviderScript::new(
+        "explicit diagnostic API observation",
+        move |request| request.body["model"] == model && request.body["stream"] == true,
+        vec![ProviderResponse::OpenAi(json!({
+            "choices":[{"index":0,"message":{"role":"assistant","content":"Observed diagnostic fixture."},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":5,"completion_tokens":4,"total_tokens":9}
+        }))],
+    )]).await;
 
     let (st_chat, chat_j) = post_json(
         app,
@@ -1405,6 +1408,7 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
         Some(auth),
         json!({
             "message": "session audit probe",
+            "explain": true,
             "session_id": session_id,
             "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
@@ -1417,7 +1421,7 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
         &ctx.pool,
         &ctx.user_id,
         session_id,
-        &["user_query"],
+        &["trace_span"],
         std::time::Duration::from_secs(10),
     )
     .await;
@@ -1427,15 +1431,48 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
     let run_id = chat_j["run_id"].as_str().expect("run_id");
     let large_output = "审计 boundary output ".repeat(8_000);
     assert!(large_output.len() > 65_535);
-    astra_services::DatabaseRunStateStore::new(ctx.shared_pool.clone())
+    let run_store = astra_services::DatabaseRunStateStore::new(ctx.shared_pool.clone());
+    run_store
         .append_events_batch(
             &ctx.user_id,
             session_id,
             run_id,
-            &[
-                json!({"event_type": "tool_call", "data": {
-                    "id": "large-audit-call", "name": "read_file", "arguments": {"path": "fixture.txt"}
-                }}),
+            &[json!({"event_type": "tool_call", "data": {
+                "id": "large-audit-call", "name": "read_file", "arguments": {"path": "fixture.txt"}
+            }})],
+        )
+        .await
+        .expect("persist unfinished audit call");
+    let call_started_at: String = sqlx::query_scalar(
+        "SELECT CAST(created_at AS CHAR) FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_type = 'tool_call' ORDER BY event_idx DESC LIMIT 1"
+    ).bind(&ctx.user_id).bind(run_id).fetch_one(&ctx.pool).await.unwrap();
+    for path in [
+        format!("/sessions/{session_id}/audit/tools"),
+        "/audit/tools".into(),
+    ] {
+        let (status, body) = get_json(app, &path, Some(auth), &[]).await;
+        assert_eq!(status, StatusCode::OK, "GET {path}: {body}");
+        let tool = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "read_file")
+            .unwrap();
+        if path == "/audit/tools" {
+            assert_eq!(tool["total_calls"], 1);
+            assert_eq!(tool["total_failures"], 0);
+            assert_eq!(tool["total_success"], 0);
+        } else {
+            assert_eq!(tool["call_count"], 1);
+            assert_eq!(tool["fail_count"], 0);
+            assert_eq!(tool["success_count"], 0);
+        }
+        assert!(
+            tool["last_error"].is_null(),
+            "unfinished call has no error: {tool}"
+        );
+    }
+    run_store.append_events_batch(&ctx.user_id, session_id, run_id, &[
                 json!({"event_type": "tool_call_end", "data": {
                     "id": "large-audit-call", "name": "read_file", "success": true,
                     "result": large_output
@@ -1447,18 +1484,65 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
         )
         .await
         .expect("persist large canonical audit events");
+    let window_path = format!("/audit/tools?until={}Z", call_started_at.replace(' ', "T"));
+    let (status, window) = get_json(app, &window_path, Some(auth), &[]).await;
+    assert_eq!(status, StatusCode::OK, "GET {window_path}: {window}");
+    let tool = window
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "read_file")
+        .unwrap();
+    assert_eq!(tool["total_calls"], 1);
+    assert_eq!(
+        tool["total_success"], 0,
+        "a later terminal is outside the observation window"
+    );
+    assert_eq!(tool["total_failures"], 0);
+    assert!(tool["last_error"].is_null());
 
     for path in [
         format!("/sessions/{session_id}/audit/summary"),
         format!("/sessions/{session_id}/audit/turns?page=1&per_page=10"),
         format!("/sessions/{session_id}/audit/tools"),
         format!("/sessions/{session_id}/audit/errors"),
-        format!("/sessions/{session_id}/audit/turns/1"),
+        "/audit/sessions".to_string(),
         "/audit/stats".to_string(),
         "/audit/tools".to_string(),
     ] {
         let (st, body) = get_json(app, &path, Some(auth), &[]).await;
         assert_eq!(st, StatusCode::OK, "GET {path}: {body}");
+        if path.ends_with("/audit/summary") {
+            assert_eq!(body["tool_calls_total"], 1);
+        }
+        if path == "/audit/sessions" {
+            let session = body["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["session_id"] == session_id)
+                .unwrap();
+            assert_eq!(
+                session["tool_calls_total"], 1,
+                "list and summary share the same wrapped-call count: {body}"
+            );
+        }
+        if path == "/audit/stats" {
+            assert_eq!(
+                body["total_turns"], 1,
+                "the root Run admission is a turn fact: {body}"
+            );
+            let expected_model = format!("mock-{}", ctx.suffix);
+            assert!(
+                body["top_models"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["model"] == expected_model),
+                "the admitted Server model must appear in audit stats: {body}"
+            );
+        }
+
         if path.ends_with("/errors") {
             let error = body["errors"]
                 .as_array()
@@ -1476,6 +1560,34 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
             assert_eq!(payload["data"]["sentinel"], "complete-json-tail");
         }
     }
+
+    let (status, _) = get_json(
+        app,
+        &format!("/sessions/{session_id}/audit/turns/1"),
+        Some(auth),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "Server chat does not synthesize a legacy audit root"
+    );
+    let (status, transcript) = get_json(
+        app,
+        &format!("/sessions/{session_id}/transcript?limit=20"),
+        Some(auth),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        transcript["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["content"] == "session audit probe")
+    );
 
     ctx.close().await;
 }
@@ -1547,6 +1659,15 @@ pub async fn run_saas_events_session_after_chat_positive() {
     let auth = &b.auth_header;
     let session_id = ctx.session_id.as_str();
     let model_offering_id = ctx.model_offering_id.clone();
+    let model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth, vec![ProviderScript::new(
+        "explicit diagnostic API observation",
+        move |request| request.body["model"] == model && request.body["stream"] == true,
+        vec![ProviderResponse::OpenAi(json!({
+            "choices":[{"index":0,"message":{"role":"assistant","content":"Observed diagnostic fixture."},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":5,"completion_tokens":4,"total_tokens":9}
+        }))],
+    )]).await;
 
     let (st_chat, chat_j) = post_json(
         app,
@@ -1554,6 +1675,7 @@ pub async fn run_saas_events_session_after_chat_positive() {
         Some(auth),
         json!({
             "message": "events session probe",
+            "explain": true,
             "session_id": session_id,
             "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
@@ -1566,7 +1688,7 @@ pub async fn run_saas_events_session_after_chat_positive() {
         &ctx.pool,
         ctx.user_id.as_str(),
         session_id,
-        &["user_query"],
+        &["trace_span"],
         std::time::Duration::from_secs(10),
     )
     .await;
@@ -1588,4 +1710,66 @@ pub async fn run_saas_events_session_after_chat_positive() {
 /// Delegation HTTP boundaries (§4.3).
 pub async fn run_saas_delegate_http_boundaries() {
     super::journey_delegate_http_matrix::run_delegate_http_boundaries().await;
+}
+
+/// Registration returns live discovery without persisting a second tool catalog.
+pub async fn run_saas_mcp_registration_uses_live_discovery() {
+    use axum::{Json, response::IntoResponse, routing::post};
+    use std::sync::{Arc, Mutex};
+    let methods = Arc::new(Mutex::new(Vec::new()));
+    let endpoint = Router::new().route("/mcp", post({
+        let methods = methods.clone();
+        move |headers: axum::http::HeaderMap, Json(request): Json<Value>| {
+            let methods = methods.clone();
+            async move {
+                assert_eq!(headers["authorization"], "Bearer mcp-registry-fixture");
+                let method = request["method"].as_str().unwrap();
+                methods.lock().unwrap().push(method.to_owned());
+                if request.get("id").is_none() {
+                    return StatusCode::ACCEPTED.into_response();
+                }
+                let result = match method {
+                    "initialize" => json!({
+                        "protocolVersion": request["params"]["protocolVersion"],
+                        "capabilities":{"tools":{}},
+                        "serverInfo":{"name":"registry-fixture","version":"1"}
+                    }),
+                    "tools/list" => json!({"tools":[{
+                        "name":"read_file", "description":"Read fixture content",
+                        "inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+                    }]}),
+                    _ => panic!("unexpected MCP method: {method}"),
+                };
+                Json(json!({"jsonrpc":"2.0","id":request["id"],"result":result})).into_response()
+            }
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        axum::serve(listener, endpoint).await.unwrap();
+    }));
+    let b = bootstrap().await;
+    let (status, record) = post_json(&b.ctx.app, "/api/v1/mcp/register-or-update", Some(&b.auth_header), json!({
+        "server":{"name":format!("registry-{}", b.ctx.suffix), "transport":"streamable_http", "url":url},
+        "binding":{"key_value":{"headers":{"Authorization":"Bearer mcp-registry-fixture"}}}
+    })).await;
+    assert_eq!(status, StatusCode::OK, "{record}");
+    assert_eq!(record["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(record["tools"][0]["tool_name"], "read_file");
+    assert!(
+        record["tools"][0]["public_name"]
+            .as_str()
+            .unwrap()
+            .ends_with("__read_file")
+    );
+    assert_eq!(
+        record["tool_namespace"],
+        format!("binding_{}", record["binding_id"].as_str().unwrap())
+    );
+    assert!(!record.to_string().contains("mcp-registry-fixture"));
+    let observed = methods.lock().unwrap().clone();
+    assert!(observed.iter().any(|method| method == "initialize"));
+    assert!(observed.iter().any(|method| method == "tools/list"));
+    b.ctx.close().await;
 }

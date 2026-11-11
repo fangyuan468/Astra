@@ -282,18 +282,27 @@ pub(crate) fn validate_reasoning_control(
     );
     thinking.validate_output_budget(crate::prompts::capped_output_tokens(&budget) as u64)?;
     let protocol = execution.thinking_protocol.unwrap_or_default();
-    let supported = thinking.is_supported_by(
-        &execution.provider,
-        capability.map(|capability| capability.as_str()),
-        protocol,
-    );
-    let effort_supported = match (thinking, &execution.reasoning_efforts) {
-        (astra_turn_core::thinking_config::ThinkingConfig::Adaptive { effort }, Some(allowed)) => {
-            allowed.iter().any(|level| level == effort.as_str())
-        }
-        _ => true,
-    };
-    if supported && effort_supported {
+    // A personal Responses endpoint is explicitly selected by its owner, but
+    // its provider may not publish an exhaustive reasoning-effort inventory.
+    // Permit trying a protocol-valid effort without treating it as verified.
+    let unverified_personal_effort = execution.access_kind
+        == astra_services::models::ModelAccessKind::CloudByok
+        && execution.subscription.is_none()
+        && execution.response_scope.is_some()
+        && protocol == astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning
+        && execution.supported_reasoning_efforts.is_none()
+        && matches!(
+            thinking,
+            astra_turn_core::thinking_config::ThinkingConfig::Adaptive { .. }
+        );
+    let supported = (unverified_personal_effort
+        || thinking.is_supported_by(
+            &execution.provider,
+            capability.map(|capability| capability.as_str()),
+            protocol,
+        ))
+        && thinking.is_within_declared_efforts(execution.supported_reasoning_efforts.as_deref());
+    if supported {
         Ok(())
     } else {
         Err(format!(
@@ -373,6 +382,27 @@ pub(crate) async fn admit_model_execution(
                 .expect("validated model_gateway capability must carry a positive context window"),
         );
         execution.source_identity = resolved.source_identity.clone();
+        if let Some(value) = gateway.metadata.get("reasoning_control") {
+            let control: astra_services::models::RuntimeModelReasoningControl =
+                serde_json::from_value(value.clone()).map_err(|_| {
+                    error_response_coded(
+                        StatusCode::BAD_REQUEST,
+                        "model gateway reasoning control declaration is malformed",
+                        "provider_runtime_context_invalid",
+                    )
+                })?;
+            control.validate().map_err(|detail| {
+                error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    detail,
+                    "provider_runtime_context_invalid",
+                )
+            })?;
+            execution.thinking_capability =
+                Some(astra_services::models::ThinkingCapability::EffortOnly);
+            execution.thinking_protocol = Some(control.protocol);
+            execution.supported_reasoning_efforts = Some(control.supported_efforts);
+        }
         // This execution material exists only after the provider-authorized
         // model_gateway descriptor and runtime identity have both been
         // validated above. Negotiate MOI's safe structured error envelope at
@@ -459,6 +489,115 @@ mod tests {
     }
 
     #[test]
+    fn personal_responses_can_try_unverified_efforts_without_weakening_declared_routes() {
+        use astra_core::model_wire::thinking::ThinkingProtocol;
+        use astra_services::models::{ModelAccessKind, ThinkingCapability};
+        use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+
+        let mut execution = AdmittedModelExecution::from_endpoint(
+            "personal".into(),
+            "model".into(),
+            "openai".into(),
+            "http://127.0.0.1:1".into(),
+            "fixture".into(),
+            None,
+            128_000,
+        );
+        execution.access_kind = ModelAccessKind::CloudByok;
+        execution.response_scope = Some("scope".into());
+        execution.thinking_protocol = Some(ThinkingProtocol::ResponsesReasoning);
+        execution.thinking_capability = None;
+        for effort in [
+            ThinkingEffort::Low,
+            ThinkingEffort::Medium,
+            ThinkingEffort::Max,
+        ] {
+            assert!(
+                validate_reasoning_control(&execution, &ThinkingConfig::Adaptive { effort })
+                    .is_ok()
+            );
+        }
+        assert!(validate_reasoning_control(&execution, &ThinkingConfig::Off).is_err());
+        assert!(validate_reasoning_control(&execution, &ThinkingConfig::ModelDefault).is_ok());
+
+        let max = ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::Max,
+        };
+        execution.access_kind = ModelAccessKind::SelfHosted;
+        assert!(
+            validate_reasoning_control(&execution, &max).is_err(),
+            "unknown gateway capability stays closed"
+        );
+        execution.access_kind = ModelAccessKind::CloudByok;
+        execution.response_scope = None;
+        assert!(
+            validate_reasoning_control(&execution, &max).is_err(),
+            "a gateway without a personal API-key route stays closed"
+        );
+        execution.thinking_capability = Some(ThinkingCapability::EffortOnly);
+        execution.supported_reasoning_efforts = Some(vec!["high".into()]);
+        assert!(
+            validate_reasoning_control(&execution, &max).is_err(),
+            "declared inventories remain binding"
+        );
+        execution.access_kind = ModelAccessKind::CloudByok;
+        assert!(
+            validate_reasoning_control(&execution, &max).is_err(),
+            "a declared list remains binding for personal routes"
+        );
+    }
+
+    #[test]
+    fn published_reasoning_controls_preserve_protocol_admission() {
+        use astra_core::model_wire::thinking::ThinkingProtocol;
+        use astra_services::models::ThinkingCapability;
+        use astra_turn_core::thinking_config::ThinkingConfig;
+
+        // Actual 0.2.10 context.thinking representation, not a current picker.
+        let old_request: astra_server_types::ChatRequest =
+            serde_json::from_value(serde_json::json!({
+                "message": "compatibility",
+                "model_selection": {"offering_id": "offering"},
+                "context": {"thinking": {"mode": "adaptive", "effort": "high"}}
+            }))
+            .unwrap();
+        let old_control: ThinkingConfig =
+            serde_json::from_value(old_request.context.unwrap()["thinking"].clone()).unwrap();
+        let mut execution = AdmittedModelExecution::from_endpoint(
+            "offering".into(),
+            "model".into(),
+            "openai".into(),
+            "http://127.0.0.1:1/chat/completions".into(),
+            "Bearer fixture".into(),
+            None,
+            128_000,
+        );
+        execution.thinking_capability = Some(ThinkingCapability::Both);
+        for protocol in [ThinkingProtocol::EnableThinking, ThinkingProtocol::Moonshot] {
+            execution.thinking_protocol = Some(protocol);
+            let error = validate_reasoning_control(&execution, &old_control).unwrap_err();
+            assert!(error.contains("cannot execute requested reasoning control"));
+            assert!(validate_reasoning_control(&execution, &ThinkingConfig::On {}).is_ok());
+            let mut wire = serde_json::json!({});
+            ThinkingConfig::On {}.apply_openai_protocol(&mut wire, protocol);
+            match protocol {
+                ThinkingProtocol::EnableThinking => {
+                    assert_eq!(wire, serde_json::json!({"enable_thinking": true}))
+                }
+                ThinkingProtocol::Moonshot => {
+                    assert_eq!(wire, serde_json::json!({"thinking": {"type": "enabled"}}))
+                }
+                _ => unreachable!(),
+            }
+        }
+        execution.thinking_protocol = Some(ThinkingProtocol::ReasoningEffort);
+        validate_reasoning_control(&execution, &old_control).unwrap();
+        let mut wire = serde_json::json!({});
+        old_control.apply_openai_protocol(&mut wire, ThinkingProtocol::ReasoningEffort);
+        assert_eq!(wire, serde_json::json!({"reasoning_effort": "high"}));
+    }
+
+    #[test]
     fn explicit_off_requires_an_actual_disabling_contract_for_thinking_models() {
         use astra_core::model_wire::thinking::ThinkingProtocol;
         use astra_services::models::ThinkingCapability;
@@ -540,7 +679,8 @@ mod tests {
         let mut execution = super::inheritance_test_support::genesis_execution();
         execution.thinking_capability = Some(ThinkingCapability::EffortOnly);
         execution.thinking_protocol = Some(ThinkingProtocol::ReasoningEffort);
-        execution.reasoning_efforts = Some(vec!["low".into(), "high".into(), "max".into()]);
+        execution.supported_reasoning_efforts =
+            Some(vec!["low".into(), "high".into(), "max".into()]);
         for effort in [
             ThinkingEffort::Low,
             ThinkingEffort::High,
@@ -577,6 +717,10 @@ mod tests {
             Ok(ResolvedModelOffering {
                 offering_id,
                 model: ResolvedActiveLlmModel {
+                    responses_reasoning_history: None,
+                    inference_protocol: None,
+                    response_scope_key: None,
+                    supported_reasoning_efforts: None,
                     price_snapshot: None,
                     model_name: "server-model".into(),
                     wire_model_name: Some("wire-model".into()),
@@ -1016,7 +1160,7 @@ mod tests {
 
 pub(crate) fn model_execution_contract_root(execution: &AdmittedModelExecution) -> String {
     use sha2::{Digest, Sha256};
-    let contract = serde_json::json!({
+    let mut contract = serde_json::json!({
         "offering": execution.offering_id, "model": execution.model_name,
         "wire_model": execution.wire_model_name, "provider": execution.provider,
         "access": execution.access_kind, "placement": execution.execution_placement,
@@ -1027,6 +1171,14 @@ pub(crate) fn model_execution_contract_root(execution: &AdmittedModelExecution) 
         "endpoint": execution.completions_url_override.as_deref().unwrap_or(&execution.base_url),
         "headers": execution.header_overrides.iter().filter(|(key, _)| !matches!(key.to_ascii_lowercase().as_str(), "authorization" | "x-api-key" | "api-key")).collect::<std::collections::BTreeMap<_, _>>(),
     });
+    if let Some(protocol) = execution.inference_protocol.filter(|protocol| {
+        *protocol != astra_core::model_wire::llm_provider_protocol(&execution.provider)
+    }) {
+        contract["inference_protocol"] = serde_json::json!(protocol);
+    }
+    if let Some(efforts) = &execution.supported_reasoning_efforts {
+        contract["supported_reasoning_efforts"] = serde_json::json!(efforts);
+    }
     format!(
         "{:x}",
         Sha256::digest(astra_core::canonical_json_string(&contract).as_bytes())
@@ -1042,35 +1194,43 @@ pub(crate) async fn inherit_routed_execution<F, Fut>(
     parent_run_id: &str,
     inherited: Option<&AdmittedModelExecution>,
     resolve: F,
-) -> Result<Option<AdmittedModelExecution>, String>
+) -> Result<
+    (
+        Option<AdmittedModelExecution>,
+        Option<astra_turn_core::thinking_config::ThinkingConfig>,
+    ),
+    String,
+>
 where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Result<AdmittedModelExecution, String>>,
 {
-    use astra_services::model_routing::{DECISION_KEY, EVENT_TYPE, ModelRoutingDecision};
-    let Some(event) = engine
-        .load_run_event_by_idempotency_key(user_id, parent_run_id, EVENT_TYPE, DECISION_KEY)
+    use astra_services::runs::InheritedRunModel;
+    match engine
+        .inherited_run_model(user_id, session_id, parent_run_id)
         .await?
-    else {
-        return Ok(inherited.cloned());
-    };
-    let decision: ModelRoutingDecision = serde_json::from_value(event["data"].clone())
-        .map_err(|_| "Invalid durable Auto routing decision".to_string())?;
-    decision.validate_identity(parent_run_id, session_id)?;
-    if decision
-        .rollout
-        .as_ref()
-        .is_some_and(|r| r.cohort == astra_services::tuning::rollout::RolloutCohort::Treatment)
     {
-        return Err(
-            "Learned canary is limited to primary execution; child admission is unavailable".into(),
-        );
+        InheritedRunModel::Original => Ok((inherited.cloned(), None)),
+        InheritedRunModel::Auto(decision) => {
+            let execution = resolve(decision.selected_offering_id).await?;
+            if model_execution_contract_root(&execution) != decision.selected_contract_root {
+                return Err("The inherited Auto model contract changed; start a new turn".into());
+            }
+            Ok((Some(execution), None))
+        }
+        InheritedRunModel::Explicit(choice) => {
+            let execution = resolve(choice.resolved.offering_id.clone()).await?;
+            if choice.selection.model.offering_id != execution.offering_id
+                || choice.resolved.model_name != execution.model_name
+                || choice.resolved.source_identity != execution.source_identity
+            {
+                return Err("The inherited model identity changed; select it again".into());
+            }
+            let thinking = (&choice.reasoning).into();
+            validate_reasoning_control(&execution, &thinking)?;
+            Ok((Some(execution), Some(thinking)))
+        }
     }
-    let execution = resolve(decision.selected_offering_id).await?;
-    if model_execution_contract_root(&execution) != decision.selected_contract_root {
-        return Err("The inherited Auto model contract changed; start a new turn".into());
-    }
-    Ok(Some(execution))
 }
 
 #[cfg(test)]

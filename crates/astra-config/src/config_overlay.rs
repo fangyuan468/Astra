@@ -97,8 +97,30 @@ impl RuntimeConfigLayer {
     }
 
     pub fn from_toml(source: &str) -> Result<Self, OverlayError> {
-        let config: RuntimeConfig = toml::from_str(source)?;
+        Self::from_toml_value(toml::from_str(source)?)
+    }
+
+    /// Parse a TOML layer that may not set `sections`. They are dropped before
+    /// typed validation, so a malformed disallowed section cannot reject the
+    /// rest of the layer. Returns the sections the source actually carried.
+    pub fn from_toml_without_sections(
+        source: &str,
+        sections: &[&'static str],
+    ) -> Result<(Self, Vec<&'static str>), OverlayError> {
         let mut value: toml::Value = toml::from_str(source)?;
+        let removed = match value.as_table_mut() {
+            Some(table) => sections
+                .iter()
+                .copied()
+                .filter(|section| table.remove(*section).is_some())
+                .collect(),
+            None => Vec::new(),
+        };
+        Ok((Self::from_toml_value(value)?, removed))
+    }
+
+    fn from_toml_value(mut value: toml::Value) -> Result<Self, OverlayError> {
+        let config: RuntimeConfig = value.clone().try_into()?;
         // TOML supports non-finite floats, JSON does not. Preserve the existing
         // trace normalization before conversion instead of turning them into null.
         if let Some(rate) = value
@@ -295,16 +317,6 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
             label: "Trace LLM thinking/reasoning".to_string(),
             kind: SettingKind::Bool,
             value: Value::from(config.trace.category_enabled(TraceCategory::Thinking)),
-        },
-        SettingItem {
-            id: "trace.harness_snapshots".to_string(),
-            label: "Persist harness snapshot diagnostics".to_string(),
-            kind: SettingKind::Bool,
-            value: Value::from(
-                config
-                    .trace
-                    .category_enabled(TraceCategory::HarnessSnapshots),
-            ),
         },
         // ── Explain Analyze ──
         SettingItem {
@@ -512,15 +524,6 @@ pub fn apply_edit(
             mark_trace_custom(&mut config);
             return Ok(config);
         }
-        "trace.context_assembly" => {
-            toggle_category(
-                &mut config.trace.enabled_categories,
-                TraceCategory::ContextAssembly,
-                as_bool(&new_value, id)?,
-            );
-            mark_trace_custom(&mut config);
-            return Ok(config);
-        }
         "trace.decision_explain" => {
             toggle_category(
                 &mut config.trace.enabled_categories,
@@ -579,24 +582,6 @@ pub fn apply_edit(
             toggle_category(
                 &mut config.trace.enabled_categories,
                 TraceCategory::SkillExecution,
-                as_bool(&new_value, id)?,
-            );
-            mark_trace_custom(&mut config);
-            return Ok(config);
-        }
-        "trace.harness_snapshots" => {
-            toggle_category(
-                &mut config.trace.enabled_categories,
-                TraceCategory::HarnessSnapshots,
-                as_bool(&new_value, id)?,
-            );
-            mark_trace_custom(&mut config);
-            return Ok(config);
-        }
-        "trace.prompt_assembly" => {
-            toggle_category(
-                &mut config.trace.enabled_categories,
-                TraceCategory::PromptAssembly,
                 as_bool(&new_value, id)?,
             );
             mark_trace_custom(&mut config);
@@ -673,18 +658,6 @@ mod tests {
     }
 
     #[test]
-    fn catalog_includes_harness_snapshots_toggle() {
-        let config = RuntimeConfig::default();
-        let catalog = build_settings_catalog(&config);
-        let item = catalog
-            .iter()
-            .find(|item| item.id == "trace.harness_snapshots")
-            .expect("catalog must expose the harness snapshots trace toggle");
-        assert_eq!(item.label, "Persist harness snapshot diagnostics");
-        assert_eq!(item.value, Value::Bool(false));
-    }
-
-    #[test]
     fn apply_edit_updates_llm_exchanges_toggle() {
         let updated = apply_edit(
             RuntimeConfig::default(),
@@ -697,22 +670,6 @@ mod tests {
                 .trace
                 .enabled_categories
                 .contains(&TraceCategory::LlmExchanges)
-        );
-    }
-
-    #[test]
-    fn apply_edit_updates_harness_snapshots_toggle() {
-        let updated = apply_edit(
-            RuntimeConfig::default(),
-            "trace.harness_snapshots",
-            Value::Bool(true),
-        )
-        .expect("toggle edit should succeed");
-        assert!(
-            updated
-                .trace
-                .enabled_categories
-                .contains(&TraceCategory::HarnessSnapshots)
         );
     }
 

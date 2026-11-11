@@ -76,6 +76,16 @@ or the `SkillHooks` phase wrapper, change accepted event names or action support
 introduce additional configuration scopes, or change admission,
 enforcement/circuit-breaker, or ServerSandbox/ServerLocal selection rules.
 
+The runtime keeps selected-skill names in turn telemetry for CLI self-model
+inputs. It does not write a separate skill-selection SQL projection or label
+selection as successful execution. Tool execution traces retain their actual
+outcomes; they are not a substitute for an audit of selection judgment.
+
+Skill registry listing, owner visibility, installation and personal evaluation
+remain supported. The separate Marketplace quality-report, global statistics
+and ranked-search facade is retired. Runtime skill-quality feedback does not
+depend on that facade.
+
 ## Tools
 
 A tool is a callable schema. Tool visibility and execution are decided by the capability system.
@@ -98,6 +108,12 @@ The unused source-public `CanonicalToolInvocationBatch`,
 wrappers are retired. Runtime admission owns provider-batch partitioning and
 ordered result reconciliation; the shared invocation parser and canonical
 history evidence remain the carrier and recovery contracts.
+
+Malformed carrier arguments return the canonical parser's specific, static
+reason through the existing tool-level rejection. Missing target names are
+never inferred from selection history, even when only one tool is selected.
+Rejected calls do not dispatch tools or change capability authority; corrected
+calls still pass the same current-schema and provider-binding admission.
 
 Ordinary `agent` spawn, status (`list`), result collection (`get_result`), wait (`wait`), and
 communication (`send_message`) share a compact resident contract when the
@@ -149,6 +165,67 @@ that every workload is cheaper. Explicitly pinned utility tools remain supported
 ## Relationship
 
 A skill may require tools, but it does not make those tools available by itself. Provider decision still controls whether a required capability can run in the current session.
+
+When skill activation omits sibling tool calls from the same model response,
+each omitted attempt settles as `suppressed`, including when the skill fails.
+Retry guidance lets the model issue a new call; it does not queue execution or
+leave the original call awaiting a callback. Actual in-flight `deferred` calls
+still require their own terminal result before run completion.
+
+Capability-source discovery returns an exact `selection_key` and activation
+hint for each result. Names have the form
+`skill__cap__<native-label>__<16hex>` or `mcp__cap__<native-label>__<16hex>`.
+The label encodes the native ID, not the display title: lowercase ASCII letters,
+digits, underscores and hyphens are retained, other ASCII becomes `_`, and
+non-ASCII codepoints become `u` plus lowercase hex. Whole encoded units are
+retained up to 24 bytes. The suffix hashes the source configuration, discovery
+tool, kind and complete capability reference, including its snapshot and
+descriptor digest. Thus identical source descriptors have stable names across
+runs, while same-name capabilities remain distinct. Conflicting full receipts
+at a short key are rejected, never overwritten or automatically renamed.
+A Tool selection enters through
+`tool_search(select:...)`; a Skill selection enters through
+`skill(skill_name=...)`. The display title is not an invocation name. Both paths
+resolve the selection against runtime custody and policy before reading or
+executing the capability. A stable name is not a grant: each run still needs its
+own discovered receipt, with unchanged identity, generation, snapshot and
+current-use checks. Registered Agent Binding MCP aliases such as
+`mcp__cap__search` retain their descriptor-owned route. A source configuration
+that registers an alias matching a complete reserved selection key is rejected
+at binding admission. Unregistered malformed names in the reserved capability
+namespace fail at that owner, without local-name lookup or fuzzy matching.
+
+Selected source invocations and scoped Skill/body/resource reads use the
+ordinary Agent Binding MCP cancellation owner: each exchange has a unique
+request ID, cancellation sends
+`notifications/cancelled`, and the original correlated response retains
+settlement authority. A cancellation notification alone cannot release an
+in-flight invocation or its workspace ownership. Skill resolvers obtain the
+run token from their existing generation-bound source runtime; it is not a
+model argument or part of the durable capability identity.
+
+For a selected source Skill, `skill(resource_path=...)` reads a package-relative
+text resource through the same custody and policy checks, with a 64 KiB content
+limit. Absolute paths, traversal and URLs are rejected. Resource reads do not
+activate the Skill again or register additional execution authority. Source
+discovery remains with its admitted discovery tool; `discover_skills` searches
+only an admitted, enumerable directory.
+
+## Executable descriptor identity and planning
+
+Discovery snapshots include presentation and provenance. An invocation's exact
+descriptor version covers its executable input/output contract, owner, trusted
+claims and execution semantics. Help-text or model-directory refreshes do not
+revoke an unchanged selection. Current admission still rejects schema, owner or
+authority changes and reports a bounded structured difference; historical
+selection does not grant current execution authority.
+
+Model-authored planning retains the user's execution policy. Finishing a plan
+under Auto or Bypass does not add a human approval step unless explicitly
+requested. Other policies keep their trusted review gate. The default approval choice
+retains current permissions; no countdown changes permission. Finalization
+checks the submitted revision and session binding atomically, so approval of an
+older draft cannot release a newer draft's authoring guard.
 
 ## Skill lifecycle
 
@@ -270,9 +347,28 @@ regression failures.
 
 ## Optional memory candidate judgment pilot
 
-Memory relevance and explicit lesson dismissal use the existing selector boundary.
+Explicit Memory-judgment comparisons reuse the existing selector boundary.
+Ordinary CLI turns do not load or dismiss automatic cross-session lessons.
 An optional server admin `judgment_offering_id` binds those judgments to a
 registered Offering, including the TypeSafe System One adapter. Offering credentials
 remain encrypted and server-owned. This binding never selects a memory extraction
 model or changes agent/tool policy. See [the pilot guide](../guides/memory-judgment-pilot.md)
 for configuration, fallback and validation limitations.
+
+## Live observations and durable effects
+
+Canonical `ToolSpec` declares whether a built-in operation is a replay-safe Run
+observation. The effect and requirement contract must also prove read-only
+execution. `ToolEffect::none()` alone grants nothing: spawning, Work transitions,
+interactions and other controls still need their existing durable receipts.
+Unknown and provider-authored operations, including Runner delivery, retain the
+durable preparation, dispatch and outcome/uncertainty boundary.
+
+Server observations traverse current routing, permissions, cancellation and
+output governance on every execution. The shared loop retains tool records and
+semantic hints. Repeated readonly calls may execute again, including after
+recovery; no extra result cache, read-identity reservation, tombstone or
+exact-once promise is introduced. Server invocation replay does not short-circuit
+through the generic loop cache. Explicit effect replay and uncertain recovery
+remain with the durable ledger; observation records cannot prove effect
+settlement or recoverable execution completion.

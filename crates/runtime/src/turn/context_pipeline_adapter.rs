@@ -77,17 +77,19 @@ pub(crate) fn build_external_sources(
 
     let (mut tool_guidance_text, _signals) =
         crate::prompts::tool_round_guidance_trace(&state.messages);
-    if !state.suppress_execution_slice_guidance() {
-        let slice_guidance = crate::prompts::execution_slice_guidance(
-            state.remaining_turns,
-            state.max_turns,
-            super::agentic_loop::lifecycle::adaptive_budget_is_renewable(state),
+    if !state.suppress_execution_limit_guidance()
+        && let Some(limit) = state.agentic_turn_budget.hard_turn_limit
+    {
+        let charged = usize::try_from(state.charged_iterations).unwrap_or(usize::MAX);
+        let limit_guidance = crate::prompts::execution_round_limit_guidance(
+            limit.get().saturating_sub(charged),
+            limit.get(),
         );
-        if !slice_guidance.is_empty() {
+        if !limit_guidance.is_empty() {
             if !tool_guidance_text.is_empty() {
                 tool_guidance_text.push_str("\n\n");
             }
-            tool_guidance_text.push_str(&slice_guidance);
+            tool_guidance_text.push_str(&limit_guidance);
         }
     }
     let tool_guidance = (!tool_guidance_text.is_empty()).then_some(tool_guidance_text);
@@ -201,17 +203,6 @@ pub(crate) fn build_external_sources(
         if cc.prefers_intra_turn_batching() {
             providers.push(Box::new(CacheStrategyProvider));
         }
-    }
-
-    // Lessons (Memoria-bootstrapped session lessons)
-    if let Some(text) = edge_profile
-        .get("lessons_text")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    {
-        providers.push(Box::new(LessonsChannelProvider {
-            text: text.to_string(),
-        }));
     }
 
     let assembler = ChannelAssembler::new(providers, ContextChannelPolicy::default());
@@ -454,37 +445,6 @@ impl astra_turn_core::context_sources::ContextChannelProvider for CacheStrategyP
             "## Execution Strategy\nThis model's prompt cache is only reliable within the current turn. When the task does not require new user input, batch related tool work and complete it within the same turn instead of stopping early or spreading the work across multiple user turns.".to_string(),
             CacheScope::Session,
         ))
-    }
-}
-
-/// Lessons: Memoria-bootstrapped session lessons.
-/// Session scope (loaded once at session start, stable thereafter).
-struct LessonsChannelProvider {
-    text: String,
-}
-
-impl astra_turn_core::context_sources::ContextChannelProvider for LessonsChannelProvider {
-    fn channel_id(&self) -> &'static str {
-        "lessons"
-    }
-    fn cache_scope(&self) -> CacheScope {
-        CacheScope::Session
-    }
-    fn token_bucket(&self) -> PromptTokenBucket {
-        PromptTokenBucket::UserPreferences
-    }
-    fn provide(&self, _turn_index: u32) -> Option<PromptSection> {
-        if self.text.is_empty() {
-            None
-        } else {
-            Some(PromptSection::stable(
-                format!(
-                    "\n\n## Session Lessons (Learned from Past Corrections)\n{}",
-                    self.text
-                ),
-                CacheScope::Session,
-            ))
-        }
     }
 }
 
@@ -1076,11 +1036,13 @@ mod tests {
     }
 
     #[test]
-    fn external_sources_projects_low_slice_horizon_only_outside_settlement() {
+    fn external_sources_projects_explicit_round_limit_only_outside_settlement() {
         let ep = serde_json::Map::new();
         let mut state = make_state();
         state.max_turns = 40;
         state.remaining_turns = 4;
+        state.charged_iterations = 36;
+        state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(40);
 
         let sources = build_external_sources(&ep, &state, &["bash"], None, None);
         let guidance = sources.tool_guidance.expect("low-slice guidance");
@@ -1093,7 +1055,7 @@ mod tests {
             settlement_sources
                 .tool_guidance
                 .as_deref()
-                .is_none_or(|guidance| !guidance.contains("<execution-slice>")),
+                .is_none_or(|guidance| !guidance.contains("<execution-round-limit>")),
             "typed settlement guidance must remain the only execution authority"
         );
 
@@ -1104,42 +1066,36 @@ mod tests {
             token_rail_sources
                 .tool_guidance
                 .as_deref()
-                .is_none_or(|guidance| !guidance.contains("<execution-slice>")),
+                .is_none_or(|guidance| !guidance.contains("<execution-round-limit>")),
             "token-rail wrap-up must not advertise ordinary execution headroom"
         );
     }
 
     #[test]
-    fn external_sources_keep_renewable_capacity_distinct_from_completion() {
+    fn external_sources_do_not_present_soft_slice_boundaries_as_limits() {
         let ep = serde_json::Map::new();
         let mut state = make_state();
         state.max_turns = 32;
         state.remaining_turns = 0;
-        state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(72);
-        state.agentic_turn_budget.extension_turns = 12;
-
-        let guidance = build_external_sources(&ep, &state, &["bash"], None, None)
-            .tool_guidance
-            .expect("renewable final-boundary guidance");
-        assert!(
-            guidance.contains("adaptive capacity checkpoint"),
-            "{guidance}"
-        );
-        assert!(
-            guidance.contains("not evidence of progress or unfinished work"),
-            "{guidance}"
-        );
-        assert!(!guidance.contains("Do not call any tool"), "{guidance}");
+        state.charged_iterations = 32;
+        for limit in [None, std::num::NonZeroUsize::new(72)] {
+            state.agentic_turn_budget.hard_turn_limit = limit;
+            let sources = build_external_sources(&ep, &state, &["bash"], None, None);
+            assert!(sources.tool_guidance.as_deref().is_none_or(|guidance| {
+                !guidance.contains("<execution-round-limit>")
+                    && !guidance.contains("Do not call any tool")
+            }));
+        }
     }
 
     #[test]
-    fn external_sources_keep_no_tool_final_boundary_when_renewal_is_blocked() {
+    fn external_sources_keep_hard_limit_independent_of_historical_advice() {
         let ep = serde_json::Map::new();
         let mut state = make_state();
         state.max_turns = 32;
         state.remaining_turns = 0;
+        state.charged_iterations = 32;
         state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(32);
-        state.agentic_turn_budget.extension_turns = 12;
 
         let nonrenewable = build_external_sources(&ep, &state, &["bash"], None, None)
             .tool_guidance
@@ -1149,7 +1105,6 @@ mod tests {
             "{nonrenewable}"
         );
 
-        state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(72);
         state.stall.verdict_events.push(
             astra_turn_core::agentic_verdict_audit::AgenticVerdictAuditEvent {
                 turn: 1,
@@ -1172,8 +1127,8 @@ mod tests {
         );
         let critical = build_external_sources(&ep, &state, &["bash"], None, None)
             .tool_guidance
-            .expect("renewable boundary despite historical critical advice");
-        assert!(!critical.contains("Do not call any tool"), "{critical}");
+            .expect("hard boundary despite historical critical advice");
+        assert!(critical.contains("Do not call any tool"), "{critical}");
     }
 
     #[test]
@@ -1291,6 +1246,7 @@ mod tests {
         });
         let output = sess
             .run_turn_adaptive(AdaptiveTurnInput {
+                planning_messages: None,
                 statics: &ci.statics,
                 agent: &ci.agent,
                 session: &ci.session,
@@ -1344,6 +1300,7 @@ mod tests {
         });
         let output = sess
             .run_turn_adaptive(AdaptiveTurnInput {
+                planning_messages: None,
                 statics: &ci.statics,
                 agent: &ci.agent,
                 session: &ci.session,
@@ -1384,6 +1341,7 @@ mod tests {
         });
         let output = sess
             .run_turn_adaptive(AdaptiveTurnInput {
+                planning_messages: None,
                 statics: &ci.statics,
                 agent: &ci.agent,
                 session: &ci.session,
@@ -1432,6 +1390,7 @@ mod tests {
         });
         let output = sess
             .run_turn_adaptive(AdaptiveTurnInput {
+                planning_messages: None,
                 statics: &ci.statics,
                 agent: &ci.agent,
                 session: &ci.session,
@@ -1474,6 +1433,7 @@ mod tests {
         });
         let output = sess
             .run_turn_adaptive(AdaptiveTurnInput {
+                planning_messages: None,
                 statics: &ci.statics,
                 agent: &ci.agent,
                 session: &ci.session,
@@ -1566,6 +1526,7 @@ mod tests {
             });
             session
                 .run_turn_adaptive(AdaptiveTurnInput {
+                    planning_messages: None,
                     statics: &input.statics,
                     agent: &input.agent,
                     session: &input.session,
@@ -1640,6 +1601,7 @@ mod tests {
         });
         let out_with = sess
             .run_turn_adaptive(AdaptiveTurnInput {
+                planning_messages: None,
                 statics: &ci.statics,
                 agent: &ci.agent,
                 session: &ci.session,
@@ -1666,6 +1628,7 @@ mod tests {
         });
         let out_without = sess2
             .run_turn_adaptive(AdaptiveTurnInput {
+                planning_messages: None,
                 statics: &ci2.statics,
                 agent: &ci2.agent,
                 session: &ci2.session,
@@ -1828,32 +1791,6 @@ mod tests {
         assert_eq!(p.cache_scope(), CacheScope::Session);
     }
 
-    // ── LessonsChannelProvider ──
-
-    #[test]
-    fn lessons_provider_emits_formatted_lessons() {
-        let p = super::LessonsChannelProvider {
-            text: "fix:compile:check".into(),
-        };
-        let section = p.provide(0).expect("should emit non-empty lessons");
-        assert!(section.text.contains("Session Lessons"));
-        assert!(section.text.contains("fix:compile:check"));
-    }
-
-    #[test]
-    fn lessons_provider_returns_none_when_empty() {
-        let p = super::LessonsChannelProvider {
-            text: String::new(),
-        };
-        assert!(p.provide(0).is_none());
-    }
-
-    #[test]
-    fn lessons_provider_cache_scope_is_session() {
-        let p = super::LessonsChannelProvider { text: "x".into() };
-        assert_eq!(p.cache_scope(), CacheScope::Session);
-    }
-
     // ── ChannelAssembler integration tests ──
 
     #[test]
@@ -1920,7 +1857,7 @@ mod tests {
             Box::new(super::EnvStaticProvider {
                 text: String::new(),
             }), // empty → None
-            Box::new(super::LessonsChannelProvider {
+            Box::new(super::EnvVolatileProvider {
                 text: String::new(),
             }), // empty → None
         ];
@@ -1986,7 +1923,6 @@ mod tests {
             "active_skills".into(),
             Value::Array(vec![Value::String("review".into())]),
         );
-        ep.insert("lessons_text".into(), Value::String("fix:bug:patch".into()));
 
         let mut state = make_state();
         state.max_turns = 20;
@@ -2010,10 +1946,6 @@ mod tests {
         assert!(
             stable_texts.iter().any(|t| t.contains("env: macos")),
             "env_static in stable"
-        );
-        assert!(
-            stable_texts.iter().any(|t| t.contains("Session Lessons")),
-            "lessons in stable"
         );
 
         assert!(
@@ -2398,13 +2330,15 @@ mod tests {
         let mut state = make_state();
         state.max_turns = 60;
         state.remaining_turns = 5;
+        state.charged_iterations = 55;
+        state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(60);
 
         let sources = build_external_sources(&ep, &state, &[], None, None);
         assert!(
             sources
                 .tool_guidance
                 .as_deref()
-                .is_some_and(|guidance| guidance.contains("<execution-slice>")),
+                .is_some_and(|guidance| guidance.contains("<execution-round-limit>")),
             "low execution horizon must reach the model through the volatile lane"
         );
         assert!(

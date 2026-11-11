@@ -15,7 +15,7 @@ use astra_mcp::{
     mcp_tool_to_schema, mcp_tools_to_provider_snapshot, sanitize_tool_name,
 };
 use astra_services::{
-    McpDiscoveredToolData, McpRegisterRequestData, mcp_binding_tool_namespace, mcp_schema_hash,
+    McpRegisterRequestData, McpRegisteredToolRecord, mcp_binding_tool_namespace,
     runs::RuntimeMcpBindingRequest,
 };
 use astra_turn_types::{
@@ -32,6 +32,8 @@ use serde_json::{Value, json};
 use tokio::sync::RwLock;
 
 const AGENT_BINDING_MCP_RPC_TIMEOUT_SECS: u64 = 120;
+const AGENT_BINDING_MCP_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const AGENT_BINDING_MCP_MAX_TOOL_CALL_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
 const AGENT_BINDING_SEMANTIC_READ_PREPARE_TIMEOUT: Duration = Duration::from_secs(2);
 const AGENT_BINDING_SEMANTIC_READ_CONTRACT_VERSION: &str =
     astra_services::runs::RUNTIME_SEMANTIC_READ_MCP_CONTRACT_VERSION;
@@ -52,11 +54,40 @@ pub(crate) struct RuntimeMcpBundle {
     pub stop_after_success_tools: crate::turn::tool_completion::RuntimeStopAfterSuccessToolSnapshot,
     pub manager: Option<Arc<RwLock<McpClientManager>>>,
     pub agent_binding_mcp: Option<Arc<AgentBindingMcpRuntime>>,
+    pub capability_source: Option<Arc<super::capability_source::CapabilitySourceRuntime>>,
     pub semantic_read_capabilities:
         crate::server::semantic_read_freshness::ProviderSemanticFreshnessRegistry,
 }
 
+/// Admit the gateway's invocation budget before starting live discovery or
+/// preparing a snapshot. Discovery and cancellation retain separate budgets.
+pub(crate) fn parse_agent_binding_mcp_tool_call_timeout(
+    metadata: &serde_json::Map<String, Value>,
+) -> Result<Duration, (StatusCode, Json<ErrorResponse>)> {
+    let Some(value) = metadata.get("tool_call_timeout_ms") else {
+        return Ok(Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS));
+    };
+    let timeout_ms = value
+        .as_u64()
+        .filter(|value| (1..=AGENT_BINDING_MCP_MAX_TOOL_CALL_TIMEOUT_MS).contains(value))
+        .ok_or_else(|| {
+            mcp_error(
+                StatusCode::BAD_REQUEST,
+                "capability_descriptors.mcp.metadata.tool_call_timeout_ms must be an integer between 1 and 3600000",
+                "agent_binding_capability_ref_invalid",
+            )
+        })?;
+    Ok(Duration::from_millis(timeout_ms))
+}
+
 impl RuntimeMcpBundle {
+    pub(crate) fn with_tool_call_timeout(mut self, timeout: Duration) -> Self {
+        if let Some(runtime) = self.agent_binding_mcp.as_mut() {
+            Arc::make_mut(runtime).tool_call_timeout = timeout;
+        }
+        self
+    }
+
     /// Return the resolver-owned public-alias to provider-native identity
     /// projection. Runtime schema installation must carry this exact map so
     /// an alias is never reinterpreted as an execution name later.
@@ -166,9 +197,12 @@ pub(crate) struct AgentBindingMcpRuntime {
     server_name: String,
     endpoint_url: String,
     authorization: String,
+    tool_call_timeout: Duration,
     tool_names_by_public_name: Arc<HashMap<String, String>>,
+    resolved_snapshot: Arc<ResolvedProviderSnapshot>,
     workspace_effects_by_public_name: Arc<HashMap<String, ResolvedToolEffect>>,
     semantic_read_tools: Arc<HashSet<String>>,
+    pub(crate) capability_source_config: Option<super::capability_source::CapabilitySourceConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -343,6 +377,10 @@ pub(crate) struct AgentBindingMcpRpcError {
 }
 
 impl AgentBindingMcpRpcError {
+    pub(crate) fn provider_acknowledged(&self) -> bool {
+        self.provider_acknowledged
+    }
+
     pub(crate) fn is_cancelled_before_dispatch(&self) -> bool {
         self.cancelled_before_dispatch
     }
@@ -401,6 +439,10 @@ fn agent_binding_mcp_rpc_error(detail: impl Into<String>) -> AgentBindingMcpRpcE
         provider_acknowledged: false,
         cancelled_before_dispatch: false,
     }
+}
+
+pub(crate) fn capability_source_rpc_error(detail: String) -> AgentBindingMcpRpcError {
+    agent_binding_mcp_rpc_error(detail)
 }
 
 fn agent_binding_mcp_provider_error(detail: impl Into<String>) -> AgentBindingMcpRpcError {
@@ -702,7 +744,7 @@ fn discovery_error(
 pub(crate) async fn discover_binding_tools(
     binding_id: &str,
     request: &McpRegisterRequestData,
-) -> Result<Vec<McpDiscoveredToolData>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Vec<McpRegisteredToolRecord>, (StatusCode, Json<ErrorResponse>)> {
     if binding_id.trim().is_empty() {
         return Err(mcp_error(
             StatusCode::BAD_REQUEST,
@@ -799,17 +841,9 @@ pub(crate) async fn discover_binding_tools(
                     "mcp_provider_projection_invalid",
                 )
             })?;
-        let hash_parts = json!({
-            "descriptor_version": descriptor.descriptor_version.as_str(),
-            "public_name": public_name,
-        });
-        discovered.push(McpDiscoveredToolData {
+        discovered.push(McpRegisteredToolRecord {
             tool_name: descriptor.native_tool_name.clone(),
             public_name,
-            description: descriptor.description.clone(),
-            input_schema_json: Some(descriptor.input_schema.clone()),
-            output_schema_json: descriptor.output_schema.clone(),
-            schema_hash: mcp_schema_hash(&hash_parts),
         });
     }
 
@@ -953,6 +987,7 @@ pub(crate) async fn prepare_request_scoped_runtime_bundle(
         stop_after_success_tools: Default::default(),
         manager: Some(Arc::new(RwLock::new(manager))),
         agent_binding_mcp: None,
+        capability_source: None,
         semantic_read_capabilities: Default::default(),
     }))
 }
@@ -987,7 +1022,7 @@ async fn post_agent_binding_mcp_rpc_with_risk(
         .map_err(agent_binding_mcp_rpc_error)?;
 
     let (status, body) = tokio::time::timeout(timeout, async {
-        let response = agent_binding_mcp_http_client()
+        let mut response = agent_binding_mcp_http_client()
             .post(endpoint_url)
             .header(reqwest::header::AUTHORIZATION, authorization)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -1005,11 +1040,32 @@ async fn post_agent_binding_mcp_rpc_with_risk(
                 .after_send(risk)
             })?;
         let status = response.status();
-        let body = response.text().await.map_err(|error| {
+        if response
+            .content_length()
+            .is_some_and(|length| length > AGENT_BINDING_MCP_MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(agent_binding_mcp_rpc_error(
+                "Agent Binding MCP response exceeds byte budget",
+            )
+            .after_send(risk));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
             agent_binding_mcp_rpc_error(format!(
                 "Agent Binding MCP RPC to '{endpoint_url}' failed while reading response: {error}"
             ))
             .after_send(risk)
+        })? {
+            if chunk.len() > AGENT_BINDING_MCP_MAX_RESPONSE_BYTES.saturating_sub(bytes.len()) {
+                return Err(agent_binding_mcp_rpc_error(
+                    "Agent Binding MCP response exceeds byte budget",
+                )
+                .after_send(risk));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8(bytes).map_err(|_| {
+            agent_binding_mcp_rpc_error("Agent Binding MCP response is not UTF-8").after_send(risk)
         })?;
         Ok::<_, AgentBindingMcpRpcError>((status, body))
     })
@@ -1074,11 +1130,11 @@ fn decode_agent_binding_mcp_rpc_response(
     body: &str,
     request_id: &Value,
 ) -> Result<Value, AgentBindingMcpRpcError> {
-    if let Ok(value) = serde_json::from_str::<Value>(body) {
+    if let Ok(value) = astra_turn_types::parse_unique_json(body.as_bytes()) {
         return json_rpc_result(value, request_id);
     }
 
-    for value in sse_json_values(body) {
+    for value in sse_json_values(body)? {
         // A stream may include notifications, server requests and responses
         // for other exchanges. Only a response can settle this exchange.
         if value.get("method").is_none() && value.get("id") == Some(request_id) {
@@ -1091,12 +1147,18 @@ fn decode_agent_binding_mcp_rpc_response(
     ))
 }
 
-fn sse_json_values(body: &str) -> Vec<Value> {
+fn sse_json_values(body: &str) -> Result<Vec<Value>, AgentBindingMcpRpcError> {
     body.lines()
         .filter_map(|line| line.trim().strip_prefix("data:"))
         .map(str::trim)
         .filter(|data| !data.is_empty() && *data != "[DONE]")
-        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .map(|data| {
+            astra_turn_types::parse_unique_json(data.as_bytes()).map_err(|error| {
+                agent_binding_mcp_rpc_error(format!(
+                    "Agent Binding MCP SSE data is invalid: {error}"
+                ))
+            })
+        })
         .collect()
 }
 
@@ -1129,9 +1191,14 @@ fn json_rpc_result(value: Value, request_id: &Value) -> Result<Value, AgentBindi
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("unknown MCP JSON-RPC error");
-        return Err(agent_binding_mcp_provider_error(format!(
+        let mut failure = agent_binding_mcp_provider_error(format!(
             "Agent Binding MCP JSON-RPC error {code}: {message}"
-        )));
+        ));
+        failure.outcome_unknown = error
+            .pointer("/data/execution_outcome")
+            .and_then(Value::as_str)
+            == Some("unknown");
+        return Err(failure);
     }
     value.get("result").cloned().ok_or_else(|| {
         agent_binding_mcp_rpc_error("Agent Binding MCP JSON-RPC response missing result")
@@ -1187,6 +1254,139 @@ fn parse_agent_binding_mcp_tools(
         });
     }
     Ok(parsed)
+}
+
+/// Resolve a lazily described tool through the same trusted binding claims
+/// and canonical descriptor constructor as the initial MCP inventory.
+pub(crate) fn resolve_capability_source_tool(
+    source_id: &str,
+    selection_key: &str,
+    candidate: &super::capability_source::CapabilityCandidate,
+    raw_tool: Value,
+) -> Result<(ResolvedProviderSnapshot, Value), String> {
+    let tools = parse_agent_binding_mcp_tools(json!({"tools": [raw_tool]}))
+        .map_err(|error| error.to_string())?;
+    let declarations =
+        agent_binding_tools_to_provider_declarations(&tools).map_err(|error| error.to_string())?;
+    let discovery = ProviderDiscoverySnapshot::new(
+        ProviderIdentity::new(source_id).map_err(|error| error.to_string())?,
+        ProviderBindingRef::new(format!("{}:{}", source_id, candidate.capability.binding_id))
+            .map_err(|error| error.to_string())?,
+        ProviderProtocolId::new("mcp").map_err(|error| error.to_string())?,
+        declarations,
+    )
+    .map_err(|error| error.to_string())?;
+    let aliases = BTreeMap::from([(
+        NativeToolId::new(&candidate.capability.native_id).map_err(|error| error.to_string())?,
+        PublicToolAlias::new(selection_key).map_err(|error| error.to_string())?,
+    )]);
+    let policy = astra_turn_core::provider_resolution::ProviderClaimTrustPolicy {
+        standard_protocols: BTreeMap::from([("mcp".to_string(), ProviderClaimTrust::Advisory)]),
+        provider_extensions: BTreeMap::from([(
+            AGENT_BINDING_EFFECT_EXTENSION_NAMESPACE.to_string(),
+            ProviderClaimTrust::Trusted,
+        )]),
+        ..Default::default()
+    };
+    let snapshot = resolve_mcp_snapshot_with_policy(&discovery, aliases, policy)?;
+    let mut schemas = mcp_resolved_provider_snapshot_to_schemas_checked(&snapshot)?;
+    if schemas.len() != 1 {
+        return Err("capability source must describe exactly one tool".into());
+    }
+    Ok((snapshot, schemas.remove(0)))
+}
+
+pub(crate) fn extract_capability_source_result(
+    result: &Value,
+) -> Result<McpToolCallResult, AgentBindingMcpRpcError> {
+    validate_capability_source_result(result)
+        .map_err(|error| error.after_send(AgentBindingMcpRpcRisk::ToolInvocation))?;
+    extract_agent_binding_mcp_tool_result(result)
+}
+
+fn validate_capability_source_result(result: &Value) -> Result<(), AgentBindingMcpRpcError> {
+    let invalid = || agent_binding_mcp_rpc_error("invalid capability source tool result");
+    let object = result.as_object().ok_or_else(invalid)?;
+    if object
+        .get("isError")
+        .is_some_and(|value| !value.is_boolean())
+        || object
+            .get("is_error")
+            .is_some_and(|value| !value.is_boolean())
+        || ["structuredContent", "_meta"]
+            .iter()
+            .any(|key| object.get(*key).is_some_and(|value| !value.is_object()))
+    {
+        return Err(invalid());
+    }
+    match object.get("content") {
+        Some(Value::Array(content)) => {
+            for item in content {
+                if !valid_mcp_content(item) {
+                    return Err(invalid());
+                }
+            }
+        }
+        None if object.contains_key("structuredContent") => {}
+        _ => return Err(invalid()),
+    }
+    Ok(())
+}
+
+fn valid_mcp_content(item: &Value) -> bool {
+    use base64::Engine as _;
+
+    let Some(object) = item.as_object() else {
+        return false;
+    };
+    if ["mimeType", "title", "description"]
+        .iter()
+        .any(|key| object.get(*key).is_some_and(|value| !value.is_string()))
+        || object.get("_meta").is_some_and(|value| !value.is_object())
+    {
+        return false;
+    }
+    let encoded = |value: Option<&Value>| {
+        value.and_then(Value::as_str).is_some_and(|text| {
+            base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .is_ok()
+        })
+    };
+    let has_uri = |value: &Value| {
+        value
+            .get("uri")
+            .and_then(Value::as_str)
+            .is_some_and(|uri| !uri.is_empty())
+    };
+    match object.get("type").and_then(Value::as_str) {
+        Some("text") => item.get("text").is_some_and(Value::is_string),
+        Some("image" | "audio") => {
+            item.get("mimeType")
+                .and_then(Value::as_str)
+                .is_some_and(|mime| !mime.is_empty())
+                && encoded(item.get("data"))
+        }
+        Some("resource_link") => has_uri(item) && item.get("name").is_some_and(Value::is_string),
+        Some("resource") => {
+            let Some(resource) = item.get("resource").filter(|value| value.is_object()) else {
+                return false;
+            };
+            if !has_uri(resource)
+                || resource
+                    .get("mimeType")
+                    .is_some_and(|value| !value.is_string())
+            {
+                return false;
+            }
+            match (resource.get("text"), resource.get("blob")) {
+                (Some(text), None) => text.is_string(),
+                (None, Some(blob)) => encoded(Some(blob)),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 fn agent_binding_tools_to_schemas_checked(
@@ -1356,6 +1556,73 @@ fn extract_agent_binding_mcp_tool_result(
 }
 
 impl AgentBindingMcpRuntime {
+    pub(crate) fn with_capability_source(
+        &self,
+        config: super::capability_source::CapabilitySourceConfig,
+    ) -> Result<Self, String> {
+        config.validate().map_err(|error| error.to_string())?;
+        if self
+            .tool_names_by_public_name
+            .keys()
+            .any(|name| super::capability_source::valid_selection_key(name))
+        {
+            return Err(
+                "registered MCP alias conflicts with a reserved capability selection key".into(),
+            );
+        }
+        if config.discovery_tools.iter().any(|name| {
+            !self.resolved_snapshot.descriptors.iter().any(|descriptor| {
+                &descriptor.native_tool_name == name
+                    && descriptor.semantic_baseline.effect
+                        == astra_turn_types::ResolvedToolEffect::ReadOnly
+            })
+        }) {
+            return Err(
+                "capability source discovery requires an authenticated read-only tool".into(),
+            );
+        }
+        let mut runtime = self.clone();
+        runtime.capability_source_config = Some(config);
+        Ok(runtime)
+    }
+
+    pub(crate) fn native_tool_name(&self, public_name: &str) -> Option<&str> {
+        self.tool_names_by_public_name
+            .get(public_name)
+            .map(String::as_str)
+    }
+
+    pub(crate) fn public_tool_name(&self, native_name: &str) -> Option<&str> {
+        self.tool_names_by_public_name
+            .iter()
+            .find(|(_, native)| native.as_str() == native_name)
+            .map(|(alias, _)| alias.as_str())
+    }
+
+    /// Uses the same transport, endpoint confinement, redaction and dispatch
+    /// certainty contract as ordinary Agent Binding MCP calls.
+    pub(crate) async fn capability_rpc(
+        &self,
+        method: &str,
+        params: Value,
+        effectful: bool,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<Value, AgentBindingMcpRpcError> {
+        let risk = if effectful {
+            AgentBindingMcpRpcRisk::ToolInvocation
+        } else {
+            AgentBindingMcpRpcRisk::SideEffectFree
+        };
+        let secrets = json!({
+            "authorization": self.authorization,
+            "url": self.endpoint_url,
+            "credentials": params.pointer("/capability/reference"),
+        });
+        self.rpc_with_cancel(method, params, risk, cancel_token)
+            .await
+            .map_err(|error| error.redacted(&secrets))
+    }
+
     #[cfg(test)]
     pub(crate) fn for_tests(server_name: &str, public_tool_names: &[&str]) -> Self {
         Self::for_tests_at_endpoint(server_name, public_tool_names, "http://127.0.0.1:1/mcp")
@@ -1371,10 +1638,23 @@ impl AgentBindingMcpRuntime {
             .iter()
             .map(|name| ((*name).to_string(), (*name).to_string()))
             .collect();
+        let tools = public_tool_names
+            .iter()
+            .map(|name| json!({"name": name, "inputSchema": {"type": "object"}}))
+            .collect::<Vec<_>>();
+        let bundle = prepare_agent_binding_mcp_bundle_from_snapshot(
+            server_name,
+            endpoint_url,
+            "Bearer test",
+            None,
+            &tools,
+        )
+        .expect("test MCP snapshot must resolve");
         Self {
             server_name: server_name.to_string(),
             endpoint_url: endpoint_url.to_string(),
             authorization: "Bearer test".to_string(),
+            tool_call_timeout: Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS),
             tool_names_by_public_name: Arc::new(tool_names_by_public_name),
             workspace_effects_by_public_name: Arc::new(
                 public_tool_names
@@ -1383,6 +1663,8 @@ impl AgentBindingMcpRuntime {
                     .collect(),
             ),
             semantic_read_tools: Arc::new(HashSet::new()),
+            resolved_snapshot: bundle.agent_binding_mcp.unwrap().resolved_snapshot.clone(),
+            capability_source_config: None,
         }
     }
 
@@ -1416,11 +1698,6 @@ impl AgentBindingMcpRuntime {
         provider_interaction_response: Option<&astra_turn_types::ProviderInteractionResponse>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<McpToolCallResult, AgentBindingMcpRpcError> {
-        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-            let mut error = agent_binding_mcp_rpc_error("MCP tool cancelled before dispatch");
-            error.cancelled_before_dispatch = true;
-            return Err(error);
-        }
         if tool_call_id.trim().is_empty() {
             return Err(agent_binding_mcp_rpc_error(
                 "Agent Binding MCP tool call identity is required",
@@ -1452,63 +1729,100 @@ impl AgentBindingMcpRuntime {
         if !protocol_metadata.is_empty() {
             params["_meta"] = Value::Object(protocol_metadata);
         }
+        let result = self
+            .rpc_with_cancel(
+                "tools/call",
+                params,
+                AgentBindingMcpRpcRisk::ToolInvocation,
+                cancel_token,
+            )
+            .await?;
+        extract_agent_binding_mcp_tool_result(&result).map_err(|error| {
+            error.redacted(&json!({
+                "authorization": &self.authorization,
+                "url": &self.endpoint_url,
+            }))
+        })
+    }
+
+    async fn rpc_with_cancel(
+        &self,
+        method: &str,
+        params: Value,
+        risk: AgentBindingMcpRpcRisk,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<Value, AgentBindingMcpRpcError> {
+        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            let mut error = agent_binding_mcp_rpc_error("MCP request cancelled before dispatch");
+            error.cancelled_before_dispatch = true;
+            return Err(error);
+        }
         // The business call id survives interaction rounds; a protocol request
         // id identifies only this exchange and must never cancel another round.
         let request_id = uuid::Uuid::new_v4().to_string();
         let payload = json!({
             "jsonrpc": "2.0",
             "id": request_id,
-            "method": "tools/call",
+            "method": method,
             "params": params,
         });
         let execution = post_agent_binding_mcp_rpc_with_risk(
             &self.endpoint_url,
             &self.authorization,
             payload,
-            Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS),
-            AgentBindingMcpRpcRisk::ToolInvocation,
+            match risk {
+                AgentBindingMcpRpcRisk::ToolInvocation => self.tool_call_timeout,
+                AgentBindingMcpRpcRisk::SideEffectFree => {
+                    Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS)
+                }
+            },
+            risk,
         );
         tokio::pin!(execution);
-        let result = if let Some(cancel_token) = cancel_token {
+        if let Some(cancel_token) = cancel_token {
             tokio::select! {
                 biased;
                 result = &mut execution => result,
                 () = cancel_token.cancelled() => {
                     // A notification requests cancellation; only the original
                     // response can settle this invocation's ownership boundary.
-                    let notification = notify_agent_binding_mcp_cancelled(
-                        &self.endpoint_url, &self.authorization, &request_id,
-                    );
-                    tokio::pin!(notification);
-                    tokio::select! {
-                        biased;
-                        result = &mut execution => result,
-                        notified = &mut notification => {
-                            if let Err(error) = notified {
-                                tracing::warn!(
-                                    server = %self.server_name,
-                                    error = %error.redacted(&json!({
-                                        "authorization": &self.authorization,
-                                        "url": &self.endpoint_url,
-                                    })),
-                                    "MCP cancellation notification failed; retaining original invocation"
-                                );
+                    // A longer tool-call budget must not lengthen the existing
+                    // bounded cancellation/receipt wait.
+                    tokio::time::timeout(
+                        Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS),
+                        async {
+                            let notification = notify_agent_binding_mcp_cancelled(
+                                &self.endpoint_url, &self.authorization, &request_id,
+                            );
+                            tokio::pin!(notification);
+                            tokio::select! {
+                                biased;
+                                result = &mut execution => result,
+                                notified = &mut notification => {
+                                    if let Err(error) = notified {
+                                        tracing::warn!(
+                                            server = %self.server_name,
+                                            error = %error.redacted(&json!({
+                                                "authorization": &self.authorization,
+                                                "url": &self.endpoint_url,
+                                            })),
+                                            "MCP cancellation notification failed; retaining original invocation"
+                                        );
+                                    }
+                                    execution.await
+                                }
                             }
-                            execution.await
-                        }
-                    }
+                        },
+                    ).await.unwrap_or_else(|_| Err(
+                        agent_binding_mcp_timeout_error(format!("MCP cancellation did not settle within {}ms", AGENT_BINDING_MCP_RPC_TIMEOUT_SECS * 1_000))
+                            .after_send(risk)
+                    ))
                 }
             }
         } else {
             execution.await
         }
         .map_err(|error| {
-            error.redacted(&json!({
-                "authorization": &self.authorization,
-                "url": &self.endpoint_url,
-            }))
-        })?;
-        extract_agent_binding_mcp_tool_result(&result).map_err(|error| {
             error.redacted(&json!({
                 "authorization": &self.authorization,
                 "url": &self.endpoint_url,
@@ -1827,9 +2141,12 @@ fn build_agent_binding_mcp_bundle(
         server_name: tool_namespace,
         endpoint_url: endpoint_url.to_string(),
         authorization: authorization.to_string(),
+        tool_call_timeout: Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS),
         tool_names_by_public_name: Arc::new(tool_names_by_public_name),
+        resolved_snapshot: Arc::new(resolved_snapshot.clone()),
         workspace_effects_by_public_name: Arc::new(workspace_effects_by_public_name),
         semantic_read_tools: Arc::new(semantic_read_tools),
+        capability_source_config: None,
     });
     let provider_snapshots = vec![resolved_snapshot];
     let provider_policy_index =
@@ -1873,6 +2190,7 @@ fn build_agent_binding_mcp_bundle(
         stop_after_success_tools,
         manager: None,
         agent_binding_mcp: Some(agent_binding_mcp),
+        capability_source: None,
         semantic_read_capabilities,
     })
 }
@@ -1880,6 +2198,195 @@ fn build_agent_binding_mcp_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn timeout_fixture_bundle(endpoint: &str) -> RuntimeMcpBundle {
+        prepare_agent_binding_mcp_bundle_from_snapshot(
+            "budget", endpoint, "Bearer fixture", None,
+            &[json!({"name":"transform", "inputSchema":{"type":"object"}, "side_effect_class":"write"})],
+        ).unwrap()
+    }
+
+    #[test]
+    fn gateway_tool_call_timeout_metadata_is_explicit_and_bounded() {
+        let default = timeout_fixture_bundle("http://127.0.0.1:1/mcp").with_tool_call_timeout(
+            parse_agent_binding_mcp_tool_call_timeout(&serde_json::Map::new()).unwrap(),
+        );
+        assert_eq!(
+            default.agent_binding_mcp.unwrap().tool_call_timeout,
+            Duration::from_secs(120)
+        );
+        for value in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("600000"),
+            Value::Null,
+            json!(3_600_001),
+        ] {
+            let metadata = serde_json::Map::from_iter([("tool_call_timeout_ms".into(), value)]);
+            let result = parse_agent_binding_mcp_tool_call_timeout(&metadata);
+            match result {
+                Err((status, _)) => assert_eq!(status, StatusCode::BAD_REQUEST),
+                Ok(_) => panic!("invalid explicit timeout must not become a default"),
+            }
+        }
+        let metadata =
+            serde_json::Map::from_iter([("tool_call_timeout_ms".into(), json!(630_000))]);
+        let configured = timeout_fixture_bundle("http://127.0.0.1:1/mcp")
+            .with_tool_call_timeout(parse_agent_binding_mcp_tool_call_timeout(&metadata).unwrap());
+        assert_eq!(
+            configured.agent_binding_mcp.unwrap().tool_call_timeout,
+            Duration::from_secs(630)
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_declared_tool_call_timeout_controls_real_http_dispatch() {
+        use axum::{Router, routing::post};
+        let app = Router::new().route("/mcp", post(|Json(body): Json<Value>| async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Json(json!({"jsonrpc":"2.0", "id":body["id"], "result":{"content":[{"type":"text","text":"finished"}]}}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for (timeout_ms, should_complete) in [(50, false), (5_000, true)] {
+            let metadata =
+                serde_json::Map::from_iter([("tool_call_timeout_ms".into(), json!(timeout_ms))]);
+            let bundle = timeout_fixture_bundle(&endpoint).with_tool_call_timeout(
+                parse_agent_binding_mcp_tool_call_timeout(&metadata).unwrap(),
+            );
+            let result = bundle
+                .agent_binding_mcp
+                .as_ref()
+                .unwrap()
+                .call_tool_by_mcp_name(
+                    "mcp__budget__transform",
+                    &json!({}),
+                    "fixture-call",
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            if should_complete {
+                assert_eq!(result.unwrap().output, "finished");
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.is_timeout());
+                assert!(error.side_effects_maybe());
+                assert!(!error.provider_acknowledged);
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn tool_call_budget_does_not_shorten_capability_discovery() {
+        use axum::{Router, routing::post};
+        let app = Router::new().route(
+            "/mcp",
+            post(|Json(body): Json<Value>| async move {
+                assert_eq!(body["method"], "capabilities/list");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Json(json!({"jsonrpc":"2.0", "id":body["id"], "result":{"items":[]}}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let metadata = serde_json::Map::from_iter([("tool_call_timeout_ms".into(), json!(50))]);
+        let bundle = timeout_fixture_bundle(&endpoint)
+            .with_tool_call_timeout(parse_agent_binding_mcp_tool_call_timeout(&metadata).unwrap());
+        let result = bundle
+            .agent_binding_mcp
+            .as_ref()
+            .unwrap()
+            .rpc_with_cancel(
+                "capabilities/list",
+                json!({}),
+                AgentBindingMcpRpcRisk::SideEffectFree,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, json!({"items":[]}));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn extended_gateway_call_keeps_cancellation_settlement_bounded() {
+        use axum::{Router, routing::post};
+        use tokio::sync::Notify;
+        use tokio_util::sync::CancellationToken;
+
+        let started = Arc::new(Notify::new());
+        let notified = Arc::new(Notify::new());
+        let app = Router::new().route(
+            "/mcp",
+            post({
+                let started = started.clone();
+                let notified = notified.clone();
+                move |Json(body): Json<Value>| {
+                    let started = started.clone();
+                    let notified = notified.clone();
+                    async move {
+                        match body["method"].as_str().unwrap() {
+                            "tools/call" => {
+                                started.notify_one();
+                                std::future::pending::<(StatusCode, Json<Value>)>().await
+                            }
+                            "notifications/cancelled" => {
+                                notified.notify_one();
+                                (StatusCode::ACCEPTED, Json(Value::Null))
+                            }
+                            other => panic!("unexpected method: {other}"),
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let metadata =
+            serde_json::Map::from_iter([("tool_call_timeout_ms".into(), json!(3_600_000))]);
+        let bundle = timeout_fixture_bundle(&endpoint)
+            .with_tool_call_timeout(parse_agent_binding_mcp_tool_call_timeout(&metadata).unwrap());
+        let runtime = bundle.agent_binding_mcp.as_ref().unwrap();
+        let token = CancellationToken::new();
+        let args = json!({});
+        let call = runtime.call_tool_by_mcp_name(
+            "mcp__budget__transform",
+            &args,
+            "cancellation-fixture",
+            None,
+            None,
+            Some(&token),
+        );
+        tokio::pin!(call);
+        tokio::select! {
+            result = &mut call => panic!("returned before dispatch: {result:?}"),
+            () = started.notified() => {},
+            () = tokio::time::sleep(Duration::from_secs(5)) => panic!("dispatch did not reach fixture"),
+        }
+        token.cancel();
+        tokio::select! {
+            result = &mut call => panic!("cancel notification cannot settle execution: {result:?}"),
+            () = notified.notified() => {},
+            () = tokio::time::sleep(Duration::from_secs(5)) => panic!("cancel notification did not reach fixture"),
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(121)).await;
+        let error = tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("cancellation must settle within its 120-second budget, not the one-hour RPC budget")
+            .unwrap_err();
+        assert!(error.is_timeout());
+        assert!(error.side_effects_maybe());
+        assert!(!error.provider_acknowledged);
+        server.abort();
+    }
 
     #[test]
     fn agent_binding_response_correlation_precedes_acknowledgement() {
@@ -2117,6 +2624,111 @@ mod tests {
         assert!(error.is_timeout());
     }
 
+    #[tokio::test]
+    async fn capability_source_rpc_redacts_private_references_before_error_consumers() {
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().route(
+            "/mcp",
+            axum::routing::post(|axum::Json(request): axum::Json<Value>| async move {
+                let reference = request["params"]["capability"]["reference"]
+                    .as_str()
+                    .unwrap();
+                let message = format!("expired reference {reference}");
+                if request["params"]["raw_error"] == true {
+                    (StatusCode::BAD_GATEWAY, message).into_response()
+                } else {
+                    axum::Json(json!({"jsonrpc":"2.0", "id":request["id"],
+                        "error":{"code":-32602,"message":message}}))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let transport =
+            AgentBindingMcpRuntime::for_tests_at_endpoint("source", &["search"], &endpoint);
+        for (method, effectful) in [
+            ("astra/capabilities/describe", false),
+            ("astra/capabilities/read_skill", false),
+            ("astra/capabilities/invoke", true),
+        ] {
+            for reference in ["opaque-ref-private", "q"] {
+                for raw_error in [false, true] {
+                    let error = transport
+                        .capability_rpc(
+                            method,
+                            json!({"capability":{"reference":reference}, "raw_error":raw_error}),
+                            effectful,
+                            None,
+                        )
+                        .await
+                        .unwrap_err();
+                    assert!(!error.to_string().contains(reference));
+                    assert!(!error.to_string().contains(&endpoint));
+                    assert_eq!(error.side_effects_maybe(), effectful && raw_error);
+                    assert_eq!(error.provider_acknowledged, !raw_error);
+                }
+            }
+        }
+        server.abort();
+    }
+
+    #[test]
+    fn capability_source_discovery_requires_resolver_owned_read_only_semantics() {
+        for effect in [None, Some("read"), Some("write"), Some("external_effect")] {
+            let mut declaration = json!({"name":"discover", "inputSchema":{"type":"object"}});
+            if let Some(effect) = effect {
+                declaration["side_effect_class"] = json!(effect);
+            }
+            let bundle = prepare_agent_binding_mcp_bundle_from_snapshot(
+                "source",
+                "https://provider.example/mcp",
+                "Bearer test",
+                None,
+                &[declaration],
+            )
+            .unwrap();
+            let result = bundle.agent_binding_mcp.unwrap().with_capability_source(
+                super::super::capability_source::CapabilitySourceConfig {
+                    contract_version: super::super::capability_source::CONTRACT_VERSION.into(),
+                    discovery_tools: std::collections::BTreeSet::from(["discover".into()]),
+                    selection_authorization: "discovery_scope".into(),
+                },
+            );
+            assert_eq!(result.is_ok(), effect == Some("read"));
+        }
+    }
+
+    #[test]
+    fn capability_source_rejects_registered_alias_that_is_a_complete_selection_key() {
+        let native_name = "search__0123456789abcdef";
+        let bundle = prepare_agent_binding_mcp_bundle_from_snapshot(
+            "cap",
+            "https://provider.example/mcp",
+            "Bearer test",
+            None,
+            &[json!({"name": native_name, "side_effect_class": "read", "inputSchema": {"type": "object"}})],
+        )
+        .unwrap();
+        let error = bundle
+            .agent_binding_mcp
+            .unwrap()
+            .with_capability_source(super::super::capability_source::CapabilitySourceConfig {
+                contract_version: super::super::capability_source::CONTRACT_VERSION.into(),
+                discovery_tools: std::collections::BTreeSet::from([native_name.into()]),
+                selection_authorization: "discovery_scope".into(),
+            })
+            .err()
+            .expect("an alias cannot own both a registered descriptor and a selection key");
+        assert_eq!(
+            error,
+            "registered MCP alias conflicts with a reserved capability selection key"
+        );
+    }
+
     #[test]
     fn agent_binding_post_send_certainty_depends_on_rpc_semantics_and_acknowledgement() {
         let prepare_timeout = agent_binding_mcp_timeout_error("timed out")
@@ -2209,6 +2821,62 @@ mod tests {
                 .and_then(Value::as_str),
             Some("external_effect")
         );
+    }
+
+    #[test]
+    fn agent_binding_provider_unknown_outcome_survives_acknowledgement() {
+        let error = decode_agent_binding_mcp_rpc_response(r#"{"jsonrpc":"2.0","id":"call","error":{"code":-32000,"message":"cannot confirm","data":{"execution_outcome":"unknown"}}}"#, &json!("call"))
+            .unwrap_err().after_send(AgentBindingMcpRpcRisk::ToolInvocation);
+        assert!(error.provider_acknowledged);
+        assert!(error.side_effects_maybe());
+        let rejected = decode_agent_binding_mcp_rpc_response(
+            r#"{"jsonrpc":"2.0","id":"call","error":{"code":-32000,"message":"denied"}}"#,
+            &json!("call"),
+        )
+        .unwrap_err()
+        .after_send(AgentBindingMcpRpcRisk::ToolInvocation);
+        assert!(!rejected.side_effects_maybe());
+    }
+
+    #[test]
+    fn agent_binding_rejects_duplicate_json_and_sse_contracts() {
+        for body in [
+            r#"{"result":{},"result":{"forged":true}}"#,
+            "data: {\"result\":{},\"result\":{\"forged\":true}}\n\n",
+        ] {
+            assert!(decode_agent_binding_mcp_rpc_response(body, &json!("call")).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_binding_rpc_rejects_oversized_response_without_losing_effect_certainty() {
+        use axum::{Router, routing::post};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/mcp",
+            post(|| async { "x".repeat(AGENT_BINDING_MCP_MAX_RESPONSE_BYTES + 1) }),
+        );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        for (risk, uncertain) in [
+            (AgentBindingMcpRpcRisk::SideEffectFree, false),
+            (AgentBindingMcpRpcRisk::ToolInvocation, true),
+        ] {
+            let error = post_agent_binding_mcp_rpc_with_risk(
+                &endpoint,
+                "Bearer test",
+                json!({"jsonrpc":"2.0","id":"size","method":"call"}),
+                Duration::from_secs(5),
+                risk,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.side_effects_maybe(), uncertain);
+            assert!(error.detail.contains("byte budget"));
+        }
+        server.abort();
     }
 
     #[test]
@@ -3154,6 +3822,48 @@ mod tests {
             result.protocol_metadata,
             Some(json!({"requestId": "request-1"}))
         );
+    }
+
+    #[test]
+    fn capability_source_invalid_acknowledgements_preserve_uncertainty() {
+        for invalid in [
+            Value::Null,
+            json!({"isError":"true"}),
+            json!({"content":null}),
+            json!({"content":[{"type":"text","text":null}]}),
+            json!({"content":[],"structuredContent":[]}),
+            json!({"content":[{"type":"image"}]}),
+            json!({"isError":true,"content":[{"type":"image","text":42}]}),
+            json!({"content":[{"type":"audio","data":"invalid","mimeType":"audio/wav"}]}),
+            json!({"content":[{"type":"resource_link","uri":"file:///test"}]}),
+            json!({"content":[{"type":"resource","resource":{"uri":"file:///test","blob":42}}]}),
+            json!({"content":[{"type":"unknown"}]}),
+        ] {
+            let error = extract_capability_source_result(&invalid)
+                .expect_err("invalid tool acknowledgement cannot succeed");
+            assert!(error.side_effects_maybe());
+            assert!(!error.provider_acknowledged);
+        }
+        let result = extract_capability_source_result(&json!({"content":[],"isError":true}))
+            .expect("valid tool error is an acknowledged result");
+        assert!(result.is_error);
+    }
+
+    #[test]
+    fn capability_source_accepts_all_standard_content_variants() {
+        for content in [
+            json!({"type":"text","text":""}),
+            json!({"type":"image","data":"YWJj","mimeType":"image/png"}),
+            json!({"type":"audio","data":"YWJj","mimeType":"audio/wav"}),
+            json!({"type":"resource_link","uri":"file:///test","name":"test"}),
+            json!({"type":"resource","resource":{"uri":"file:///test","text":""}}),
+            json!({"type":"resource","resource":{"uri":"file:///test","blob":"YWJj"}}),
+        ] {
+            let result =
+                extract_capability_source_result(&json!({"content":[content],"isError":true}))
+                    .expect("valid non-text errors retain their acknowledgement");
+            assert!(result.is_error);
+        }
     }
 
     #[tokio::test]

@@ -232,7 +232,13 @@ pub(crate) async fn command(command: &NativeAuthCommand) -> Result<(), String> {
         NativeAuthCommand::Workspace { id, clear } => {
             let session = store.current()?;
             if *clear {
-                return store.select_workspace(&session, None);
+                let committed = store.select_workspace(&session, None)?;
+                if !committed.directory_synced {
+                    eprintln!(
+                        "Workspace selection was cleared, but crash durability is unconfirmed."
+                    );
+                }
+                return Ok(());
             }
             let credential = store.credential("moi", Some(&session.generation)).await?;
             let bootstrap = super::auth_flow::uc::moi_bootstrap(
@@ -247,7 +253,15 @@ pub(crate) async fn command(command: &NativeAuthCommand) -> Result<(), String> {
             {
                 return Err("MOI workspace response identity mismatch".into());
             }
-            super::auth_flow::uc::choose_workspace(&store, &session, bootstrap, id.as_deref())
+            let mut interrupt = super::auth_flow::uc::LoginInterrupt::new()?;
+            super::auth_flow::uc::choose_workspace(
+                &store,
+                &session,
+                bootstrap,
+                id.as_deref(),
+                &mut interrupt,
+            )
+            .await
         }
         NativeAuthCommand::Status { json } => {
             let configured = store.configured()?;
@@ -343,7 +357,11 @@ fn credential_pipe(_: i32) -> Result<std::fs::File, String> {
 }
 
 pub(crate) async fn logout() -> Result<(), String> {
-    if let Some(session) = NativeStore::new()?.logout()? {
+    let committed = NativeStore::new()?.logout()?;
+    if !committed.directory_synced {
+        eprintln!("Sign-out is visible, but local durability after a crash is unconfirmed.");
+    }
+    if let Some(session) = committed.value {
         native::revoke(&session.environment, &session.refresh_token).await?;
     }
     Ok(())

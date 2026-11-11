@@ -1,5 +1,6 @@
 //! Durable session-memory work owned by the canonical session lifecycle.
-//! Request publication precedes turn completion. Short checkpoints and bounded
+//! Explicit Session close/finalize reconstructs input from canonical Context.
+//! Short checkpoints and bounded
 //! destructive cleanup take the existing session write fence, shared by all pods
 //! and turn admission; a lease selects a worker, never grants user authority.
 
@@ -457,7 +458,7 @@ impl SessionMemoryLifecycleStore {
             let query = format!(
                 "UPDATE agent_session_memory_work SET state_json = ?, complete = ?, {scheduling}, updated_at = NOW(6) WHERE user_id = ? AND session_id = ?"
             );
-            sqlx::query(&query)
+            sqlx::query(sqlx::AssertSqlSafe(query))
                 .bind(serde_json::to_string(&work).map_err(|error| error.to_string())?)
                 .bind(!work.pending())
                 .bind(user)
@@ -504,7 +505,7 @@ impl SessionMemoryLifecycleStore {
         let query = format!(
             "UPDATE agent_session_memory_work SET lease_token = NULL, lease_expires_at = NULL, next_attempt_at = {due}, attempts = {attempts}, updated_at = NOW(6) WHERE user_id = ? AND session_id = ? AND lease_token = ?"
         );
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query))
             .bind(&claim.user_id)
             .bind(&claim.session_id)
             .bind(&claim.token)
@@ -551,22 +552,14 @@ async fn execution_is_idle(
     user: &str,
     session: &str,
 ) -> Result<bool, String> {
-    let slot = sqlx::query(
-        "SELECT 1 FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
-    )
-    .bind(user)
-    .bind(session)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|error| error.to_string())?;
-    if slot.is_some() {
+    if !crate::storage::session_execution_activity(tx, user, session, None)
+        .await
+        .map_err(|error| error.to_string())?
+        .is_idle()
+    {
         return Ok(false);
     }
-    // Terminal Run persistence releases the execution slot before canonical
-    // context commit. The coordinator's existing writer/reservation authority
-    // still permits that commit, so neither close nor destructive maintenance
-    // may treat the old watermark as settled. Use database time and current
-    // reads under the shared Session fence, just like the context coordinator.
+    // Independent Controller work also prevents destructive maintenance.
     let context_writer = sqlx::query(
         "SELECT 1 FROM session_context_heads WHERE owner_user_id = ? AND session_id = ?
          AND (active_writer_expires_at_ms > CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED)

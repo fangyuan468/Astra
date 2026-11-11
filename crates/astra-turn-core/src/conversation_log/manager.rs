@@ -1,6 +1,6 @@
 //! Unified CSL manager — encapsulates store + seq tracking + snapshot + GC.
 //!
-//! Used identically by CLI (FileCslStore) and server (DbCslStore).
+//! Used by CLI continuation with FileCslStore.
 //!
 //! The manager stores canonical runtime history. Prompt-facing projections are
 //! derived by callers at wire/session-display boundaries; they are never used
@@ -11,8 +11,8 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 use super::{
-    AppendMeta, CslEntry, CslStore, CslStoreError, MaterializedState, SessionStateCompact,
-    SessionStatePatch, materialize, validate_session_id,
+    CslEntry, CslStore, CslStoreError, MaterializedState, SessionStateCompact, SessionStatePatch,
+    materialize, validate_session_id,
 };
 
 fn validate_csl_source_cursor(
@@ -80,7 +80,6 @@ pub struct CslManager {
     last_turn: u32,
     last_canonical_messages: Vec<serde_json::Value>,
     last_canonical_message_hashes: Vec<CanonicalMessageHash>,
-    trace_id: Option<String>,
     last_session_state: SessionStateCompact,
     /// A manager may be reconstructed while a prior projection is still
     /// completing. Do not assume `last_seq == 0` means the store is empty:
@@ -103,14 +102,9 @@ impl CslManager {
             last_turn: 0,
             last_canonical_messages: Vec::new(),
             last_canonical_message_hashes: Vec::new(),
-            trace_id: None,
             last_session_state: SessionStateCompact::default(),
             loaded: false,
         })
-    }
-
-    pub fn set_trace_id(&mut self, id: String) {
-        self.trace_id = Some(id);
     }
 
     pub fn last_seq(&self) -> u64 {
@@ -233,11 +227,6 @@ impl CslManager {
         );
         let mut canonical_messages = messages.to_vec();
         carry_forward_user_turn_semantics(&self.last_canonical_messages, &mut canonical_messages);
-        let canonical_message_count = canonical_messages.len();
-        let meta = AppendMeta {
-            trace_id: self.trace_id.clone(),
-            message_count: Some(canonical_message_count as u32),
-        };
 
         if self.last_seq == 0 {
             let canonical_message_hashes = canonical_message_hashes(&canonical_messages);
@@ -251,9 +240,7 @@ impl CslManager {
                 messages: canonical_messages.clone(),
                 session_state: session_state.clone(),
             };
-            self.store
-                .append(&self.session_id, &snapshot, &meta)
-                .await?;
+            self.store.append(&self.session_id, &snapshot).await?;
             self.last_seq = 1;
             self.last_turn = turn;
             self.last_canonical_messages = canonical_messages;
@@ -279,9 +266,7 @@ impl CslManager {
                 messages: canonical_messages.clone(),
                 session_state: session_state.clone(),
             };
-            self.store
-                .append(&self.session_id, &snapshot, &meta)
-                .await?;
+            self.store.append(&self.session_id, &snapshot).await?;
             self.last_seq = next_seq;
             self.last_turn = turn;
             self.last_canonical_messages = canonical_messages;
@@ -300,7 +285,7 @@ impl CslManager {
             appended,
             state_patch: Some(SessionStatePatch::from_full(&session_state)),
         };
-        self.store.append(&self.session_id, &delta, &meta).await?;
+        self.store.append(&self.session_id, &delta).await?;
         self.last_seq = next_seq;
         self.last_turn = turn;
         record_full_history_clone(
@@ -328,9 +313,7 @@ impl CslManager {
                 messages: canonical_messages.clone(),
                 session_state: session_state.clone(),
             };
-            self.store
-                .append(&self.session_id, &snapshot, &meta)
-                .await?;
+            self.store.append(&self.session_id, &snapshot).await?;
             self.last_seq = snap_seq;
             self.last_canonical_message_hashes = canonical_message_hashes;
 
@@ -358,7 +341,6 @@ impl CslManager {
             new_session_id.to_string(),
             self.config.clone(),
         )?;
-        child.trace_id = self.trace_id.clone();
         let mat = child.load().await?;
         Ok((child, mat))
     }
@@ -1069,20 +1051,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trace_id_propagated_via_append_meta() {
-        let tmp = TempDir::new().unwrap();
-        let mut mgr = test_manager(&tmp);
-        mgr.set_trace_id("trace-123".into());
-
-        let msgs = vec![user_msg("hello")];
-        mgr.persist_turn(1, &msgs, &default_state()).await.unwrap();
-
-        // The trace_id is written to AppendMeta which FileCslStore ignores.
-        // We verify the manager accepted it (no error) and state is correct.
-        assert_eq!(mgr.last_seq(), 1);
-    }
-
-    #[tokio::test]
     async fn session_state_patch_from_full_covers_all_fields() {
         let state = SessionStateCompact {
             source_cursor: None,
@@ -1617,13 +1585,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CslStore for FailingGcStore {
-        async fn append(
-            &self,
-            session_id: &str,
-            entry: &CslEntry,
-            meta: &super::AppendMeta,
-        ) -> Result<(), CslStoreError> {
-            self.inner.append(session_id, entry, meta).await
+        async fn append(&self, session_id: &str, entry: &CslEntry) -> Result<(), CslStoreError> {
+            self.inner.append(session_id, entry).await
         }
 
         async fn load_from_latest_snapshot(

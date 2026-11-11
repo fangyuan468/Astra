@@ -175,6 +175,80 @@ fn probe_child() {
         }
     }
     startup.handoff();
+    if case == "draft_recovery" {
+        use crate::tui::{
+            bottom_pane::{BottomPane, BottomPaneAction},
+            slash_dispatch,
+        };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for draft_command in ["/skill", "/stats"] {
+            let mut pane = BottomPane::new();
+            pane.composer = crate::tui::bottom_pane::chat_composer::ChatComposer::new_ephemeral();
+            pane.set_slash_items(vec![crate::tui::slash_menu::SlashItem::simple(
+                "/skill", "skills",
+            )]);
+            // Seed the command explicitly: scheduler-sized gaps in synthetic
+            // key loops can activate paste detection and consume Enter. This
+            // case tests draft custody across commands, not typing cadence.
+            pane.replace_composer_text(draft_command);
+            pane.restore_into_composer("//returned");
+            let BottomPaneAction::SubmitInput(command) =
+                pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            else {
+                panic!("expected slash command");
+            };
+            assert_eq!(pane.composer.text(), "//returned");
+            let mut state = crate::cli::session::session_state::SessionState::default();
+            let mut widget = crate::tui::chat_widget::ChatWidget::new("");
+            let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+            let mut retries = std::collections::BTreeMap::new();
+            runtime.block_on(async {
+                let result = slash_dispatch::dispatch(
+                    &command,
+                    &mut slash_dispatch::DispatchContext {
+                        api: &api,
+                        profile: None,
+                        state: &mut state,
+                        guard: &mut guard,
+                        bottom_pane: &mut pane,
+                        chat_widget: &mut widget,
+                        width: 120,
+                        client_id: "draft-recovery",
+                        pending_work_retries: &mut retries,
+                    },
+                )
+                .await;
+                assert!(matches!(result, slash_dispatch::SlashResult::Handled));
+            });
+            if draft_command == "/stats" {
+                assert!(pane.has_active_view());
+                pane.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+                assert!(!pane.has_active_view());
+                assert_eq!(pane.composer.text(), "/");
+            } else {
+                assert_eq!(pane.composer.text(), "$");
+            }
+            pane.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            assert_eq!(pane.composer.text(), "//returned");
+            let BottomPaneAction::SubmitInput(returned) =
+                pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            else {
+                panic!("recovery needs a new submission gesture");
+            };
+            assert_eq!(returned, "//returned");
+            assert_eq!(pane.queued_next_turn_submission_count(), 0);
+        }
+        drop(guard);
+        drop(startup);
+        let after = nix::sys::termios::tcgetattr(std::io::stdin()).unwrap();
+        println!(
+            "{RESULT}{}",
+            serde_json::json!({
+                "restored": terminal_modes_restored(&before, &after), "draft_recovered": true,
+            })
+        );
+        return;
+    }
     if case == "late_da1" {
         assert!(sixel_before.is_none());
         let image = tempfile::NamedTempFile::new().unwrap();
@@ -699,6 +773,7 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
             | "early_palette"
             | "early_theme"
             | "keyboard_enhancement_panic"
+            | "draft_recovery"
     ) {
         return (value, output);
     }
@@ -900,4 +975,10 @@ fn pty_resize_cursor_query_preserves_input_and_handles_missing_reply() {
     ] {
         run_case(case);
     }
+}
+
+#[test]
+fn pty_command_and_picker_navigation_preserve_recovered_drafts() {
+    let (value, _) = run_case("draft_recovery");
+    assert_eq!(value["draft_recovered"], true);
 }

@@ -329,7 +329,7 @@ describe('AstraWebSocket', () => {
     const failed = await nextAttachedSocket(ws, first);
     failed._receive({ type: 'error', code: 'UPSTREAM_ERROR', retryable: true, message: 'DB busy' });
     await new Promise((resolve) => setTimeout(resolve, 25));
-    expect((ws as any).ws).toBe(failed);
+    expect(ws.readyState).toBe(MockWebSocket.CLOSED);
     expect(ws.connectionState).toBe('disconnected');
     expect(ws.runId).toBe('r1');
     ws.close();

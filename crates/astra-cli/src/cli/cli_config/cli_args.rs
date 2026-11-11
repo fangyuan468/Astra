@@ -110,10 +110,6 @@ pub(crate) struct Cli {
     /// Set a display name for this session
     #[arg(short = 'n', long = "name")]
     pub session_name: Option<String>,
-    /// Minimal mode: skip hooks, auto-memory, background prefetches.
-    /// Only explicitly provided context (--system-prompt, --add-dir, --mcp-config) is used.
-    #[arg(long = "bare")]
-    pub bare: bool,
     /// Disable auto-loading of .astra/instructions.md project instructions
     #[arg(long = "no-instructions")]
     pub no_instructions: bool,
@@ -121,9 +117,6 @@ pub(crate) struct Cli {
     /// One-shot results remain usable, but cannot be recovered or auto-resumed locally.
     #[arg(long = "no-journal-content")]
     pub no_journal_content: bool,
-    /// Print startup timing for each initialization phase
-    #[arg(long = "startup-trace")]
-    pub startup_trace: bool,
     /// Emit structured tracing to stderr (same as ASTRA_DIAGNOSTIC_LOG=1); hidden from --help
     #[arg(long = "diagnostic-log", hide = true)]
     pub diagnostic_log: bool,
@@ -174,6 +167,9 @@ pub(crate) enum Command {
     #[command(alias = "sessions")]
     #[command(subcommand)]
     Session(SessionCmd),
+    /// Recover local workspace operations after checking that commands stopped
+    #[command(subcommand)]
+    Workspace(WorkspaceCmd),
     /// Introspect persistent agent state
     #[command(name = "self")]
     #[command(subcommand)]
@@ -267,7 +263,7 @@ impl Command {
         use crate::cli::cli_config::cli_utils::CliProfileIdentityAdmission;
 
         match self {
-            Self::Login(_) | Self::Register(_) => {
+            Self::Login(_) | Self::Register(_) | Self::Workspace(_) => {
                 CliProfileIdentityAdmission::AuthenticationBootstrap
             }
             Self::Admin(args) if args.is_authentication_bootstrap() => {
@@ -276,6 +272,12 @@ impl Command {
             _ => CliProfileIdentityAdmission::RequireBoundAccount,
         }
     }
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum WorkspaceCmd {
+    /// Confirm that earlier commands have stopped and allow file rollback
+    ConfirmStopped,
 }
 
 impl Cli {
@@ -350,7 +352,7 @@ pub(crate) struct RegisterArgs {
 
 #[derive(Args, Debug)]
 #[command(
-    after_help = "Examples:\n  astra login\n  astra login --manual\n  astra login --username alice --password secret"
+    after_help = "Examples:\n  astra login\n  astra login --device-code\n  astra login --manual\n  astra login --username alice --password secret"
 )]
 pub(crate) struct LoginArgs {
     /// Username to log in with
@@ -362,6 +364,9 @@ pub(crate) struct LoginArgs {
     /// Enter a Memoria connection key instead of opening the browser
     #[arg(long)]
     pub manual: bool,
+    /// Sign in to MOI from a headless terminal using another device's browser
+    #[arg(long, conflicts_with_all = ["username", "password", "manual"])]
+    pub device_code: bool,
 }
 
 #[derive(Args, Debug)]
@@ -818,7 +823,7 @@ pub(crate) enum SessionCmd {
 
 #[derive(Args, Debug)]
 pub(crate) struct SessionJudgeArgs {
-    /// JudgmentRequest JSON with shared evidence and typed questions (no agent task)
+    /// JudgmentRequest JSON with shared evidence and typed questions; use - to read stdin
     #[arg(short, long)]
     pub message: String,
     /// Active Server model selector
@@ -978,6 +983,12 @@ pub(crate) struct SessionIdArgs {
     after_help = "Examples:\n  astra model add\n  astra model list\n  astra model add deepseek --provider deepseek --model deepseek-v4-flash --context-window 1000000 --api-key-stdin --default\n  astra model add gateway --provider openai-compatible --base-url https://gateway.example/v1 --model MODEL_ID --api-key-stdin\n  astra model show deepseek\n  astra model probe deepseek"
 )]
 pub(crate) enum ModelCmd {
+    /// Link a subscription account using browser authorization
+    Connect(ModelConnectArgs),
+    /// List your provider connections without credential material
+    Connections,
+    /// Revoke a linked account and disable its models
+    Disconnect { connection_id: String },
     /// List available models
     List,
     /// Add a personal Cloud BYOK model
@@ -992,11 +1003,14 @@ pub(crate) enum ModelCmd {
 
 #[derive(Args, Debug)]
 pub(crate) struct ModelAddArgs {
+    /// Subscription connection UUID (for provider chatgpt)
+    #[arg(long = "connection")]
+    pub connection_id: Option<String>,
     /// Configuration alias used with chat --model (wizard default: provider model ID)
     #[arg(value_name = "ALIAS")]
     pub name: Option<String>,
     /// Model provider (omit to choose interactively)
-    #[arg(long, value_parser = ["openai", "anthropic", "deepseek", "openai-compatible"])]
+    #[arg(long, value_parser = ["openai", "anthropic", "deepseek", "openai-compatible", "chatgpt"])]
     pub provider: Option<String>,
     /// Exact model ID from your provider's API documentation (not the Astra alias)
     #[arg(long)]
@@ -1004,6 +1018,9 @@ pub(crate) struct ModelAddArgs {
     /// HTTPS API base URL, required for openai-compatible
     #[arg(long)]
     pub base_url: Option<String>,
+    /// API format required by the provider (default: chat)
+    #[arg(long = "api-format", value_parser = ["chat", "responses"])]
+    pub api_format: Option<String>,
     /// Read the API key from standard input
     #[arg(long)]
     pub api_key_stdin: bool,
@@ -1013,6 +1030,20 @@ pub(crate) struct ModelAddArgs {
     /// Model context-window size in tokens
     #[arg(long, default_value_t = 128_000)]
     pub context_window: i32,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ModelConnectArgs {
+    #[arg(value_parser=["chatgpt"])]
+    pub provider: String,
+    #[arg(long)]
+    pub label: Option<String>,
+    /// Reauthorize the same account registration
+    #[arg(long)]
+    pub connection: Option<String>,
+    /// Retry a failed code exchange using its issued registration
+    #[arg(long = "retry", conflicts_with = "connection")]
+    pub retry_authorization_id: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1351,6 +1382,23 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     #[test]
+    fn device_code_login_is_explicit_and_conflicts_with_other_login_methods() {
+        let cli = Cli::try_parse_from(["astra", "login", "--device-code"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Login(args)) if args.device_code));
+        for extra in [
+            vec!["--manual"],
+            vec!["--username", "alice"],
+            vec!["--password", "secret"],
+        ] {
+            let mut args = vec!["astra", "login", "--device-code"];
+            args.extend(extra);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        let cli = Cli::try_parse_from(["astra", "login"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Login(args)) if !args.device_code));
+    }
+
+    #[test]
     fn mcp_effective_view_is_explicit_and_conflicts_with_a_selected_scope() {
         let cli = Cli::try_parse_from(["astra", "mcp", "list", "--effective"]).unwrap();
         assert!(
@@ -1544,5 +1592,59 @@ mod tests {
         assert_eq!(args.base_url.as_deref(), Some("https://gateway.example/v1"));
         assert_eq!(args.provider.as_deref(), Some("openai-compatible"));
         assert!(Cli::try_parse_from(["astra", "model", "add", "--provider", "unknown"]).is_err());
+    }
+
+    #[test]
+    fn subscription_commands_keep_connection_and_registration_retry_explicit() {
+        let cli = Cli::try_parse_from([
+            "astra",
+            "model",
+            "add",
+            "coding",
+            "--provider",
+            "chatgpt",
+            "--connection",
+            "connection-id",
+            "--model",
+            "visible-model",
+            "--default",
+        ])
+        .unwrap();
+        let Some(Command::Model(ModelCmd::Add(args))) = cli.command else {
+            panic!("model add")
+        };
+        assert_eq!(args.connection_id.as_deref(), Some("connection-id"));
+        assert!(!args.api_key_stdin);
+        assert!(args.default);
+        for command in [
+            vec![
+                "astra", "model", "connect", "chatgpt", "--label", "personal",
+            ],
+            vec![
+                "astra",
+                "model",
+                "connect",
+                "chatgpt",
+                "--retry",
+                "attempt-id",
+            ],
+            vec!["astra", "model", "connections"],
+            vec!["astra", "model", "disconnect", "connection-id"],
+        ] {
+            assert!(Cli::try_parse_from(command).is_ok());
+        }
+        assert!(
+            Cli::try_parse_from([
+                "astra",
+                "model",
+                "connect",
+                "chatgpt",
+                "--connection",
+                "connection-id",
+                "--retry",
+                "attempt-id"
+            ])
+            .is_err()
+        );
     }
 }

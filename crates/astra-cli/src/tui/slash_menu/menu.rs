@@ -73,7 +73,10 @@ impl SlashItem {
 
 /// Should the menu be open for the given composer buffer?
 pub(crate) fn is_open_for(buffer: &str, items: &[SlashItem]) -> bool {
-    if !buffer.starts_with('/') || buffer.contains(['\n', '\r']) {
+    if !buffer.starts_with('/')
+        || !crate::tui::slash_dispatch::parse_submission(buffer).is_command()
+        || buffer.contains(['\n', '\r'])
+    {
         return false;
     }
     let Some((command, suffix)) = buffer.split_once(char::is_whitespace) else {

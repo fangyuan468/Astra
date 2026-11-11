@@ -145,7 +145,7 @@ pub struct ResolvedProviderPolicyIndex {
     by_alias: BTreeMap<String, ResolvedProviderEntry>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ResolvedProviderEntry {
     policy: ResolvedInvocationPolicy,
     model_catalog: Option<std::sync::Arc<astra_turn_types::ProviderModelCatalog>>,
@@ -220,8 +220,37 @@ impl ResolvedProviderPolicyIndex {
         self.by_alias.get(public_alias).map(|entry| &entry.policy)
     }
 
+    /// Add an immutable lazy snapshot. Repeated materialization is idempotent;
+    /// an alias cannot silently acquire a different descriptor or policy.
+    pub fn extend_snapshot(
+        &mut self,
+        snapshot: &ResolvedProviderSnapshot,
+    ) -> Result<(), ProviderResolutionError> {
+        let added = Self::from_snapshots(std::slice::from_ref(snapshot))?;
+        for (alias, entry) in &added.by_alias {
+            if self
+                .by_alias
+                .get(alias)
+                .is_some_and(|existing| existing != entry)
+            {
+                return Err(ProviderResolutionError::CrossSnapshotAliasCollision {
+                    alias: alias.clone(),
+                });
+            }
+        }
+        self.by_alias.extend(added.by_alias);
+        Ok(())
+    }
+
     pub fn len(&self) -> usize {
         self.by_alias.len()
+    }
+
+    pub fn descriptor_refs(&self) -> BTreeMap<String, ResolvedToolDescriptorRef> {
+        self.by_alias
+            .iter()
+            .map(|(alias, entry)| (alias.clone(), entry.policy.descriptor.clone()))
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1029,6 +1058,40 @@ mod tests {
     }
 
     #[test]
+    fn lazy_policy_extension_is_idempotent_and_atomic_on_collision() {
+        let resolve = |binding: &str, ids: &[&str]| {
+            resolve_provider_snapshot(
+                &discovery_for_binding(
+                    binding,
+                    ids.iter()
+                        .map(|id| declaration(id, ProviderToolClaims::default()))
+                        .collect(),
+                ),
+                &ProviderClaimTrustPolicy::default(),
+                &aliases(ids),
+            )
+            .unwrap()
+        };
+        let initial = resolve("initial", &["z_collision"]);
+        let mut index =
+            ResolvedProviderPolicyIndex::from_snapshots(std::slice::from_ref(&initial)).unwrap();
+        let before = index.descriptor_refs();
+        index.extend_snapshot(&initial).unwrap();
+        assert_eq!(index.descriptor_refs(), before);
+        let conflicting = resolve("other", &["a_new", "z_collision"]);
+        assert!(matches!(
+            index.extend_snapshot(&conflicting),
+            Err(ProviderResolutionError::CrossSnapshotAliasCollision { .. })
+        ));
+        assert_eq!(index.descriptor_refs(), before);
+        assert!(index.resolve("provider__a_new").is_none());
+        index
+            .extend_snapshot(&resolve("other", &["a_new"]))
+            .unwrap();
+        assert_eq!(index.len(), 2);
+    }
+
+    #[test]
     fn resolution_is_order_stable_and_sibling_changes_are_descriptor_local() {
         let read_claims = ProviderToolClaims {
             read_only: Some(protocol_claim(true, "readOnlyHint")),
@@ -1055,7 +1118,8 @@ mod tests {
         assert_eq!(first, reordered);
 
         let mut changed_b = declaration("b", ProviderToolClaims::default());
-        changed_b.description = Some("changed sibling".to_string());
+        changed_b.input_schema =
+            json!({"type":"object","required":["path"],"properties":{"path":{"type":"string"}}});
         let changed = resolve_provider_snapshot(
             &discovery(vec![declaration("a", read_claims), changed_b]),
             &trusted_mcp(),
@@ -1074,6 +1138,46 @@ mod tests {
         assert_eq!(version(&first, "a"), version(&changed, "a"));
         assert_ne!(version(&first, "b"), version(&changed, "b"));
         assert_ne!(first.content_hash, changed.content_hash);
+    }
+
+    #[test]
+    fn descriptor_refresh_preserves_executable_identity_but_revokes_real_changes() {
+        let resolve = |tool| {
+            resolve_provider_snapshot(&discovery(vec![tool]), &trusted_mcp(), &aliases(&["read"]))
+                .unwrap()
+        };
+        let mut tool = declaration("read", ProviderToolClaims::default());
+        tool.input_schema = json!({"type":"object","properties":{
+            "description":{"type":"string","description":"help","enum":["old"]}
+        },"required":["description"],"additionalProperties":false});
+        let original = resolve(tool.clone());
+        tool.description = Some("clearer help".into());
+        tool.title = Some("Read".into());
+        tool.input_schema["properties"]["description"]["description"] = json!("updated help");
+        let presented = resolve(tool.clone());
+        assert_eq!(
+            original.descriptors[0].descriptor_ref(),
+            presented.descriptors[0].descriptor_ref()
+        );
+        assert_ne!(original.content_hash, presented.content_hash);
+        for change in 0..3 {
+            let mut changed = tool.clone();
+            match change {
+                0 => changed.input_schema["properties"]["description"]["enum"] = json!(["new"]),
+                1 => changed.task_support = ProviderTaskSupport::Required,
+                _ => changed.claims.read_only = Some(protocol_claim(true, "readOnlyHint")),
+            }
+            assert_ne!(
+                original.descriptors[0].descriptor_ref(),
+                resolve(changed).descriptors[0].descriptor_ref()
+            );
+        }
+        let moved = discovery_for_binding("other-owner", vec![tool]);
+        let moved = resolve_provider_snapshot(&moved, &trusted_mcp(), &aliases(&["read"])).unwrap();
+        assert_ne!(
+            original.descriptors[0].descriptor_ref(),
+            moved.descriptors[0].descriptor_ref()
+        );
     }
 
     #[test]

@@ -1,5 +1,7 @@
 mod completions;
 #[cfg(feature = "server")]
+pub mod edge_capacity_rpc;
+#[cfg(feature = "server")]
 pub mod edge_connection_pool;
 pub mod edge_ws_protocol;
 mod model_admission;
@@ -54,6 +56,17 @@ pub const WORK_API_MAJOR: &str = "1";
 /// recoverable model/tool error.
 pub const AGENT_INTERACTION_API_MAJOR_HEADER: &str = "x-astra-agent-interaction-api-major";
 pub const AGENT_INTERACTION_API_MAJOR: &str = "3";
+
+/// Read-only model catalog response format. Unversioned clients and explicit
+/// `2` retain the published 0.2.12 field set, including protocol-aware
+/// controls and pricing; `3` is the current production projection. This is
+/// not an execution or authorization capability.
+pub const MODEL_CATALOG_VERSION_HEADER: &str = "x-astra-model-catalog-version";
+/// Frozen published 0.2.12 catalog format, also served to unversioned
+/// requests.
+pub const MODEL_CATALOG_VERSION_V2: &str = "2";
+/// Current catalog response format requested by supported clients.
+pub const MODEL_CATALOG_VERSION: &str = "3";
 
 /// Versioned, server-issued lifecycle update for the compact live Work board.
 ///
@@ -723,64 +736,6 @@ pub struct WorkBranchDeletionRequestV1 {
 }
 
 #[cfg(feature = "server")]
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkPatchMaterializationRequestV1 {
-    pub request_id: String,
-    pub patch_artifact_id: String,
-    pub expected_target_branch_revision: i64,
-    pub expected_target_graph_revision: i64,
-}
-
-#[cfg(feature = "server")]
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkPatchMaterializationsQueryV1 {
-    pub source_branch_id: String,
-    pub before_created_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub before_operation_id: Option<String>,
-    pub limit: Option<u16>,
-}
-
-#[cfg(feature = "server")]
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkPatchCommitRequestV1 {
-    pub request_id: String,
-    pub patch_artifact_id: String,
-    pub expected_target_branch_revision: i64,
-    pub expected_target_graph_revision: i64,
-    pub message: String,
-}
-
-#[cfg(feature = "server")]
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkPatchCommitsQueryV1 {
-    pub before_created_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub before_operation_id: Option<String>,
-    pub limit: Option<u16>,
-}
-
-#[cfg(feature = "server")]
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkPatchArtifactExportRequestV1 {
-    pub request_id: String,
-    pub expected_branch_revision: i64,
-    pub expected_graph_revision: i64,
-}
-
-#[cfg(feature = "server")]
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkPatchArtifactsQueryV1 {
-    pub before_created_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub before_patch_artifact_id: Option<String>,
-    pub limit: Option<u16>,
-}
-
-#[cfg(feature = "server")]
 #[derive(Clone, Debug, Serialize)]
 pub struct WorkBranchAttachResponseV1 {
     pub schema_version: u16,
@@ -1414,11 +1369,6 @@ pub struct ChatRequest {
     pub plan_subtask_id: Option<String>,
     #[serde(default)]
     pub is_plan_subtask: Option<bool>,
-    /// Server-issued canonical authority. Omitted on initial admission;
-    /// identity inside this envelope is never trusted without signature and
-    /// authenticated-owner validation.
-    #[serde(default)]
-    pub conversation_authority: Option<astra_turn_types::ConversationAuthorityEnvelopeV1>,
 }
 
 #[cfg(feature = "server")]
@@ -1594,8 +1544,6 @@ pub struct SessionArtifactResponse {
     pub retention_policy: Option<String>,
     pub retention_until: Option<String>,
     pub status: Option<String>,
-    pub referenced_by_manifest_count: u32,
-    pub referenced_by_state_items_count: u32,
     pub referenced_by_citation_count: u32,
     pub referenced_by_durable_count: u32,
     pub created_at: Option<String>,
@@ -1731,6 +1679,8 @@ pub struct CancelRunResponse {
     pub run_id: String,
     pub status: String,
     pub execution_settled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_not_saved: Option<bool>,
 }
 
 #[cfg(feature = "server")]
@@ -2258,12 +2208,14 @@ impl From<AdminUserRoleRecord> for AdminUserRoleResponse {
 #[cfg(feature = "server")]
 impl From<SessionRecord> for SessionResponse {
     fn from(value: SessionRecord) -> Self {
+        let mut metadata = value.metadata;
+        metadata.remove(astra_services::auth::session::PROVIDER_SCOPE_PROOF_KEY);
         Self {
             session_id: value.session_id,
             user_id: value.user_id,
             agent_id: value.agent_id,
             title: value.title,
-            metadata: value.metadata,
+            metadata,
             status: value.status,
             event_count: value.event_count,
             created_at: value.created_at,
@@ -2351,6 +2303,7 @@ impl From<CancelRunRecord> for CancelRunResponse {
             run_id: value.run_id,
             status: value.status,
             execution_settled: value.execution_settled,
+            context_not_saved: value.context_not_saved,
         }
     }
 }
@@ -2513,7 +2466,6 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         explain: request.explain,
         interaction_mode: request.interaction_mode,
         interactive_client: request.interactive_client,
-        conversation_authority: request.conversation_authority,
     }
 }
 

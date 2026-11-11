@@ -7,19 +7,14 @@ Context and prompt owns context assembly, prompt-cache stability, dynamic state 
 
 This document defines the target behavior that implementation should converge toward.
 
-Context manifests project observed LLM calls. The retained 8k template supplies
-coarse projection budgets; context assembly owns actual request budgeting.
-The `post_compaction` reason describes a call after compaction state was recorded;
-multiple subsequent calls can carry it. Trace-gated, best-effort manifests are
-not one-per-compaction certificates, and their count does not prove preservation.
-Preservation belongs at acceptance of a canonical rewrite. Request-time manifest
-diagnostics retain only message/tool-result token totals across provider inference;
-they do not retain another transcript copy. These estimates are skipped unless
-context-assembly persistence has an owner and database, and the host must still
-confirm the authoritative session/run identity after inference. Retrieval-stage
-metadata describes runtime facts, but does not itself execute retrieval. Synthetic
-confidence, expiry, seven-child rendering, and 10GB retrieval assertions are not
-evidence that those policies or execution paths are implemented.
+The separate persisted per-call Context manifest product and its coarse 8k
+budget projection are retired. Canonical Context commits, heads, pins and
+receipts retain conversation custody. Live assembly traces, Explain Context,
+actual model input budgets, compaction, provider receipts and usage remain
+independent owners; they are not per-compaction preservation certificates.
+Preservation is verified when accepting a canonical rewrite. The removed
+per-attempt artifact-evidence list and zone estimates are not reconstructed from
+provider usage. Diagnostic manifests no longer add artifact retention pins.
 
 The database-inspired foundation for this design is described in
 [ContextPipe: Database-Inspired Context Assembly for Long-Horizon
@@ -64,14 +59,23 @@ The stable prefix should include:
 
 It should not include volatile provider online/offline status, large task lists, or transient sync counters.
 
+Canonical and resident Bash schemas share the same compact, producer-owned
+execution hint. Unconditional shell syntax limits come first, followed by a
+script route for loops and the existing external-write scope contract. This
+guidance changes neither tool admission nor sandbox permission enforcement.
+
 ## Dynamic blocks
 
-For OpenAI-compatible requests, the provider projection has at most one system
-message, at the beginning. Stable agent/platform rules and typed runtime
-instructions are consolidated there. Runtime facts and advisory evidence are
+OpenAI-compatible and Responses requests share at most one leading system
+message. Stable agent/platform rules and typed runtime instructions are
+consolidated there. Runtime facts and advisory evidence are
 separate user-role messages marked `astra-runtime-context`; this wire role does
 not turn them into canonical human requests. Genuine user content and real
 assistant/tool groups retain their identity and order.
+
+Turn focus and acknowledgments refer to human-authored requests and facts.
+Marked runtime-owned observations are evidence for that active request, not a
+new request to answer or acknowledge, even when their provider wire role is user.
 
 Delivery and authority are independent. Required context is not automatically a
 system instruction. The producer-owned injection kind selects policy; the
@@ -80,6 +84,11 @@ facts before rendering. User text and wrapper-like strings never grant authority
 Platform integrations must put invariant rules in `stable_runtime_system_prompt`
 and per-turn data in `runtime_system_prompt`. Switching a runtime policy can
 change the system prefix; changing round facts must not.
+
+Current semantic mailbox input and terminal child outcomes are placed after older
+conversation/tool observations, including stale running-status receipts. Ordinary
+runtime context keeps its declared cache placement; semantic input follows event
+chronology. This uses the existing typed ownership, delivery and history lanes.
 
 Semantic mailbox input and terminal child results survive temporary delivery
 retirement for the current human turn. They use the existing typed canonical
@@ -112,6 +121,16 @@ Deployments that support preserving appended message boundaries can explicitly
 select `AppendOnlyUserTail` to retain the stable authority policy and append
 runtime instructions with their existing lifetime and supersession semantics.
 Do not silently reinterpret an explicitly selected `TailSuffix` capability.
+
+An OpenAI-compatible prefix-caching deployment can explicitly select
+`TailAfterUser` after verifying that it treats marked runtime context following
+a human message as evidence, not a new human request. On a human-message tail,
+the runtime context follows the human message so the latter can remain in the
+next request's reusable prefix. Tool results remain contiguous with their
+assistant calls, and other tail shapes keep the existing suffix boundary.
+Delivery policy remains independent: `all` retains optional context. This
+changes provider message order, not canonical conversation history or runtime
+authority, and is never inferred from a model name.
 
 Repeated states within one typed authority kind must not create a new system
 instruction for every changing value. The stable leading turn-focus policy
@@ -156,6 +175,9 @@ Compaction should preserve:
 Compaction should not turn transient tool output into permanent truth without attribution.
 Generate a compaction summary only after history actually changes. An elevated
 pressure tier alone does not authorize an LLM call for intact or protected history.
+Pre-turn summarization rejects a zero spill prefix before resolving the model,
+revalidating its Offering or assembling a summary request. This optimization
+does not widen the prefix or preserve arbitrary single-task intermediate facts.
 
 ## Memory injection
 
@@ -224,3 +246,28 @@ continues to use `detect_workspace_context`.
 The unused `theme::strip_ansi` source API is retired. Terminal rendering tests
 use the same ANSI parser as production width calculation; rendering and
 terminal-control behavior remain unchanged.
+
+Admitted Skill instructions are recovered from the existing execution facts when
+absent from the actual request history, including ordinary requests after a
+pre-turn rewrite and continuation restore. A local compaction flag is not a
+presence certificate. A unique activation/result pair carrying the delivered
+body, or a valid active recovery frame carrying its bounded rendering, avoids
+reinjection. Calls, resource reads, short receipts and user-authored quotations
+do not prove instruction delivery. Recovery uses the existing attachment budget
+and wire placement without resolving or activating the Skill again, performing
+auxiliary inference, or accessing the database. Re-entry limits block repeated
+activation of that Skill; they do not instruct premature completion of the task.
+The activation owner captures the complete safety-governed body before
+model-budget truncation. Normal delivery and recovery derive from those same
+bytes; continuation preserves emitted redaction markers without regenerating
+them or replaying activation. Existing continuation bodies pass through this
+same safety projection when accepted. Client-pipeline invocation facts are
+recorded from the complete final governed result after PostToolUse hooks and
+successful result persistence; ordinary delivery consumes that same governed
+callback body.
+
+Ordinary agent waiting is directly exposed through the canonical `agent.wait`
+action. Models need not propose a final answer to invoke an internal completion
+barrier. The existing completion owner still prevents finalization before owned
+children settle. Mailbox questions and answers use their existing correlation IDs;
+provider-owned collaborators retain their distinct advertised resume capability.

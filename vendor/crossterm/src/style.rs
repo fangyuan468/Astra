@@ -423,6 +423,10 @@ pub struct PrintStyledContent<D: Display>(pub StyledContent<D>);
 
 impl<D: Display> Command for PrintStyledContent<D> {
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        if Colored::ansi_color_disabled_memoized() {
+            return write!(f, "{}", self.0.content());
+        }
+
         let style = self.0.style();
 
         let mut reset_background = false;
@@ -537,6 +541,91 @@ fn parse_next_u8<'a>(iter: &mut impl Iterator<Item = &'a str>) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn styled_content_respects_effective_policy() {
+        const CASE: &str = "ASTRA_TEST_STYLE_POLICY";
+        if let Ok(case) = std::env::var(CASE) {
+            match case.as_str() {
+                "force-on" | "force-on-empty" => force_color_output(true),
+                "force-off" => force_color_output(false),
+                _ => {}
+            }
+            let plain = matches!(case.as_str(), "set" | "empty" | "force-off");
+            let mut combined = ContentStyle {
+                foreground_color: Some(Color::Red),
+                background_color: Some(Color::Blue),
+                underline_color: Some(Color::Yellow),
+                ..ContentStyle::default()
+            };
+            combined.attributes.set(Attribute::Bold);
+            combined.attributes.set(Attribute::Dim);
+            let variants = [
+                ContentStyle {
+                    foreground_color: Some(Color::Red),
+                    ..ContentStyle::default()
+                },
+                ContentStyle {
+                    background_color: Some(Color::Blue),
+                    ..ContentStyle::default()
+                },
+                ContentStyle {
+                    underline_color: Some(Color::Yellow),
+                    ..ContentStyle::default()
+                },
+                ContentStyle {
+                    attributes: Attribute::Dim.into(),
+                    ..ContentStyle::default()
+                },
+                combined,
+            ];
+            // Fresh children exercise concurrent first-use initialization;
+            // force overrides are applied before any worker starts.
+            let barrier = std::sync::Barrier::new(4);
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    let barrier = &barrier;
+                    let case = &case;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for style in variants {
+                            let text = style.apply("payload").to_string();
+                            assert!(text.contains("payload"));
+                            assert_eq!(text.contains('\x1b'), !plain, "{case}: {text:?}");
+                            if plain {
+                                assert_eq!(text, "payload");
+                            }
+                        }
+                    });
+                }
+            });
+            return;
+        }
+        let name = format!(
+            "{}::styled_content_respects_effective_policy",
+            module_path!().split_once("::").unwrap().1
+        );
+        for (case, value) in [
+            ("unset", None),
+            ("set", Some("1")),
+            ("empty", Some("")),
+            ("force-on", Some("1")),
+            ("force-on-empty", Some("")),
+            ("force-off", None),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", &name, "--nocapture"])
+                .env(CASE, case)
+                .env_remove("NO_COLOR");
+            if let Some(value) = value {
+                child.env("NO_COLOR", value);
+            }
+            let result = child.output().unwrap();
+            assert!(result.status.success(), "{case}: {result:?}");
+            assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+        }
+    }
 
     // On Windows many env var tests will fail so we need to conditionally check for ANSI support.
     // This allows other terminals on Windows to still assert env var support.

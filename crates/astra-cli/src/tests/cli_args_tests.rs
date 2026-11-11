@@ -1,6 +1,6 @@
 use crate::cli::cli_config::cli_args::{
     Cli, Command, ConfigCmd, McpCmd, PermissionsSubcommand, ServeMode, SessionCaptureCmd,
-    SessionCmd,
+    SessionCmd, WorkspaceCmd,
 };
 use crate::cli::cli_config::cli_utils::CliProfileIdentityAdmission;
 use crate::cli::session::session_state::ExplainMode;
@@ -26,6 +26,20 @@ fn cli_no_args_gives_no_command() {
     assert!(!cli.yes);
     assert!(cli.model.is_none());
     assert!(cli.resume.is_none());
+}
+
+#[test]
+fn workspace_recovery_is_a_local_command() {
+    let cli = Cli::try_parse_from(["astra", "workspace", "confirm-stopped"]).unwrap();
+    let command = cli.command.unwrap();
+    assert!(matches!(
+        &command,
+        Command::Workspace(WorkspaceCmd::ConfirmStopped)
+    ));
+    assert_eq!(
+        command.profile_identity_admission(),
+        CliProfileIdentityAdmission::AuthenticationBootstrap
+    );
 }
 
 #[test]
@@ -113,7 +127,6 @@ fn cli_bool_flags_default_and_set() {
         ("yes-short", &["-y"], |c| c.yes),
         ("yes-long", &["--yes"], |c| c.yes),
         ("verbose", &["--verbose"], |c| c.verbose),
-        ("bare", &["--bare"], |c| c.bare),
         ("no-instructions", &["--no-instructions"], |c| {
             c.no_instructions
         }),
@@ -195,6 +208,18 @@ fn removed_cli_control_flags_are_rejected() {
             Cli::try_parse_from(args).is_err(),
             "removed control flag should be rejected: {:?}",
             args[1]
+        );
+    }
+}
+
+#[test]
+fn removed_unimplemented_mode_flags_are_rejected() {
+    for flag in ["--bare", "--startup-trace"] {
+        let err = Cli::try_parse_from(["astra", flag]).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::UnknownArgument,
+            "removed flag must not be silently accepted: {flag}"
         );
     }
 }
@@ -644,7 +669,6 @@ fn cli_all_top_level_flags_combined() {
         "550e8400-e29b-41d4-a716-446655440000",
         "-n",
         "debug-session",
-        "--bare",
     ])
     .unwrap();
     assert_eq!(cli.model.as_deref(), Some("gpt-4o"));
@@ -662,7 +686,6 @@ fn cli_all_top_level_flags_combined() {
         Some("550e8400-e29b-41d4-a716-446655440000")
     );
     assert_eq!(cli.session_name.as_deref(), Some("debug-session"));
-    assert!(cli.bare);
 }
 
 #[test]

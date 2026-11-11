@@ -25,11 +25,9 @@
 
 mod harness;
 mod journey_admin_smoke_matrix;
-mod journey_context_decision_chain_matrix;
 mod journey_delegate_http_matrix;
 mod journey_extended;
 mod journey_full;
-mod journey_full_capture_matrix;
 mod journey_meta_matrix;
 mod journey_models_matrix;
 mod journey_phase0_production_baseline;
@@ -112,14 +110,9 @@ matrix_test! {
     journey_tasks_runs::run_orphan_cancel_claim_race_http
 }
 matrix_test! {
-    e2e_matrix_paused_accounting_generation_fence_http, 2,
-    "live MatrixOne + mock LLM; paused accounting generation fence",
-    journey_tasks_runs::run_paused_accounting_generation_fence_http
-}
-matrix_test! {
-    e2e_matrix_live_pause_wins_post_loop_settlement_accounting, 4,
-    "live MatrixOne + mock LLM; pause wins the post-loop settlement race",
-    journey_tasks_runs::run_live_pause_wins_post_loop_settlement_accounting
+    e2e_matrix_live_resume_commits_through_the_current_owner, 4,
+    "live MatrixOne + mock LLM; live resume completes through the owner terminal transaction",
+    journey_tasks_runs::run_live_resume_commits_through_the_current_owner
 }
 matrix_test! {
     e2e_matrix_session_cancel_delete, 2,
@@ -131,11 +124,7 @@ matrix_test! {
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
     journey_extended::run_chat_stream_session_info_smoke
 }
-matrix_test! {
-    e2e_matrix_stream_session_metadata_enables_full_llm_exchange_journaling, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_full_capture_matrix::run_stream_session_metadata_enables_full_llm_exchange_journaling
-}
+
 matrix_test! {
     e2e_matrix_stream_bootstrap_cleanup_preserves_live_fixture, 4,
     "live MatrixOne + mock LLM; overlapping fixture cleanup isolation gate",
@@ -303,11 +292,6 @@ matrix_test! {
     e2e_matrix_session_artifact_latest_tiebreaker, 2,
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
     journey_session_artifacts_matrix::run_session_artifact_latest_route_uses_stable_tiebreaker
-}
-matrix_test! {
-    e2e_matrix_context_decision_chain, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_context_decision_chain_matrix::run_context_decision_chain_db
 }
 matrix_test! {
     e2e_matrix_models, 2,
@@ -511,9 +495,9 @@ matrix_test! {
     journey_saas_platform_matrix::run_saas_admin_audit_rbac_smoke
 }
 matrix_test! {
-    e2e_matrix_saas_skills_cross_user_isolation, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.4 skills isolation",
-    journey_saas_platform_matrix::run_saas_skills_cross_user_isolation
+    e2e_matrix_saas_skills_publisher_ownership, 2,
+    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.4 skill publisher ownership",
+    journey_saas_platform_matrix::run_saas_skills_publisher_ownership
 }
 matrix_test! {
     e2e_matrix_saas_run_projection_smoke, 2,
@@ -544,4 +528,10 @@ matrix_test! {
     e2e_matrix_saas_delegate_http_boundaries, 2,
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §4.3 delegate HTTP",
     journey_saas_platform_matrix::run_saas_delegate_http_boundaries
+}
+
+matrix_test! {
+    e2e_matrix_saas_mcp_registration_uses_live_discovery, 2,
+    "live MatrixOne + loopback MCP; registration retains discovery without a tool projection",
+    journey_saas_platform_matrix::run_saas_mcp_registration_uses_live_discovery
 }

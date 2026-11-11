@@ -10,7 +10,8 @@
 //!
 //! # Design
 //!
-//! * **Fail-open**: DB errors log a warning and return defaults / proceed.
+//! * **Read-only checks fail open**: DB errors log a warning and return defaults.
+//!   Durable Session creation requires its quota counter to commit atomically.
 //! * **Atomic counters**: `ON DUPLICATE KEY UPDATE` for race-free increments.
 //! * **No implicit token price policy**: daily tokens are unlimited unless an
 //!   administrator writes a finite per-user limit; `0` means no cap.
@@ -272,7 +273,7 @@ impl DatabaseResourceGovernor {
             ResourceLimits::DEFAULT_MAX_CONCURRENT_BASH,
             ResourceLimits::DEFAULT_MAX_SESSIONS_PER_DAY,
         );
-        sqlx::query(&resource_limits_ddl)
+        sqlx::query(sqlx::AssertSqlSafe(resource_limits_ddl))
             .execute(self.pool.get())
             .await?;
 
@@ -292,6 +293,78 @@ impl DatabaseResourceGovernor {
         .await?;
 
         Ok(())
+    }
+
+    /// Reserve one durable Session creation in the caller's transaction.
+    ///
+    /// Call this after idempotent replay has been ruled out. The existing daily
+    /// usage row serializes ordinary and fork creation, and the increment rolls
+    /// back with the Session if any later operation fails. Resource tables must
+    /// already have been initialized by the database resource governor.
+    pub async fn reserve_session_creation(
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        user_id: &str,
+    ) -> Result<LimitCheck, sqlx::Error> {
+        let today = Self::today();
+        sqlx::query(
+            "INSERT INTO resource_usage (user_id, usage_date, sessions_created)
+             VALUES (?, ?, 0)
+             ON DUPLICATE KEY UPDATE sessions_created = sessions_created",
+        )
+        .bind(user_id)
+        .bind(&today)
+        .execute(&mut **tx)
+        .await?;
+        let (sessions_created, tokens_consumed): (i64, i64) = sqlx::query_as(
+            "SELECT CAST(sessions_created AS SIGNED), CAST(tokens_consumed AS SIGNED)
+             FROM resource_usage WHERE user_id = ? AND usage_date = ? FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(&today)
+        .fetch_one(&mut **tx)
+        .await?;
+        let limits: Option<(i32, i32, i64)> = sqlx::query_as(
+            "SELECT max_concurrent_sessions, max_sessions_per_day, max_tokens_per_day
+             FROM resource_limits WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let (concurrent_limit, daily_limit, token_limit) = limits.unwrap_or((
+            ResourceLimits::DEFAULT_MAX_CONCURRENT_SESSIONS as i32,
+            ResourceLimits::DEFAULT_MAX_SESSIONS_PER_DAY as i32,
+            ResourceLimits::DEFAULT_MAX_TOKENS_PER_DAY as i64,
+        ));
+        let active_sessions = if concurrent_limit > 0 {
+            sqlx::query_scalar(
+                "SELECT COUNT(DISTINCT session_id) FROM agent_runs
+                 WHERE user_id = ? AND status IN ('running', 'paused', 'waiting')",
+            )
+            .bind(user_id)
+            .fetch_one(&mut **tx)
+            .await?
+        } else {
+            0
+        };
+        let check = Self::evaluate_session_create_snapshot(
+            i64::from(concurrent_limit),
+            i64::from(daily_limit),
+            token_limit,
+            sessions_created,
+            tokens_consumed,
+            active_sessions,
+        );
+        if check == LimitCheck::Allowed {
+            sqlx::query(
+                "UPDATE resource_usage SET sessions_created = sessions_created + 1
+                 WHERE user_id = ? AND usage_date = ?",
+            )
+            .bind(user_id)
+            .bind(&today)
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(check)
     }
 
     /// Count sessions that currently hold execution capacity.
@@ -618,9 +691,9 @@ impl ResourceGovernor for DatabaseResourceGovernor {
             0
         };
 
-        // This remains an observational, non-reserving check. Hard concurrent
-        // enforcement still requires an atomic quota reservation with the
-        // session insert; a read-only check cannot close that race.
+        // This remains a non-reserving preflight. Database Session creation
+        // rechecks through reserve_session_creation and commits the daily
+        // counter with the Session; a read-only check cannot close that race.
         Self::evaluate_session_create_snapshot(
             max_concurrent_sessions,
             max_sessions_per_day,

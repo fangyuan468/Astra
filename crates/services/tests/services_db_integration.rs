@@ -1,6 +1,5 @@
 //! Live MatrixOne checks for list endpoints (`pagination` caps, `skills_registry` seek list + index),
-//! cross-session audit aggregates (`get_cross_session_stats`, `list_sessions`, runtime
-//! promotions), session restore, and owner-bound sync behavior.
+//! cross-session audit aggregates (`get_cross_session_stats`, `list_sessions`), session restore, and owner-bound sync behavior.
 //!
 //! ```text
 //! ASTRA_TEST_DB_IT=1 cargo test -p astra-services --test services_db_integration -- --ignored
@@ -19,38 +18,30 @@ use astra_services::introspection::{
 };
 use astra_services::session_audit::TurnListParams;
 use astra_services::session_audit::{
-    AuditSessionListParams, CrossSessionRuntimePromotionListParams, CrossSessionStatsParams,
-    DatabaseSessionAuditService, MAX_SESSION_RUNTIME_PROMOTION_ROWS, RUNTIME_PROMOTION_EVENT_TYPE,
-    RuntimePromotionController, RuntimePromotionOutcome, RuntimePromotionRecommendation,
+    AuditSessionListParams, CrossSessionStatsParams, DatabaseSessionAuditService,
     SessionAuditService,
 };
-use astra_services::session_restore::{
-    COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND, HybridRestoreService, SessionRestoreService,
-    persist_remote_composite_snapshot_index, pull_step_checkpoint_from_cloud,
-};
+use astra_services::session_restore::SessionRestoreService;
 use astra_services::session_workspace::{
     ContextTraceSignal, ContextTraceToolSurface, WORKSPACE_METADATA_ARTIFACT_KIND,
     WORKSPACE_METADATA_PROJECTION_ID, WorkspaceMetadata, persist_remote_workspace,
     to_remote_artifact_record,
 };
 use astra_services::{
-    AcquireWriterOutcome, AdminAuditFilter, AdminAuditReader, ContextService,
-    DatabaseAdminAuditReader, DatabaseContextManifestStore, DatabaseContextService,
-    DatabaseDecisionService, DatabaseEventService, DatabaseIntrospectionService,
-    DatabaseMarketplaceService, DatabaseMarketplaceStatsService, DatabasePersonalSkillStore,
+    AcquireWriterOutcome, AdminAuditFilter, AdminAuditReader, DatabaseAdminAuditReader,
+    DatabaseEventService, DatabaseIntrospectionService, DatabaseMarketplaceService,
     DatabaseReflectService, DatabaseSessionArtifactStore, DatabaseSessionContextCoordinator,
-    DatabaseSessionService, DatabaseSkillService, DatabaseStateProjectionStore,
-    DecisionCreateRequestData, DecisionListFilter, DecisionService, EventCreateRequestData,
-    EventListFilter, EventService, IntrospectionService, MAX_API_LIST_LIMIT, MarketplaceService,
-    MarketplaceStatsService, ReflectService, ReserveTurnOutcome, RetrievalStage,
-    SessionArtifactJsonStore, SessionArtifactReference, SessionArtifactReferenceKind,
-    SessionArtifactStore, SessionArtifactStoreError, SessionContextCoordinator,
-    SessionContextCoordinatorError, SessionListFilter, SessionService, SkillSearchQuery,
-    SkillService, SnapshotCreateRequestData, SnapshotListFilter, SubmitUserSkillVersion,
+    DatabaseSessionService, DatabaseSkillService, EventCreateRequestData, EventListFilter,
+    EventService, IntrospectionService, MAX_API_LIST_LIMIT, MarketplaceService, ReflectService,
+    ReserveTurnOutcome, SessionArtifactJsonStore, SessionArtifactReference,
+    SessionArtifactReferenceKind, SessionArtifactStore, SessionArtifactStoreError,
+    SessionContextCoordinator, SessionContextCoordinatorError, SessionListFilter, SessionService,
+    SkillService,
 };
 use astra_turn_types::{
     ActorContextV1, ActorKindV1, AuthorityEpochsV1, SessionKeyV1, SessionSurfaceV1,
 };
+use sha2::Digest;
 use sqlx::Row;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -58,6 +49,8 @@ use std::time::Duration;
 use uuid::Uuid;
 
 mod common;
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::prelude::*;
 
 // Historical rows are read-side inputs, not a substitute checkpoint upload API.
 async fn seed_restore_session_fixture(
@@ -69,21 +62,6 @@ async fn seed_restore_session_fixture(
     sqlx::query("INSERT INTO agent_sessions (session_id, user_id, title, status, event_count, metadata) VALUES (?, ?, 'restore fixture', 'active', 0, CAST(? AS JSON))")
         .bind(session_id).bind(user_id).bind(metadata.to_string())
         .execute(pool).await.expect("seed historical session");
-}
-
-async fn seed_restore_checkpoint_fixture(
-    pool: &sqlx::Pool<sqlx::MySql>,
-    user_id: &str,
-    session_id: &str,
-    checkpoint: &astra_services::session_checkpoint::Checkpoint,
-    state_json: Option<&str>,
-) {
-    sqlx::query("INSERT INTO session_checkpoints (checkpoint_id, session_id, user_id, number, turn, title, summary, tools_json, total_tokens, had_stalls, error_count, state_json) VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), ?, ?, ?, CAST(? AS JSON))")
-        .bind(Uuid::new_v4().to_string()).bind(session_id).bind(user_id)
-        .bind(checkpoint.number).bind(checkpoint.turn).bind(&checkpoint.title)
-        .bind(&checkpoint.summary).bind(serde_json::to_string(&checkpoint.tools_used).unwrap())
-        .bind(checkpoint.total_tokens).bind(checkpoint.had_stalls).bind(checkpoint.error_count)
-        .bind(state_json).execute(pool).await.expect("seed historical checkpoint");
 }
 
 fn context_trace_request_fixture(
@@ -106,10 +84,7 @@ fn context_trace_request_fixture(
 }
 
 fn agent_event_fixture_payload_hash(payload: serde_json::Value) -> String {
-    astra_services::observation_capture::canonical_observation_payload_hash(
-        astra_services::observation_capture::ObservationPayloadDomain::AgentEvent,
-        &payload,
-    )
+    astra_services::observation_capture::canonical_agent_event_payload_hash(&payload)
 }
 
 fn model_request_fixture_accepted_event(
@@ -294,11 +269,13 @@ async fn session_creation_returns_database_generated_fields_after_commit() {
         "agent_session_lifecycle_fences",
         "auth_audit_logs",
     ] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
-            .bind(&user_id)
-            .execute(&pool)
-            .await
-            .expect("clean up test-owned rows");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_id = ?"
+        )))
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean up test-owned rows");
     }
 }
 
@@ -837,7 +814,6 @@ async fn cleanup_session_bundle(
     session_id_2: &str,
     user_id: &str,
     event_ids: &[String],
-    decision_ids: &[String],
     audit_ids: &[String],
 ) {
     for eid in event_ids {
@@ -856,20 +832,6 @@ async fn cleanup_session_bundle(
             .execute(pool)
             .await;
     }
-    for did in decision_ids {
-        let _ =
-            sqlx::query("DELETE FROM ctx_decision_audits WHERE decision_id = ? AND user_id = ?")
-                .bind(did)
-                .bind(user_id)
-                .execute(pool)
-                .await;
-    }
-    let _ = sqlx::query("DELETE FROM ctx_snapshots WHERE user_id = ? AND session_id IN (?, ?)")
-        .bind(user_id)
-        .bind(session_id)
-        .bind(session_id_2)
-        .execute(pool)
-        .await;
     let _ = sqlx::query("DELETE FROM skill_installations WHERE user_id = ?")
         .bind(user_id)
         .execute(pool)
@@ -1153,7 +1115,7 @@ async fn unpublish_skill_is_owner_bound_for_same_name_versions() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
+async fn events_sessions_admin_and_marketplace_installed_pagination() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
 
@@ -1163,18 +1125,12 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
     let e1 = Uuid::new_v4().to_string();
     let e2 = Uuid::new_v4().to_string();
     let e3 = Uuid::new_v4().to_string();
-    let snapshot_id = Uuid::new_v4().to_string();
-    let snapshot_id_2 = Uuid::new_v4().to_string();
-    let snapshot_id_3 = Uuid::new_v4().to_string();
     let installation_id = Uuid::new_v4().to_string();
     let installation_id_2 = Uuid::new_v4().to_string();
     let installation_id_3 = Uuid::new_v4().to_string();
     let skill_name = format!("skill-{}", Uuid::new_v4());
     let skill_name_2 = format!("skill-{}", Uuid::new_v4());
     let skill_name_3 = format!("skill-{}", Uuid::new_v4());
-    let decision_id = Uuid::new_v4().to_string();
-    let decision_id_2 = Uuid::new_v4().to_string();
-    let decision_id_3 = Uuid::new_v4().to_string();
     let a0 = Uuid::new_v4().to_string();
     let a1 = Uuid::new_v4().to_string();
     let a2 = Uuid::new_v4().to_string();
@@ -1190,11 +1146,6 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
         activity_id_3.clone(),
     ];
     let event_ids = vec![e1.clone(), e2.clone(), e3.clone()];
-    let decision_ids = vec![
-        decision_id.clone(),
-        decision_id_2.clone(),
-        decision_id_3.clone(),
-    ];
 
     cleanup_session_bundle(
         &pool,
@@ -1202,7 +1153,6 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
         &session_id_2,
         &user_id,
         &event_ids,
-        &decision_ids,
         &audit_ids,
     )
     .await;
@@ -1337,135 +1287,6 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
         vec![e2.as_str()]
     );
     assert!(second_session_page.next_cursor.is_none());
-
-    for (capture_id, event_id, ts) in [
-        (&snapshot_id, &e1, "2026-05-01 10:00:00.000000"),
-        (&snapshot_id_2, &e2, "2026-05-01 12:00:00.000000"),
-        (&snapshot_id_3, &e3, "2026-05-01 11:00:00.000000"),
-    ] {
-        sqlx::query(
-            "INSERT INTO ctx_snapshots \
-             (context_capture_id, user_id, session_id, event_id, context_data, created_at) \
-             VALUES (?, ?, ?, ?, CAST('{\"kind\":\"it\"}' AS JSON), ?)",
-        )
-        .bind(capture_id)
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(event_id)
-        .bind(ts)
-        .execute(&pool)
-        .await
-        .expect("insert snapshot");
-    }
-
-    let ctx_service = DatabaseContextService::new(settings.clone()).with_pool(shared.clone());
-    let first_snapshot_page = ctx_service
-        .list_snapshots(SnapshotListFilter {
-            user_id: user_id.clone(),
-            session_id: None,
-            limit: 2,
-            cursor: None,
-        })
-        .await
-        .expect("list first snapshot page");
-    assert_eq!(
-        first_snapshot_page
-            .snapshots
-            .iter()
-            .map(|snapshot| snapshot.context_capture_id.as_str())
-            .collect::<Vec<_>>(),
-        vec![snapshot_id_2.as_str(), snapshot_id_3.as_str()]
-    );
-    let second_snapshot_page = ctx_service
-        .list_snapshots(SnapshotListFilter {
-            user_id: user_id.clone(),
-            session_id: None,
-            limit: 2,
-            cursor: first_snapshot_page.next_cursor.clone(),
-        })
-        .await
-        .expect("list second snapshot page");
-    assert_eq!(
-        second_snapshot_page
-            .snapshots
-            .iter()
-            .map(|snapshot| snapshot.context_capture_id.as_str())
-            .collect::<Vec<_>>(),
-        vec![snapshot_id.as_str()]
-    );
-    assert!(second_snapshot_page.next_cursor.is_none());
-
-    for (did, event_id, ts) in [
-        (&decision_id, &e1, "2026-05-01 10:00:00.000000"),
-        (&decision_id_2, &e2, "2026-05-01 12:00:00.000000"),
-        (&decision_id_3, &e3, "2026-05-01 11:00:00.000000"),
-    ] {
-        sqlx::query(
-            "INSERT INTO ctx_decision_audits \
-             (decision_id, user_id, session_id, event_id, context_capture_id, decision_type, decision_output, model_params, created_at) \
-             VALUES (?, ?, ?, ?, 'cc', 'it_dec', CAST('{}' AS JSON), CAST('{}' AS JSON), ?)",
-        )
-        .bind(did)
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(event_id)
-        .bind(ts)
-        .execute(&pool)
-        .await
-        .expect("insert decision");
-    }
-
-    let dec = DatabaseDecisionService::new(settings.clone()).with_pool(shared.clone());
-    let dlist = dec
-        .list_decisions(DecisionListFilter {
-            user_id: user_id.clone(),
-            session_id: None,
-            decision_type: None,
-            limit: 99_999,
-            cursor: None,
-        })
-        .await
-        .expect("list_decisions");
-    assert_eq!(dlist.limit, MAX_API_LIST_LIMIT);
-    assert_eq!(dlist.decisions.len(), 3);
-
-    let first_decision_page = dec
-        .list_decisions(DecisionListFilter {
-            user_id: user_id.clone(),
-            session_id: None,
-            decision_type: None,
-            limit: 2,
-            cursor: None,
-        })
-        .await
-        .expect("list first decision page");
-    assert_eq!(
-        first_decision_page
-            .decisions
-            .iter()
-            .map(|decision| decision.decision_id.as_str())
-            .collect::<Vec<_>>(),
-        vec![decision_id_2.as_str(), decision_id_3.as_str()]
-    );
-    let second_decision_page = dec
-        .list_decisions(DecisionListFilter {
-            user_id: user_id.clone(),
-            session_id: None,
-            decision_type: None,
-            limit: 2,
-            cursor: first_decision_page.next_cursor.clone(),
-        })
-        .await
-        .expect("list second decision page");
-    assert_eq!(
-        second_decision_page
-            .decisions
-            .iter()
-            .map(|decision| decision.decision_id.as_str())
-            .collect::<Vec<_>>(),
-        vec![decision_id.as_str()]
-    );
-    assert!(second_decision_page.next_cursor.is_none());
 
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
@@ -1707,29 +1528,12 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
     );
     assert!(second_installed_page.next_cursor.is_none());
 
-    let mstats = DatabaseMarketplaceStatsService::new(settings).with_pool(shared);
-    let sr = mstats
-        .search_ranked(SkillSearchQuery {
-            query: None,
-            category: None,
-            trust_tier: None,
-            limit: Some(5),
-            after_ranking_score: None,
-            after_skill_name: None,
-            after_version: None,
-        })
-        .await
-        .expect("search_ranked");
-    assert_eq!(sr.limit, 5);
-    assert!(sr.total.is_none());
-
     cleanup_session_bundle(
         &pool,
         &session_id,
         &session_id_2,
         &user_id,
         &event_ids,
-        &decision_ids,
         &audit_ids,
     )
     .await;
@@ -1749,7 +1553,6 @@ async fn get_session_events_uses_session_event_count_summary_without_event_scan(
         &user_id,
         std::slice::from_ref(&session_id),
         std::slice::from_ref(&event_id),
-        &[],
     )
     .await;
 
@@ -1817,43 +1620,19 @@ async fn get_session_events_uses_session_event_count_summary_without_event_scan(
         "unfiltered list_events session total should use agent_sessions.event_count summary"
     );
 
-    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[session_id], &[event_id], &[])
-        .await;
+    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[session_id], &[event_id]).await;
 }
 
 /// Matches [`astra_services::session_audit::MAX_AUDIT_SESSIONS_PER_PAGE`] (not exported).
 const MAX_AUDIT_SESSIONS_PER_PAGE: u32 = 100;
-
-fn assert_cross_session_stats_no_promotions(s: &astra_services::session_audit::CrossSessionStats) {
-    assert_eq!(s.total_runtime_promotions, 0);
-    assert_eq!(s.adaptive_baseline_runtime_promotions, 0);
-    assert_eq!(s.promoted_runtime_promotions, 0);
-    assert_eq!(s.deferred_runtime_promotions, 0);
-    assert_eq!(s.queued_runtime_promotions, 0);
-    assert_eq!(s.auto_applied_runtime_promotions, 0);
-    assert_eq!(s.runtime_promote_recommendations, 0);
-    assert_eq!(s.runtime_canary_recommendations, 0);
-    assert_eq!(s.runtime_hold_recommendations, 0);
-}
 
 async fn cleanup_agent_sessions_and_events_for_owner(
     pool: &sqlx::Pool<sqlx::MySql>,
     user_id: &str,
     session_ids: &[String],
     event_ids: &[String],
-    decision_ids: &[String],
 ) {
     for sid in session_ids {
-        let _ = sqlx::query("DELETE FROM ctx_decision_audits WHERE session_id = ? AND user_id = ?")
-            .bind(sid)
-            .bind(user_id)
-            .execute(pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM ctx_snapshots WHERE session_id = ? AND user_id = ?")
-            .bind(sid)
-            .bind(user_id)
-            .execute(pool)
-            .await;
         let _ = sqlx::query("DELETE FROM agent_event_edges WHERE session_id = ? AND user_id = ?")
             .bind(sid)
             .bind(user_id)
@@ -1867,28 +1646,6 @@ async fn cleanup_agent_sessions_and_events_for_owner(
             .execute(pool)
             .await;
     }
-    for did in decision_ids {
-        let _ =
-            sqlx::query("DELETE FROM ctx_decision_audits WHERE decision_id = ? AND user_id = ?")
-                .bind(did)
-                .bind(user_id)
-                .execute(pool)
-                .await;
-    }
-    for sid in session_ids {
-        let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
-            .bind(sid)
-            .bind(user_id)
-            .execute(pool)
-            .await;
-        let _ = sqlx::query(
-            "DELETE FROM agent_session_lifecycle_fences WHERE session_id = ? AND user_id = ?",
-        )
-        .bind(sid)
-        .bind(user_id)
-        .execute(pool)
-        .await;
-    }
 }
 
 async fn count_user_session_rows(
@@ -1897,9 +1654,9 @@ async fn count_user_session_rows(
     user_id: &str,
     session_id: &str,
 ) -> i64 {
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) AS c FROM {table} WHERE session_id = ? AND user_id = ?"
-    ))
+    )))
     .bind(session_id)
     .bind(user_id)
     .fetch_one(pool)
@@ -1965,31 +1722,15 @@ async fn cleanup_session_delete_fixture_for_owner(
     .execute(pool)
     .await;
 
-    let _ = sqlx::query(
-        "DELETE FROM user_skill_evaluations \
-         WHERE (owner_user_id, run_id) IN (
-             SELECT user_id, run_id FROM agent_runs
-             WHERE session_id = ? AND user_id = ?
-         )",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .execute(pool)
-    .await;
-
     for table in [
-        "ctx_decision_audits",
-        "ctx_snapshots",
         "session_artifacts",
-        "conversation_log",
         "agent_event_edges",
         "agent_events",
-        "agent_session_execution_slots",
         "agent_runs",
         "agent_sessions",
     ] {
         let sql = format!("DELETE FROM {table} WHERE session_id = ? AND user_id = ?");
-        let _ = sqlx::query(&sql)
+        let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(session_id)
             .bind(user_id)
             .execute(pool)
@@ -1998,7 +1739,7 @@ async fn cleanup_session_delete_fixture_for_owner(
 
     for table in ["workspace_records", "workspace_cleanup_debts"] {
         let sql = format!("DELETE FROM {table} WHERE session_id = ? AND owner_id = ?");
-        let _ = sqlx::query(&sql)
+        let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(session_id)
             .bind(user_id)
             .execute(pool)
@@ -2040,20 +1781,15 @@ async fn cleanup_restore_fixture_for_owner(
 ) {
     for sid in session_ids {
         for table in [
-            "ctx_decision_audits",
-            "ctx_snapshots",
             "agent_event_edges",
             "session_artifact_references",
             "session_artifacts",
-            "session_checkpoints",
             "agent_events",
-            "prompt_deltas",
-            "prompt_request_records",
             "agent_sessions",
             "agent_session_lifecycle_fences",
         ] {
             let sql = format!("DELETE FROM {table} WHERE session_id = ? AND user_id = ?");
-            let _ = sqlx::query(&sql)
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(sid)
                 .bind(user_id)
                 .execute(pool)
@@ -2311,34 +2047,6 @@ async fn add_agent_session_event_count_or_create_is_owner_bound_delta_upsert() {
         &[&owner_user_id, &other_user_id],
     )
     .await;
-}
-
-async fn force_session_artifacts_created_at(
-    pool: &sqlx::Pool<sqlx::MySql>,
-    user_id: &str,
-    session_id: &str,
-    artifact_ids: &[String],
-    created_at: &str,
-) {
-    for artifact_id in artifact_ids {
-        let result = sqlx::query(
-            "UPDATE session_artifacts
-             SET created_at = ?
-             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
-        )
-        .bind(created_at)
-        .bind(user_id)
-        .bind(session_id)
-        .bind(artifact_id)
-        .execute(pool)
-        .await
-        .expect("force tied artifact timestamp");
-        assert_eq!(
-            result.rows_affected(),
-            1,
-            "test fixture must update exactly one artifact timestamp for {artifact_id}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -3048,390 +2756,6 @@ async fn session_artifact_store_is_owner_bound_on_reads_and_writes() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn prompt_observability_is_owner_bound_for_session_and_run() {
-    let (shared, _settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-
-    let owner_user_id = Uuid::new_v4().to_string();
-    let other_user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-    let run_id = Uuid::new_v4().to_string();
-    cleanup_restore_fixture_for_owners(
-        &pool,
-        std::slice::from_ref(&session_id),
-        &[&owner_user_id, &other_user_id],
-    )
-    .await;
-
-    for (user_id, request_id, created_at, marker) in [
-        (
-            &owner_user_id,
-            Uuid::new_v4().to_string(),
-            "2026-10-02 10:00:00.000000",
-            "owner",
-        ),
-        (
-            &other_user_id,
-            Uuid::new_v4().to_string(),
-            "2026-10-02 11:00:00.000000",
-            "other",
-        ),
-    ] {
-        sqlx::query(
-            "INSERT INTO prompt_request_records \
-             (request_id, session_id, user_id, run_id, turn, round, attempt, source, model, provider, \
-              max_output_tokens, message_count, tool_count, previous_request_id, request_hash, summary_json, created_at) \
-             VALUES (?, ?, ?, ?, ?, 0, 0, 'turn', 'gpt-5.4', 'test', NULL, ?, ?, NULL, ?, ?, ?)",
-        )
-        .bind(request_id)
-        .bind(&session_id)
-        .bind(user_id)
-        .bind(&run_id)
-        .bind(1_i64)
-        .bind(if marker == "owner" { 3_i64 } else { 30_i64 })
-        .bind(if marker == "owner" { 2_i64 } else { 20_i64 })
-        .bind(format!("hash-{marker}"))
-        .bind(
-            serde_json::json!({
-                "marker": marker,
-                "delta_counts": {
-                    "reuse": 1,
-                    "append": if marker == "owner" { 2 } else { 20 },
-                    "replace": 0,
-                    "drop": 0
-                }
-            })
-            .to_string(),
-        )
-        .bind(created_at)
-        .execute(&pool)
-        .await
-        .expect("insert prompt request record");
-    }
-
-    assert_eq!(
-        astra_services::count_prompt_requests_for_session(&shared, &owner_user_id, &session_id)
-            .await
-            .expect("owner session prompt count"),
-        1,
-        "owner session prompt count must not include another user's row"
-    );
-    assert_eq!(
-        astra_services::count_prompt_requests_for_run(&shared, &owner_user_id, &run_id)
-            .await
-            .expect("owner run prompt count"),
-        1,
-        "owner run prompt count must not include another user's row"
-    );
-    let latest_session = astra_services::load_latest_prompt_observability_for_session(
-        &shared,
-        &owner_user_id,
-        &session_id,
-    )
-    .await
-    .expect("owner latest session prompt")
-    .expect("owner latest session prompt exists");
-    assert_eq!(latest_session.request_hash, "hash-owner");
-    assert_eq!(latest_session.message_count, 3);
-    assert_eq!(latest_session.delta_counts.append, 2);
-
-    let latest_run =
-        astra_services::load_latest_prompt_observability_for_run(&shared, &owner_user_id, &run_id)
-            .await
-            .expect("owner latest run prompt")
-            .expect("owner latest run prompt exists");
-    assert_eq!(latest_run.request_hash, "hash-owner");
-    assert_eq!(latest_run.tool_count, 2);
-
-    cleanup_restore_fixture_for_owners(&pool, &[session_id], &[&owner_user_id, &other_user_id])
-        .await;
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn prompt_delta_previous_chunks_are_owner_session_bound() {
-    let (shared, _settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-
-    let owner_user_id = Uuid::new_v4().to_string();
-    let other_user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-    cleanup_restore_fixture_for_owners(
-        &pool,
-        std::slice::from_ref(&session_id),
-        &[&owner_user_id, &other_user_id],
-    )
-    .await;
-
-    sqlx::query(
-        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count)
-         VALUES (?, ?, 'prompt-delta-owner-bound', 'active', 0)",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .execute(&pool)
-    .await
-    .expect("seed owner session");
-
-    let first_messages = (0..260)
-        .map(|index| {
-            serde_json::json!({
-                "role": if index % 2 == 0 { "user" } else { "assistant" },
-                "content": format!("stable-{index}"),
-            })
-        })
-        .collect::<Vec<_>>();
-    let first_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
-        user_id: &owner_user_id,
-        session_id: &session_id,
-        run_id: Some("first-root-run"),
-        turn: 1,
-        round: 0,
-        attempt: 0,
-        source: "turn",
-        messages: &first_messages,
-        tools: &[],
-        max_output_tokens: None,
-    })
-    .expect("first prompt plan");
-    let first = astra_services::persist_prompt_request(
-        &shared,
-        &astra_services::PromptRequestPersistInput {
-            session_id: session_id.clone(),
-            user_id: owner_user_id.clone(),
-            run_id: Some("first-root-run".into()),
-            turn: 1,
-            round: 0,
-            attempt: 0,
-            source: "turn".into(),
-            model: "test-model".into(),
-            provider: "test".into(),
-        },
-        &first_plan,
-    )
-    .await
-    .expect("persist first prompt");
-    assert_eq!(first.delta_counts.append, 260);
-    assert!(
-        first.delta_counts.token_weights.append > 0,
-        "new prompt chunks must carry token-weighted delta evidence"
-    );
-    assert_eq!(
-        first.delta_counts.token_weights.tokenizer_revision,
-        astra_turn_types::token_estimate::CANONICAL_JSON_TOKENIZER_REVISION
-    );
-    assert!(first.delta_counts.token_weights.complete);
-
-    sqlx::query(
-        "INSERT INTO prompt_deltas
-         (user_id, session_id, request_id, delta_seq, logical_key, chunk_kind, position,
-          op, chunk_id, chunk_hash, previous_chunk_hash)
-         VALUES (?, ?, ?, 99, 'message:99:user', 'message', 99,
-                 'append', 'foreign-chunk', REPEAT('a', 64), NULL)",
-    )
-    .bind(&other_user_id)
-    .bind(&session_id)
-    .bind(&first.request_id)
-    .execute(&pool)
-    .await
-    .expect("seed foreign delta with same request id");
-
-    let second_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
-        user_id: &owner_user_id,
-        session_id: &session_id,
-        run_id: Some("second-root-run"),
-        turn: 2,
-        round: 0,
-        attempt: 0,
-        source: "turn",
-        messages: &first_messages,
-        tools: &[],
-        max_output_tokens: None,
-    })
-    .expect("second prompt plan");
-    let second = astra_services::persist_prompt_request(
-        &shared,
-        &astra_services::PromptRequestPersistInput {
-            session_id: session_id.clone(),
-            user_id: owner_user_id.clone(),
-            run_id: Some("second-root-run".into()),
-            turn: 2,
-            round: 0,
-            attempt: 0,
-            source: "turn".into(),
-            model: "test-model".into(),
-            provider: "test".into(),
-        },
-        &second_plan,
-    )
-    .await
-    .expect("persist second prompt");
-
-    assert_eq!(
-        second.previous_request_id.as_deref(),
-        Some(first.request_id.as_str())
-    );
-    assert_eq!(second.delta_counts.reuse, 260);
-    assert_eq!(
-        second.delta_counts.token_weights.reuse, first.delta_counts.token_weights.append,
-        "the same retained chunk must preserve its tokenizer-independent weight"
-    );
-    assert_eq!(
-        second.delta_counts.drop, 0,
-        "foreign prompt_deltas rows with the same request_id must not affect owner diffing"
-    );
-    assert!(second.delta_counts.token_weights.complete);
-    let second_delta_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM prompt_deltas
-         WHERE user_id = ? AND session_id = ? AND request_id = ?",
-    )
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .bind(&second.request_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count compressed reuse rows");
-    let second_reuse_count: Option<i32> = sqlx::query_scalar(
-        "SELECT reuse_count FROM prompt_deltas
-         WHERE user_id = ? AND session_id = ? AND request_id = ? AND op = 'reuse_prefix'",
-    )
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .bind(&second.request_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load compressed reuse count");
-    assert_eq!(second_delta_rows, 1);
-    assert_eq!(second_reuse_count, Some(260));
-
-    let third_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
-        user_id: &owner_user_id,
-        session_id: &session_id,
-        run_id: None,
-        turn: 3,
-        round: 0,
-        attempt: 0,
-        source: "turn",
-        messages: &first_messages,
-        tools: &[],
-        max_output_tokens: None,
-    })
-    .expect("third prompt plan");
-    let third = astra_services::persist_prompt_request(
-        &shared,
-        &astra_services::PromptRequestPersistInput {
-            session_id: session_id.clone(),
-            user_id: owner_user_id.clone(),
-            run_id: None,
-            turn: 3,
-            round: 0,
-            attempt: 0,
-            source: "turn".into(),
-            model: "test-model".into(),
-            provider: "other-provider".into(),
-        },
-        &third_plan,
-    )
-    .await
-    .expect("persist provider-change prompt");
-    assert_eq!(third.delta_counts.reuse, 260);
-    assert!(
-        !third.delta_counts.token_weights.complete,
-        "provider changes must not claim cache evidence from another namespace"
-    );
-
-    let mut previous_request_id = third.request_id;
-    for turn in 4..=100 {
-        let plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
-            user_id: &owner_user_id,
-            session_id: &session_id,
-            run_id: None,
-            turn,
-            round: 0,
-            attempt: 0,
-            source: "turn",
-            messages: &first_messages,
-            tools: &[],
-            max_output_tokens: None,
-        })
-        .expect("long-session prompt plan");
-        let persisted = astra_services::persist_prompt_request(
-            &shared,
-            &astra_services::PromptRequestPersistInput {
-                session_id: session_id.clone(),
-                user_id: owner_user_id.clone(),
-                run_id: None,
-                turn,
-                round: 0,
-                attempt: 0,
-                source: "turn".into(),
-                model: "test-model".into(),
-                provider: "other-provider".into(),
-            },
-            &plan,
-        )
-        .await
-        .expect("persist long-session prompt");
-        assert_eq!(
-            persisted.previous_request_id.as_deref(),
-            Some(previous_request_id.as_str())
-        );
-        assert_eq!(persisted.delta_counts.reuse, 260);
-        previous_request_id = persisted.request_id;
-    }
-
-    let mut changed_messages = first_messages.clone();
-    changed_messages.last_mut().expect("tail")["content"] = serde_json::json!("changed-tail");
-    let tail_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
-        user_id: &owner_user_id,
-        session_id: &session_id,
-        run_id: None,
-        turn: 101,
-        round: 0,
-        attempt: 0,
-        source: "turn",
-        messages: &changed_messages,
-        tools: &[],
-        max_output_tokens: None,
-    })
-    .expect("tail-change prompt plan");
-    let tail = astra_services::persist_prompt_request(
-        &shared,
-        &astra_services::PromptRequestPersistInput {
-            session_id: session_id.clone(),
-            user_id: owner_user_id.clone(),
-            run_id: None,
-            turn: 101,
-            round: 0,
-            attempt: 0,
-            source: "turn".into(),
-            model: "test-model".into(),
-            provider: "other-provider".into(),
-        },
-        &tail_plan,
-    )
-    .await
-    .expect("persist tail-change prompt");
-    assert_eq!(tail.delta_counts.reuse, 259);
-    assert_eq!(tail.delta_counts.replace, 1);
-    let tail_delta_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM prompt_deltas
-         WHERE user_id = ? AND session_id = ? AND request_id = ?",
-    )
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .bind(&tail.request_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count tail-change delta rows");
-    assert_eq!(tail_delta_rows, 2);
-
-    cleanup_restore_fixture_for_owners(&pool, &[session_id], &[&owner_user_id, &other_user_id])
-        .await;
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -3450,7 +2774,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     let e_tool_call2 = Uuid::new_v4().to_string();
     let e_turn_err = Uuid::new_v4().to_string();
     let e_stall = Uuid::new_v4().to_string();
-    let event_ids = vec![
+    let mut event_ids = vec![
         e_turn_a1.clone(),
         e_turn_a2.clone(),
         e_turn_b1.clone(),
@@ -3466,7 +2790,6 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         &user_id,
         &[s1.clone(), s2.clone()],
         &event_ids,
-        &[],
     )
     .await;
 
@@ -3573,7 +2896,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
              VALUES (?, ?, ?, ?, '{}', '', CAST(? AS JSON), ?, ?, ?, ?, ?, ?, ?, ?)",
             [tool.is_some(), model.is_some()],
         );
-        sqlx::query(&insert_sql)
+        sqlx::query(insert_sql)
             .bind(eid)
             .bind(&s1)
             .bind(&user_id)
@@ -3674,6 +2997,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     .expect("insert turn_error s2");
 
     let audit = DatabaseSessionAuditService::new(settings.clone()).with_pool(shared.clone());
+    let queries = common::SqlQueries::default();
     let stats = audit
         .get_cross_session_stats(
             &user_id,
@@ -3682,6 +3006,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
                 until: Some(until.clone()),
             },
         )
+        .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
         .await
         .expect("get_cross_session_stats");
 
@@ -3699,7 +3024,6 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     assert!((stats.avg_turns_per_session - 1.5).abs() < 1e-9);
     assert!((stats.avg_tokens_per_session - 27.5).abs() < 1e-9);
     assert!((stats.tool_error_rate - (1.0_f64 / 3.0)).abs() < 1e-9);
-    assert_cross_session_stats_no_promotions(&stats);
 
     assert_eq!(stats.top_tools.len(), 1);
     assert_eq!(stats.top_tools[0].name, "bash");
@@ -3710,6 +3034,18 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     assert_eq!(stats.top_models[0].model, "m1");
     assert_eq!(stats.top_models[0].session_count, 2);
     assert_eq!(stats.top_models[0].total_tokens, 55);
+
+    let statements = queries.0.lock().unwrap().join(" ");
+    assert!(
+        !statements.contains("ROW_NUMBER()"),
+        "count-only statistics must not rank discarded error previews"
+    );
+    assert!(
+        !statements.contains("SELECT event_id, SUBSTRING(content"),
+        "count-only statistics must not fetch discarded error text"
+    );
+    assert!(statements.contains("GROUP BY e.session_id, e.meta_tool_name"));
+    assert!(statements.contains("llm_model_used AS model"));
 
     let list = audit
         .list_sessions(
@@ -3734,7 +3070,418 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     assert_eq!(list.total, 2);
     assert_eq!(list.sessions.len(), 2);
 
-    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[s1, s2], &event_ids, &[]).await;
+    // A real immutable opening, with a bound root agent, must be counted
+    // without a physical run_started row or hiding unrelated Journal facts.
+    let mut run = common::collaborator_fixture::record(&user_id, &s1, None);
+    let durable_run = run.run_id.clone();
+    run.agent_id = Some("bound-root".into());
+    run.events = vec![
+        serde_json::json!({"event_type":"run_started", "data":{
+            "resolved_model_selection":{"model_name":"durable-model"}
+        }}),
+        serde_json::json!({"event_type":"tool_call", "data":{"name":"read_file", "id":"durable-call"}}),
+        serde_json::json!({"event_type":"tool_call_end", "data":{"name":"read_file", "id":"durable-call", "success":true}}),
+    ];
+    astra_services::RunStateStore::insert_run(
+        &astra_services::DatabaseRunStateStore::new(shared.clone()),
+        run,
+    )
+    .await
+    .unwrap();
+    for table in ["agent_runs", "agent_run_events"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {table} SET created_at = '2026-06-15 10:12:00.000000' WHERE user_id = ? AND run_id = ?")))
+            .bind(&user_id).bind(&durable_run).execute(&pool).await.unwrap();
+    }
+    let queries = common::SqlQueries::default();
+    let durable = audit
+        .get_cross_session_stats(
+            &user_id,
+            &CrossSessionStatsParams {
+                since: Some(since),
+                until: Some(until),
+            },
+        )
+        .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
+        .await
+        .unwrap();
+    assert_eq!(durable.session_count, 2);
+    assert_eq!(durable.total_turns, 3);
+    assert_eq!(durable.total_tool_calls, 4);
+    assert_eq!(durable.total_tool_failures, 1);
+    assert!(
+        durable
+            .top_models
+            .iter()
+            .any(|model| model.model == "durable-model" && model.session_count == 1)
+    );
+    assert!(
+        durable.top_models.iter().any(|model| model.model == "m1"
+            && model.session_count == 2
+            && model.total_tokens == 55)
+    );
+    assert_eq!(durable.top_tools.len(), 2);
+    assert_eq!(durable.top_tools[0].name, "bash");
+    assert_eq!(durable.top_tools[0].call_count, 3);
+    assert_eq!(durable.top_tools[1].name, "read_file");
+    assert_eq!(durable.top_tools[1].call_count, 1);
+    let statements = queries.0.lock().unwrap().join(" ");
+    assert!(statements.contains("agent_run_openings"));
+    assert!(!statements.contains("opening_context_json"));
+    let store = astra_services::DatabaseRunStateStore::new(shared.clone());
+    astra_services::RunStateStore::append_events_batch(
+        &store,
+        &user_id,
+        &s1,
+        &durable_run,
+        &[serde_json::json!({"type":"tool_call", "name":"bash", "id":"pending-call"})],
+    )
+    .await
+    .unwrap();
+    // A known durable success wins a conflicting Journal terminal. A pending
+    // durable call, however, must retain a known Journal failure of that call.
+    for (call, name) in [("durable-call", "read_file"), ("pending-call", "bash")] {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, run_id, tool_call_id, meta_tool_name, meta_duration_ms, metadata, payload_hash, ingestion_write_id) VALUES (?, ?, ?, 'tool_call_failed', 'journal failure preview', ?, ?, ?, 17, CAST('{}' AS JSON), ?, ?)")
+            .bind(&id).bind(&s1).bind(&user_id).bind(&durable_run).bind(call).bind(name)
+            .bind(agent_event_fixture_payload_hash(serde_json::json!({"event_id":id})))
+            .bind(Uuid::new_v4().to_string()).execute(&pool).await.unwrap();
+        event_ids.push(id);
+    }
+    let all = CrossSessionStatsParams {
+        since: None,
+        until: None,
+    };
+    let mixed = audit.get_cross_session_stats(&user_id, &all).await.unwrap();
+    assert_eq!((mixed.total_tool_calls, mixed.total_tool_failures), (5, 2));
+    let tools = audit.get_cross_session_tools(&user_id, &all).await.unwrap();
+    let bash = tools.iter().find(|tool| tool.name == "bash").unwrap();
+    assert_eq!(
+        (bash.total_calls, bash.total_success, bash.total_failures),
+        (4, 2, 2)
+    );
+    assert_eq!(
+        bash.sessions_used_in, 1,
+        "a Session present in both sources is counted once"
+    );
+    assert_eq!(bash.last_error.as_deref(), Some("journal failure preview"));
+    let read = tools.iter().find(|tool| tool.name == "read_file").unwrap();
+    assert_eq!(
+        (read.total_calls, read.total_success, read.total_failures),
+        (1, 1, 0)
+    );
+    astra_services::RunStateStore::append_events_batch(
+        &store,
+        &user_id,
+        &s1,
+        &durable_run,
+        &[serde_json::json!({"type":"tool_call_end", "call_id":"pending-call", "success":true})],
+    )
+    .await
+    .unwrap();
+    let settled = audit.get_cross_session_stats(&user_id, &all).await.unwrap();
+    assert_eq!(
+        (settled.total_tool_calls, settled.total_tool_failures),
+        (5, 1)
+    );
+    let summary = audit.get_summary(&user_id, &s1).await.unwrap();
+    assert_eq!(
+        (summary.tool_calls_total, summary.tool_calls_failed),
+        (5, 1)
+    );
+    let listed = audit
+        .list_sessions(
+            &user_id,
+            &AuditSessionListParams {
+                page: 1,
+                per_page: 1,
+                status: None,
+                model: None,
+                since: None,
+                until: None,
+                min_turns: None,
+                sort: "created".into(),
+                order: "asc".into(),
+                after_sort_value: None,
+                after_session_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.sessions.len(), 1);
+    assert_eq!(listed.sessions[0].session_id, s1);
+    assert_eq!(
+        listed.sessions[0].tool_calls_total,
+        summary.tool_calls_total
+    );
+    for (call, name, synthetic) in [
+        ("durable-call", "read_file", true),
+        ("DURABLE-CALL", "read_file", false),
+        ("unnamed", "", false),
+    ] {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, run_id, tool_call_id, meta_tool_name, metadata, payload_hash, ingestion_write_id) VALUES (?, ?, ?, 'tool_call_failed', 'independent fact', ?, ?, ?, CAST(? AS JSON), ?, ?)")
+            .bind(&id).bind(&s1).bind(&user_id).bind(&durable_run).bind(call).bind(name)
+            .bind(serde_json::json!({"tool_call_id_is_synthetic":synthetic}).to_string())
+            .bind(agent_event_fixture_payload_hash(serde_json::json!({"event_id":id})))
+            .bind(Uuid::new_v4().to_string()).execute(&pool).await.unwrap();
+        event_ids.push(id);
+    }
+    let independent = audit.get_cross_session_stats(&user_id, &all).await.unwrap();
+    assert_eq!(
+        (
+            independent.total_tool_calls,
+            independent.total_tool_failures
+        ),
+        (8, 4),
+        "synthetic, differently cased and unnamed facts cannot be erased by a guessed match"
+    );
+    let tools = audit.get_cross_session_tools(&user_id, &all).await.unwrap();
+    assert_eq!(
+        tools.iter().map(|tool| tool.total_calls).sum::<u32>(),
+        7,
+        "unnamed terminals contribute to totals but not named-tool analytics"
+    );
+    for index in 0..101 {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, meta_tool_name, metadata, payload_hash, ingestion_write_id) VALUES (?, ?, ?, 'tool_call_failed', 'bounded winning error preview', ?, CAST('{}' AS JSON), ?, ?)")
+            .bind(&id).bind(&s2).bind(&user_id).bind(format!("z-tool-{index:03}"))
+            .bind(agent_event_fixture_payload_hash(serde_json::json!({"event_id":id})))
+            .bind(Uuid::new_v4().to_string()).execute(&pool).await.unwrap();
+        event_ids.push(id);
+    }
+    let queries = common::SqlQueries::default();
+    let tools = audit
+        .get_cross_session_tools(&user_id, &all)
+        .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
+        .await
+        .unwrap();
+    assert_eq!(tools.len(), 100);
+    assert!(!tools.iter().any(|tool| tool.name == "z-tool-100"));
+    assert!(tools.iter().all(|tool| tool.last_error.is_some()));
+    {
+        let statements = queries.0.lock().unwrap();
+        let previews = statements
+            .iter()
+            .filter(|sql| sql.contains("SELECT event_id, SUBSTRING(content"))
+            .collect::<Vec<_>>();
+        assert_eq!(previews.len(), 1);
+        assert_eq!(
+            previews[0].matches('?').count(),
+            101,
+            "one owner bind and only the 100 returned winning errors"
+        );
+    }
+    let queries = common::SqlQueries::default();
+    let counts = audit
+        .get_cross_session_stats(&user_id, &all)
+        .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        (counts.total_tool_calls, counts.total_tool_failures),
+        (109, 105)
+    );
+    assert_eq!(counts.top_tools.len(), 10);
+    assert!(
+        !queries
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|sql| sql.contains("ROW_NUMBER()")
+                || sql.contains("SELECT event_id, SUBSTRING(content"))
+    );
+    // A later empty failure or successful output is not error evidence. Within
+    // one second, preserve microseconds first and use binary IDs only for ties.
+    let error_prefix = Uuid::new_v4().to_string();
+    for (suffix, at, kind, content) in [
+        (
+            "z",
+            "2026-06-15 12:00:00.000001",
+            "tool_call_failed",
+            Some("older error"),
+        ),
+        (
+            "Z",
+            "2026-06-15 12:00:00.100001",
+            "tool_call_failed",
+            Some("same-time upper ID"),
+        ),
+        (
+            "a",
+            "2026-06-15 12:00:00.100001",
+            "tool_call_failed",
+            Some("microsecond winner"),
+        ),
+        (
+            "empty",
+            "2026-06-15 12:00:01.000000",
+            "tool_call_failed",
+            Some(""),
+        ),
+        (
+            "null",
+            "2026-06-15 12:00:02.000000",
+            "tool_call_failed",
+            None,
+        ),
+        (
+            "ok",
+            "2026-06-15 12:00:03.000000",
+            "tool_call_completed",
+            Some("successful output"),
+        ),
+    ] {
+        let id = format!("{error_prefix}-{suffix}");
+        sqlx::query("INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, meta_tool_name, metadata, payload_hash, ingestion_write_id, created_at) VALUES (?, ?, ?, ?, ?, 'error-order', CAST('{}' AS JSON), ?, ?, ?)")
+            .bind(&id).bind(&s2).bind(&user_id).bind(kind).bind(content)
+            .bind(agent_event_fixture_payload_hash(serde_json::json!({"event_id":id})))
+            .bind(Uuid::new_v4().to_string()).bind(at).execute(&pool).await.unwrap();
+        event_ids.push(id);
+    }
+    let queries = common::SqlQueries::default();
+    let named = audit
+        .get_tool_analytics(&user_id, &s2)
+        .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
+        .await
+        .unwrap();
+    let error_order = named
+        .iter()
+        .find(|tool| tool.name == "error-order")
+        .unwrap();
+    assert_eq!(
+        (
+            error_order.call_count,
+            error_order.success_count,
+            error_order.fail_count
+        ),
+        (6, 1, 5)
+    );
+    assert_eq!(
+        error_order.last_error.as_deref(),
+        Some("microsecond winner")
+    );
+    assert_eq!(
+        error_order.total_duration_ms, 0,
+        "NULL durations remain unavailable samples"
+    );
+    {
+        let statements = queries.0.lock().unwrap();
+        assert!(!statements.iter().any(|sql| sql.contains("ROW_NUMBER()")));
+        assert!(
+            statements
+                .iter()
+                .any(|sql| sql.contains("MAX_BY_NON_NULL("))
+        );
+    }
+    let global = audit.get_cross_session_tools(&user_id, &all).await.unwrap();
+    assert_eq!(
+        global
+            .iter()
+            .find(|tool| tool.name == "error-order")
+            .unwrap()
+            .last_error
+            .as_deref(),
+        Some("microsecond winner")
+    );
+    let before_pending = audit.get_cross_session_stats(&user_id, &all).await.unwrap();
+    astra_services::RunStateStore::append_events_batch(&store,&user_id,&s1,&durable_run,&[
+        serde_json::json!({"type":"tool_call","name":"pending-rate","id":"rate-pending"}),
+        serde_json::json!({"type":"tool_call","name":"rejected-rate","id":"rate-rejected"}),
+        serde_json::json!({"type":"tool_call_end","call_id":"rate-rejected","success":false,"executed":false}),
+    ]).await.unwrap();
+    let after_pending = audit.get_cross_session_stats(&user_id, &all).await.unwrap();
+    assert_eq!(
+        after_pending.total_tool_calls,
+        before_pending.total_tool_calls + 2
+    );
+    assert_eq!(
+        after_pending.total_tool_failures,
+        before_pending.total_tool_failures
+    );
+    assert_eq!(
+        after_pending.tool_error_rate, before_pending.tool_error_rate,
+        "pending and rejected calls cannot dilute the known-outcome rate"
+    );
+    sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?")
+        .bind(&user_id)
+        .bind(&durable_run)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for table in ["agent_run_openings", "agent_runs"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_id = ? AND run_id = ?"
+        )))
+        .bind(&user_id)
+        .bind(&durable_run)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Former promotion labels remain generic facts, including metadata that
+    // never satisfied the retired controller-specific reporting schema.
+    let events = DatabaseEventService::new(settings).with_pool(shared);
+    let metadata = serde_json::json!({"client_note":"ordinary owner fact"});
+    let created = events
+        .create_event(
+            user_id.clone(),
+            EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::Client,
+                event_id: None,
+                session_id: s1.clone(),
+                event_type: "runtime_promotion_verdict".into(),
+                content: "historical client fact".into(),
+                agent_id: None,
+                agent_version: None,
+                parent_event_id: None,
+                parent_event_ids: None,
+                causal_chain_id: None,
+                metadata: Some(metadata.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let id = created.record.event_id;
+    assert_eq!(
+        events
+            .get_event(id.clone(), user_id.clone())
+            .await
+            .unwrap()
+            .metadata,
+        metadata
+    );
+    assert_eq!(
+        events
+            .get_event(id.clone(), "other-owner".into())
+            .await
+            .unwrap_err()
+            .0,
+        axum::http::StatusCode::NOT_FOUND
+    );
+    event_ids.push(id);
+    let queries = common::SqlQueries::default();
+    let stats = audit
+        .get_cross_session_stats(
+            &user_id,
+            &CrossSessionStatsParams {
+                since: None,
+                until: None,
+            },
+        )
+        .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
+        .await
+        .unwrap();
+    let json = serde_json::to_value(stats).unwrap();
+    assert_eq!(json["session_count"], 2);
+    assert!(json.get("total_runtime_promotions").is_none());
+    assert!(!queries.0.lock().unwrap().iter().any(|sql| {
+        sql.contains("SELECT event_id, session_id, CAST(metadata AS CHAR) AS metadata")
+    }));
+
+    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[s1, s2], &event_ids).await;
 }
 
 #[tokio::test]
@@ -3754,7 +3501,6 @@ async fn session_audit_session_turn_count_uses_turn_seq_high_watermark() {
         &user_id,
         std::slice::from_ref(&session_id),
         &event_ids,
-        &[],
     )
     .await;
 
@@ -3880,339 +3626,754 @@ async fn session_audit_session_turn_count_uses_turn_seq_high_watermark() {
     assert_eq!(filtered.total, 0);
     assert!(filtered.sessions.is_empty());
 
-    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[session_id], &event_ids, &[])
-        .await;
+    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[session_id], &event_ids).await;
 }
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn cross_session_runtime_promotions_db_roundtrip() {
-    let (shared, settings) = setup_pool_and_settings().await;
+async fn audit_session_pages_preserve_filters_order_and_owner_scope() {
+    let (_bootstrap, mut settings) = setup_pool_and_settings().await;
+    settings.db_pool_max_connections = 1;
+    settings.db_pool_min_connections = 1;
+    let shared = SharedPool::new(&settings).await.unwrap();
     let pool = shared.get().clone();
-
-    let user_id = Uuid::new_v4().to_string();
-    let s1 = Uuid::new_v4().to_string();
-    let since = "2026-07-01 00:00:00.000000".to_string();
-    let until = "2026-07-01 23:59:59.000000".to_string();
-
-    let e1 = Uuid::new_v4().to_string();
-    let e2 = Uuid::new_v4().to_string();
-    let e3 = Uuid::new_v4().to_string();
-    let e4 = Uuid::new_v4().to_string();
-    let event_ids = vec![e1.clone(), e2.clone(), e3.clone(), e4.clone()];
-
-    cleanup_agent_sessions_and_events_for_owner(
-        &pool,
-        &user_id,
-        std::slice::from_ref(&s1),
-        &event_ids,
-        &[],
-    )
-    .await;
-
-    sqlx::query(
-        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'promo', 'active', 0)",
-    )
-    .bind(&s1)
-    .bind(&user_id)
-    .execute(&pool)
-    .await
-    .expect("insert session");
-
-    let payloads: [(String, serde_json::Value, &str); 4] = [
-        (
-            e1.clone(),
-            serde_json::json!({
-                "controller": "adaptive_baseline",
-                "outcome": "auto_applied",
-                "recommendation": "promote",
-                "subject_id": "subj-e1",
-                "summary": "sum-e1",
-                "turn": 1,
-                "confidence_score": 0.91,
-                "support_score": 0.81,
-                "safety_score": 0.71,
-                "overall_score": 0.79,
-                "blockers": [],
-                "evidence": ["e1"],
-                "rollback_hint": null,
-                "run_id": "run-e1"
-            }),
-            "2026-07-01 10:00:00.000000",
-        ),
-        (
-            e2.clone(),
-            serde_json::json!({
-                "controller": "adaptive_baseline",
-                "outcome": "queued",
-                "recommendation": "canary",
-                "subject_id": "subj-e2",
-                "summary": "sum-e2",
-                "turn": 2,
-                "confidence_score": 0.82,
-                "support_score": 0.72,
-                "safety_score": 0.62,
-                "overall_score": 0.70,
-                "blockers": ["b2"],
-                "evidence": [],
-                "rollback_hint": "hint2",
-                "run_id": null
-            }),
-            "2026-07-01 10:01:00.000000",
-        ),
-        (
-            e3.clone(),
-            serde_json::json!({
-                "controller": "adaptive_baseline",
-                "outcome": "deferred",
-                "recommendation": "hold",
-                "subject_id": "subj-e3",
-                "summary": "sum-e3",
-                "confidence_score": 0.73,
-                "support_score": 0.63,
-                "safety_score": 0.53,
-                "overall_score": 0.61,
-                "blockers": [],
-                "evidence": [],
-                "rollback_hint": null,
-                "run_id": null
-            }),
-            "2026-07-01 10:02:00.000000",
-        ),
-        (
-            e4.clone(),
-            serde_json::json!({
-                "controller": "adaptive_baseline",
-                "outcome": "promoted",
-                "recommendation": "promote",
-                "subject_id": "subj-e4",
-                "summary": "sum-e4",
-                "turn": 4,
-                "confidence_score": 0.64,
-                "support_score": 0.54,
-                "safety_score": 0.44,
-                "overall_score": 0.52,
-                "blockers": [],
-                "evidence": [],
-                "rollback_hint": null,
-                "run_id": "run-e4"
-            }),
-            "2026-07-01 10:03:00.000000",
-        ),
+    let owner = Uuid::new_v4().to_string();
+    let foreign = Uuid::new_v4().to_string();
+    let prefix = Uuid::new_v4().to_string();
+    let ids = [
+        format!("{prefix}-a"),
+        format!("{prefix}-b"),
+        format!("{prefix}-c"),
     ];
-
-    for (eid, meta, ts) in payloads.iter() {
-        sqlx::query(
-            "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
-             causal_chain_id, metadata, payload_hash, ingestion_write_id, created_at) \
-             VALUES (?, ?, ?, ?, '{}', '', CAST(? AS JSON), ?, ?, ?)",
-        )
-        .bind(eid)
-        .bind(&s1)
-        .bind(&user_id)
-        .bind(RUNTIME_PROMOTION_EVENT_TYPE)
-        .bind(meta.to_string())
-        .bind(agent_event_fixture_payload_hash(serde_json::json!({
-            "event_id": eid,
-            "session_id": &s1,
-            "user_id": &user_id,
-            "event_type": RUNTIME_PROMOTION_EVENT_TYPE,
-            "content": "{}",
-            "causal_chain_id": "",
-            "metadata": meta,
-            "created_at": ts,
-        })))
-        .bind(Uuid::new_v4().to_string())
-        .bind(ts)
-        .execute(&pool)
-        .await
-        .expect("insert runtime promotion event");
+    for (index, session) in ids.iter().enumerate() {
+        seed_restore_session_fixture(&pool, &owner, session, serde_json::json!({})).await;
+        sqlx::query("UPDATE agent_sessions SET created_at = '2026-06-15 09:30:00.000000', ended_at = DATE_ADD('2026-06-15 09:30:00.000000', INTERVAL ? SECOND) WHERE user_id = ? AND session_id = ?")
+            .bind([10_i64, 30, 20][index]).bind(&owner).bind(session).execute(&pool).await.unwrap();
     }
+    seed_restore_session_fixture(&pool, &foreign, &ids[0], serde_json::json!({})).await;
+    let mut events = Vec::new();
+    for (user, session, turn, tokens, at, model) in [
+        (
+            &owner,
+            &ids[0],
+            1_i64,
+            5_i64,
+            "2026-06-15 10:00:00.100000",
+            None,
+        ),
+        (&owner, &ids[0], 2, 5, "2026-06-15 10:05:00.250000", None),
+        (
+            &owner,
+            &ids[1],
+            1,
+            30,
+            "2026-06-15 10:01:00",
+            Some("journal-model"),
+        ),
+        (
+            &foreign,
+            &ids[0],
+            99,
+            900,
+            "2026-06-15 11:00:00",
+            Some("foreign-model"),
+        ),
+    ] {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, turn_seq, token_usage, token_input, token_output, token_total, llm_model_used, metadata, payload_hash, ingestion_write_id, created_at) VALUES (?, ?, ?, 'user_query', 'input', ?, CAST('{}' AS JSON), ?, 0, ?, ?, CAST('{}' AS JSON), ?, ?, ?)")
+            .bind(&id).bind(session).bind(user).bind(turn).bind(tokens).bind(tokens).bind(model)
+            .bind(agent_event_fixture_payload_hash(serde_json::json!({"event_id":id})))
+            .bind(Uuid::new_v4().to_string()).bind(at).execute(&pool).await.unwrap();
+        events.push(id);
+    }
+    let store = astra_services::DatabaseRunStateStore::new(shared.clone());
+    let mut parent = None;
+    for (user, session, model, child) in [
+        (&owner, &ids[0], Some("admitted-model"), false),
+        (&owner, &ids[0], Some("child-model"), true),
+        (&owner, &ids[1], None, false),
+        (&foreign, &ids[0], Some("foreign-model"), false),
+    ] {
+        let mut record = common::collaborator_fixture::record(
+            user,
+            session,
+            if child { parent.as_deref() } else { None },
+        );
+        if let Some(model) = model {
+            record.events = vec![
+                serde_json::json!({"event_type":"run_started","data":{"model_selection":{"model_name":model}}}),
+            ];
+        }
+        let run = record.run_id.clone();
+        astra_services::RunStateStore::insert_run(&store, record)
+            .await
+            .unwrap();
+        if parent.is_none() {
+            parent = Some(run.clone());
+        }
+        sqlx::query("UPDATE agent_runs SET created_at = ? WHERE user_id = ? AND run_id = ?")
+            .bind(if session == &ids[1] {
+                "2026-06-15 10:01:00"
+            } else {
+                "2026-06-15 10:00:00"
+            })
+            .bind(user)
+            .bind(&run)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Empty openings own a physical run_created receipt. Keep every
+        // fixture observation on the same historical clock as its C0 row.
+        sqlx::query("UPDATE agent_run_events SET created_at = ? WHERE user_id = ? AND run_id = ?")
+            .bind(if session == &ids[1] {
+                "2026-06-15 10:01:00"
+            } else {
+                "2026-06-15 10:00:00"
+            })
+            .bind(user)
+            .bind(&run)
+            .execute(&pool)
+            .await
+            .unwrap();
+        if user == &foreign {
+            sqlx::query("UPDATE agent_run_openings SET opening_events_json = '{invalid' WHERE user_id = ? AND run_id = ?")
+                .bind(user).bind(&run).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO agent_run_events (id, run_id, event_idx, user_id, session_id, event_type, event_id, event_hash, payload_json) VALUES (?, ?, 1, ?, ?, 'tool_call', ?, ?, '{invalid')")
+                .bind(Uuid::new_v4().to_string()).bind(&run).bind(user).bind(session)
+                .bind(Uuid::new_v4().to_string()).bind("0".repeat(64)).execute(&pool).await.unwrap();
+        }
+    }
+    let audit = DatabaseSessionAuditService::new(settings).with_pool(shared);
+    for sort in ["created", "unknown", "turns", "tokens", "duration"] {
+        for order in ["asc", "desc"] {
+            for minimum in [None, Some(1)] {
+                let mut expected = match sort {
+                    "turns" => vec![2, 1, 0],
+                    "tokens" => vec![2, 0, 1],
+                    "duration" => vec![1, 2, 0],
+                    _ => vec![0, 1, 2],
+                };
+                if minimum.is_some() {
+                    expected.retain(|index| *index != 2);
+                }
+                if order == "desc" {
+                    expected.reverse();
+                }
+                let mut params: AuditSessionListParams =
+                    serde_json::from_value(serde_json::json!({
+                        "per_page":1, "sort":sort, "order":order, "min_turns":minimum,
+                    }))
+                    .unwrap();
+                let first = audit.list_sessions(&owner, &params).await.unwrap();
+                assert_eq!(
+                    first.total as usize,
+                    expected.len(),
+                    "{sort}/{order}/{minimum:?}"
+                );
+                assert_eq!(
+                    first.sessions[0].session_id, ids[expected[0]],
+                    "{sort}/{order}/{minimum:?}: {:?}",
+                    first.sessions
+                );
+                let cursor = first.next_cursor.unwrap();
+                params.page = 2;
+                let numbered = audit.list_sessions(&owner, &params).await.unwrap();
+                assert_eq!(numbered.sessions[0].session_id, ids[expected[1]]);
+                if sort == "duration" {
+                    let left = first.sessions[0].duration_secs;
+                    let right = numbered.sessions[0].duration_secs;
+                    assert!(if order == "asc" {
+                        left <= right
+                    } else {
+                        left >= right
+                    });
+                    if expected[0] == 0 {
+                        assert!((left - 300.25).abs() < 1e-9);
+                    }
+                }
+                params.page = 7;
+                params.after_sort_value = Some(cursor.sort_value);
+                params.after_session_id = Some(cursor.session_id);
+                let explicit = audit.list_sessions(&owner, &params).await.unwrap();
+                assert_eq!(explicit.page, 7);
+                assert_eq!(
+                    explicit.total, first.total,
+                    "total is independent of the cursor"
+                );
+                assert_eq!(
+                    explicit.sessions[0].session_id,
+                    numbered.sessions[0].session_id
+                );
+            }
+        }
+    }
+    let mut params: AuditSessionListParams =
+        serde_json::from_value(serde_json::json!({"per_page":1,"order":"asc"})).unwrap();
+    let queries = common::SqlQueries::default();
+    params.page = 2;
+    let page = audit
+        .list_sessions(&owner, &params)
+        .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
+        .await
+        .unwrap();
+    assert_eq!(page.sessions[0].session_id, ids[1]);
+    {
+        let statements = queries
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|sql| sql.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>();
+        let skip = statements
+            .iter()
+            .find(|sql| sql.starts_with("SELECT session_id,"))
+            .unwrap();
+        let count = statements
+            .iter()
+            .find(|sql| sql.starts_with("SELECT COUNT(*) AS cnt"))
+            .unwrap();
+        for sql in [skip, count] {
+            assert!(!sql.contains("agent_run_events") && !sql.contains("agent_events"));
+            assert!(!sql.contains("GROUP BY"));
+        }
+        let page_sql = statements
+            .iter()
+            .find(|sql| sql.starts_with("WITH selected_sessions AS ("))
+            .unwrap();
+        assert_eq!(
+            page_sql.matches("JOIN selected_sessions selected").count(),
+            2
+        );
+    }
+    for (model, expected) in [
+        ("child-model", Some(0)),
+        ("journal-model", Some(1)),
+        ("foreign-model", None),
+    ] {
+        params.page = 1;
+        params.model = Some(model.into());
+        params.status = Some("active".into());
+        params.since = Some("2026-06-15T09:30:00Z".into());
+        params.until = params.since.clone();
+        let filtered = audit.list_sessions(&owner, &params).await.unwrap();
+        assert_eq!(filtered.total, u32::from(expected.is_some()));
+        if let Some(index) = expected {
+            assert_eq!(filtered.sessions[0].session_id, ids[index]);
+        }
+    }
+    params.model = None;
+    params.page = 99;
+    let queries = common::SqlQueries::default();
+    let empty = audit
+        .list_sessions(&owner, &params)
+        .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
+        .await
+        .unwrap();
+    assert!(empty.sessions.is_empty());
+    assert_eq!(empty.total, 3);
+    assert!(
+        !queries
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|sql| sql.contains("WITH selected_runs AS")),
+        "an empty page must not fall through to owner-wide tool analytics"
+    );
+    // A creation page observes its own rows, including the has-more row. A
+    // corrupt cold opening must not poison scalar observation or its count.
+    let bad_session = format!("{prefix}-d");
+    seed_restore_session_fixture(&pool, &owner, &bad_session, serde_json::json!({})).await;
+    sqlx::query("UPDATE agent_sessions SET created_at = '2026-06-15 09:31:00' WHERE user_id = ? AND session_id = ?")
+        .bind(&owner).bind(&bad_session).execute(&pool).await.unwrap();
+    let mut record = common::collaborator_fixture::record(&owner, &bad_session, None);
+    record.events = vec![
+        serde_json::json!({"event_type":"run_started","data":{"model_selection":{"model_name":"bad-model"}}}),
+    ];
+    let bad_run = record.run_id.clone();
+    astra_services::RunStateStore::insert_run(&store, record)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_run_openings SET opening_events_json = '{invalid' WHERE user_id = ? AND run_id = ?")
+        .bind(&owner).bind(&bad_run).execute(&pool).await.unwrap();
+    params = serde_json::from_value(serde_json::json!({"per_page":1,"order":"asc"})).unwrap();
+    let healthy = audit.list_sessions(&owner, &params).await.unwrap();
+    assert_eq!(healthy.total, 4);
+    assert_eq!(healthy.sessions[0].session_id, ids[0]);
+    params.after_sort_value = Some("2026-06-15 09:30:00.000000".into());
+    params.after_session_id = Some(ids[2].clone());
+    let selected = audit.list_sessions(&owner, &params).await.unwrap();
+    assert_eq!(selected.sessions[0].session_id, bad_session);
+    assert_eq!(selected.sessions[0].model.as_deref(), Some("bad-model"));
+    assert!(
+        astra_services::RunStateStore::load_run(&store, &owner, &bad_run)
+            .await
+            .is_err(),
+        "execution recovery still rejects the corrupted immutable opening"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    let mut cleanup_sessions = ids.to_vec();
+    cleanup_sessions.push(bad_session);
+    for user in [&owner, &foreign] {
+        for table in ["agent_run_events", "agent_run_openings", "agent_runs"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE user_id = ?"
+            )))
+            .bind(user)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        cleanup_agent_sessions_and_events_for_owner(&pool, user, &cleanup_sessions, &events).await;
+    }
+}
 
-    let audit = DatabaseSessionAuditService::new(settings.clone()).with_pool(shared.clone());
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn audit_canonical_runs_count_bound_roots_and_keep_admitted_models() {
+    let (_bootstrap, mut settings) = setup_pool_and_settings().await;
+    settings.db_pool_max_connections = 1;
+    settings.db_pool_min_connections = 1;
+    let shared = SharedPool::new(&settings).await.unwrap();
+    let pool = shared.get().clone();
+    let owner = Uuid::new_v4().to_string();
+    let session = Uuid::new_v4().to_string();
+    seed_restore_session_fixture(&pool, &owner, &session, serde_json::json!({})).await;
+    let store = astra_services::DatabaseRunStateStore::new(shared.clone());
+    let mut root_id = None;
+    for case in 0..4 {
+        let mut run = common::collaborator_fixture::record(
+            &owner,
+            &session,
+            if case >= 2 { root_id.as_deref() } else { None },
+        );
+        run.agent_id = Some("bound-agent".into());
+        if case == 1 {
+            run.status = "waiting".into();
+        }
+        let model = match case {
+            1 => serde_json::json!("null"),
+            2 => serde_json::json!("child-model"),
+            3 => serde_json::json!(123),
+            _ => serde_json::json!("initial-model"),
+        };
+        run.events = vec![serde_json::json!({"event_type":"run_started", "data":{
+            "resolved_model_selection":{"model_name": model}
+        }})];
+        let id = run.run_id.clone();
+        astra_services::RunStateStore::insert_run(&store, run)
+            .await
+            .unwrap();
+        let captured: Option<String> = sqlx::query_scalar(
+            "SELECT admitted_model_name FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&owner)
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            captured.as_deref(),
+            match case {
+                0 => Some("initial-model"),
+                1 => Some("null"),
+                2 => Some("child-model"),
+                _ => None,
+            }
+        );
+        if case == 0 {
+            root_id = Some(id.clone());
+        }
+        sqlx::query("UPDATE agent_runs SET resolved_model_name = 'later-auto-model' WHERE user_id = ? AND run_id = ?")
+            .bind(&owner).bind(&id).execute(&pool).await.unwrap();
+    }
+    let audit = DatabaseSessionAuditService::new(settings).with_pool(shared);
+    let summary = audit.get_summary(&owner, &session).await.unwrap();
+    assert_eq!(
+        summary.turn_count, 2,
+        "bound roots count, child Runs do not"
+    );
+    assert!(summary.models_used.contains(&"initial-model".into()));
+    assert!(summary.models_used.contains(&"child-model".into()));
+    assert!(!summary.models_used.contains(&"later-auto-model".into()));
+    assert!(
+        summary.models_used.contains(&"null".into()),
+        "a literal string model name is not JSON null"
+    );
+    assert!(
+        !summary.models_used.contains(&"123".into()),
+        "non-string admission values are not model names"
+    );
     let stats = audit
         .get_cross_session_stats(
-            &user_id,
+            &owner,
             &CrossSessionStatsParams {
-                since: Some(since.clone()),
-                until: Some(until.clone()),
+                since: None,
+                until: None,
             },
         )
         .await
-        .expect("stats");
-
-    assert_eq!(stats.total_runtime_promotions, 4);
-    assert_eq!(stats.adaptive_baseline_runtime_promotions, 4);
-    assert_eq!(stats.auto_applied_runtime_promotions, 1);
-    assert_eq!(stats.queued_runtime_promotions, 1);
-    assert_eq!(stats.deferred_runtime_promotions, 1);
-    assert_eq!(stats.promoted_runtime_promotions, 1);
-    assert_eq!(stats.runtime_promote_recommendations, 2);
-    assert_eq!(stats.runtime_canary_recommendations, 1);
-    assert_eq!(stats.runtime_hold_recommendations, 1);
-
-    let list = audit
-        .list_cross_session_runtime_promotions(
-            &user_id,
-            &CrossSessionRuntimePromotionListParams {
-                page: 1,
-                per_page: 20,
-                since: Some(since.clone()),
-                until: Some(until.clone()),
-                session_id: None,
-                controller: None,
-                outcome: None,
-                recommendation: None,
-            },
+        .unwrap();
+    assert_eq!((stats.session_count, stats.total_turns), (1, 2));
+    assert_eq!(stats.top_models.len(), 3);
+    assert!(
+        stats
+            .top_models
+            .iter()
+            .all(|model| model.model != "later-auto-model")
+    );
+    let params = AuditSessionListParams {
+        page: 1,
+        per_page: 10,
+        status: None,
+        model: Some("child-model".into()),
+        since: None,
+        until: None,
+        min_turns: None,
+        sort: "created".into(),
+        order: "asc".into(),
+        after_sort_value: None,
+        after_session_id: None,
+    };
+    let list = audit.list_sessions(&owner, &params).await.unwrap();
+    assert_eq!(
+        list.total, 1,
+        "model filtering matches any admission, including a child's model"
+    );
+    assert_eq!(list.sessions[0].turn_count, 2);
+    assert_eq!(
+        audit
+            .list_sessions("another-owner", &params)
+            .await
+            .unwrap()
+            .total,
+        0
+    );
+    // A materialized Journal root gets its admission/terminal facts from the
+    // selected canonical Run, never from another Run's opening or mutable model.
+    let run = root_id.unwrap();
+    let event = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, run_id, turn_seq, metadata, payload_hash, ingestion_write_id) VALUES (?, ?, ?, 'user_query', 'root input', ?, 1, CAST('{}' AS JSON), ?, ?)")
+        .bind(&event).bind(&session).bind(&owner).bind(&run)
+        .bind(agent_event_fixture_payload_hash(serde_json::json!({"event_id":event})))
+        .bind(Uuid::new_v4().to_string()).execute(&pool).await.unwrap();
+    let turn_params = TurnListParams {
+        page: 1,
+        per_page: 1,
+        after_created_at: None,
+        after_event_id: None,
+    };
+    let queries = common::SqlQueries::default();
+    let page = audit
+        .list_turns(&owner, &session, &turn_params)
+        .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
+        .await
+        .unwrap();
+    assert_eq!(page.turns[0].model.as_deref(), Some("initial-model"));
+    assert!(!page.turns[0].has_error);
+    {
+        let statements = queries.0.lock().unwrap();
+        let facts = statements
+            .iter()
+            .filter(|sql| sql.contains("AS started_at"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            facts.len(),
+            1,
+            "one batch for admission, terminal and independent errors"
+        );
+        assert!(facts[0].contains("UNION ALL"));
+        assert!(!facts[0].contains("opening_context_json"));
+        assert!(!facts[0].contains("'run_finished'"));
+    }
+    sqlx::query("UPDATE agent_runs SET created_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE user_id = ? AND run_id = ?")
+        .bind(&owner).bind(&run).execute(&pool).await.unwrap();
+    assert!(
+        astra_services::RunStateStore::update_run_status_with_events_if_current(
+            &store,
+            &owner,
+            &session,
+            &run,
+            &["running"],
+            None,
+            "failed",
+            None,
+            Some("canonical failure"),
+            &[],
         )
         .await
-        .expect("list promotions");
-
-    assert_eq!(list.total, 4);
-    assert_eq!(list.promotions.len(), 4);
-    assert_eq!(list.page, 1);
-    assert_eq!(list.per_page, 20);
-
-    let by_id: std::collections::HashMap<_, _> = list
-        .promotions
-        .iter()
-        .map(|p| (p.event_id.clone(), p))
-        .collect();
-
-    let p1 = by_id.get(&e1).expect("e1");
-    assert_eq!(p1.session_id, s1);
-    assert_eq!(p1.controller, RuntimePromotionController::AdaptiveBaseline);
-    assert_eq!(p1.outcome, RuntimePromotionOutcome::AutoApplied);
-    assert_eq!(p1.recommendation, RuntimePromotionRecommendation::Promote);
-    assert_eq!(p1.subject_id, "subj-e1");
-    assert_eq!(p1.summary, "sum-e1");
-    assert_eq!(p1.turn, Some(1));
-    assert!((p1.confidence_score - 0.91).abs() < 1e-9);
-    assert!((p1.support_score - 0.81).abs() < 1e-9);
-    assert!((p1.safety_score - 0.71).abs() < 1e-9);
-    assert!((p1.overall_score - 0.79).abs() < 1e-9);
-    assert!(p1.blockers.is_empty());
-    assert_eq!(p1.evidence, vec!["e1".to_string()]);
-    assert_eq!(p1.rollback_hint, None);
-    assert_eq!(p1.run_id.as_deref(), Some("run-e1"));
-
-    let p2 = by_id.get(&e2).expect("e2");
-    assert_eq!(p2.controller, RuntimePromotionController::AdaptiveBaseline);
-    assert_eq!(p2.outcome, RuntimePromotionOutcome::Queued);
-    assert_eq!(p2.recommendation, RuntimePromotionRecommendation::Canary);
-    assert_eq!(p2.blockers, vec!["b2".to_string()]);
-    assert_eq!(p2.rollback_hint.as_deref(), Some("hint2"));
-
-    let p3 = by_id.get(&e3).expect("e3");
-    assert_eq!(p3.outcome, RuntimePromotionOutcome::Deferred);
-    assert_eq!(p3.recommendation, RuntimePromotionRecommendation::Hold);
-
-    let p4 = by_id.get(&e4).expect("e4");
-    assert_eq!(p4.outcome, RuntimePromotionOutcome::Promoted);
-    assert_eq!(p4.recommendation, RuntimePromotionRecommendation::Promote);
-
-    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[s1], &event_ids, &[]).await;
+        .unwrap()
+    );
+    let failed = audit.get_turn_detail(&owner, &session, 1).await.unwrap();
+    assert!(failed.has_error);
+    assert_eq!(failed.error_message.as_deref(), Some("canonical failure"));
+    assert!(failed.duration_ms >= 1_000);
+    astra_services::RunStateStore::append_events_batch(&store, &owner, &session, &run, &[
+        serde_json::json!({"event_type":"run_error","data":{"error":"independent failure detail"}}),
+        serde_json::json!({"event_type":"run_error","data":{"error":null}}),
+    ]).await.unwrap();
+    let later = audit.get_turn_detail(&owner, &session, 1).await.unwrap();
+    assert_eq!(
+        later.error_message.as_deref(),
+        Some("independent failure detail")
+    );
+    assert_eq!(
+        later.duration_ms, failed.duration_ms,
+        "post-terminal events do not move terminal time"
+    );
+    sqlx::query("UPDATE agent_events SET metadata = CAST('{\"duration_ms\":0}' AS JSON) WHERE user_id = ? AND event_id = ?")
+        .bind(&owner).bind(&event).execute(&pool).await.unwrap();
+    assert_eq!(
+        audit
+            .get_turn_detail(&owner, &session, 1)
+            .await
+            .unwrap()
+            .duration_ms,
+        0,
+        "a measured zero must not become a Run lifetime estimate"
+    );
+    sqlx::query("UPDATE agent_run_events SET payload_json = '{invalid' WHERE user_id = ? AND run_id = ? AND event_type = 'run_error' AND event_idx = 1")
+        .bind(&owner).bind(&run).execute(&pool).await.unwrap();
+    let error = audit
+        .get_turn_detail(&owner, &session, 1)
+        .await
+        .unwrap_err();
+    assert!(error.1.0.detail.contains("invalid payload JSON"));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1,
+        "selected error decoding must release the sole connection"
+    );
+    for table in ["agent_run_events", "agent_run_openings", "agent_runs"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
+        )))
+        .bind(&owner)
+        .bind(&session)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    cleanup_agent_sessions_and_events_for_owner(&pool, &owner, &[session], &[event]).await;
 }
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn session_runtime_promotions_db_read_is_bounded() {
-    let (shared, settings) = setup_pool_and_settings().await;
+async fn audit_turn_page_decodes_only_selected_runs() {
+    let (_bootstrap, mut settings) = setup_pool_and_settings().await;
+    settings.db_pool_max_connections = 1;
+    settings.db_pool_min_connections = 1;
+    let shared = SharedPool::new(&settings).await.unwrap();
     let pool = shared.get().clone();
-
-    let user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-    let cap = usize::try_from(MAX_SESSION_RUNTIME_PROMOTION_ROWS).expect("cap fits usize");
-    let total = cap + 5;
-    let event_ids: Vec<String> = (0..total).map(|_| Uuid::new_v4().to_string()).collect();
-
-    cleanup_agent_sessions_and_events_for_owner(
-        &pool,
-        &user_id,
-        std::slice::from_ref(&session_id),
-        &event_ids,
-        &[],
-    )
-    .await;
-
-    sqlx::query(
-        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'promo-cap', 'active', 0)",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .execute(&pool)
-    .await
-    .expect("insert session");
-
-    for (idx, event_id) in event_ids.iter().enumerate() {
-        let metadata = serde_json::json!({
-            "controller": "adaptive_baseline",
-            "outcome": "deferred",
-            "recommendation": "hold",
-            "subject_id": format!("subject-{idx:03}"),
-            "summary": format!("summary-{idx:03}"),
-            "confidence_score": 0.5,
-            "support_score": 0.5,
-            "safety_score": 0.5,
-            "overall_score": 0.5,
-            "blockers": [],
-            "evidence": [],
-            "rollback_hint": null,
-            "run_id": null
-        });
-        let created_at = format!("2026-07-02 10:{:02}:{:02}.000000", idx / 60, idx % 60);
-        sqlx::query(
-            "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
-             causal_chain_id, metadata, payload_hash, ingestion_write_id, created_at) \
-             VALUES (?, ?, ?, ?, '{}', '', CAST(? AS JSON), ?, ?, ?)",
-        )
-        .bind(event_id)
-        .bind(&session_id)
-        .bind(&user_id)
-        .bind(RUNTIME_PROMOTION_EVENT_TYPE)
-        .bind(metadata.to_string())
-        .bind(agent_event_fixture_payload_hash(serde_json::json!({
-            "event_id": event_id,
-            "session_id": &session_id,
-            "user_id": &user_id,
-            "event_type": RUNTIME_PROMOTION_EVENT_TYPE,
-            "content": "{}",
-            "causal_chain_id": "",
-            "metadata": &metadata,
-            "created_at": &created_at,
-        })))
-        .bind(Uuid::new_v4().to_string())
-        .bind(&created_at)
+    let owner = Uuid::new_v4().to_string();
+    let session = Uuid::new_v4().to_string();
+    let runs = [Uuid::new_v4().to_string(), Uuid::new_v4().to_string()];
+    seed_restore_session_fixture(&pool, &owner, &session, serde_json::json!({})).await;
+    let mut events = Vec::new();
+    for (turn, run) in runs.iter().enumerate() {
+        let event = Uuid::new_v4().to_string();
+        let timestamp = format!("2026-10-01 00:0{turn}:00.000000");
+        sqlx::query("INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, run_id, turn_seq, metadata, payload_hash, ingestion_write_id, created_at) VALUES (?, ?, ?, 'user_query', 'page fixture', ?, ?, CAST('{}' AS JSON), ?, ?, ?)")
+            .bind(&event).bind(&session).bind(&owner).bind(run).bind(turn as i32 + 1)
+            .bind(agent_event_fixture_payload_hash(serde_json::json!({"event_id":event})))
+            .bind(Uuid::new_v4().to_string()).bind(timestamp).execute(&pool).await.unwrap();
+        events.push(event);
+    }
+    for (user, run, index, kind, payload) in [
+        (
+            owner.as_str(),
+            runs[0].as_str(),
+            1_i64,
+            "tool_call",
+            r#"{"name":"bash","id":"selected"}"#,
+        ),
+        (
+            owner.as_str(),
+            runs[0].as_str(),
+            2,
+            "tool_call_end",
+            r#"{"name":"bash","id":"selected","success":true}"#,
+        ),
+        (
+            owner.as_str(),
+            runs[0].as_str(),
+            3,
+            "tool_call",
+            r#"{"name":"read_file","id":"pending"}"#,
+        ),
+        (owner.as_str(), runs[1].as_str(), 1, "tool_call", "{invalid"),
+        ("other-owner", runs[0].as_str(), 1, "tool_call", "{invalid"),
+    ] {
+        sqlx::query("INSERT INTO agent_run_events (id, run_id, event_idx, user_id, session_id, event_type, event_id, event_hash, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(Uuid::new_v4().to_string()).bind(run).bind(index).bind(user).bind(&session)
+            .bind(kind).bind(Uuid::new_v4().to_string())
+            .bind(format!("{:x}", sha2::Sha256::digest(payload.as_bytes())))
+            .bind(payload).execute(&pool).await.unwrap();
+    }
+    for (call, name, kind) in [
+        ("pending", "read_file", "tool_call_failed"),
+        ("independent", "rg", "tool_call_completed"),
+    ] {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, run_id, parent_event_id, tool_call_id, meta_tool_name, metadata, payload_hash, ingestion_write_id) VALUES (?, ?, ?, ?, 'known Journal outcome', ?, ?, ?, ?, CAST('{}' AS JSON), ?, ?)")
+            .bind(&id).bind(&session).bind(&owner).bind(kind).bind(&runs[0]).bind(&events[0]).bind(call).bind(name)
+            .bind(agent_event_fixture_payload_hash(serde_json::json!({"event_id":id})))
+            .bind(Uuid::new_v4().to_string()).execute(&pool).await.unwrap();
+        events.push(id);
+    }
+    let audit = DatabaseSessionAuditService::new(settings).with_pool(shared);
+    let mut params = TurnListParams {
+        page: 1,
+        per_page: 1,
+        after_created_at: None,
+        after_event_id: None,
+    };
+    let queries = common::SqlQueries::default();
+    let page = audit
+        .list_turns(&owner, &session, &params)
+        .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
+        .await
+        .unwrap();
+    assert_eq!(page.total, 2);
+    assert_eq!(page.turns.len(), 1);
+    assert_eq!(page.turns[0].turn, 1);
+    assert_eq!(page.turns[0].tool_calls.len(), 3);
+    let bash = page.turns[0]
+        .tool_calls
+        .iter()
+        .find(|tool| tool.name == "bash")
+        .unwrap();
+    assert!(bash.ok);
+    assert!(
+        page.turns[0]
+            .tool_calls
+            .iter()
+            .any(|tool| tool.name == "rg" && tool.ok)
+    );
+    assert!(
+        page.turns[0]
+            .tool_calls
+            .iter()
+            .any(|tool| tool.name == "read_file" && !tool.ok)
+    );
+    assert!(
+        page.turns[0].has_error,
+        "pending durable calls retain known Journal failures"
+    );
+    let detail = audit.get_turn_detail(&owner, &session, 1).await.unwrap();
+    assert_eq!(detail.tool_calls.len(), 3);
+    assert!(detail.has_error);
+    let payload = r#"{"call_id":"pending","success":true}"#;
+    sqlx::query("INSERT INTO agent_run_events (id, run_id, event_idx, user_id, session_id, event_type, event_id, event_hash, payload_json) VALUES (?, ?, 4, ?, ?, 'tool_call_end', ?, ?, ?)")
+        .bind(Uuid::new_v4().to_string()).bind(&runs[0]).bind(&owner).bind(&session)
+        .bind(Uuid::new_v4().to_string()).bind(format!("{:x}", sha2::Sha256::digest(payload.as_bytes())))
+        .bind(payload).execute(&pool).await.unwrap();
+    let settled = audit.list_turns(&owner, &session, &params).await.unwrap();
+    assert_eq!(
+        settled.turns[0].tool_calls.len(),
+        3,
+        "exact call identity prevents a duplicate brief"
+    );
+    assert!(settled.turns[0].tool_calls.iter().all(|tool| tool.ok));
+    assert!(
+        !settled.turns[0].has_error,
+        "a conflicting Journal tool result is replaced by the known canonical result"
+    );
+    let payload = r#"{"call_id":"pending","success":false,"executed":false}"#;
+    sqlx::query("INSERT INTO agent_run_events (id, run_id, event_idx, user_id, session_id, event_type, event_id, event_hash, payload_json) VALUES (?, ?, 6, ?, ?, 'tool_call_end', ?, ?, ?)")
+        .bind(Uuid::new_v4().to_string()).bind(&runs[0]).bind(&owner).bind(&session)
+        .bind(Uuid::new_v4().to_string()).bind(format!("{:x}", sha2::Sha256::digest(payload.as_bytes())))
+        .bind(payload).execute(&pool).await.unwrap();
+    let rejected = audit.list_turns(&owner, &session, &params).await.unwrap();
+    assert_eq!(rejected.turns[0].tool_calls.len(), 2);
+    assert!(!rejected.turns[0].has_error);
+    let payload = r#"{"event_type":"run_error","data":{"error":"standalone error fact"}}"#;
+    sqlx::query("INSERT INTO agent_run_events (id, run_id, event_idx, user_id, session_id, event_type, event_id, event_hash, payload_json) VALUES (?, ?, 5, ?, ?, 'run_error', ?, ?, ?)")
+        .bind(Uuid::new_v4().to_string()).bind(&runs[0]).bind(&owner).bind(&session)
+        .bind(Uuid::new_v4().to_string()).bind(format!("{:x}", sha2::Sha256::digest(payload.as_bytes())))
+        .bind(payload).execute(&pool).await.unwrap();
+    let standalone = audit.get_turn_detail(&owner, &session, 1).await.unwrap();
+    assert!(standalone.has_error);
+    assert_eq!(
+        standalone.error_message.as_deref(),
+        Some("standalone error fact")
+    );
+    let shared_root = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, run_id, turn_seq, metadata, payload_hash, ingestion_write_id, created_at) VALUES (?, ?, ?, 'user_query', 'another turn in the same Run', ?, 3, CAST('{}' AS JSON), ?, ?, '2026-10-01 00:02:00.000000')")
+        .bind(&shared_root).bind(&session).bind(&owner).bind(&runs[0])
+        .bind(agent_event_fixture_payload_hash(serde_json::json!({"event_id":shared_root})))
+        .bind(Uuid::new_v4().to_string()).execute(&pool).await.unwrap();
+    events.push(shared_root);
+    let ambiguous = audit.list_turns(&owner, &session, &params).await.unwrap();
+    assert_eq!(
+        ambiguous.turns[0].tool_calls.len(),
+        1,
+        "Run-only calls are not assigned to an arbitrary turn"
+    );
+    assert!(
+        ambiguous.turns[0].tool_calls.iter().all(|tool| tool.ok),
+        "exact Journal parent/call identity still admits the canonical result"
+    );
+    assert!(
+        audit
+            .get_turn_detail(&owner, &session, 3)
+            .await
+            .unwrap()
+            .tool_calls
+            .is_empty()
+    );
+    let statements = queries.0.lock().unwrap().join(" ");
+    assert!(statements.contains("AND run_id IN ("));
+    assert_eq!(
+        audit
+            .list_turns("other-owner", &session, &params)
+            .await
+            .unwrap_err()
+            .0,
+        axum::http::StatusCode::NOT_FOUND
+    );
+    let cursor = page.next_cursor.unwrap();
+    params.after_created_at = Some(cursor.created_at);
+    params.after_event_id = Some(cursor.event_id);
+    let error = audit
+        .list_turns(&owner, &session, &params)
+        .await
+        .unwrap_err();
+    assert_eq!(error.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(error.1.0.detail.contains("invalid payload JSON"));
+    // Whole-Session analytics intentionally still validates every selected fact.
+    assert_eq!(
+        audit
+            .get_tool_analytics(&owner, &session)
+            .await
+            .unwrap_err()
+            .0,
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1,
+        "a decoding failure must release or replace the sole streaming connection"
+    );
+    sqlx::query("DELETE FROM agent_run_events WHERE session_id = ?")
+        .bind(&session)
         .execute(&pool)
         .await
-        .expect("insert runtime promotion event");
-    }
-
-    let audit = DatabaseSessionAuditService::new(settings).with_pool(shared.clone());
-    let list = audit
-        .list_session_runtime_promotions(&user_id, &session_id)
-        .await
-        .expect("list session promotions");
-
-    let expected_first = format!("subject-{:03}", total - 1);
-    let expected_last = format!("subject-{:03}", total - cap);
-    assert_eq!(list.total, MAX_SESSION_RUNTIME_PROMOTION_ROWS as u32);
-    assert_eq!(list.promotions.len(), cap);
-    assert_eq!(
-        list.promotions.first().map(|p| p.subject_id.as_str()),
-        Some(expected_first.as_str()),
-        "bounded read should keep newest promotion first"
-    );
-    assert_eq!(
-        list.promotions.last().map(|p| p.subject_id.as_str()),
-        Some(expected_last.as_str()),
-        "bounded read should drop oldest overflow rows"
-    );
-
-    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[session_id], &event_ids, &[])
-        .await;
+        .unwrap();
+    cleanup_agent_sessions_and_events_for_owner(&pool, &owner, &[session], &events).await;
 }
 
 #[tokio::test]
@@ -4408,7 +4569,6 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
         &user_id,
         std::slice::from_ref(&session_id),
         &[turn_event_id, child_event_id, error_event_id],
-        &[],
     )
     .await;
 }
@@ -4416,7 +4576,10 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn session_audit_prices_historical_physical_attempts_without_catalog_repricing() {
-    let (shared, settings) = setup_pool_and_settings().await;
+    let (_bootstrap, mut settings) = setup_pool_and_settings().await;
+    settings.db_pool_max_connections = 1;
+    settings.db_pool_min_connections = 1;
+    let shared = SharedPool::new(&settings).await.unwrap();
     let pool = shared.get().clone();
 
     let user_id = Uuid::new_v4().to_string();
@@ -4745,7 +4908,6 @@ async fn session_audit_prices_historical_physical_attempts_without_catalog_repri
         &user_id,
         std::slice::from_ref(&session_id),
         std::slice::from_ref(&event_id),
-        &[],
     )
     .await;
     sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
@@ -4765,7 +4927,6 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
     let user_id = Uuid::new_v4().to_string();
     let session_a = Uuid::new_v4().to_string();
     let session_b = Uuid::new_v4().to_string();
-    let checkpoint_id = Uuid::new_v4().to_string();
     let existing_metadata_a =
         serde_json::json!({"agent_id":"astra-server","note":"keep me","git_branch":"feature/cloud-sync","model":"gpt-5.4"}).to_string();
 
@@ -4897,19 +5058,6 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
         .expect("seed session event_count");
     }
 
-    sqlx::query(
-        "INSERT INTO session_checkpoints \
-         (checkpoint_id, session_id, user_id, number, turn, title, summary, tools_json, total_tokens, created_at) \
-         VALUES (?, ?, ?, 1, 2, 'checkpoint-a', 'cloud checkpoint', CAST(? AS JSON), 250, '2026-09-01 10:02:00.000000')",
-    )
-    .bind(&checkpoint_id)
-    .bind(&session_a)
-    .bind(&user_id)
-    .bind(serde_json::json!(["bash", "rg"]).to_string())
-    .execute(&pool)
-    .await
-    .expect("insert session checkpoint");
-
     let trace_a = ContextTraceSignal {
         turn_id: "turn-a".into(),
         captured_at: Some("2026-09-01T10:02:30Z".into()),
@@ -4923,7 +5071,6 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
         history: None,
         budget: None,
         timing: None,
-        explanations: vec!["trace-a".into()],
     };
     let trace_b = ContextTraceSignal {
         turn_id: "turn-b".into(),
@@ -4938,7 +5085,6 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
         history: None,
         budget: None,
         timing: None,
-        explanations: vec!["trace-b".into()],
     };
 
     event_service
@@ -4983,9 +5129,9 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
         "context-trace push should add its inserted event delta to session B"
     );
 
-    let restore = HybridRestoreService::new(pool.clone());
+    let restore = SessionRestoreService::new(pool.clone());
     let restored_a = restore
-        .restore_session(&user_id, &session_a)
+        .load_cloud_summary(&user_id, &session_a)
         .await
         .expect("restore session A")
         .expect("session A restored");
@@ -4993,7 +5139,7 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
     assert_eq!(restored_a.turn_count, 2);
     assert_eq!(restored_a.total_tokens_in, 200);
     assert_eq!(restored_a.total_tokens_out, 50);
-    assert_eq!(restored_a.checkpoint_count, 1);
+    assert_eq!(restored_a.checkpoint_count, 0);
     assert!(
         restored_a.resume_bundle.is_none(),
         "isolated user_query rows do not prove a complete causal conversation"
@@ -5017,7 +5163,7 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
     );
 
     let restored_b = restore
-        .restore_session(&user_id, &session_b)
+        .load_cloud_summary(&user_id, &session_b)
         .await
         .expect("restore session B")
         .expect("session B restored");
@@ -5048,15 +5194,24 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
         .iter()
         .find(|session| session.session_id == session_a)
         .expect("session A listed");
-    assert_eq!(listed_a.turn_count, 2);
+    assert_eq!(
+        listed_a.turn_count, 0,
+        "directory requires a canonical head"
+    );
     assert_eq!(listed_a.model.as_deref(), Some("gpt-5.4"));
     assert_eq!(listed_a.git_branch.as_deref(), Some("feature/cloud-sync"));
     let listed_b = resumable
         .iter()
         .find(|session| session.session_id == session_b)
         .expect("session B listed");
-    assert_eq!(listed_b.turn_count, 1);
-    assert_eq!(listed_b.model.as_deref(), Some("claude-sonnet-4.5"));
+    assert_eq!(
+        listed_b.turn_count, 0,
+        "diagnostic events do not supply directory turns"
+    );
+    assert!(
+        listed_b.model.is_none(),
+        "directory does not infer a model from events"
+    );
     assert_eq!(listed_b.git_branch.as_deref(), Some("legacy-fallback"));
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_a, session_b]).await;
@@ -5069,6 +5224,7 @@ async fn session_restore_turn_count_uses_turn_seq_high_watermark() {
     let pool = shared.get().clone();
 
     let user_id = Uuid::new_v4().to_string();
+    let other_user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
     let first_event_id = Uuid::new_v4().to_string();
     let fourth_event_id = Uuid::new_v4().to_string();
@@ -5147,9 +5303,28 @@ async fn session_restore_turn_count_uses_turn_seq_high_watermark() {
         .expect("insert sparse-turn restore event");
     }
 
-    let restore = HybridRestoreService::new(pool.clone());
+    // A different owner may independently use the same session ID. Its
+    // history and checkpoints must not affect this owner's restore summary.
+    seed_restore_session_fixture(&pool, &other_user_id, &session_id, serde_json::json!({})).await;
+    sqlx::query(
+        "INSERT INTO agent_events \
+         (event_id, session_id, user_id, event_type, turn_seq, token_usage, \
+          token_input, token_output, llm_model_used, payload_hash, ingestion_write_id) \
+         VALUES (?, ?, ?, 'user_query', 99, CAST(? AS JSON), 1000, 1000, 'foreign-model', ?, ?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&session_id)
+    .bind(&other_user_id)
+    .bind(r#"{"input_tokens":1000,"output_tokens":1000}"#)
+    .bind("foreign-payload")
+    .bind(Uuid::new_v4().to_string())
+    .execute(&pool)
+    .await
+    .expect("insert foreign owner event");
+
+    let restore = SessionRestoreService::new(pool.clone());
     let restored = restore
-        .restore_session(&user_id, &session_id)
+        .load_cloud_summary(&user_id, &session_id)
         .await
         .expect("restore sparse-turn session")
         .expect("sparse-turn session restored");
@@ -5157,6 +5332,9 @@ async fn session_restore_turn_count_uses_turn_seq_high_watermark() {
         restored.turn_count, 4,
         "restore_session must report turn_seq high watermark, not user_query row count"
     );
+    assert_eq!(restored.total_tokens_in, 2);
+    assert_eq!(restored.total_tokens_out, 2);
+    assert_eq!(restored.checkpoint_count, 0);
 
     let listed = restore
         .list_resumable_sessions(&user_id)
@@ -5167,11 +5345,11 @@ async fn session_restore_turn_count_uses_turn_seq_high_watermark() {
         .find(|session| session.session_id == session_id)
         .expect("sparse-turn session listed");
     assert_eq!(
-        listed_session.turn_count, 4,
-        "list_resumable_sessions must use the same turn high watermark as restore_session"
+        listed_session.turn_count, 0,
+        "directory omits diagnostic turn counts; selected detail recovery retains its high watermark"
     );
 
-    cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
+    cleanup_restore_fixture_for_owners(&pool, &[session_id], &[&user_id, &other_user_id]).await;
 }
 
 #[tokio::test]
@@ -5208,7 +5386,6 @@ async fn sync_audit_no_longer_persists_session_sync_log_on_live_matrixone() {
             history: None,
             budget: None,
             timing: None,
-            explanations: vec![format!("trace-{idx}")],
         };
         event_service
             .create_event(
@@ -5288,7 +5465,6 @@ async fn monotonic_remote_workspace_projection_restores_picker_metadata_on_live_
         history: None,
         budget: None,
         timing: None,
-        explanations: vec!["restored from old remote workspace artifact".into()],
     });
 
     let mut newer_workspace = WorkspaceMetadata::with_context(
@@ -5313,7 +5489,6 @@ async fn monotonic_remote_workspace_projection_restores_picker_metadata_on_live_
         history: None,
         budget: None,
         timing: None,
-        explanations: vec!["restored from newest remote workspace artifact".into()],
     });
 
     let artifact_store = DatabaseSessionArtifactStore::new(settings.clone()).with_pool(shared);
@@ -5362,15 +5537,18 @@ async fn monotonic_remote_workspace_projection_restores_picker_metadata_on_live_
         .expect("remote workspace projection exists");
     assert_eq!(projection.content, newer_artifact.content);
 
-    let restore = HybridRestoreService::new(pool.clone());
+    let restore = SessionRestoreService::new(pool.clone());
     let restored = restore
-        .restore_session(&user_id, &session_id)
+        .load_cloud_summary(&user_id, &session_id)
         .await
         .expect("restore session")
         .expect("session restored from remote workspace artifact");
 
     assert!(restored.restored_from_cloud);
-    assert_eq!(restored.turn_count, newer_workspace.turn_count);
+    assert_eq!(
+        restored.turn_count, 0,
+        "workspace hints do not supply the canonical turn clock"
+    );
     assert_eq!(restored.total_tokens_in, newer_workspace.total_tokens_in);
     assert_eq!(restored.total_tokens_out, newer_workspace.total_tokens_out);
     assert!(
@@ -5384,184 +5562,6 @@ async fn monotonic_remote_workspace_projection_restores_picker_metadata_on_live_
     assert!(restored.model.is_none());
     assert!(restored.last_context_trace.is_none());
     assert!(restored.workspace.is_none());
-
-    cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn concurrent_remote_composite_snapshot_indexes_merge_without_local_index_on_live_matrixone()
-{
-    let (shared, settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-
-    let user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-
-    cleanup_restore_fixture_for_owner(&pool, &user_id, std::slice::from_ref(&session_id)).await;
-
-    let local_index_path = astra_services::local_session_artifact_store()
-        .session_path(&session_id, "step_checkpoints/composite_snapshots.json")
-        .expect("composite snapshot index path");
-    assert!(
-        !local_index_path.exists(),
-        "fixture should prove remote composite snapshot persistence without local composite_snapshots.json"
-    );
-
-    seed_restore_session_fixture(&pool, &user_id, &session_id, serde_json::json!({"git_branch": Some("feature/remote-composite"), "model": Some("gpt-5.4")})).await;
-    seed_restore_checkpoint_fixture(
-        &pool,
-        &user_id,
-        &session_id,
-        &astra_services::session_checkpoint::Checkpoint {
-            number: 3,
-            turn: 7,
-            title: "remote composite checkpoint".into(),
-            summary: "checkpoint only exists in MatrixOne".into(),
-            tools_used: vec!["bash".into(), "rg".into()],
-            total_tokens: 321,
-            had_stalls: false,
-            error_count: 0,
-        },
-        None,
-    )
-    .await;
-
-    let build_index = |label: &str, branch: &str, git_commit: &str, created_at: &str| {
-        let data_snapshot = astra_services::DataSnapshotRef {
-            snapshot_name: format!("snapshot-{session_id}-{label}"),
-            databases: vec!["app_db".into()],
-            timestamp: Some("2026-09-08T10:00:00Z".into()),
-            branch_name: Some(branch.into()),
-        };
-        let mut composite_snapshot =
-            astra_core::composite_snapshot::CompositeSnapshotBuilder::new(&session_id, 7)
-                .label(label)
-                .session_state("000003-heavy.json")
-                .data_snapshot(data_snapshot.clone())
-                .git_commit(git_commit)
-                .workspace_state(&session_id)
-                .build();
-        composite_snapshot.created_at = created_at.into();
-        let mut index = astra_services::CompositeSnapshotIndex::default();
-        index
-            .append(&mut composite_snapshot)
-            .expect("append composite snapshot");
-        (index, composite_snapshot, data_snapshot)
-    };
-
-    let old_git_commit = "0123456789abcdef0123456789abcdef01234567";
-    let new_git_commit = "fedcba9876543210fedcba9876543210fedcba98";
-    let (old_index, _old_snapshot, _old_data_snapshot) = build_index(
-        "remote-composite-old",
-        "feature/remote-composite-old",
-        old_git_commit,
-        "2026-09-08T09:59:59Z",
-    );
-    let (new_index, new_snapshot, new_data_snapshot) = build_index(
-        "remote-composite-new",
-        "feature/remote-composite-new",
-        new_git_commit,
-        "2026-09-08T10:00:00Z",
-    );
-
-    let artifact_store = DatabaseSessionArtifactStore::new(settings.clone()).with_pool(shared);
-    let (old_artifact, new_artifact) = tokio::join!(
-        persist_remote_composite_snapshot_index(&session_id, &user_id, &old_index, &artifact_store),
-        persist_remote_composite_snapshot_index(&session_id, &user_id, &new_index, &artifact_store)
-    );
-    let old_artifact = old_artifact.expect("persist old remote composite snapshot index");
-    let new_artifact = new_artifact.expect("persist newest remote composite snapshot index");
-    force_session_artifacts_created_at(
-        &pool,
-        &user_id,
-        &session_id,
-        &[
-            old_artifact.artifact_id.clone(),
-            new_artifact.artifact_id.clone(),
-        ],
-        "2026-09-08 10:00:00.123456",
-    )
-    .await;
-
-    assert_eq!(old_artifact.artifact_id, new_artifact.artifact_id);
-    assert_eq!(
-        new_artifact.artifact_id,
-        astra_services::session_restore::COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID
-    );
-    let projection_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM session_artifacts \
-         WHERE user_id = ? AND session_id = ? AND artifact_kind = ?",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND)
-    .fetch_one(&pool)
-    .await
-    .expect("count composite snapshot projection rows");
-    assert_eq!(
-        projection_rows, 1,
-        "mutable composite snapshot state must occupy exactly one row"
-    );
-    let expected_artifact = &new_artifact;
-    let expected_index = old_index.clone().merge_by_identity(new_index.clone());
-    let expected_snapshot = &new_snapshot;
-    let expected_data_snapshot = &new_data_snapshot;
-    let expected_git = new_git_commit;
-
-    let latest_artifact = artifact_store
-        .load_latest_json_artifact(
-            &user_id,
-            &session_id,
-            COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND,
-        )
-        .await
-        .expect("load latest remote composite snapshot artifact")
-        .expect("remote composite snapshot artifact exists");
-    assert_eq!(latest_artifact.artifact_id, expected_artifact.artifact_id);
-
-    let listed: astra_services::CompositeSnapshotIndex =
-        serde_json::from_value(latest_artifact.content).expect("decode persisted composite index");
-    assert_eq!(listed.snapshots.len(), expected_index.snapshots.len());
-    assert_eq!(listed.current_version(), expected_index.current_version());
-    let listed_snapshot = listed
-        .snapshots
-        .iter()
-        .find(|snapshot| snapshot.snapshot_id == expected_snapshot.snapshot_id)
-        .expect("newest snapshot remains present after projection merge");
-    assert_eq!(listed_snapshot.snapshot_id, expected_snapshot.snapshot_id);
-    assert_eq!(
-        listed_snapshot.label.as_deref(),
-        expected_snapshot.label.as_deref()
-    );
-    assert_eq!(listed_snapshot.turn, expected_snapshot.turn);
-
-    assert_eq!(listed_snapshot.git_commit(), Some(expected_git));
-    assert_eq!(
-        listed_snapshot.data_snapshot(),
-        Some(expected_data_snapshot)
-    );
-
-    let restore = HybridRestoreService::new(pool.clone());
-    let checkpoints = restore
-        .list_checkpoints(&user_id, &session_id)
-        .await
-        .expect("list ordinary remote checkpoint");
-    assert_eq!(checkpoints.len(), 1);
-    let checkpoint = &checkpoints[0];
-    assert_eq!(checkpoint.number, 3);
-    assert_eq!(checkpoint.turn, 7);
-    assert_eq!(checkpoint.total_tokens, 321);
-    assert_eq!(checkpoint.title, "remote composite checkpoint");
-    assert_eq!(checkpoint.summary, "checkpoint only exists in MatrixOne");
-    assert!(
-        restore
-            .list_checkpoints(&Uuid::new_v4().to_string(), &session_id)
-            .await
-            .expect("foreign owner checkpoint query")
-            .is_empty(),
-        "checkpoint listing must not expose another owner's records"
-    );
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
 }
@@ -5656,9 +5656,9 @@ async fn restore_recent_tools_ignores_agent_events_turn_complete_metadata_on_liv
         .expect("insert non-authoritative turn_complete");
     }
 
-    let restore = HybridRestoreService::new(pool.clone());
+    let restore = SessionRestoreService::new(pool.clone());
     let restored = restore
-        .restore_session(&user_id, &session_id)
+        .load_cloud_summary(&user_id, &session_id)
         .await
         .expect("restore session")
         .expect("session restored");
@@ -5668,7 +5668,7 @@ async fn restore_recent_tools_ignores_agent_events_turn_complete_metadata_on_liv
     assert!(
         restored.recent_tools.is_empty(),
         "agent_events turn_complete metadata is not authoritative recent-tool state; \
-         session_checkpoints must be the single restore source"
+         diagnostic event traces must not supply resumable tool state"
     );
     assert!(restored.last_context_trace.is_none());
 
@@ -5700,7 +5700,6 @@ async fn client_context_trace_requires_owned_session_on_live_matrixone() {
         history: None,
         budget: None,
         timing: None,
-        explanations: vec!["missing row".into()],
     };
 
     let rejected = event_service
@@ -5712,9 +5711,9 @@ async fn client_context_trace_requires_owned_session_on_live_matrixone() {
         .expect_err("Client cannot create a missing session");
     assert_eq!(rejected.0, axum::http::StatusCode::NOT_FOUND);
     for table in ["agent_sessions", "agent_events"] {
-        let (rows,): (i64,) = sqlx::query_as(&format!(
+        let (rows,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
-        ))
+        )))
         .bind(&user_id)
         .bind(&session_id)
         .fetch_one(&pool)
@@ -5783,9 +5782,9 @@ async fn client_context_trace_requires_owned_session_on_live_matrixone() {
         "the diagnostic event must retain its exact tool-surface evidence"
     );
 
-    let restore = HybridRestoreService::new(pool.clone());
+    let restore = SessionRestoreService::new(pool.clone());
     let restored = restore
-        .restore_session(&user_id, &session_id)
+        .load_cloud_summary(&user_id, &session_id)
         .await
         .expect("restore session")
         .expect("session restored");
@@ -5806,384 +5805,6 @@ async fn client_context_trace_requires_owned_session_on_live_matrixone() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn historical_checkpoint_readers_keep_session_and_step_rows_separate_on_live_matrixone() {
-    let (shared, _settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-
-    let user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-    let heavy_only_session = Uuid::new_v4().to_string();
-
-    let heavy_state_json = |owner_id: &str,
-                            session_id: &str,
-                            sequence: u64,
-                            messages: serde_json::Value,
-                            blocked_tools: serde_json::Value,
-                            recent_tools: serde_json::Value,
-                            approval_overrides: serde_json::Value,
-                            interruption: serde_json::Value,
-                            compaction_state: serde_json::Value| {
-        let conversation_cursor = astra_turn_types::SessionCursorV1 {
-            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
-            owner_id: owner_id.to_string(),
-            session_id: session_id.to_string(),
-            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.to_string(),
-            completed_turn: 1,
-            journal_event_seq: sequence,
-            conversation_seq: sequence,
-            canonical_root_hash: astra_turn_types::canonical_conversation_root(
-                messages
-                    .as_array()
-                    .expect("checkpoint messages must be an array"),
-            ),
-            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
-            compaction_generation: 0,
-            config_version_id: None,
-        };
-        serde_json::json!({
-            "Heavy": {
-                "light": {},
-                "conversation_cursor": conversation_cursor,
-                "messages": messages,
-                "blocked_tools": blocked_tools,
-                "recent_tools": recent_tools,
-                "approval_overrides": approval_overrides,
-                "interruption": interruption,
-                "compaction_state": compaction_state
-            }
-        })
-        .to_string()
-    };
-
-    cleanup_restore_fixture_for_owner(
-        &pool,
-        &user_id,
-        &[session_id.clone(), heavy_only_session.clone()],
-    )
-    .await;
-
-    sqlx::query(
-        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'checkpoint-it', 'active', 1)",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .execute(&pool)
-    .await
-    .expect("insert checkpoint session");
-
-    let checkpoint_event_id = Uuid::new_v4().to_string();
-    let checkpoint_token_usage = serde_json::json!({
-        "input_tokens": 10,
-        "cached_input_tokens": 0,
-        "cache_creation_tokens": 0,
-        "output_tokens": 5,
-        "total_tokens": 15,
-    });
-    sqlx::query(
-        "INSERT INTO agent_events \
-         (event_id, session_id, user_id, event_type, content, token_usage, token_input, \
-          token_output, token_total, turn_seq, payload_hash, ingestion_write_id, created_at) \
-         VALUES (?, ?, ?, 'user_query', 'checkpoint turn', CAST(? AS JSON), 10, 5, 15, 1, \
-                 ?, ?, '2026-09-04 09:00:00.000000')",
-    )
-    .bind(&checkpoint_event_id)
-    .bind(&session_id)
-    .bind(&user_id)
-    .bind(checkpoint_token_usage.to_string())
-    .bind(agent_event_fixture_payload_hash(serde_json::json!({
-        "event_id": &checkpoint_event_id,
-        "session_id": &session_id,
-        "user_id": &user_id,
-        "event_type": "user_query",
-        "content": "checkpoint turn",
-        "token_usage": &checkpoint_token_usage,
-        "token_input": 10,
-        "token_output": 5,
-        "token_total": 15,
-        "turn_seq": 1,
-        "created_at": "2026-09-04 09:00:00.000000",
-    })))
-    .bind(Uuid::new_v4().to_string())
-    .execute(&pool)
-    .await
-    .expect("insert checkpoint user_query");
-
-    sqlx::query(
-        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'checkpoint-heavy-only', 'active', 1)",
-    )
-    .bind(&heavy_only_session)
-    .bind(&user_id)
-    .execute(&pool)
-    .await
-    .expect("insert heavy-only session");
-
-    let heavy_event_id = Uuid::new_v4().to_string();
-    let heavy_token_usage = serde_json::json!({
-        "input_tokens": 11,
-        "cached_input_tokens": 0,
-        "cache_creation_tokens": 0,
-        "output_tokens": 4,
-        "total_tokens": 15,
-    });
-    sqlx::query(
-        "INSERT INTO agent_events \
-         (event_id, session_id, user_id, event_type, content, token_usage, token_input, \
-          token_output, token_total, turn_seq, payload_hash, ingestion_write_id, created_at) \
-         VALUES (?, ?, ?, 'user_query', 'heavy-only turn', CAST(? AS JSON), 11, 4, 15, 1, \
-                 ?, ?, '2026-09-04 09:10:00.000000')",
-    )
-    .bind(&heavy_event_id)
-    .bind(&heavy_only_session)
-    .bind(&user_id)
-    .bind(heavy_token_usage.to_string())
-    .bind(agent_event_fixture_payload_hash(serde_json::json!({
-        "event_id": &heavy_event_id,
-        "session_id": &heavy_only_session,
-        "user_id": &user_id,
-        "event_type": "user_query",
-        "content": "heavy-only turn",
-        "token_usage": &heavy_token_usage,
-        "token_input": 11,
-        "token_output": 4,
-        "token_total": 15,
-        "turn_seq": 1,
-        "created_at": "2026-09-04 09:10:00.000000",
-    })))
-    .bind(Uuid::new_v4().to_string())
-    .execute(&pool)
-    .await
-    .expect("insert heavy-only user_query");
-
-    seed_restore_checkpoint_fixture(
-        &pool,
-        &user_id,
-        &session_id,
-        &astra_services::session_checkpoint::Checkpoint {
-            number: 1,
-            turn: 1,
-            title: "session-ckpt".into(),
-            summary: "ordinary checkpoint".into(),
-            tools_used: vec!["bash".into(), "rg".into()],
-            total_tokens: 150,
-            had_stalls: false,
-            error_count: 0,
-        },
-        None,
-    )
-    .await;
-
-    let approval_overrides = serde_json::json!({
-        "rules": [[{
-            "tool_name": "bash",
-            "command_prefix": "git commit",
-            "path_pattern": null,
-            "side_effect": "execute"
-        }, true]]
-    });
-    seed_restore_checkpoint_fixture(&pool, &user_id, &session_id, &astra_services::session_checkpoint::Checkpoint {number: 1_000_000_001, turn: 3, title: "step-heavy-v2".into(), summary: "heavy".into(), tools_used: vec!["step-two".into()], total_tokens: 0, had_stalls: false, error_count: 0}, Some(&heavy_state_json(
-            &user_id,
-            &session_id,
-            3,
-            serde_json::json!([
-                {"role":"user","content":"first"},
-                {"role":"assistant","content":"reply"},
-                {"role":"user","content":"follow-up"},
-                {"role":"assistant","content":"done"}
-            ]),
-            serde_json::json!(["dangerous_tool","web_fetch"]),
-            serde_json::json!(["step-two"]),
-            approval_overrides.clone(),
-            serde_json::json!({"kind":"rate_limited","resumable":true}),
-            serde_json::json!({"attempt_count":2,"cumulative_tokens_freed":120,"last_was_insufficient":false}),
-        ))).await;
-    seed_restore_checkpoint_fixture(&pool, &user_id, &heavy_only_session, &astra_services::session_checkpoint::Checkpoint {number: 1_000_000_001, turn: 1, title: "heavy-only-v1".into(), summary: "heavy".into(), tools_used: vec!["heavy-only-tool".into()], total_tokens: 0, had_stalls: false, error_count: 0}, Some(&heavy_state_json(
-            &user_id,
-            &heavy_only_session,
-            1,
-            serde_json::json!([
-                {"role":"user","content":"heavy-only user"},
-                {"role":"assistant","content":"heavy-only answer"}
-            ]),
-            serde_json::json!(["grep"]),
-            serde_json::json!(["heavy-only-tool"]),
-            serde_json::json!(null),
-            serde_json::json!({"kind":"context_window","resumable":true}),
-            serde_json::json!({"attempt_count":1,"cumulative_tokens_freed":80,"last_was_insufficient":true}),
-        ))).await;
-
-    let rows = sqlx::query(
-        "SELECT number, title, summary, CAST(tools_json AS CHAR) AS tools_json, state_json \
-         FROM session_checkpoints WHERE user_id = ? AND session_id = ? ORDER BY number",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .fetch_all(&pool)
-    .await
-    .expect("load checkpoint rows");
-    assert_eq!(
-        rows.len(),
-        2,
-        "ordinary and step checkpoints should coexist"
-    );
-
-    let ordinary = &rows[0];
-    assert_eq!(
-        ordinary
-            .try_get::<i32, _>("number")
-            .expect("ordinary number"),
-        1
-    );
-    assert_eq!(
-        ordinary
-            .try_get::<String, _>("title")
-            .expect("ordinary title"),
-        "session-ckpt"
-    );
-    assert_eq!(
-        ordinary
-            .try_get::<String, _>("summary")
-            .expect("ordinary summary"),
-        "ordinary checkpoint"
-    );
-    assert_eq!(
-        ordinary
-            .try_get::<Option<String>, _>("state_json")
-            .expect("ordinary state"),
-        None
-    );
-    assert_eq!(
-        serde_json::from_str::<Vec<String>>(
-            ordinary
-                .try_get::<Option<String>, _>("tools_json")
-                .expect("ordinary tools")
-                .as_deref()
-                .expect("ordinary tools JSON"),
-        )
-        .expect("parse ordinary tools"),
-        vec!["bash".to_string(), "rg".to_string()],
-        "ordinary checkpoint tools must remain physically separate from the namespaced step row"
-    );
-
-    let step = &rows[1];
-    assert_eq!(
-        step.try_get::<i32, _>("number").expect("step number"),
-        1_000_000_001,
-        "step checkpoints should use the cloud namespace offset and avoid colliding with ordinary checkpoints"
-    );
-    assert_eq!(
-        step.try_get::<String, _>("title").expect("step title"),
-        "step-heavy-v2"
-    );
-    assert_eq!(
-        step.try_get::<String, _>("summary").expect("step summary"),
-        "heavy"
-    );
-    assert_eq!(
-        step.try_get::<Option<String>, _>("tools_json")
-            .expect("step tools")
-            .as_deref(),
-        Some(r#"["step-two"]"#)
-    );
-    let pulled_step = pull_step_checkpoint_from_cloud(&pool, &user_id, &session_id)
-        .await
-        .expect("pull heavy step checkpoint");
-    assert_eq!(
-        step.try_get::<Option<String>, _>("state_json")
-            .expect("step state")
-            .as_deref(),
-        pulled_step.as_deref()
-    );
-    assert!(
-        pulled_step
-            .as_deref()
-            .unwrap_or_default()
-            .contains(r#""follow-up""#),
-        "pulled heavy checkpoint should return the latest StepCheckpoint JSON"
-    );
-
-    let restore = HybridRestoreService::new(pool.clone());
-    let checkpoints = restore
-        .list_checkpoints(&user_id, &session_id)
-        .await
-        .expect("list checkpoints");
-    assert_eq!(
-        checkpoints.len(),
-        1,
-        "cloud checkpoint listing should exclude namespaced step checkpoint rows"
-    );
-    assert_eq!(checkpoints[0].number, 1);
-    assert_eq!(checkpoints[0].title, "session-ckpt");
-
-    let restored = restore
-        .restore_session(&user_id, &session_id)
-        .await
-        .expect("restore checkpoint session")
-        .expect("checkpoint session restored");
-    assert_eq!(restored.turn_count, 1);
-    assert_eq!(restored.checkpoint_count, 1);
-    assert_eq!(
-        restored.recent_tools,
-        vec!["step-two".to_string()],
-        "the exact-cursor heavy checkpoint projection must win prompt-facing state; \
-         ordinary checkpoint tools remain available only through checkpoint history"
-    );
-    assert_eq!(restored.resume_messages().len(), 4);
-    assert_eq!(restored.resume_messages()[0]["role"], "user");
-    assert_eq!(restored.resume_messages()[3]["content"], "done");
-    assert_eq!(
-        restored.blocked_tools,
-        vec!["dangerous_tool".to_string(), "web_fetch".to_string()]
-    );
-    assert_eq!(
-        restored.approval_overrides.as_ref(),
-        Some(&approval_overrides)
-    );
-    assert_eq!(
-        restored
-            .interruption
-            .as_ref()
-            .and_then(|json| json.get("kind"))
-            .and_then(serde_json::Value::as_str),
-        Some("rate_limited")
-    );
-    assert_eq!(
-        restored
-            .compaction_state
-            .as_ref()
-            .and_then(|json| json.get("attempt_count"))
-            .and_then(serde_json::Value::as_u64),
-        Some(2)
-    );
-
-    let restored_heavy_only = restore
-        .restore_session(&user_id, &heavy_only_session)
-        .await
-        .expect("restore heavy-only session")
-        .expect("heavy-only session restored");
-    assert_eq!(restored_heavy_only.checkpoint_count, 0);
-    assert_eq!(
-        restored_heavy_only.recent_tools,
-        vec!["heavy-only-tool".to_string()],
-        "cloud restore should fall back to heavy checkpoint recent_tools when no ordinary checkpoint exists"
-    );
-    assert_eq!(restored_heavy_only.blocked_tools, vec!["grep".to_string()]);
-    assert_eq!(restored_heavy_only.resume_messages().len(), 2);
-    assert_eq!(
-        restored_heavy_only
-            .interruption
-            .as_ref()
-            .and_then(|json| json.get("kind"))
-            .and_then(serde_json::Value::as_str),
-        Some("context_window")
-    );
-
-    cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id, heavy_only_session]).await;
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -6199,7 +5820,6 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
         &owner_user_id,
         std::slice::from_ref(&session_id),
         &[],
-        &[],
     )
     .await;
     cleanup_agent_sessions_and_events_for_owner(
@@ -6210,7 +5830,6 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
             stray_event_id.clone(),
             non_owner_session_end_event_id.clone(),
         ],
-        &[],
     )
     .await;
 
@@ -6371,6 +5990,9 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
     };
     let (sender, shutdown, stats, join) = EventIngestionWorker::spawn(pool.clone(), config);
     sender.enqueue(IngestionEvent {
+        run_id: None,
+        parent_run_id: None,
+        turn_seq: None,
         event_id: non_owner_session_end_event_id.clone(),
         session_id: session_id.clone(),
         user_id: other_user_id.clone(),
@@ -6450,7 +6072,6 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
         &owner_user_id,
         std::slice::from_ref(&session_id),
         &[owner_event.record.event_id],
-        &[],
     )
     .await;
     cleanup_agent_sessions_and_events_for_owner(
@@ -6458,7 +6079,6 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
         &other_user_id,
         &[session_id],
         &[stray_event_id, non_owner_session_end_event_id],
-        &[],
     )
     .await;
 }
@@ -6473,7 +6093,6 @@ async fn session_owned_services_isolate_same_session_id_across_owners_on_live_ma
     let other_user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
     let event_id = Uuid::new_v4().to_string();
-    let context_capture_id = Uuid::new_v4().to_string();
 
     cleanup_restore_fixture_for_owner(&pool, &owner_user_id, std::slice::from_ref(&session_id))
         .await;
@@ -6492,42 +6111,27 @@ async fn session_owned_services_isolate_same_session_id_across_owners_on_live_ma
     .await
     .expect("insert owner session");
 
-    let context_service = DatabaseContextService::new(settings.clone()).with_pool(shared.clone());
-    let snapshot_result = context_service
-        .create_snapshot(
+    let event_service = DatabaseEventService::new(settings.clone()).with_pool(shared.clone());
+    let rejected = event_service
+        .create_event(
             other_user_id.clone(),
-            SnapshotCreateRequestData {
+            EventCreateRequestData {
+                ingestion_source: astra_services::EventIngestionSource::Client,
+                event_id: Some(event_id),
                 session_id: session_id.clone(),
-                event_id: event_id.clone(),
-                context_data: serde_json::json!({"attempt": "non-owner"}),
+                event_type: "owner_isolation".into(),
+                content: "{}".into(),
+                agent_id: None,
+                agent_version: None,
+                parent_event_id: None,
+                parent_event_ids: None,
+                causal_chain_id: None,
+                metadata: None,
             },
         )
-        .await;
-    assert_eq!(
-        snapshot_result
-            .expect_err("non-owner cannot create context snapshot")
-            .0,
-        axum::http::StatusCode::NOT_FOUND
-    );
-
-    let decision_service = DatabaseDecisionService::new(settings.clone()).with_pool(shared.clone());
-    let decision_result = decision_service
-        .record_decision(
-            other_user_id.clone(),
-            DecisionCreateRequestData {
-                session_id: session_id.clone(),
-                event_id: event_id.clone(),
-                context_capture_id,
-                decision_type: "it_decision".into(),
-                decision_output: serde_json::json!({"allowed": false}),
-                model_params: None,
-            },
-        )
-        .await;
-    let error = decision_result.expect_err("non-owner cannot record decision");
-    assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
-    assert_eq!(error.1.0.detail, format!("Session {session_id} not found"));
-
+        .await
+        .expect_err("foreign owner cannot write retained Session events");
+    assert_eq!(rejected.0, axum::http::StatusCode::NOT_FOUND);
     seed_restore_session_fixture(
         &pool,
         &other_user_id,
@@ -6536,102 +6140,15 @@ async fn session_owned_services_isolate_same_session_id_across_owners_on_live_ma
     )
     .await;
 
-    seed_restore_checkpoint_fixture(
-        &pool,
-        &owner_user_id,
-        &session_id,
-        &astra_services::session_checkpoint::Checkpoint {
-            number: 1,
-            turn: 1,
-            title: "owner-checkpoint".into(),
-            summary: "owner checkpoint must survive".into(),
-            tools_used: vec!["owner_tool".into()],
-            total_tokens: 10,
-            had_stalls: false,
-            error_count: 0,
-        },
-        None,
-    )
-    .await;
-    let restore = HybridRestoreService::new(pool.clone());
+    let restore = SessionRestoreService::new(pool.clone());
     assert!(
         restore
-            .restore_session(&other_user_id, &session_id)
+            .load_cloud_summary(&other_user_id, &session_id)
             .await
             .expect("other owner restore should not error")
             .is_some(),
         "the other owner restores only its independently created session"
     );
-    assert!(
-        restore
-            .list_checkpoints(&other_user_id, &session_id)
-            .await
-            .expect("non-owner checkpoint list should not error")
-            .is_empty(),
-        "the other owner's new session has no checkpoints yet"
-    );
-    assert_eq!(
-        restore
-            .list_checkpoints(&owner_user_id, &session_id)
-            .await
-            .expect("owner checkpoint list")
-            .len(),
-        1
-    );
-    seed_restore_checkpoint_fixture(
-        &pool,
-        &other_user_id,
-        &session_id,
-        &astra_services::session_checkpoint::Checkpoint {
-            number: 1,
-            turn: 99,
-            title: "other-owner-checkpoint".into(),
-            summary: "must remain owner isolated".into(),
-            tools_used: vec!["other_tool".into()],
-            total_tokens: 999,
-            had_stalls: true,
-            error_count: 9,
-        },
-        None,
-    )
-    .await;
-    for (user_id, title, tokens) in [
-        (&owner_user_id, "owner-checkpoint", 10),
-        (&other_user_id, "other-owner-checkpoint", 999),
-    ] {
-        let checkpoints = restore
-            .list_checkpoints(user_id, &session_id)
-            .await
-            .expect("read owner-bound checkpoints");
-        assert_eq!(checkpoints.len(), 1);
-        assert_eq!(checkpoints[0].number, 1);
-        assert_eq!(checkpoints[0].title, title);
-        assert_eq!(checkpoints[0].total_tokens, tokens);
-    }
-
-    let snapshot_count =
-        sqlx::query("SELECT COUNT(*) AS c FROM ctx_snapshots WHERE session_id = ? AND user_id = ?")
-            .bind(&session_id)
-            .bind(&owner_user_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count context snapshots")
-            .try_get::<i64, _>("c")
-            .expect("decode snapshot count");
-    assert_eq!(snapshot_count, 0, "rejected snapshot must not write rows");
-
-    let decision_count = sqlx::query(
-        "SELECT COUNT(*) AS c FROM ctx_decision_audits WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count decisions")
-    .try_get::<i64, _>("c")
-    .expect("decode decision count");
-    assert_eq!(decision_count, 0, "rejected decision must not write rows");
-
     let metadata_after: Option<String> = sqlx::query(
         "SELECT CAST(metadata AS CHAR) AS metadata_json FROM agent_sessions WHERE session_id = ? AND user_id = ?",
     )
@@ -6660,346 +6177,6 @@ async fn session_owned_services_isolate_same_session_id_across_owners_on_live_ma
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn context_and_decision_writes_require_owner_bound_references_on_live_matrixone() {
-    let (shared, settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-
-    let owner_user_id = Uuid::new_v4().to_string();
-    let other_user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-    let owner_event_id = Uuid::new_v4().to_string();
-    let other_event_id = Uuid::new_v4().to_string();
-    let other_context_id = Uuid::new_v4().to_string();
-
-    cleanup_agent_sessions_and_events_for_owner(
-        &pool,
-        &owner_user_id,
-        std::slice::from_ref(&session_id),
-        std::slice::from_ref(&owner_event_id),
-        &[],
-    )
-    .await;
-    cleanup_agent_sessions_and_events_for_owner(
-        &pool,
-        &other_user_id,
-        std::slice::from_ref(&session_id),
-        std::slice::from_ref(&other_event_id),
-        &[],
-    )
-    .await;
-
-    sqlx::query(
-        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'ctx-ref-integrity-it', 'active', 2)",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .execute(&pool)
-    .await
-    .expect("insert owner session");
-
-    for (event_id, user_id, event_type) in [
-        (&owner_event_id, &owner_user_id, "owner_event"),
-        (&other_event_id, &other_user_id, "other_event"),
-    ] {
-        sqlx::query(
-            "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
-             causal_chain_id, payload_hash, ingestion_write_id) \
-             VALUES (?, ?, ?, ?, '{}', '', ?, ?)",
-        )
-        .bind(event_id)
-        .bind(&session_id)
-        .bind(user_id)
-        .bind(event_type)
-        .bind(agent_event_fixture_payload_hash(serde_json::json!({
-            "event_id": event_id,
-            "session_id": &session_id,
-            "user_id": user_id,
-            "event_type": event_type,
-            "content": "{}",
-            "causal_chain_id": "",
-        })))
-        .bind(Uuid::new_v4().to_string())
-        .execute(&pool)
-        .await
-        .expect("insert event");
-    }
-
-    let context_service = DatabaseContextService::new(settings.clone()).with_pool(shared.clone());
-    let wrong_event_result = context_service
-        .create_snapshot(
-            owner_user_id.clone(),
-            SnapshotCreateRequestData {
-                session_id: session_id.clone(),
-                event_id: other_event_id.clone(),
-                context_data: serde_json::json!({"wrong": "event-owner"}),
-            },
-        )
-        .await;
-    assert_eq!(
-        wrong_event_result
-            .expect_err("owner snapshot cannot reference another owner's event")
-            .0,
-        axum::http::StatusCode::NOT_FOUND
-    );
-
-    let snapshot = context_service
-        .create_snapshot(
-            owner_user_id.clone(),
-            SnapshotCreateRequestData {
-                session_id: session_id.clone(),
-                event_id: owner_event_id.clone(),
-                context_data: serde_json::json!({"owner": true}),
-            },
-        )
-        .await
-        .expect("owner snapshot can reference owner event");
-
-    sqlx::query(
-        "INSERT INTO ctx_snapshots \
-         (context_capture_id, user_id, session_id, event_id, context_data) \
-         VALUES (?, ?, ?, ?, CAST('{\"secret\":\"other\"}' AS JSON))",
-    )
-    .bind(&other_context_id)
-    .bind(&other_user_id)
-    .bind(&session_id)
-    .bind(&other_event_id)
-    .execute(&pool)
-    .await
-    .expect("insert other-owner snapshot");
-
-    let decision_service = DatabaseDecisionService::new(settings.clone()).with_pool(shared.clone());
-    let wrong_context_result = decision_service
-        .record_decision(
-            owner_user_id.clone(),
-            DecisionCreateRequestData {
-                session_id: session_id.clone(),
-                event_id: owner_event_id.clone(),
-                context_capture_id: other_context_id.clone(),
-                decision_type: "wrong_context_owner".into(),
-                decision_output: serde_json::json!({"allowed": false}),
-                model_params: None,
-            },
-        )
-        .await;
-    assert_eq!(
-        wrong_context_result
-            .expect_err("owner decision cannot reference another owner's context")
-            .0,
-        axum::http::StatusCode::NOT_FOUND
-    );
-
-    let wrong_event_result = decision_service
-        .record_decision(
-            owner_user_id.clone(),
-            DecisionCreateRequestData {
-                session_id: session_id.clone(),
-                event_id: other_event_id.clone(),
-                context_capture_id: snapshot.context_capture_id.clone(),
-                decision_type: "wrong_event_owner".into(),
-                decision_output: serde_json::json!({"allowed": false}),
-                model_params: None,
-            },
-        )
-        .await;
-    assert_eq!(
-        wrong_event_result
-            .expect_err("owner decision cannot reference another owner's event")
-            .0,
-        axum::http::StatusCode::NOT_FOUND
-    );
-
-    let decision = decision_service
-        .record_decision(
-            owner_user_id.clone(),
-            DecisionCreateRequestData {
-                session_id: session_id.clone(),
-                event_id: owner_event_id.clone(),
-                context_capture_id: snapshot.context_capture_id.clone(),
-                decision_type: "owner_reference_integrity".into(),
-                decision_output: serde_json::json!({"allowed": true}),
-                model_params: None,
-            },
-        )
-        .await
-        .expect("owner decision can reference owner event and context");
-
-    let owner_decisions = sqlx::query(
-        "SELECT COUNT(*) AS c FROM ctx_decision_audits WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count owner decisions")
-    .try_get::<i64, _>("c")
-    .expect("decode owner decision count");
-    assert_eq!(
-        owner_decisions, 1,
-        "rejected decision references must not write stray owner rows"
-    );
-    assert_eq!(decision.context_capture_id, snapshot.context_capture_id);
-
-    let request = DecisionCreateRequestData {
-        session_id: session_id.clone(),
-        event_id: owner_event_id.clone(),
-        context_capture_id: snapshot.context_capture_id.clone(),
-        decision_type: "retained_reference_contract".into(),
-        decision_output: serde_json::json!({"allowed": true}),
-        model_params: None,
-    };
-    for (candidate, expected) in [
-        (
-            DecisionCreateRequestData {
-                event_id: other_event_id.clone(),
-                context_capture_id: other_context_id.clone(),
-                ..request.clone()
-            },
-            format!("Event {other_event_id} not found"),
-        ),
-        (
-            DecisionCreateRequestData {
-                session_id: Uuid::new_v4().to_string(),
-                ..request.clone()
-            },
-            String::from("Session "),
-        ),
-    ] {
-        let error = decision_service
-            .record_decision(owner_user_id.clone(), candidate)
-            .await
-            .unwrap_err();
-        assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
-        assert!(error.1.0.detail.starts_with(&expected));
-    }
-    for blank in ["", " \t "] {
-        let receipt = decision_service
-            .record_decision(
-                owner_user_id.clone(),
-                DecisionCreateRequestData {
-                    context_capture_id: blank.into(),
-                    ..request.clone()
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(receipt.context_capture_id, blank);
-        assert_eq!(receipt.model_params, serde_json::json!({}));
-        assert_eq!(receipt.decision_output, request.decision_output);
-        let stored_timestamp: String = sqlx::query_scalar(
-            "SELECT DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') FROM ctx_decision_audits WHERE decision_id = ? AND user_id = ?",
-        ).bind(&receipt.decision_id).bind(&owner_user_id).fetch_one(&pool).await.unwrap();
-        assert_eq!(receipt.created_at, stored_timestamp);
-    }
-    let other_session_id = Uuid::new_v4().to_string();
-    let other_session_snapshot = Uuid::new_v4().to_string();
-    sqlx::query("INSERT INTO agent_sessions (session_id, user_id, status) VALUES (?, ?, 'active')")
-        .bind(&other_session_id)
-        .bind(&owner_user_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO ctx_snapshots (context_capture_id, user_id, session_id, event_id, context_data) VALUES (?, ?, ?, ?, '{}')")
-        .bind(&other_session_snapshot).bind(&owner_user_id).bind(&other_session_id).bind(&owner_event_id).execute(&pool).await.unwrap();
-    for (candidate, expected) in [
-        (
-            DecisionCreateRequestData {
-                session_id: other_session_id.clone(),
-                ..request.clone()
-            },
-            format!("Event {owner_event_id} not found"),
-        ),
-        (
-            DecisionCreateRequestData {
-                context_capture_id: other_session_snapshot.clone(),
-                ..request.clone()
-            },
-            format!("Snapshot {other_session_snapshot} not found"),
-        ),
-        (
-            DecisionCreateRequestData {
-                context_capture_id: format!(" {} ", request.context_capture_id),
-                ..request.clone()
-            },
-            format!("Snapshot  {}  not found", request.context_capture_id),
-        ),
-    ] {
-        let error = decision_service
-            .record_decision(owner_user_id.clone(), candidate)
-            .await
-            .unwrap_err();
-        assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
-        assert_eq!(error.1.0.detail, expected);
-    }
-    cleanup_agent_sessions_and_events_for_owner(
-        &pool,
-        &owner_user_id,
-        &[other_session_id],
-        &[],
-        &[],
-    )
-    .await;
-    let count: i64 = sqlx::query_scalar(
-        "SELECT event_count FROM agent_sessions WHERE user_id = ? AND session_id = ?",
-    )
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        count, 2,
-        "retained decisions never change the session counter"
-    );
-    // Valid event and snapshot remain intact: this rejects the old unfenced path.
-    sqlx::query("UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6) WHERE user_id = ? AND session_id = ?")
-        .bind(&owner_user_id).bind(&session_id).execute(&pool).await.unwrap();
-    let error = decision_service
-        .record_decision(owner_user_id.clone(), request.clone())
-        .await
-        .unwrap_err();
-    assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
-    assert_eq!(error.1.0.detail, format!("Session {session_id} not found"));
-    DatabaseSessionService::new(settings.clone())
-        .with_pool(shared.clone())
-        .delete_session(session_id.clone(), owner_user_id.clone())
-        .await
-        .unwrap();
-    let error = decision_service
-        .record_decision(owner_user_id.clone(), request)
-        .await
-        .unwrap_err();
-    assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
-    let remaining: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM ctx_decision_audits WHERE user_id = ? AND session_id = ?",
-    )
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(remaining, 0);
-
-    cleanup_agent_sessions_and_events_for_owner(
-        &pool,
-        &owner_user_id,
-        std::slice::from_ref(&session_id),
-        std::slice::from_ref(&owner_event_id),
-        &[],
-    )
-    .await;
-    cleanup_agent_sessions_and_events_for_owner(
-        &pool,
-        &other_user_id,
-        &[session_id],
-        &[other_event_id],
-        &[],
-    )
-    .await;
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -7017,10 +6194,6 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
     let other_query_event_id = Uuid::new_v4().to_string();
     let other_llm_event_id = Uuid::new_v4().to_string();
     let other_drift_assessment_event_id = Uuid::new_v4().to_string();
-    let owner_context_id = Uuid::new_v4().to_string();
-    let other_context_id = Uuid::new_v4().to_string();
-    let owner_decision_id = Uuid::new_v4().to_string();
-    let other_decision_id = Uuid::new_v4().to_string();
     let owner_tool_event_id = Uuid::new_v4().to_string();
     let owner_boundary_event_id = Uuid::new_v4().to_string();
 
@@ -7036,7 +6209,6 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             owner_tool_event_id.clone(),
             owner_boundary_event_id.clone(),
         ],
-        std::slice::from_ref(&owner_decision_id),
     )
     .await;
     cleanup_agent_sessions_and_events_for_owner(
@@ -7048,7 +6220,6 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             other_llm_event_id.clone(),
             other_drift_assessment_event_id.clone(),
         ],
-        std::slice::from_ref(&other_decision_id),
     )
     .await;
     cleanup_model_request_fixtures(
@@ -7387,97 +6558,7 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
     .await
     .expect("insert canonical dependency boundary fixture");
 
-    for (
-        context_id,
-        user_id,
-        event_id,
-        llm_response_id,
-        token_budget,
-        total_tokens,
-        relevance,
-        created_at,
-    ) in [
-        (
-            &owner_context_id,
-            &owner_user_id,
-            &owner_query_event_id,
-            &owner_llm_event_id,
-            1000_i32,
-            100_i64,
-            serde_json::json!({"selected_events": 0.95}),
-            "2026-06-01 10:01:30.000000",
-        ),
-        (
-            &other_context_id,
-            &other_user_id,
-            &other_query_event_id,
-            &other_llm_event_id,
-            9000_i32,
-            900_i64,
-            serde_json::json!({"selected_events": 0.05}),
-            "2026-06-01 10:03:30.000000",
-        ),
-    ] {
-        sqlx::query(
-            "INSERT INTO ctx_snapshots \
-             (context_capture_id, user_id, session_id, event_id, llm_response_id, token_budget, total_tokens, relevance_scores, task_type, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), 'it', ?)",
-        )
-        .bind(context_id)
-        .bind(user_id)
-        .bind(&session_id)
-        .bind(event_id)
-        .bind(llm_response_id)
-        .bind(token_budget)
-        .bind(total_tokens)
-        .bind(relevance.to_string())
-        .bind(created_at)
-        .execute(&pool)
-        .await
-        .expect("insert mixed owner snapshot");
-    }
-
-    for (decision_id, user_id, event_id, context_id, decision_type, output, model, created_at) in [
-        (
-            &owner_decision_id,
-            &owner_user_id,
-            &owner_query_event_id,
-            &owner_context_id,
-            "owner_decision",
-            serde_json::json!({"visible": "owner"}),
-            "owner-model",
-            "2026-06-01 10:01:40.000000",
-        ),
-        (
-            &other_decision_id,
-            &other_user_id,
-            &other_query_event_id,
-            &other_context_id,
-            "other_decision",
-            serde_json::json!({"secret": "other"}),
-            "other-model",
-            "2026-06-01 10:03:40.000000",
-        ),
-    ] {
-        sqlx::query(
-            "INSERT INTO ctx_decision_audits \
-             (decision_id, user_id, session_id, event_id, context_capture_id, decision_type, decision_output, model_params, model_used, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, CAST(? AS JSON), CAST('{}' AS JSON), ?, ?)",
-        )
-        .bind(decision_id)
-        .bind(user_id)
-        .bind(&session_id)
-        .bind(event_id)
-        .bind(context_id)
-        .bind(decision_type)
-        .bind(output.to_string())
-        .bind(model)
-        .bind(created_at)
-        .execute(&pool)
-        .await
-        .expect("insert mixed owner decision");
-    }
-
+    let queries = common::SqlQueries::default();
     let reflect = DatabaseReflectService::new(settings.clone()).with_pool(shared.clone());
     let report = reflect
         .build_evidence(
@@ -7492,10 +6573,25 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
                 "what happened?",
             ),
         )
+        .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
         .await
         .expect("owner reflect report");
+    {
+        let statements = queries.0.lock().unwrap();
+        let delivery_queries = statements
+            .iter()
+            .filter(|sql| sql.contains("AS spawned"))
+            .collect::<Vec<_>>();
+        assert_eq!(delivery_queries.len(), 1);
+        assert!(delivery_queries[0].contains("AS total_events"));
+    }
     assert_eq!(report.data_coverage.events, 6);
-    assert_eq!(report.data_coverage.decisions, 1);
+    assert!(
+        !report
+            .data_coverage
+            .providers
+            .contains_key("decision_audits")
+    );
     assert_eq!(report.model_requests.records_observed, 4);
     assert_eq!(report.model_requests.accepted_records_observed, 2);
     assert_eq!(
@@ -7526,7 +6622,7 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
     assert_eq!(view.topic, "overview");
     assert_eq!(view.facet, "overview");
     assert_eq!(view.data_coverage.events, 6);
-    assert_eq!(view.data_coverage.decisions, 1);
+
     assert!(!report.summary.is_empty());
     assert!(
         report.observations.iter().any(|observation| {
@@ -7543,27 +6639,6 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             })
         }),
         "reflect report should include standardized evidence refs"
-    );
-    let owner_decision_ref = format!("urn:astra:decision:cloud:{owner_decision_id}");
-    let other_decision_ref = format!("urn:astra:decision:cloud:{other_decision_id}");
-    assert!(
-        report
-            .evidence
-            .iter()
-            .any(|evidence| evidence.ref_id == owner_decision_ref),
-        "lightweight reflection should preserve a bounded owner decision evidence identity"
-    );
-    assert!(
-        report
-            .observations
-            .iter()
-            .any(|observation| { observation.evidence_refs.contains(&owner_decision_ref) })
-    );
-    assert!(
-        !report
-            .evidence
-            .iter()
-            .any(|evidence| evidence.ref_id == other_decision_ref)
     );
     assert!(
         !report
@@ -7602,40 +6677,53 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
     assert!(report.graph_slice.edges.is_empty());
     assert!(report.graph_slice.edges.is_empty());
 
+    let mut delivery_events = Vec::new();
+    for (user, kind, run) in [
+        (&owner_user_id, "agent_spawned", "delivery-completed"),
+        (&owner_user_id, "agent_spawned", "delivery-interrupted"),
+        (&owner_user_id, "agent_spawned", "delivery-failed"),
+        (&owner_user_id, "agent_spawned", "delivery-cancelled"),
+        (&owner_user_id, "agent_completed", "delivery-completed"),
+        (&owner_user_id, "agent_completed", "delivery-completed"),
+        (&owner_user_id, "agent_interrupted", "delivery-interrupted"),
+        (&owner_user_id, "agent_failed", "delivery-failed"),
+        (&owner_user_id, "agent_cancelled", "delivery-cancelled"),
+        (&other_user_id, "agent_spawned", "foreign-delivery"),
+        (&other_user_id, "agent_completed", "foreign-delivery"),
+    ] {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO agent_events (event_id, user_id, session_id, event_type, run_id, content, payload_hash, ingestion_write_id, created_at) VALUES (?, ?, ?, ?, ?, 'delivery fixture', ?, ?, '2026-05-31 09:00:00.000000')")
+            .bind(&id).bind(user).bind(&session_id).bind(kind).bind(run)
+            .bind(agent_event_fixture_payload_hash(serde_json::json!({"event_id":id})))
+            .bind(Uuid::new_v4().to_string()).execute(&pool).await.unwrap();
+        delivery_events.push((user.clone(), id));
+    }
+    // Exercise all delivery outcomes separately from the original evidence
+    // projection: adding facts can legitimately change its bounded selection.
+    let delivery_report = reflect
+        .build_evidence(
+            &owner_user_id,
+            &session_id,
+            astra_services::reflect::ReflectRequest::from_observation_params(
+                Some("overview"),
+                Some("overview"),
+                None,
+                None,
+                10,
+                "delivery outcomes?",
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delivery_report.data_coverage.events, 15);
+    assert!(
+        delivery_report
+            .summary
+            .contains("4 spawned, 1 completed, 1 interrupted, 1 failed, 1 cancelled")
+    );
+
     let introspection =
         DatabaseIntrospectionService::new(settings.clone()).with_pool(shared.clone());
-    let snapshot = introspection
-        .get_context_snapshot(&owner_user_id, &session_id, None, false, false, 2000)
-        .await
-        .expect("owner context snapshot");
-    assert_eq!(snapshot["snapshot_id"], owner_context_id);
-    assert_eq!(snapshot["total_turns"], 1);
-    assert_eq!(snapshot["context_managed_tokens"], 100);
-    assert_eq!(snapshot["llm_prompt_tokens"], 100);
-    assert_eq!(snapshot["llm_total_tokens"], 110);
-
-    let trend = introspection
-        .get_context_trend(&owner_user_id, &session_id, 10, 128000)
-        .await
-        .expect("owner context trend");
-    assert_eq!(trend["turns_sampled"], 1);
-    assert_eq!(trend["current_tokens"]["input_tokens"], 100);
-
-    let retrieval = introspection
-        .get_retrieval_quality(&owner_user_id, &session_id, 10)
-        .await
-        .expect("owner retrieval quality");
-    assert_eq!(retrieval["turns_sampled"], 1);
-
-    let trace = introspection
-        .get_decision_trace(&owner_user_id, &session_id, 10)
-        .await
-        .expect("owner decision trace");
-    let decisions = trace["decisions"].as_array().expect("decisions array");
-    assert_eq!(decisions.len(), 1);
-    assert_eq!(decisions[0]["decision_id"], owner_decision_id);
-    assert_ne!(decisions[0]["decision_id"], other_decision_id);
-
     let drift = introspection
         .get_drift_check(&owner_user_id, &session_id)
         .await
@@ -7681,7 +6769,6 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             owner_tool_event_id,
             owner_boundary_event_id,
         ],
-        &[owner_decision_id],
     )
     .await;
     cleanup_agent_sessions_and_events_for_owner(
@@ -7693,7 +6780,6 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             other_llm_event_id,
             other_drift_assessment_event_id,
         ],
-        &[other_decision_id],
     )
     .await;
     cleanup_model_request_fixtures(
@@ -7702,6 +6788,14 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         &[owner_root_attempt, owner_child_attempt],
     )
     .await;
+    for (user, id) in delivery_events {
+        sqlx::query("DELETE FROM agent_events WHERE user_id = ? AND event_id = ?")
+            .bind(user)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
     cleanup_model_request_fixtures(&pool, &other_user_id, &[other_attempt]).await;
 }
 
@@ -7716,14 +6810,8 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     let session_id = Uuid::new_v4().to_string();
     let owner_event_id = Uuid::new_v4().to_string();
     let foreign_event_id = Uuid::new_v4().to_string();
-    let owner_context_capture_id = Uuid::new_v4().to_string();
-    let foreign_context_capture_id = Uuid::new_v4().to_string();
-    let owner_decision_id = Uuid::new_v4().to_string();
-    let foreign_decision_id = Uuid::new_v4().to_string();
     let owner_run_id = Uuid::new_v4().to_string();
     let foreign_run_id = Uuid::new_v4().to_string();
-    let owner_skill_eval_id = Uuid::new_v4().to_string();
-    let foreign_skill_eval_id = Uuid::new_v4().to_string();
     let owner_artifact_id = Uuid::new_v4().to_string();
     let foreign_artifact_id = Uuid::new_v4().to_string();
     let owner_workspace_id = format!("workspace-{}", Uuid::new_v4());
@@ -7788,80 +6876,12 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         .expect("insert event edge");
     }
 
-    for (user_id, seq, content) in [
-        (&owner_user_id, 1_i64, "owner"),
-        (&other_user_id, 2_i64, "foreign"),
-    ] {
-        let payload = format!(
-            "{{\"type\":\"snapshot\",\"seq\":{seq},\"turn\":1,\"messages\":[{{\"role\":\"user\",\"content\":\"{content}\"}}],\"session_state\":{{}}}}"
-        );
-        sqlx::query(
-            "INSERT INTO conversation_log \
-             (user_id, session_id, seq, turn, entry_type, payload) \
-             VALUES (?, ?, ?, 1, 0, ?)",
-        )
-        .bind(user_id)
-        .bind(&session_id)
-        .bind(seq)
-        .bind(payload)
-        .execute(&pool)
-        .await
-        .expect("insert conversation log");
-    }
-
-    for (user_id, run_id, evaluation_id, marker) in [
-        (&owner_user_id, &owner_run_id, &owner_skill_eval_id, "owner"),
-        (
-            &other_user_id,
-            &foreign_run_id,
-            &foreign_skill_eval_id,
-            "foreign",
-        ),
-    ] {
-        sqlx::query(
-            "INSERT INTO agent_runs \
-             (run_id, user_id, session_id, root_run_id, ancestor_path, status) \
-             VALUES (?, ?, ?, ?, '', 'running')",
-        )
-        .bind(run_id)
-        .bind(user_id)
-        .bind(&session_id)
-        .bind(run_id)
-        .execute(&pool)
-        .await
-        .expect("insert session run");
-
-        sqlx::query(
-            "INSERT INTO user_skill_evaluations \
-             (evaluation_id, owner_user_id, source_id, version_id, run_id, hits, suspects, false_positives, payload_json) \
-             VALUES (?, ?, ?, ?, ?, 1, 1, 0, ?)",
-        )
-        .bind(evaluation_id)
-        .bind(user_id)
-        .bind(format!("skill-source-{marker}"))
-        .bind(format!("skill-version-{marker}"))
-        .bind(run_id)
-        .bind(format!("{{\"marker\":\"{marker}\"}}"))
-        .execute(&pool)
-        .await
-            .expect("insert skill evaluation");
-    }
-
     for (user_id, run_id) in [
         (&owner_user_id, &owner_run_id),
         (&other_user_id, &foreign_run_id),
     ] {
-        sqlx::query(
-            "INSERT INTO agent_session_execution_slots
-             (user_id, session_id, run_id, acquired_at, updated_at)
-             VALUES (?, ?, ?, NOW(6), NOW(6))",
-        )
-        .bind(user_id)
-        .bind(&session_id)
-        .bind(run_id)
-        .execute(&pool)
-        .await
-        .expect("insert session execution slot");
+        sqlx::query("INSERT INTO agent_runs (run_id, user_id, session_id, root_run_id, ancestor_path, status) VALUES (?, ?, ?, ?, '', 'running')")
+            .bind(run_id).bind(user_id).bind(&session_id).bind(run_id).execute(&pool).await.unwrap();
     }
 
     for (user_id, run_id, artifact_id, marker) in [
@@ -7888,54 +6908,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         .execute(&pool)
         .await
         .expect("insert session artifact");
-    }
-
-    for (user_id, event_id, context_capture_id, decision_id, marker) in [
-        (
-            &owner_user_id,
-            &owner_event_id,
-            &owner_context_capture_id,
-            &owner_decision_id,
-            "owner",
-        ),
-        (
-            &other_user_id,
-            &foreign_event_id,
-            &foreign_context_capture_id,
-            &foreign_decision_id,
-            "foreign",
-        ),
-    ] {
-        let context_data = format!("{{\"marker\":\"{marker}\"}}");
-        sqlx::query(
-            "INSERT INTO ctx_snapshots \
-             (context_capture_id, user_id, session_id, event_id, context_data) \
-             VALUES (?, ?, ?, ?, CAST(? AS JSON))",
-        )
-        .bind(context_capture_id)
-        .bind(user_id)
-        .bind(&session_id)
-        .bind(event_id)
-        .bind(&context_data)
-        .execute(&pool)
-        .await
-        .expect("insert context snapshot");
-
-        let decision_output = format!("{{\"marker\":\"{marker}\"}}");
-        sqlx::query(
-            "INSERT INTO ctx_decision_audits \
-             (decision_id, user_id, session_id, event_id, context_capture_id, decision_type, decision_output) \
-             VALUES (?, ?, ?, ?, ?, 'owner_scoped_delete_it', CAST(? AS JSON))",
-        )
-        .bind(decision_id)
-        .bind(user_id)
-        .bind(&session_id)
-        .bind(event_id)
-        .bind(context_capture_id)
-        .bind(&decision_output)
-        .execute(&pool)
-        .await
-        .expect("insert decision audit");
     }
 
     for (user_id, workspace_id, run_id, marker) in [
@@ -8013,30 +6985,34 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     .await
     .expect("insert unresolved cleanup debt");
 
-    let decision_service = DatabaseDecisionService::new(settings.clone()).with_pool(shared.clone());
-    let retained_request = DecisionCreateRequestData {
+    let event_service = DatabaseEventService::new(settings.clone()).with_pool(shared.clone());
+    let retained_request = EventCreateRequestData {
+        ingestion_source: astra_services::EventIngestionSource::Client,
+        event_id: None,
         session_id: session_id.clone(),
-        event_id: owner_event_id.clone(),
-        context_capture_id: owner_context_capture_id.clone(),
-        decision_type: "retained_delete_fixture".into(),
-        decision_output: serde_json::json!({"owner": true}),
-        model_params: None,
+        event_type: "retained_delete_fixture".into(),
+        content: "{}".into(),
+        agent_id: None,
+        agent_version: None,
+        parent_event_id: None,
+        parent_event_ids: None,
+        causal_chain_id: None,
+        metadata: None,
     };
-    decision_service
-        .record_decision(owner_user_id.clone(), retained_request.clone())
+    event_service
+        .create_event(owner_user_id.clone(), retained_request.clone())
         .await
         .unwrap();
     let session_service = DatabaseSessionService::new(settings).with_pool(shared);
     session_service
         .delete_session(session_id.clone(), owner_user_id.clone())
         .await
-        .expect("owner-scoped delete must ignore unrelated foreign rows");
-    let error = decision_service
-        .record_decision(owner_user_id.clone(), retained_request)
+        .unwrap();
+    let error = event_service
+        .create_event(owner_user_id.clone(), retained_request)
         .await
         .unwrap_err();
     assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
-    assert_eq!(error.1.0.detail, format!("Session {session_id} not found"));
 
     let delete_audit = load_session_delete_audit_details(&pool, &owner_user_id, &session_id).await;
     assert_eq!(
@@ -8057,18 +7033,10 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         deleted_rows_for_table(&delete_audit, "agent_event_edges"),
         1
     );
-    assert_eq!(deleted_rows_for_table(&delete_audit, "agent_events"), 1);
-    assert_eq!(
-        deleted_rows_for_table(&delete_audit, "agent_session_execution_slots"),
-        1
-    );
+    assert_eq!(deleted_rows_for_table(&delete_audit, "agent_events"), 2);
     assert_eq!(deleted_rows_for_table(&delete_audit, "agent_sessions"), 1);
     assert_eq!(
         deleted_rows_for_table(&delete_audit, "session_artifacts"),
-        1
-    );
-    assert_eq!(
-        deleted_rows_for_table(&delete_audit, "user_skill_evaluations"),
         1
     );
     assert_eq!(
@@ -8079,18 +7047,11 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     for (label, table) in [
         ("agent_sessions", "agent_sessions"),
         ("agent_events", "agent_events"),
-        (
-            "agent_session_execution_slots",
-            "agent_session_execution_slots",
-        ),
-        ("conversation_log", "conversation_log"),
         ("session_artifacts", "session_artifacts"),
-        ("ctx_snapshots", "ctx_snapshots"),
-        ("ctx_decision_audits", "ctx_decision_audits"),
     ] {
-        let owner_remaining = sqlx::query(&format!(
+        let owner_remaining = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) AS c FROM {table} WHERE session_id = ? AND user_id = ?"
-        ))
+        )))
         .bind(&session_id)
         .bind(&owner_user_id)
         .fetch_one(&pool)
@@ -8100,9 +7061,9 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         .expect("decode owner row count");
         assert_eq!(owner_remaining, 0, "{label} owner rows must be deleted");
 
-        let foreign_remaining = sqlx::query(&format!(
+        let foreign_remaining = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) AS c FROM {table} WHERE session_id = ? AND user_id = ?"
-        ))
+        )))
         .bind(&session_id)
         .bind(&other_user_id)
         .fetch_one(&pool)
@@ -8116,36 +7077,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
             "{label} foreign rows must not be touched by owner delete"
         );
     }
-
-    let owner_skill_eval_remaining = sqlx::query(
-        "SELECT COUNT(*) AS c FROM user_skill_evaluations WHERE owner_user_id = ? AND evaluation_id = ?",
-    )
-    .bind(&owner_user_id)
-    .bind(&owner_skill_eval_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count owner skill evaluation")
-    .try_get::<i64, _>("c")
-    .expect("decode owner skill evaluation count");
-    assert_eq!(
-        owner_skill_eval_remaining, 0,
-        "owner skill evaluation must be deleted through owner/run match"
-    );
-
-    let foreign_skill_eval_remaining = sqlx::query(
-        "SELECT COUNT(*) AS c FROM user_skill_evaluations WHERE owner_user_id = ? AND evaluation_id = ?",
-    )
-    .bind(&other_user_id)
-    .bind(&foreign_skill_eval_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count foreign skill evaluation")
-    .try_get::<i64, _>("c")
-    .expect("decode foreign skill evaluation count");
-    assert_eq!(
-        foreign_skill_eval_remaining, 1,
-        "foreign skill evaluation must not be touched by owner delete"
-    );
 
     let owner_edge_remaining = sqlx::query(
         "SELECT COUNT(*) AS c FROM agent_event_edges WHERE user_id = ? AND child_event_id = ?",
@@ -8249,9 +7180,6 @@ async fn session_delete_removes_owner_scoped_database_rows_and_local_files_on_li
 
     let owner_user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
-    let context_capture_id = Uuid::new_v4().to_string();
-    let decision_id = Uuid::new_v4().to_string();
-    let event_id = Uuid::new_v4().to_string();
 
     cleanup_session_delete_fixture_for_owner(&pool, &owner_user_id, &session_id).await;
 
@@ -8264,42 +7192,6 @@ async fn session_delete_removes_owner_scoped_database_rows_and_local_files_on_li
     .execute(&pool)
     .await
     .expect("insert owner session");
-    sqlx::query(
-        "INSERT INTO conversation_log \
-         (user_id, session_id, seq, turn, entry_type, payload) \
-         VALUES (?, ?, 1, 1, 0, '{\"type\":\"snapshot\",\"seq\":1,\"turn\":1,\"messages\":[],\"session_state\":{}}')",
-    )
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .execute(&pool)
-    .await
-    .expect("insert owner conversation log");
-    sqlx::query(
-        "INSERT INTO ctx_snapshots \
-         (context_capture_id, user_id, session_id, event_id, context_data) \
-         VALUES (?, ?, ?, ?, CAST('{\"owner\":true}' AS JSON))",
-    )
-    .bind(&context_capture_id)
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .bind(&event_id)
-    .execute(&pool)
-    .await
-    .expect("insert owner context snapshot");
-    sqlx::query(
-        "INSERT INTO ctx_decision_audits \
-         (decision_id, user_id, session_id, event_id, context_capture_id, decision_type, decision_output) \
-         VALUES (?, ?, ?, ?, ?, 'owner_delete_it', CAST('{\"owner\":true}' AS JSON))",
-    )
-    .bind(&decision_id)
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .bind(&event_id)
-    .bind(&context_capture_id)
-    .execute(&pool)
-    .await
-    .expect("insert owner decision audit");
-
     let temp_sessions = tempfile::tempdir().expect("temp sessions dir");
     let _journal_guard =
         astra_services::session_journal::JournalDirGuard::new(temp_sessions.path());
@@ -8321,12 +7213,7 @@ async fn session_delete_removes_owner_scoped_database_rows_and_local_files_on_li
         "session service delete must remove owner checkpoint/artifact directory"
     );
 
-    for label in [
-        "agent_sessions",
-        "ctx_snapshots",
-        "ctx_decision_audits",
-        "conversation_log",
-    ] {
+    for label in ["agent_sessions", "agent_events"] {
         let remaining = count_user_session_rows(&pool, label, &owner_user_id, &session_id).await;
         assert_eq!(remaining, 0, "{label} must be removed by hard delete");
     }
@@ -8411,6 +7298,562 @@ async fn session_delete_rejects_non_owner_without_removing_local_files_on_live_m
     cleanup_session_delete_fixture_for_owner(&pool, &owner_user_id, &session_id).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn sync_outbox_projects_verified_journal_columns_without_changing_identity() {
+    use astra_services::session_journal::{JournalEvent, JournalProducerScope};
+    let (_bootstrap, mut settings) = setup_pool_and_settings().await;
+    settings.db_pool_max_connections = 1;
+    settings.db_pool_min_connections = 1;
+    let shared = SharedPool::new(&settings).await.unwrap();
+    let pool = shared.get().clone();
+    let owner = Uuid::new_v4().to_string();
+    let session = Uuid::new_v4().to_string();
+    let service = DatabaseEventService::new(settings.clone()).with_pool(shared.clone());
+    let root = JournalEvent::turn(
+        Some(&session),
+        4,
+        Some("projection-model"),
+        "question",
+        "answer",
+        0,
+        10,
+        5,
+        1,
+    )
+    .with_cache_tokens(3, 2)
+    .with_run_id(Some("local-root"));
+    let mut root = root;
+    root.tool_calls = Some(vec![
+        serde_json::from_value(
+            serde_json::json!({"name":"bash","ok":true,"ms":15,"tool_call_id":"cli-call"}),
+        )
+        .unwrap(),
+    ]);
+    let mut ids = Vec::new();
+    for case in 0..3 {
+        let mut event = root.clone();
+        if case == 1 {
+            event.producer_scope = Some(JournalProducerScope {
+                run_id: "local-child".into(),
+                parent_run_id: Some("local-root".into()),
+                agent_id: Some("agent".into()),
+                local_turn: Some(99),
+            });
+        } else if case == 2 {
+            event.tokens_in = None;
+            event.tokens_out = None;
+            event.cache_read_tokens = None;
+            event.cache_creation_tokens = None;
+            event.metadata.as_mut().unwrap()["qualified_usage"] = serde_json::json!({});
+        }
+        let payload = serde_json::to_value(&event).unwrap();
+        let hash = astra_services::sync_outbox_canonical_payload_hash(&payload);
+        let id = astra_services::sync_outbox_stable_event_id(&event, &hash).unwrap();
+        let request = EventCreateRequestData {
+            ingestion_source: astra_services::events::EventIngestionSource::SyncOutbox,
+            event_id: Some(id.clone()),
+            session_id: session.clone(),
+            event_type: "turn".into(),
+            content: payload.to_string(),
+            agent_id: None,
+            agent_version: None,
+            parent_event_id: None,
+            parent_event_ids: None,
+            causal_chain_id: None,
+            metadata: Some(serde_json::json!({"sync_outbox":{"payload_hash":hash}})),
+        };
+        let created = service
+            .create_event(owner.clone(), request.clone())
+            .await
+            .unwrap();
+        assert!(!created.idempotent_replay);
+        assert_eq!(created.record.content, request.content);
+        assert_eq!(
+            created.record.metadata,
+            request.metadata.as_ref().unwrap().clone()
+        );
+        let replay = service
+            .create_event(
+                owner.clone(),
+                EventCreateRequestData {
+                    metadata: Some(created.record.metadata.clone()),
+                    ..request
+                },
+            )
+            .await
+            .unwrap();
+        assert!(replay.idempotent_replay);
+        assert_eq!(replay.record, created.record);
+        let row = sqlx::query("SELECT run_id, parent_run_id, turn_seq, llm_model_used, token_input, token_output, token_total, CAST(token_usage AS CHAR) AS usage_json FROM agent_events WHERE user_id = ? AND event_id = ?")
+            .bind(&owner).bind(&id).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            row.try_get::<String, _>("run_id").unwrap(),
+            if case == 1 {
+                "local-child"
+            } else {
+                "local-root"
+            }
+        );
+        assert_eq!(
+            row.try_get::<Option<String>, _>("parent_run_id")
+                .unwrap()
+                .as_deref(),
+            if case == 1 { Some("local-root") } else { None }
+        );
+        assert_eq!(
+            row.try_get::<Option<i64>, _>("turn_seq").unwrap(),
+            if case == 1 { None } else { Some(4) }
+        );
+        assert_eq!(
+            row.try_get::<String, _>("llm_model_used").unwrap(),
+            "projection-model"
+        );
+        let expected = if case == 2 {
+            (None, None, None)
+        } else {
+            (Some(15), Some(5), Some(20))
+        };
+        assert_eq!(
+            (
+                row.try_get::<Option<i64>, _>("token_input").unwrap(),
+                row.try_get::<Option<i64>, _>("token_output").unwrap(),
+                row.try_get::<Option<i64>, _>("token_total").unwrap()
+            ),
+            expected
+        );
+        let usage: serde_json::Value =
+            serde_json::from_str(&row.try_get::<String, _>("usage_json").unwrap()).unwrap();
+        if case == 2 {
+            assert_eq!(usage, serde_json::json!({}));
+        }
+        ids.push(id);
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT event_count FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&owner)
+    .bind(&session)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 3, "projection must not add rows on exact replay");
+    let audit = DatabaseSessionAuditService::new(settings).with_pool(shared);
+    let summary = audit.get_summary(&owner, &session).await.unwrap();
+    assert_eq!(
+        summary.turn_count, 4,
+        "real CLI turns retain their high watermark and exclude child-local turns"
+    );
+    assert_eq!((summary.tokens_in, summary.tokens_out), (30, 10));
+    assert_eq!(summary.models_used, vec!["projection-model"]);
+    let stats = audit
+        .get_cross_session_stats(
+            &owner,
+            &CrossSessionStatsParams {
+                since: None,
+                until: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(stats.total_turns, 4);
+    assert_eq!((stats.total_tokens_in, stats.total_tokens_out), (30, 10));
+    assert_eq!(stats.top_models[0].model, "projection-model");
+    assert_eq!(stats.top_models[0].total_tokens, 40);
+    let params = TurnListParams {
+        page: 1,
+        per_page: 1,
+        after_created_at: None,
+        after_event_id: None,
+    };
+    let first = audit.list_turns(&owner, &session, &params).await.unwrap();
+    assert_eq!(first.total, 4);
+    assert_eq!(first.turns.len(), 1);
+    assert_eq!(first.turns[0].user_input_preview, "question");
+    assert_eq!(first.turns[0].tool_calls[0].name, "bash");
+    assert_eq!(first.turns[0].tool_calls[0].duration_ms, 15);
+    let detail = audit.get_turn_detail(&owner, &session, 4).await.unwrap();
+    assert_eq!(detail.user_input, "question");
+    assert_eq!(detail.assistant_output, "answer");
+    assert_eq!(detail.tool_calls.len(), 1);
+    assert_eq!(detail.duration_ms, 1);
+    assert!(!detail.has_error);
+    let cursor = first.next_cursor.unwrap();
+    let sentinel = [&ids[0], &ids[2]]
+        .into_iter()
+        .find(|id| **id != cursor.event_id)
+        .unwrap();
+    let sentinel_content: String =
+        sqlx::query_scalar("SELECT content FROM agent_events WHERE user_id = ? AND event_id = ?")
+            .bind(&owner)
+            .bind(sentinel)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE agent_events SET content = '{invalid' WHERE user_id = ? AND event_id = ?")
+        .bind(&owner)
+        .bind(sentinel)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        audit.list_turns(&owner, &session, &params).await.is_ok(),
+        "unselected sentinel JSON must not be decoded"
+    );
+    let next = TurnListParams {
+        after_created_at: Some(cursor.created_at.clone()),
+        after_event_id: Some(cursor.event_id.clone()),
+        ..params.clone()
+    };
+    assert!(audit.list_turns(&owner, &session, &next).await.is_err());
+    sqlx::query("UPDATE agent_events SET content = ? WHERE user_id = ? AND event_id = ?")
+        .bind(sentinel_content)
+        .bind(&owner)
+        .bind(sentinel)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let original: (String,String) = sqlx::query_as("SELECT CAST(token_usage AS CHAR),CAST(metadata AS CHAR) FROM agent_events WHERE user_id = ? AND event_id = ?")
+        .bind(&owner).bind(sentinel).fetch_one(&pool).await.unwrap();
+    for (usage, metadata) in [
+        (
+            serde_json::json!({"input_tokens":"invalid"}).to_string(),
+            original.1.clone(),
+        ),
+        (original.0.clone(), "[]".into()),
+    ] {
+        sqlx::query("UPDATE agent_events SET token_usage = CAST(? AS JSON), metadata = CAST(? AS JSON) WHERE user_id = ? AND event_id = ?")
+            .bind(usage).bind(metadata).bind(&owner).bind(sentinel).execute(&pool).await.unwrap();
+        assert!(
+            audit.list_turns(&owner, &session, &params).await.is_ok(),
+            "unused sentinel fields are not decoded"
+        );
+    }
+    sqlx::query("UPDATE agent_events SET token_usage = CAST(? AS JSON),metadata = CAST(? AS JSON) WHERE user_id = ? AND event_id = ?")
+        .bind(original.0).bind(original.1).bind(&owner).bind(sentinel).execute(&pool).await.unwrap();
+    let selected_content: String =
+        sqlx::query_scalar("SELECT content FROM agent_events WHERE user_id = ? AND event_id = ?")
+            .bind(&owner)
+            .bind(&cursor.event_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut changed: serde_json::Value = serde_json::from_str(&selected_content).unwrap();
+    changed["user_input"] = "tampered".into();
+    for corrupt in ["{invalid".to_string(), changed.to_string()] {
+        sqlx::query("UPDATE agent_events SET content = ? WHERE user_id = ? AND event_id = ?")
+            .bind(corrupt)
+            .bind(&owner)
+            .bind(&cursor.event_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(audit.list_turns(&owner, &session, &params).await.is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+    sqlx::query("UPDATE agent_events SET content = ? WHERE user_id = ? AND event_id = ?")
+        .bind(selected_content)
+        .bind(&owner)
+        .bind(&cursor.event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let ordinary = service
+        .create_event(
+            owner.clone(),
+            EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::Client,
+                event_id: None,
+                session_id: session.clone(),
+                event_type: "user_query".into(),
+                content: "ordinary input".into(),
+                agent_id: None,
+                agent_version: None,
+                parent_event_id: None,
+                parent_event_ids: None,
+                causal_chain_id: None,
+                metadata: Some(serde_json::json!({"sync_outbox":{},"turn":1,"tool_calls":[{"name":"bash","ok":true,"ms":123}]})),
+            },
+        )
+        .await
+        .unwrap()
+        .record
+        .event_id;
+    for at in ["2000-01-01 00:00:00", "2099-01-01 00:00:00"] {
+        sqlx::query("UPDATE agent_events SET created_at = ? WHERE user_id = ? AND event_id = ?")
+            .bind(at)
+            .bind(&owner)
+            .bind(&ordinary)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut cursor_params = params.clone();
+        let mut collected = Vec::new();
+        loop {
+            let page = audit
+                .list_turns(&owner, &session, &cursor_params)
+                .await
+                .unwrap();
+            assert_eq!(page.total, 5);
+            for item in page.turns {
+                let detail = audit
+                    .get_turn_detail(&owner, &session, item.turn)
+                    .await
+                    .unwrap();
+                assert_eq!(detail.user_input, item.user_input_preview);
+                if item.user_input_preview == "ordinary input" {
+                    assert_eq!(item.tool_calls[0].duration_ms, 123);
+                    assert_eq!(detail.tool_calls[0].duration_ms, 123);
+                }
+                collected.push(item.turn);
+            }
+            if let Some(cursor) = page.next_cursor {
+                cursor_params.after_created_at = Some(cursor.created_at);
+                cursor_params.after_event_id = Some(cursor.event_id);
+            } else {
+                break;
+            }
+        }
+        assert_eq!(
+            collected,
+            if at.starts_with("2000") {
+                vec![5, 4, 4]
+            } else {
+                vec![4, 4, 5]
+            }
+        );
+        let numbered = audit
+            .list_turns(
+                &owner,
+                &session,
+                &TurnListParams {
+                    page: 2,
+                    ..params.clone()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(numbered.turns[0].turn, collected[1]);
+        assert_eq!(
+            audit
+                .get_summary(&owner, &session)
+                .await
+                .unwrap()
+                .turn_count,
+            5
+        );
+        assert_eq!(
+            audit
+                .get_cross_session_stats(
+                    &owner,
+                    &CrossSessionStatsParams {
+                        since: None,
+                        until: None
+                    }
+                )
+                .await
+                .unwrap()
+                .total_turns,
+            5
+        );
+        assert_eq!(
+            audit
+                .get_turn_detail(&owner, &session, 2)
+                .await
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::NOT_FOUND
+        );
+    }
+    ids.push(ordinary);
+    let batch_queries = common::SqlQueries::default();
+    let batch_page = audit
+        .list_turns(
+            &owner,
+            &session,
+            &TurnListParams {
+                per_page: 100,
+                ..params.clone()
+            },
+        )
+        .with_subscriber(tracing_subscriber::registry().with(batch_queries.clone()))
+        .await
+        .unwrap();
+    assert_eq!(batch_page.turns.len(), 3);
+    {
+        let statements = batch_queries.0.lock().unwrap();
+        // Count every root-body read first, including any accidental per-row
+        // reads that do not use IN. Then check the single batch's restriction.
+        let bodies = statements
+            .iter()
+            .filter(|sql| {
+                sql.contains("FROM agent_events")
+                    && sql.contains(" AS content,")
+                    && sql.contains("parent_run_id IS NULL")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bodies.len(), 1, "a multi-row page hydrates its roots once");
+        assert!(bodies[0].contains("event_id IN ("));
+    }
+
+    // Delete after scalar key selection but before the one body batch. This
+    // deterministic interleaving needs no production hook or retry stress.
+    #[derive(Clone)]
+    struct DeleteSelectedRoot {
+        pool: sqlx::MySqlPool,
+        owner: String,
+        event: String,
+        handle: tokio::runtime::Handle,
+        fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl tracing::field::Visit for DeleteSelectedRoot {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "db.statement"
+                && value.contains("WITH numbered_roots AS")
+                && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let writer = self.clone();
+                std::thread::spawn(move || {
+                    writer.handle.block_on(async {
+                        sqlx::query("DELETE FROM agent_events WHERE user_id = ? AND event_id = ?")
+                            .bind(writer.owner)
+                            .bind(writer.event)
+                            .execute(&writer.pool)
+                            .await
+                            .unwrap();
+                    })
+                })
+                .join()
+                .unwrap();
+            }
+        }
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    }
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DeleteSelectedRoot {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() == "sqlx::query" {
+                event.record(&mut self.clone());
+            }
+        }
+    }
+    let deleted = DeleteSelectedRoot {
+        pool: _bootstrap.get().clone(),
+        owner: owner.clone(),
+        event: cursor.event_id.clone(),
+        handle: tokio::runtime::Handle::current(),
+        fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let queries = common::SqlQueries::default();
+    let shortened = audit
+        .list_turns(&owner, &session, &params)
+        .with_subscriber(
+            tracing_subscriber::registry()
+                .with(deleted.clone())
+                .with(queries.clone()),
+        )
+        .await
+        .unwrap();
+    assert!(deleted.fired.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(shortened.turns.is_empty());
+    let advance = shortened.next_cursor.unwrap();
+    assert_eq!(
+        advance.event_id, cursor.event_id,
+        "deleted bodies cannot strand continuation on the same page"
+    );
+    {
+        let statements = queries.0.lock().unwrap();
+        let bodies = statements
+            .iter()
+            .filter(|sql| sql.contains(" AS content,") && sql.contains("event_id IN ("))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bodies.len(),
+            1,
+            "one owner-scoped body batch, not one query per row"
+        );
+        assert!(!bodies[0].contains("JOIN"));
+    }
+    let continued = audit
+        .list_turns(
+            &owner,
+            &session,
+            &TurnListParams {
+                after_created_at: Some(advance.created_at),
+                after_event_id: Some(advance.event_id),
+                ..params.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(continued.turns[0].user_input_preview, "question");
+
+    // Keep accepted edge sequences addressable without wrapping display counts.
+    for sequence in [0, u32::MAX] {
+        let mut event = root.clone();
+        event.turn = Some(sequence);
+        event.tokens_in = None;
+        event.tokens_out = None;
+        event.cache_read_tokens = None;
+        event.cache_creation_tokens = None;
+        event.metadata.as_mut().unwrap()["qualified_usage"] = serde_json::json!({});
+        let payload = serde_json::to_value(&event).unwrap();
+        let hash = astra_services::sync_outbox_canonical_payload_hash(&payload);
+        let id = astra_services::sync_outbox_stable_event_id(&event, &hash).unwrap();
+        service
+            .create_event(
+                owner.clone(),
+                EventCreateRequestData {
+                    ingestion_source: astra_services::events::EventIngestionSource::SyncOutbox,
+                    event_id: Some(id.clone()),
+                    session_id: session.clone(),
+                    event_type: "turn".into(),
+                    content: payload.to_string(),
+                    agent_id: None,
+                    agent_version: None,
+                    parent_event_id: None,
+                    parent_event_ids: None,
+                    causal_chain_id: None,
+                    metadata: Some(serde_json::json!({"sync_outbox":{"payload_hash":hash}})),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            audit
+                .get_turn_detail(&owner, &session, sequence)
+                .await
+                .unwrap()
+                .turn,
+            sequence
+        );
+        if sequence == u32::MAX {
+            assert!(
+                audit.list_turns(&owner, &session, &params).await.is_err(),
+                "the display watermark cannot wrap its u32 API bound"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT 1")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                1
+            );
+        }
+        ids.push(id);
+    }
+    cleanup_agent_sessions_and_events_for_owner(&pool, &owner, &[session], &ids).await;
+}
+
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn sync_outbox_create_event_upserts_missing_session_header_live_matrixone() {
@@ -8479,7 +7922,6 @@ async fn sync_outbox_create_event_upserts_missing_session_header_live_matrixone(
         &user_id,
         std::slice::from_ref(&session_id),
         &[created.record.event_id],
-        &[],
     )
     .await;
 }
@@ -8659,7 +8101,6 @@ async fn sync_outbox_create_event_isolates_same_session_id_across_owners_live_ma
         &owner_user_id,
         std::slice::from_ref(&session_id),
         &[],
-        &[],
     )
     .await;
     cleanup_agent_sessions_and_events_for_owner(
@@ -8667,7 +8108,6 @@ async fn sync_outbox_create_event_isolates_same_session_id_across_owners_live_ma
         &other_user_id,
         std::slice::from_ref(&session_id),
         &[event_id],
-        &[],
     )
     .await;
 }
@@ -8705,16 +8145,14 @@ async fn ordinary_create_event_requires_existing_session_header_live_matrixone()
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn event_count_delta_service_context_state_paths_live_matrixone() {
+async fn event_count_delta_service_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
 
     let user_id = Uuid::new_v4().to_string();
     let service_session = Uuid::new_v4().to_string();
-    let context_session = Uuid::new_v4().to_string();
-    let state_session = Uuid::new_v4().to_string();
 
-    for session_id in [&service_session, &context_session, &state_session] {
+    for session_id in [&service_session] {
         sqlx::query(
             "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
              VALUES (?, ?, 'write-path-it', 'active', 0)",
@@ -8780,133 +8218,9 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
         "DatabaseEventService::create_event should add one event_count delta per persisted row"
     );
 
-    let context_manifest_store = DatabaseContextManifestStore::new(shared.clone());
-    let normalized_reason = context_manifest_store
-        .normalize_reason(
-            &user_id,
-            "unknown-it-reason",
-            &context_session,
-            Some("run-context-it"),
-            "turn-1",
-            "services_db_integration",
-        )
-        .await
-        .expect("normalize unknown reason");
-    assert_eq!(normalized_reason, "other");
-    let next_stage = context_manifest_store
-        .record_retrieval_degrade_event(
-            &user_id,
-            &context_session,
-            Some("run-context-it"),
-            RetrievalStage::Structured,
-            "timeout",
-            25,
-        )
-        .await
-        .expect("record retrieval degrade event");
-    assert_eq!(next_stage, Some(RetrievalStage::Fts));
-    let context_count =
-        sqlx::query("SELECT event_count FROM agent_sessions WHERE session_id = ? AND user_id = ?")
-            .bind(&context_session)
-            .bind(&user_id)
-            .fetch_one(&pool)
-            .await
-            .expect("load context manifest session count")
-            .try_get::<i64, _>("event_count")
-            .expect("decode context manifest event_count");
-    assert_eq!(
-        context_count, 2,
-        "context manifest diagnostics should add one event_count delta per persisted event"
-    );
-    let context_event_ids =
-        sqlx::query("SELECT event_id FROM agent_events WHERE session_id = ? AND user_id = ?")
-            .bind(&context_session)
-            .bind(&user_id)
-            .fetch_all(&pool)
-            .await
-            .expect("load context manifest event ids")
-            .into_iter()
-            .map(|row| row.try_get::<String, _>("event_id").expect("event_id"))
-            .collect::<Vec<_>>();
-    assert_eq!(context_event_ids.len(), 2);
-
-    let state_projection_store = DatabaseStateProjectionStore::new(shared.clone());
-    let active_skill_name = format!("active-skill-{}", Uuid::new_v4());
-    let personal_skill_store = DatabasePersonalSkillStore::new(shared.clone());
-    let active_skill_version = personal_skill_store
-        .submit_version(
-            &user_id,
-            &active_skill_name,
-            SubmitUserSkillVersion {
-                version: "1.0.0".into(),
-                manifest_json: serde_json::json!({"name": &active_skill_name}),
-                content_markdown: "# Active skill\n\nCanonical published fixture.".into(),
-                status: Some("published".into()),
-            },
-        )
-        .await
-        .expect("publish personal skill version fixture");
-    state_projection_store
-        .activate_personal_skill_from_ui(
-            &user_id,
-            &state_session,
-            &active_skill_name,
-            &active_skill_version.version_id,
-        )
-        .await
-        .expect("activate personal skill");
-    let state_count =
-        sqlx::query("SELECT event_count FROM agent_sessions WHERE session_id = ? AND user_id = ?")
-            .bind(&state_session)
-            .bind(&user_id)
-            .fetch_one(&pool)
-            .await
-            .expect("load state projection session count")
-            .try_get::<i64, _>("event_count")
-            .expect("decode state projection event_count");
-    assert_eq!(
-        state_count, 1,
-        "state projection skill activation should add one event_count delta"
-    );
-    let state_event_ids =
-        sqlx::query("SELECT event_id FROM agent_events WHERE session_id = ? AND user_id = ?")
-            .bind(&state_session)
-            .bind(&user_id)
-            .fetch_all(&pool)
-            .await
-            .expect("load state projection event ids")
-            .into_iter()
-            .map(|row| row.try_get::<String, _>("event_id").expect("event_id"))
-            .collect::<Vec<_>>();
-    assert_eq!(state_event_ids.len(), 1);
-
-    let mut event_ids = vec![created_one.record.event_id, created_two.record.event_id];
-    event_ids.extend(context_event_ids);
-    event_ids.extend(state_event_ids);
-    let _ = sqlx::query(
-        "DELETE FROM session_state_items WHERE session_id = ? AND user_id = ? AND item_key = ?",
-    )
-    .bind(&state_session)
-    .bind(&user_id)
-    .bind(&active_skill_name)
-    .execute(&pool)
-    .await;
-    let _ = sqlx::query("DELETE FROM user_skill_versions WHERE version_id = ?")
-        .bind(&active_skill_version.version_id)
-        .execute(&pool)
+    let event_ids = vec![created_one.record.event_id, created_two.record.event_id];
+    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[service_session], &event_ids)
         .await;
-    let _ = sqlx::query("DELETE FROM user_skill_sources WHERE source_id = ?")
-        .bind(&active_skill_version.source_id)
-        .execute(&pool)
-        .await;
-    cleanup_agent_sessions_and_events_for_owner(
-        &pool,
-        &user_id,
-        &[service_session, context_session, state_session],
-        &event_ids,
-        &[],
-    )
-    .await;
 }
 
 // ── At-most-once idempotency integration tests ───────────────────────────────

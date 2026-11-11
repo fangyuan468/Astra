@@ -6,10 +6,12 @@ pub(super) async fn build_runtime_wiring(
     shared_pool: &SharedPool,
     run_encryptor: &Arc<FernetTokenEncryptor>,
     state: &AppState,
+    memoria_port: Option<Arc<dyn astra_memoria::MemoriaPort>>,
 ) -> Result<RuntimeWiring, Box<dyn std::error::Error>> {
-    let run_store = Arc::new(astra_services::runs::DatabaseRunStateStore::new(
-        shared_pool.clone(),
-    ));
+    let run_store = Arc::new(
+        astra_services::runs::DatabaseRunStateStore::new(shared_pool.clone())
+            .with_scope_encryptor(Arc::clone(run_encryptor)),
+    );
     let run_engine = crate::server::run::engine::RunEngine::new(run_store)
         .with_metrics_registry(state.metrics_registry());
     let selected_workspace_provider = run_engine.execution_owner_pod_id().map(|owner| {
@@ -30,16 +32,6 @@ pub(super) async fn build_runtime_wiring(
         )),
         delegation_tracker.clone(),
     ));
-    let memoria_port = state.auth_service.memoria_credentials().map(|resolver| {
-        let mut port =
-            crate::turn::cloud::memoria_compact::UserScopedMemoriaPort::template(resolver);
-        if settings.memoria.allows_self_hosted_master_fallback()
-            && let Some(master_key) = settings.memoria.master_key.clone()
-        {
-            port = port.with_self_hosted_fallback(settings.memoria.base_url.clone(), master_key);
-        }
-        Arc::new(port) as Arc<dyn astra_memoria::MemoriaPort>
-    });
     let matrix_rt = Arc::new(
         crate::matrix_cloud_runtime::MatrixCloudRuntime::attach(shared_pool.clone(), "default")
             .with_encryptor(Arc::clone(run_encryptor), memoria_port),
@@ -112,7 +104,7 @@ pub(super) async fn build_runtime_wiring(
     }
     let resource_governor = initialize_resource_governor(shared_pool).await?;
     let capacity = crate::capacity_model::CapacityInput::from_env();
-    let admission_limits = capacity.distributed_admission_limits();
+    let admission_limits = capacity.process_admission_limits();
     let run_concurrency_limit = capacity.run_concurrency_limit();
     let mut run_lifecycle = AgenticRunLifecycleService::new(
         settings.matrixone.clone(),
@@ -120,6 +112,7 @@ pub(super) async fn build_runtime_wiring(
         state.edge_callback_ledger.clone(),
         run_engine.clone(),
     )
+    .with_runtime_config(&settings.runtime)
     .with_admission_limits(admission_limits)
     .with_trace_ingestion(matrix_rt.clone_ingestion_sender())
     .with_pool(shared_pool.clone())
@@ -130,15 +123,12 @@ pub(super) async fn build_runtime_wiring(
     .with_edge_registry_service(state.execution.edge_registry_service.clone())
     .with_workspace_record_store(workspace_record_store)
     .with_selected_workspace_provider(selected_workspace_provider)
-    .with_resource_governor(resource_governor.clone())
     .with_skill_service(state.skill_service.clone())
     .with_model_service(state.model_service.clone())
     .with_auth_service(state.auth_service.clone())
     .with_model_catalog_cache(state.model_catalog_cache.clone())
-    .with_mcp_registry_service(state.mcp_registry_service.clone())
     .with_agent_binding_service(state.agent_binding_service.clone())
     .with_reflect_service(state.reflect_service.clone())
-    .with_hook_db_writer(state.turn_persistence.hook_db_writer.clone())
     .with_observer_worker(state.turn_persistence.observer_worker.clone())
     .with_auxiliary_event_writer(state.turn_persistence.auxiliary_event_writer.clone())
     .with_run_concurrency_limit(run_concurrency_limit)
@@ -149,7 +139,7 @@ pub(super) async fn build_runtime_wiring(
     }
 
     #[cfg(feature = "harness")]
-    let run_lifecycle = run_lifecycle.with_harness_registry(state.harness_registry.clone());
+    let run_lifecycle = run_lifecycle.with_harness_observation();
 
     // Reconciliation must follow complete service composition. A checkpoint
     // cannot be dispatched while model, policy, mailbox or tool owners are
@@ -177,13 +167,13 @@ async fn recover_active_runs(
                     .filter(|run| {
                         run.status == astra_core::STATUS_PAUSED
                             && run.waiting_for.is_none()
-                            && run.checkpoint_version.as_deref() != Some("execution_handoff_v1")
+                            && run.current_checkpoint_version() != Some("execution_handoff_v1")
                     })
                     .count();
                 let handoffs_preserved = recovered_runs
                     .iter()
                     .filter(|run| {
-                        run.checkpoint_version.as_deref() == Some("execution_handoff_v1")
+                        run.current_checkpoint_version() == Some("execution_handoff_v1")
                             && !matches!(
                                 run.status.as_str(),
                                 astra_core::STATUS_COMPLETED
@@ -269,4 +259,21 @@ pub(super) fn default_agent_profile_registry() -> astra_services::AgentProfileRe
     let _ = profile_registry.register(writer);
 
     profile_registry
+}
+
+/// One authority template for prompt recall, session writes and observation.
+pub(super) fn build_memoria_port(
+    settings: &AppSettings,
+    state: &AppState,
+) -> Option<Arc<dyn astra_memoria::MemoriaPort>> {
+    state.auth_service.memoria_credentials().map(|resolver| {
+        let mut port =
+            crate::turn::cloud::memoria_compact::UserScopedMemoriaPort::template(resolver);
+        if settings.memoria.allows_self_hosted_master_fallback()
+            && let Some(master_key) = settings.memoria.master_key.clone()
+        {
+            port = port.with_self_hosted_fallback(settings.memoria.base_url.clone(), master_key);
+        }
+        Arc::new(port) as Arc<dyn astra_memoria::MemoriaPort>
+    })
 }

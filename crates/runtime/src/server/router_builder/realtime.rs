@@ -21,6 +21,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             post(auth_handlers::auth_memoria_handler)
                 .delete(auth_handlers::auth_memoria_disconnect_handler),
         )
+        .route(
+            "/auth/browser-sessions",
+            post(auth_handlers::auth_browser_session_handler),
+        )
         .route("/auth/refresh", post(auth_handlers::auth_refresh_handler))
         .route("/auth/logout", post(auth_handlers::auth_logout_handler))
         .route(
@@ -172,6 +176,14 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(edge::edge_service_status_handler::edge_service_status_handler),
         )
         .route(
+            "/service/edges/capacity",
+            get(edge::edge_capacity_handler::describe_capacity)
+                .post(edge::edge_capacity_handler::call_capacity)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    astra_server_types::edge_ws_protocol::MAX_EDGE_MESSAGE_BYTES,
+                )),
+        )
+        .route(
             "/chat/runs/{run_id}",
             get(crate::server::run::handlers::get_run_status_handler)
                 .delete(crate::server::run::handlers::delete_run_handler),
@@ -179,10 +191,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/chat/runs/{run_id}/projection",
             get(crate::server::run::handlers::get_run_projection_handler),
-        )
-        .route(
-            "/chat/runs/{run_id}/projection/repair",
-            post(crate::server::run::handlers::repair_run_projection_handler),
         )
         .route(
             "/chat/runs/{run_id}/stream",
@@ -198,7 +206,8 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/chat/runs/{run_id}/cancel",
-            post(crate::server::run::handlers::cancel_run_handler),
+            post(crate::server::run::handlers::cancel_run_handler)
+                .get(crate::server::run::handlers::get_run_execution_settlement_handler),
         )
         .route(
             "/chat/runs/{run_id}/permission-mode",
@@ -206,8 +215,17 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
                 .get(crate::server::run::handlers::permission_mode_snapshot_handler),
         )
         .route(
+            "/chat/runs/{run_id}/model",
+            post(crate::server::run::handlers::request_run_model_handler)
+                .get(crate::server::run::handlers::run_model_snapshot_handler),
+        )
+        .route(
             "/chat/runs/{run_id}/intents",
             post(crate::server::run::handlers::submit_run_user_intent_handler),
+        )
+        .route(
+            "/chat/runs/{run_id}/intents/{intent_id}",
+            get(crate::server::run::handlers::run_user_intent_status_handler),
         )
         .route(
             "/chat/runs/{run_id}/delegate",

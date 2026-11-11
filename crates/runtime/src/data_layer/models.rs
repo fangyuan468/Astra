@@ -4,12 +4,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use crate::AppState;
+mod catalog_transport;
 use astra_core::{ErrorResponse, error_response, error_response_coded, internal_error};
 use axum::{
     Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
+use catalog_transport::CatalogVersion;
 
 const DEFAULT_MODEL_CATALOG_LIMIT: u32 = 50;
 
@@ -90,8 +92,11 @@ pub async fn create_user_model_handler(
         .create_user_model(
             user.user_id,
             UserModelCreateRequestData {
+                connection_id: request.connection_id,
                 name: request.name,
                 provider: request.provider,
+                inference_protocol: request.inference_protocol,
+                responses_reasoning_history: request.responses_reasoning_history,
                 model: request.model,
                 base_url: request.base_url,
                 api_key: request.api_key,
@@ -139,6 +144,8 @@ pub async fn update_user_model_handler(
             model_id,
             UserModelUpdateRequestData {
                 api_key: request.api_key,
+                inference_protocol: request.inference_protocol,
+                responses_reasoning_history: request.responses_reasoning_history,
                 context_window: request.context_window,
                 is_default: request.is_default,
                 is_active: request.is_active,
@@ -210,9 +217,10 @@ pub async fn list_models_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<ModelCatalogQuery>,
-) -> Result<Json<ModelListPageResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
+    let version = CatalogVersion::from_headers(&headers)?;
     let catalog = effective_model_catalog(&state, &headers, &query, false).await?;
-    Ok(Json(ModelListPageResponse {
+    Ok(version.models(ModelListPageResponse {
         items: catalog
             .offerings
             .into_iter()
@@ -316,9 +324,24 @@ async fn effective_model_catalog(
         .await?;
         catalog.items.retain(|item| !active_only || item.is_active);
         catalog.items = model_catalog_for_purpose(catalog.items, query.purpose);
-        let declared = astra_services::models::server_model_access_declarations(
+        // The seek cursor contract orders lexicographically by (provider,
+        // name, offering_id); paginating the service's natural list order
+        // would silently drop every Offering that sorts before the cursor.
+        catalog.items.sort_by(|left, right| {
+            (
+                left.provider.as_str(),
+                left.name.as_str(),
+                left.offering_id.as_str(),
+            )
+                .cmp(&(
+                    right.provider.as_str(),
+                    right.name.as_str(),
+                    right.offering_id.as_str(),
+                ))
+        });
+        let declared = astra_services::models::server_model_access_declarations_for_models(
             catalog.allows_deployment,
-            catalog.items.iter().map(|item| item.access_kind),
+            &catalog.items,
         );
         let catalog_revision = model_catalog_revision(&catalog.items);
         let default_catalog = catalog
@@ -440,7 +463,8 @@ pub async fn get_model_access_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<ModelCatalogQuery>,
-) -> Result<Json<ModelAccessProjectionResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
+    let version = CatalogVersion::from_headers(&headers)?;
     if query.purpose == astra_core::model_wire::purpose::ModelCatalogPurpose::All {
         return Err(astra_core::error_response_coded(
             StatusCode::BAD_REQUEST,
@@ -476,7 +500,7 @@ pub async fn get_model_access_handler(
         projection.default_offering_id = None;
         projection.default_resolution = None;
     }
-    Ok(Json(projection))
+    Ok(version.access(projection))
 }
 
 /// Check all requested child Offerings before a CLI fanout launches any slot.
@@ -673,6 +697,7 @@ mod tests {
 
     fn edge_item(id: &str, name: &str) -> ModelListItem {
         ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: id.to_string(),
             access_id: "this-device".to_string(),

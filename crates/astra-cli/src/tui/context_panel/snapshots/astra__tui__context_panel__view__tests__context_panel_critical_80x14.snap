@@ -1,6 +1,5 @@
 ---
 source: crates/astra-cli/src/tui/context_panel/view.rs
-assertion_line: 2285
 expression: "render_panel(&b, 80, 14)"
 ---
 ┌ Context window (96% · high) ─────────────────────────────────────────────────┐
@@ -14,6 +13,6 @@ expression: "render_panel(&b, 80, 14)"
 │  ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛶ ⛶ ⛶   ⛁ Current turn      1.5k  ( 1.5%)                     │
 │                        ⛶ Free space        4.5k  ( 4.5%)                     │
 │                                                                              │
-│                                                                              │
-│                                                                              │
+│   History · conversation turns                                               │
+│    └ Admission input history unavailable                                     │
 └──────────────────────────────────────────────────────────────────────────────┘

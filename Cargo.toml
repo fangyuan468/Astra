@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/core",
+    "crates/astra-build-info",
     "crates/astra-logging",
     "crates/services",
     "crates/runtime",
@@ -31,12 +32,13 @@ exclude = ["vendor/crossterm"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.12"
+version = "0.2.14"
 edition = "2024"
 license = "Apache-2.0"
 
 [workspace.dependencies]
 astra-core = { path = "crates/core" }
+astra-build-info = { path = "crates/astra-build-info" }
 astra-credentials = { path = "crates/astra-credentials" }
 astra-harness = { path = "crates/astra-harness" }
 astra-logging = { path = "crates/astra-logging" }
@@ -63,6 +65,7 @@ async-stream = "0.3.6"
 async-trait = "0.1.89"
 axum = { version = "0.8.6", features = ["ws"] }
 base64 = "0.22.1"
+data-encoding = "2.11.0"
 bcrypt = "0.17.1"
 chrono = { version = "0.4.42", features = ["clock"] }
 dotenvy = "0.15.7"
@@ -73,18 +76,22 @@ fs2 = "0.4"
 tar = "0.4"
 futures-util = "0.3.31"
 hmac = "0.12.1"
-jsonwebtoken = { version = "10.3.0", default-features = false, features = ["rust_crypto"] }
+# Reuse AWS-LC: the RustCrypto backend pins crypto-bigint 0.5, affected by
+# RUSTSEC-2026-0387 with no compatible patched release.
+jsonwebtoken = { version = "10.3.0", default-features = false, features = ["aws_lc_rs"] }
 nix = { version = "0.31.2", features = ["fs", "signal", "term"] }
 regex = "1.12.2"
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "stream", "socks"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
+# Requests can be serialized, replayed, and decoded by a separate Edge process.
+serde_json = { version = "1.0.145", features = ["float_roundtrip"] }
 serde_path_to_error = "0.1.20"
 serde_yaml_ng = "0.10.0"
 sha2 = "0.10.9"
 similar = "2.7.0"
 hex = "0.4.3"
-sqlx = { version = "0.8.6", default-features = false, features = ["mysql", "runtime-tokio-rustls"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["mysql", "mysql-rsa", "runtime-tokio", "tls-rustls-ring-webpki"] }
+sqlx-core = { version = "=0.9.0", default-features = false }
 tokio = { version = "1.47.1", features = ["macros", "net", "process", "rt-multi-thread", "signal"] }
 libc = "0.2"
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -119,9 +126,11 @@ tracing-opentelemetry = { version = "0.33.0", default-features = false }
 tracing-appender = { version = "0.2", default-features = false }
 percent-encoding = "2.3"
 http-body-util = "0.1"
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+# WSS callers supply the explicit public-root connector from astra-core::net.
+# Enabling a roots feature here would add a second trust-policy owner.
+tokio-tungstenite = { version = "0.26", features = ["__rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-webpki-roots = "0.26"
+webpki-roots = "1.0.10"
 clap = { version = "4", features = ["derive", "env"] }
 hostname = "0.4"
 insta = { version = "1.41", features = ["yaml"] }
@@ -142,3 +151,13 @@ strip = "symbols"
 # Local startup-query prototype; see vendor/crossterm/ASTRA-PATCH.md.
 [patch.crates-io]
 crossterm = { path = "vendor/crossterm" }
+# Preserve TCP_NODELAY and cancel pending return health checks on pool close.
+# Based directly on upstream 6e57d05; see docs/design/data-and-storage.md.
+sqlx-core = { git = "https://github.com/XuPeng-SH/sqlx", rev = "718ace3156fa67cf639a872e016cabd95796e6fc" }
+# SQLx 0.9.0 retains its optional SQLite driver in Cargo.lock; use the
+# upstream bound fix so the lockfile can select the patched SQLite release.
+sqlx-sqlite = { git = "https://github.com/transact-rs/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+
+# The upstream SQLite package must share the same patched core as MySQL.
+[patch."https://github.com/transact-rs/sqlx"]
+sqlx-core = { git = "https://github.com/XuPeng-SH/sqlx", rev = "718ace3156fa67cf639a872e016cabd95796e6fc" }

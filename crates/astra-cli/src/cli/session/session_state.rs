@@ -269,6 +269,13 @@ impl SessionModelChoice {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct LocalContextAssemblyTrace {
+    /// Producer-assigned local journal turn, independent of the display ID.
+    pub local_turn: u32,
+    pub trace: astra_turn_core::context_assembly_trace::ContextAssemblyTrace,
+}
+
 // NOTE: SessionState is per-session and NOT shared across sessions. In future
 // server/multi-session mode, ensure each session gets its own SessionState
 // instance to prevent cross-session data leakage (permissions, history, tokens).
@@ -340,6 +347,9 @@ pub(crate) struct SessionState {
     /// Monotonic identity of the live session attachment. Deferred work must
     /// carry and match this epoch before it can update mutable session state.
     pub session_attachment_epoch: u64,
+    /// Validated Server restore provenance, bound to this owner/session attachment.
+    /// Its cursor is never advanced or used as a local journal clock.
+    pub(crate) server_resume_attachment: Option<(astra_turn_types::SessionCursorV1, u64)>,
     pub history: Vec<(String, String)>, // (user_msg, assistant_msg)
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
@@ -407,8 +417,7 @@ pub(crate) struct SessionState {
     /// successful commit or recovery sync clears it.
     pub session_persistence_error: Option<String>,
     /// Full context-assembly trace from the last successfully committed turn.
-    pub latest_context_assembly_trace:
-        Option<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>,
+    pub latest_context_assembly_trace: Option<LocalContextAssemblyTrace>,
     /// Serialized context-pipeline state restored from the latest heavy checkpoint.
     pub runtime_pipeline_state: Option<serde_json::Value>,
     /// Serialized compaction effectiveness tracker restored from the latest heavy checkpoint.
@@ -445,24 +454,6 @@ pub(crate) struct SessionState {
     /// Original user query at session start (for drift baseline comparison).
     pub drift_original_query: Option<String>,
 
-    /// Cross-session lessons loaded once at first-turn bootstrap. Empty
-    /// until a turn loads lessons for the current session.
-    /// Passed through to every turn's ToolExecutor so the LLM sees prior
-    /// session's advice on every SelfModel snapshot.
-    pub session_lessons: Vec<astra_services::LessonHint>,
-    pub memory_selection_reports: Vec<astra_turn_types::MemorySelectionReport>,
-    /// Set after the first bootstrap attempt regardless of result count.
-    /// Prevents per-turn DB calls for new users with zero lessons.
-    pub session_lessons_loaded: bool,
-    /// Incremental lesson extraction at natural breakpoints (corrections,
-    /// stalls, plan completion). Tracks which lessons have already been
-    /// recorded this session to prevent double-recording.
-    pub lesson_checkpointer: astra_runtime::learning::checkpoint::LessonCheckpointer,
-
-    /// Governed memory Offering cached at first use. Provider route material
-    /// and credentials remain Server-side and are never retained in session
-    /// state.
-    pub memory_inference_offering: super::session_memory_inference::MemoryJudgmentOffering,
     /// Background session-memory.md extraction coordinator. `None` means
     /// the current CLI path has no API-backed extraction service.
     pub session_memory_port:
@@ -544,7 +535,7 @@ pub(crate) struct SessionState {
     pub pending_bg_notifications: Vec<String>,
     /// Shared command queue for background task operations.
     /// The tool executor pushes spawn/kill/output commands; the TUI drains them.
-    pub bg_task_commands: std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>,
+    pub(crate) background_tasks: crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     /// Shared background task list cache.
     /// The TUI event loop writes the rendered task-list XML here every tick
     /// (not just on-demand) so [`ToolExecutor::task_list_bg`] can read the
@@ -556,7 +547,7 @@ pub(crate) struct SessionState {
     /// into the executor's ToolContext so each bash invocation can
     /// observe the signal. Headless paths still see it but never
     /// fire the signal so behaviour is unchanged.
-    pub bash_detach_slot: astra_tools::detach::DetachShellSlot,
+    pub foreground_wait_control: astra_tools::detach::ForegroundWaitControl,
 
     // ── Harness (observation + verification layer) ──
     #[cfg(feature = "harness")]
@@ -602,6 +593,7 @@ impl Default for SessionState {
             notification_threshold_secs: 10,
             active_conversation: None,
             session_attachment_epoch: 0,
+            server_resume_attachment: None,
             history: Vec::new(),
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
@@ -652,12 +644,6 @@ impl Default for SessionState {
             resume_guidance: None,
             resume_restricted_tools: Vec::new(),
             drift_original_query: None,
-            session_lessons: Vec::new(),
-            memory_selection_reports: Vec::new(),
-            session_lessons_loaded: false,
-            lesson_checkpointer: astra_runtime::learning::checkpoint::LessonCheckpointer::new(),
-            memory_inference_offering:
-                super::session_memory_inference::MemoryJudgmentOffering::Unresolved,
             session_memory_port: None,
 
             latest_turn_quality_feedback: None,
@@ -685,9 +671,14 @@ impl Default for SessionState {
             native_delivery_shutdown: None,
             tui_plan_review_request_tx: None,
             pending_bg_notifications: Vec::new(),
-            bg_task_commands: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            background_tasks: crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+                std::env::temp_dir()
+                    .join("astra")
+                    .join("bg_tasks")
+                    .join(uuid::Uuid::new_v4().to_string()),
+            ),
             bg_task_list_cache: std::sync::Arc::new(tokio::sync::RwLock::new(String::new())),
-            bash_detach_slot: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            foreground_wait_control: astra_tools::detach::ForegroundWaitControl::default(),
             #[cfg(feature = "harness")]
             harness_sink: astra_harness::InMemorySnapshotSink::arc(),
         }
@@ -732,6 +723,7 @@ impl SessionState {
             .checked_add(1)
             .expect("session attachment epoch exhausted");
         self.active_conversation = None;
+        self.server_resume_attachment = None;
         // Invalidate before publishing any new identity. Never pair an old
         // session id with a newly advanced attachment epoch.
         self.perm_manager.clear_active_session_id();
@@ -774,6 +766,7 @@ impl SessionState {
             self.advance_session_attachment();
         } else {
             self.active_conversation = None;
+            self.server_resume_attachment = None;
         }
         self.perm_manager.clear_active_session_id();
         self.session_id = None;
@@ -803,6 +796,11 @@ impl SessionState {
         // boundary without requiring unbounded shutdown waits.
         self.active_work_registry =
             std::sync::Arc::new(astra_core::work_unit::ActiveWorkRegistry::default());
+        // A selected checkout belongs to this session. Rotate the shared
+        // owner so a retiring turn cannot redirect a different session.
+        self.git_worktree_journal = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::edge_tools::worktree::GitWorktreeRollbackJournal::default(),
+        ));
         self.pending_recovery = None;
         self.run_id = None;
         *astra_core::sync_poison::recover_mutex_lock(&self.active_turn_local_run_control) = None;
@@ -828,12 +826,6 @@ impl SessionState {
         self.clear_runtime_recovery_state();
         self.clear_resume_recovery_state();
         self.drift_original_query = None;
-        self.session_lessons.clear();
-        self.memory_selection_reports.clear();
-        self.session_lessons_loaded = false;
-        self.lesson_checkpointer = Default::default();
-        self.memory_inference_offering =
-            super::session_memory_inference::MemoryJudgmentOffering::Unresolved;
         self.latest_turn_quality_feedback = None;
         self.cloud_plan_mirror = None;
         self.observability_session = None;
@@ -1064,7 +1056,6 @@ mod default_tests {
             resume_guidance: Some("resume".into()),
             resume_restricted_tools: vec!["read_file".into()],
             drift_original_query: Some("orig".into()),
-            session_lessons_loaded: true,
             latest_turn_quality_feedback: Some(astra_runtime::self_model::TurnQualityFeedback {
                 turn: 1,
                 findings: vec!["finding".into()],
@@ -1098,14 +1089,20 @@ mod default_tests {
         assert!(state.resume_guidance.is_none());
         assert!(state.resume_restricted_tools.is_empty());
         assert!(state.drift_original_query.is_none());
-        assert!(state.session_lessons.is_empty());
-        assert!(!state.session_lessons_loaded);
         assert!(state.latest_turn_quality_feedback.is_none());
         assert!(!state.last_turn_interrupted);
         assert!(state.plan_mode_sync_error.is_none());
         assert!(state.session_persistence_error.is_none());
         assert!(state.perm_manager.export_session_overrides().is_none());
         assert!(state.pending_bg_notifications.is_empty());
+    }
+
+    #[test]
+    fn resetting_session_replaces_the_worktree_owner() {
+        let mut state = SessionState::default();
+        let prior = state.git_worktree_journal.clone();
+        state.reset_for_new_session();
+        assert!(!std::sync::Arc::ptr_eq(&prior, &state.git_worktree_journal));
     }
 
     #[test]

@@ -29,6 +29,10 @@ pub(crate) fn genesis_execution() -> AdmittedModelExecution {
     let mut execution = AdmittedModelExecution::from_offering(ResolvedModelOffering {
         offering_id: OFFERING_ID.into(),
         model: ResolvedActiveLlmModel {
+            responses_reasoning_history: None,
+            inference_protocol: None,
+            response_scope_key: None,
+            supported_reasoning_efforts: None,
             price_snapshot: None,
             model_name: MODEL_NAME.into(),
             wire_model_name: Some("genesis-wire-model".into()),
@@ -178,7 +182,6 @@ pub(crate) async fn auto_parent_run(run_id: &str, execution: &AdmittedModelExecu
         .await
         .unwrap();
     let decision = ModelRoutingDecision {
-        rollout: None,
         schema_version: 2,
         features: None,
         work_admission: None,

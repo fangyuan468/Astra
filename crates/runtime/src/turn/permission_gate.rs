@@ -74,6 +74,7 @@ pub async fn check_tool_permission(
         mailbox,
         timeout,
         None,
+        None,
     )
     .await
 }
@@ -85,6 +86,7 @@ pub async fn check_tool_permission_with_provider_policy(
     mailbox: Option<&mut AgentMailbox>,
     timeout: Duration,
     provider_policy: Option<&ResolvedInvocationPolicy>,
+    source_discovery_tool: Option<&str>,
 ) -> PermissionCheckResult {
     let Some(ctx) = permission_context else {
         return PermissionCheckResult::Denied {
@@ -108,6 +110,7 @@ pub async fn check_tool_permission_with_provider_policy(
             &normalized_args,
             &ctx_guard,
             provider_policy,
+            source_discovery_tool,
         );
         astra_turn_core::permission::audit::record_evaluated_envelope(
             tool_name,
@@ -144,7 +147,10 @@ pub async fn check_tool_permission_with_provider_policy(
 
     // Try to request permission from parent
     let Some(mailbox) = mailbox else {
-        let reason = format!("Tool '{tool_name}' requires permission but no parent available");
+        let reason = format!(
+            "Tool '{tool_name}' requires approval: {}. No approval was granted: no parent available",
+            prompt.reason
+        );
         ctx.write()
             .await
             .record_blocked_tool_with_reason(tool_name, Some(&reason));
@@ -152,7 +158,8 @@ pub async fn check_tool_permission_with_provider_policy(
     };
 
     // Build permission request
-    let mut request = PermissionRequest::new(tool_name, normalized_args).with_reason(prompt.reason);
+    let mut request =
+        PermissionRequest::new(tool_name, normalized_args).with_reason(prompt.reason.clone());
     if let Some(ref hint) = prompt.detail {
         request = request.with_hint(hint.clone());
     }
@@ -197,7 +204,10 @@ pub async fn check_tool_permission_with_provider_policy(
             }
         }
         Err(e) => {
-            let reason = format!("Permission request failed: {}", e);
+            let reason = format!(
+                "Tool '{tool_name}' requires approval: {}. Permission request failed: {e}",
+                prompt.reason
+            );
             ctx.write()
                 .await
                 .record_blocked_tool_with_reason(tool_name, Some(&reason));
@@ -239,6 +249,7 @@ pub async fn check_tool_permission_in_plan_mode(
         timeout,
         plan_mode_active,
         None,
+        None,
     )
     .await
 }
@@ -251,6 +262,7 @@ pub async fn check_tool_permission_in_plan_mode_with_provider_policy(
     timeout: Duration,
     plan_mode_active: bool,
     provider_policy: Option<&ResolvedInvocationPolicy>,
+    source_discovery_tool: Option<&str>,
 ) -> PermissionCheckResult {
     let normalized_args = match normalized_tool_args(tool_name, args) {
         Ok(args) => args,
@@ -264,14 +276,7 @@ pub async fn check_tool_permission_in_plan_mode_with_provider_policy(
         }
     };
 
-    let plan_mode_blocked = provider_policy.map_or_else(
-        || crate::turn::plan_mode_guard::is_plan_mode_blocked_tool(tool_name, &normalized_args),
-        // A native collaborator is admitted as a control-plane stage. Its
-        // adapter clamps the actual workspace effect to the plan-mode ceiling
-        // before starting the provider, so do not reject it merely because
-        // its descriptor cannot claim that every invocation is read-only.
-        |policy| !policy.is_read_only() && !policy.is_collaborator_stage(),
-    );
+    let plan_mode_blocked = plan_mode_blocks(tool_name, &normalized_args, provider_policy);
     if plan_mode_active && plan_mode_blocked {
         return PermissionCheckResult::Denied {
             reason: format!(
@@ -307,8 +312,24 @@ pub async fn check_tool_permission_in_plan_mode_with_provider_policy(
         mailbox,
         timeout,
         effective_provider_policy,
+        source_discovery_tool,
     )
     .await
+}
+
+pub(crate) fn plan_mode_blocks(
+    tool_name: &str,
+    normalized_args: &serde_json::Value,
+    provider_policy: Option<&ResolvedInvocationPolicy>,
+) -> bool {
+    provider_policy.map_or_else(
+        || crate::turn::plan_mode_guard::is_plan_mode_blocked_tool(tool_name, normalized_args),
+        // A native collaborator is admitted as a control-plane stage. Its
+        // adapter clamps the actual workspace effect to the plan-mode ceiling
+        // before starting the provider, so do not reject it merely because
+        // its descriptor cannot claim that every invocation is read-only.
+        |policy| !policy.is_read_only() && !policy.is_collaborator_stage(),
+    )
 }
 
 #[cfg(test)]
@@ -379,6 +400,7 @@ mod tests {
             Duration::from_secs(1),
             true,
             Some(&read),
+            None,
         )
         .await;
         assert!(is_allowed(&allowed));
@@ -391,6 +413,7 @@ mod tests {
             Duration::from_secs(1),
             true,
             Some(&collaborator),
+            None,
         )
         .await;
         assert!(is_allowed(&allowed_collaborator));
@@ -403,9 +426,67 @@ mod tests {
             Duration::from_secs(1),
             true,
             Some(&unknown),
+            None,
         )
         .await;
         assert!(matches!(denied, PermissionCheckResult::Denied { .. }));
+    }
+
+    #[tokio::test]
+    async fn materialized_source_selection_uses_only_its_discovery_allowlist_scope() {
+        let policy = provider_policy(astra_turn_types::ResolvedToolEffect::Unknown);
+        let selected = "mcp__cap__selected";
+        let discovery = "mcp__source__search";
+        let context = |allowed: &[&str], deny_selected: bool| {
+            PermissionSyncContext::shared(InheritedPermissions {
+                mode: PermissionMode::Auto,
+                allowed_tools: Some(allowed.iter().map(|tool| (*tool).to_string()).collect()),
+                deny_rules: if deny_selected {
+                    vec![astra_turn_core::permission::types::PermissionRule::tool(
+                        selected,
+                    )]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            })
+        };
+        let permitted = context(&[discovery], false);
+        async fn check(
+            ctx: &PermissionSyncHandle,
+            source: Option<&str>,
+            policy: &ResolvedInvocationPolicy,
+        ) -> PermissionCheckResult {
+            check_tool_permission_with_provider_policy(
+                "mcp__cap__selected",
+                Some("{}"),
+                Some(ctx),
+                None,
+                Duration::from_secs(1),
+                Some(policy),
+                source,
+            )
+            .await
+        }
+        assert!(is_allowed(
+            &check(&permitted, Some(discovery), &policy).await
+        ));
+        assert!(matches!(
+            check(&permitted, None, &policy).await,
+            PermissionCheckResult::Denied { .. }
+        ));
+        assert!(matches!(
+            check(&permitted, Some("mcp__source__wrong"), &policy).await,
+            PermissionCheckResult::Denied { .. }
+        ));
+        assert!(matches!(
+            check(&context(&["tool_search"], false), Some(discovery), &policy).await,
+            PermissionCheckResult::Denied { .. }
+        ));
+        assert!(matches!(
+            check(&context(&[discovery], true), Some(discovery), &policy).await,
+            PermissionCheckResult::Denied { .. }
+        ));
     }
 
     #[tokio::test]

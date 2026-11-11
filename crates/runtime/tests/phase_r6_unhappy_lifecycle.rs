@@ -2,7 +2,7 @@
 #![cfg(feature = "e2e-hooks")]
 
 use astra_runtime::server::provider_test_support::{
-    InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+    ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
     bind_server_workspace, loop_state, server_host_builder,
 };
 use astra_runtime::server::tool_transport::{
@@ -23,10 +23,10 @@ async fn recover_from_call(
     )
     .unwrap();
     let gateway = ProviderGateway::start(vec![ProviderScript::new("primary recovery", |r| r.path == "/v1/chat/completions" && r.body["model"] == "provider-fixture-model", vec![
-        ProviderResponse::OpenAi(json!({"id":"misbehaving-response","model":"provider-fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":preliminary_text,"tool_calls":[{"id":"call-unhappy","type":"function","function":{"name":name,"arguments":arguments}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}})),
-        ProviderResponse::OpenAi(json!({"id":"recovery-response","model":"provider-fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":"The request could not be executed; no changes were made."},"finish_reason":"stop"}],"usage":{"prompt_tokens":15,"completion_tokens":6,"total_tokens":21}})),
+        ProviderResponse::OpenAi(json!({"id":"misbehaving-response","model":"provider-fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":preliminary_text,"tool_calls":[{"id":"call-unhappy","type":"function","function":{"name":name,"arguments":arguments}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}})),
+        ProviderResponse::OpenAi(json!({"id":"recovery-response","model":"provider-fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":"The request could not be executed; no changes were made."},"finish_reason":"stop"}],"usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":15,"completion_tokens":6,"total_tokens":21}})),
     ])]).await;
-    let ledger = InferenceLedgerFixture::default();
+    let ledger = ProviderObservationsFixture::default();
     let session = format!("unhappy-fixture-{}", uuid::Uuid::new_v4());
     let mut host = server_host_builder(
         &gateway,
@@ -106,8 +106,12 @@ async fn unhappy_tool_call_with_invalid_json_args() {
         serde_json::from_str(records[0]["result_full"].as_str().unwrap()).unwrap();
     assert_eq!(rejection["status"], "rejected");
     assert_eq!(rejection["error_kind"], "tool_call_arguments_invalid");
-    let wire_rejection: Value = serde_json::from_str(paired_failure(&messages)).unwrap();
+    let (body, guidance) = paired_failure(&messages)
+        .split_once("\n\n[Runtime tool guidance]\n")
+        .expect("the model receives both the rejection and its execution facts");
+    let wire_rejection: Value = serde_json::from_str(body).unwrap();
     assert_eq!(wire_rejection["error_kind"], "tool_call_arguments_invalid");
+    assert!(guidance.contains("\"execution\":\"not_executed\""));
 }
 
 #[tokio::test]
@@ -120,12 +124,18 @@ async fn unhappy_tool_call_to_unknown_tool_name() {
             .iter()
             .all(|message| message.get("tool_calls").is_none() && message["role"] != "tool")
     );
-    assert!(
-        messages.iter().any(|message| message["content"]
-            .as_str()
-            .is_some_and(|text| text
-                .contains("provider_attempt_ended_without_executable_or_visible_delivery")))
-    );
+    let settlement = messages
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .filter_map(|content| content.strip_prefix("<astra-runtime-context>\n"))
+        .filter_map(|content| content.strip_suffix("\n</astra-runtime-context>"))
+        .filter_map(|content| serde_json::from_str::<Value>(content).ok())
+        .find(|context| context["schema"] == "final_answer_settlement.v1")
+        .expect("text-only settlement accompanies recovery");
+    assert_eq!(settlement["signal"], "textless_provider_response");
+    assert_eq!(settlement["authority"], "runtime_bounded_text_only_retry");
+    assert_eq!(settlement["evidence"]["rounds_completed"], 1);
+    assert_eq!(settlement["evidence"]["tool_calls_completed"], 0);
 }
 
 #[tokio::test]

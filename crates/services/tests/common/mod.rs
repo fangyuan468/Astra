@@ -23,7 +23,9 @@
 
 #![allow(dead_code)]
 
+pub mod cleanup_catalog;
 pub mod collaborator_fixture;
+pub mod mysql_response_proxy;
 
 use astra_core::{MatrixOneSettings, SharedPool};
 use astra_services::storage::ensure_core_schema;
@@ -144,30 +146,24 @@ pub async fn cleanup_work_owner(pool: &SharedPool, owner_id: &str) {
         ("work_acceptance_decisions", "owner_id"),
         ("work_check_runs", "owner_id"),
         ("work_recovery_points", "owner_id"),
-        ("work_patch_materialization_operations", "owner_id"),
-        ("work_patch_commit_operations", "owner_id"),
-        ("work_patch_artifacts", "owner_id"),
         ("work_attention_receipts", "owner_id"),
         ("work_event_sequences", "owner_id"),
         ("work_events", "owner_id"),
         ("work_proposals", "owner_id"),
         ("work_proposal_sequences", "owner_id"),
         ("work_branch_subjects", "owner_id"),
-        ("work_item_edges", "owner_id"),
         ("work_item_revisions", "owner_id"),
         ("work_items", "owner_id"),
         ("work_graph_revisions", "owner_id"),
         ("work_graph_sequences", "owner_id"),
         ("work_criterion_sets", "owner_id"),
         ("work_criterion_revisions", "owner_id"),
-        ("work_criteria", "owner_id"),
         ("work_goal_revisions", "owner_id"),
         ("work_branches", "owner_id"),
         ("works", "owner_id"),
         ("agent_run_events", "user_id"),
         ("run_checkpoints", "user_id"),
-        ("run_display_projections", "user_id"),
-        ("agent_session_execution_slots", "user_id"),
+        ("agent_run_openings", "user_id"),
         ("agent_runs", "user_id"),
         ("session_context_operation_receipts", "owner_user_id"),
         ("session_context_authority_events", "owner_user_id"),
@@ -177,7 +173,7 @@ pub async fn cleanup_work_owner(pool: &SharedPool, owner_id: &str) {
         ("agent_sessions", "user_id"),
     ] {
         let statement = format!("DELETE FROM {table} WHERE {owner_column} = ?");
-        sqlx::query(&statement)
+        sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(owner_id)
             .execute(pool.get())
             .await
@@ -275,4 +271,25 @@ pub async fn controller_attachment(
     .expect("insert controller attachment");
 
     attachment
+}
+
+/// Capture actual statements only within the instrumented store call.
+#[derive(Clone, Default)]
+pub struct SqlQueries(pub std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl tracing::field::Visit for SqlQueries {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "db.statement" {
+            self.0.lock().unwrap().push(value.to_owned());
+        }
+    }
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SqlQueries {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() == "sqlx::query" {
+            event.record(&mut self.clone());
+        }
+    }
 }

@@ -46,20 +46,7 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
     // Returns the compact schema-addressed contract. The host records the
     // selection for typed admission; it must not reinsert the full target
     // schema into the repeated provider `tools[]` prefix.
-    if let Some(tool_names) = select_payload(query) {
-        let mut requested = Vec::new();
-        for name in tool_names
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-        {
-            if !requested
-                .iter()
-                .any(|existing: &String| existing.eq_ignore_ascii_case(name))
-            {
-                requested.push(name.to_string());
-            }
-        }
+    if let Some(requested) = selected_tool_names(query) {
         if requested.is_empty() {
             return tool_search_error("'select:' requires at least one tool name").to_string();
         }
@@ -194,14 +181,35 @@ pub fn tool_selection_contract(schema: &Value) -> Option<Value> {
 
 /// Stable content address for one compact selection contract.
 ///
-/// The digest covers exactly the contract returned to the model by
-/// `tool_search`: canonical name, compact description, parameter shape, and
-/// truncation fact. Provider binding and capability authority are deliberately
+/// The digest addresses the full executable input schema and canonical name.
+/// Presentation text, truncation and directory refreshes do not revoke a
+/// selected unchanged contract. Provider binding and capability authority are deliberately
 /// excluded and must be revalidated at execution time.
 #[must_use]
 pub fn tool_selection_contract_digest(selection: &Value) -> String {
-    let canonical = astra_core::canonical_json_string(selection);
+    let executable = json!({"name": selection.get("name"), "parameters": selection.get("parameters").map(astra_turn_types::executable_schema)});
+    let canonical = astra_core::canonical_json_string(&executable);
     format!("sha256:{:x}", Sha256::digest(canonical.as_bytes()))
+}
+
+/// Parse the same explicit-selection contract used by tool_search. Consumers
+/// resolving lazy sources must not introduce different whitespace or case rules.
+pub fn selected_tool_names(query: &str) -> Option<Vec<String>> {
+    let names = select_payload(query.trim())?;
+    let mut requested = Vec::new();
+    for name in names
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        if !requested
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(name))
+        {
+            requested.push(name.to_string());
+        }
+    }
+    Some(requested)
 }
 
 fn select_payload(query: &str) -> Option<&str> {
@@ -1032,14 +1040,16 @@ mod tests {
 
     #[test]
     fn selection_contract_digest_is_stable_for_equivalent_object_key_order() {
-        let left = json!({
+        let left = super::tool_selection_contract(&json!({
             "type": "function",
             "function": {"name": "read_file", "parameters": {"type": "object"}}
-        });
-        let right = json!({
+        }))
+        .unwrap();
+        let right = super::tool_selection_contract(&json!({
             "function": {"parameters": {"type": "object"}, "name": "read_file"},
             "type": "function"
-        });
+        }))
+        .unwrap();
 
         assert_eq!(
             tool_selection_contract_digest(&left),
@@ -1047,10 +1057,10 @@ mod tests {
         );
         assert_ne!(
             tool_selection_contract_digest(&left),
-            tool_selection_contract_digest(&json!({
+            tool_selection_contract_digest(&super::tool_selection_contract(&json!({
                 "type": "function",
                 "function": {"name": "read_file", "parameters": {"type": "object", "additionalProperties": false}}
-            }))
+            })).unwrap())
         );
     }
 
@@ -1179,6 +1189,59 @@ mod tests {
     }
 
     #[test]
+    fn task_output_selection_explains_live_activity_and_paging() {
+        let schemas = crate::schemas::all_tool_schemas();
+        let selected: Value = serde_json::from_str(&tool_search(
+            &schemas,
+            &json!({"query": "select:task_output"}),
+        ))
+        .unwrap();
+        assert_eq!(selected["selection_status"], "ok");
+        let tool = &selected["matches"][0];
+        assert_eq!(tool["description_truncated"], false);
+        let summary = tool["description"].as_str().unwrap();
+        for term in ["block=true", "wake_on_output=true", "snapshot", "timeout"] {
+            assert!(summary.contains(term), "missing {term}: {summary}");
+        }
+        let parameters = &tool["parameters"];
+        assert_eq!(parameters["required"], json!(["task_id"]));
+        let revision = &parameters["properties"]["after_output_revision"];
+        assert_eq!(revision["type"], "integer");
+        let guidance = revision["description"].as_str().unwrap();
+        for term in [
+            "output_revision",
+            "block=true",
+            "wake_on_output=true",
+            "offset/pattern",
+            "not a byte cursor",
+        ] {
+            assert!(guidance.contains(term), "missing {term}: {guidance}");
+        }
+        assert!(
+            parameters["properties"]["offset"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("after terminal status")
+        );
+        let pattern_guidance = parameters["properties"]["pattern"]["description"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(
+            pattern_guidance.contains("live search"),
+            "{pattern_guidance}"
+        );
+        assert!(
+            pattern_guidance.contains("bounded snapshot"),
+            "{pattern_guidance}"
+        );
+        assert!(
+            pattern_guidance.contains("cannot combine with block or offset"),
+            "{pattern_guidance}"
+        );
+    }
+
+    #[test]
     fn select_description_stays_compact() {
         // Contract prose is bounded in history; discovery is not a promise
         // to inject another schema into a later request.
@@ -1236,7 +1299,7 @@ mod tests {
         let fanout = &parsed["matches"][0];
         let desc = fanout["description"].as_str().unwrap_or_default();
         assert!(
-            desc.contains("Parent work excludes child scope")
+            desc.contains(crate::agent_parent_scope_guidance!())
                 && desc.contains("Exact provider/Offering")
                 && desc.contains("slots=target_count")
                 && desc.contains("description+prompt")
@@ -1258,6 +1321,12 @@ mod tests {
             assert_eq!(parsed["selection_status"], "ok", "{query}: {parsed}");
             for selected in parsed["matches"].as_array().unwrap() {
                 let parameters = &selected["parameters"]["properties"];
+                if selected["name"] == "agent" {
+                    assert_eq!(
+                        parameters["agent_id"]["description"],
+                        "get_result/list only."
+                    );
+                }
                 let brief = if selected["name"] == "agent" {
                     &parameters["prompt"]
                 } else {
@@ -1269,7 +1338,7 @@ mod tests {
                     normalized.contains("exact output")
                         || normalized.contains("exact child output")
                 );
-                assert!(guidance.contains("parent uses model/status receipts"));
+                assert!(guidance.contains("parent") && guidance.contains("model/status receipts"));
                 assert!(brief.get("x-astra-discovery-summary").is_none());
                 let reasoning = if selected["name"] == "agent" {
                     vec![&parameters["reasoning"]]
@@ -1280,7 +1349,16 @@ mod tests {
                     ]
                 };
                 for control in reasoning {
-                    assert_eq!(control["description"], "Omit outside user-requested scope.");
+                    let guidance = control["description"].as_str().unwrap();
+                    for term in [
+                        "User scope only",
+                        "mode=adaptive",
+                        "effort",
+                        "mode=enabled",
+                        "budget_tokens",
+                    ] {
+                        assert!(guidance.contains(term));
+                    }
                     assert!(control.get("x-astra-discovery-summary").is_none());
                 }
                 let policies = if selected["name"] == "agent" {
@@ -1291,7 +1369,28 @@ mod tests {
                         &parameters["slots"]["items"]["properties"]["requested_model_policy"],
                     ]
                 };
+                let executions = if selected["name"] == "agent" {
+                    vec![&parameters["execution"]]
+                } else {
+                    vec![
+                        &parameters["defaults"]["properties"]["execution"],
+                        &parameters["slots"]["items"]["properties"]["execution"],
+                    ]
+                };
+                for execution in executions {
+                    let guidance = execution["description"].as_str().expect(
+                        "selected execution must distinguish provider collaborators from Chat Offerings",
+                    );
+                    assert!(guidance.contains("provider directory"));
+                    assert!(guidance.contains("requested_model_policy"));
+                    assert!(execution.get("x-astra-discovery-summary").is_none());
+                }
                 for policy in policies {
+                    let guidance = policy["description"].as_str().unwrap();
+                    assert!(guidance.contains("inherit"));
+                    assert!(guidance.contains("model_catalog"));
+                    assert!(guidance.contains("fixed"));
+                    assert!(guidance.contains("User model override"));
                     let source = &policy["oneOf"][1]["properties"]["selector"]["oneOf"][1]["properties"]
                         ["source"];
                     assert_eq!(source["description"], "Exact provider/access_label.");
@@ -1373,20 +1472,21 @@ mod tests {
     #[test]
     fn explicit_selection_materializes_conditional_required_fields() {
         let schemas = crate::schemas::all_tool_schemas();
-
-        let selected = tool_search(&schemas, &json!({"query": "select:agent"}));
-        let selected: Value = serde_json::from_str(&selected).expect("valid json");
-        let parameters = &selected["matches"][0]["parameters"];
-        let description = parameters["description"]
-            .as_str()
-            .expect("compact parameters must explain action requirements");
-        assert!(
-            description.contains("spawn requires description + prompt"),
-            "conditional spawn fields must survive compact discovery: {selected}"
-        );
-        assert!(
-            parameters.get("x-astra-per-action-required").is_none(),
-            "internal action metadata must remain hidden from the model schema"
-        );
+        for (query, required) in [
+            ("select:agent", "spawn requires description + prompt"),
+            ("select:worktree", "enter requires branch"),
+        ] {
+            let selected = tool_search(&schemas, &json!({"query": query}));
+            let selected: Value = serde_json::from_str(&selected).expect("valid json");
+            let parameters = &selected["matches"][0]["parameters"];
+            let description = parameters["description"]
+                .as_str()
+                .expect("compact parameters must explain action requirements");
+            assert!(description.contains(required), "{selected}");
+            assert!(
+                parameters.get("x-astra-per-action-required").is_none(),
+                "internal action metadata must remain hidden from the model schema"
+            );
+        }
     }
 }

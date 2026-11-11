@@ -2,8 +2,7 @@
 //! Model proposals are execution inputs, never a second source of user authority.
 
 use astra_turn_types::{
-    AutoModelStrategy, DelegationReasoningRequirement, ModelSelection, ModelSelector,
-    RequestedModelPolicy,
+    AutoModelStrategy, ModelSelection, ModelSelector, ReasoningRequirement, RequestedModelPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,7 +33,7 @@ pub struct DelegationSlotBrief {
     /// Structured reasoning control already validated from this exact tool
     /// slot. Keeping it beside the canonical slot prevents Auto from being
     /// resolved against a weaker pre-override reasoning default.
-    pub reasoning: Option<DelegationReasoningRequirement>,
+    pub reasoning: Option<ReasoningRequirement>,
     /// Runtime-authored position within one invocation. The proposal remains
     /// untrusted matching data, not a source of user requirements.
     pub invocation: Option<DelegationSlotInvocation>,
@@ -258,7 +257,7 @@ pub fn parse_delegation_scope_response(
     {
         return Err("delegation scope response exceeds its bounded contract".into());
     }
-    let value = astra_turn_types::parse_unique_judgment_json(raw.as_bytes())
+    let value = astra_turn_types::parse_unique_json(raw.as_bytes())
         .map_err(|_| "delegation scope response is not valid JSON")?;
     let binding: DelegationScopeBinding = serde_json::from_value(value)
         .map_err(|_| "delegation scope response has an invalid schema")?;
@@ -604,6 +603,7 @@ mod tests {
 
     fn offered(name: &str, provider: &str, id: &str) -> ModelListItem {
         ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: id.into(),
             access_id: "test-access".into(),

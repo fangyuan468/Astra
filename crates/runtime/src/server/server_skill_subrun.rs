@@ -148,8 +148,8 @@ impl Drop for OuterSkillDispatchGuard {
 /// but shared LLM credentials and skill resolver.
 pub struct ServerSkillSubRunExecutor {
     #[cfg(any(test, feature = "e2e-hooks"))]
-    pub(crate) test_inference_ledger:
-        Option<crate::turn::llm::durable::TestInferenceLedgerPersistence>,
+    pub(crate) provider_observations:
+        Option<crate::server::provider_test_support::ProviderObservationsFixture>,
     model_catalog_reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
     model_service: Option<Arc<dyn astra_services::ModelService>>,
     matrixone: MatrixOneSettings,
@@ -229,9 +229,15 @@ impl ServerSkillSubRunExecutor {
     async fn inherited_model_execution(
         &self,
         parent_run_id: &str,
-    ) -> Result<Option<AdmittedModelExecution>, String> {
+    ) -> Result<
+        (
+            Option<AdmittedModelExecution>,
+            Option<astra_turn_core::thinking_config::ThinkingConfig>,
+        ),
+        String,
+    > {
         let Some(engine) = &self.run_engine else {
-            return Ok(self.admitted_model_execution.clone());
+            return Ok((self.admitted_model_execution.clone(), None));
         };
         crate::server::model_execution_admission::inherit_routed_execution(
             engine,
@@ -291,7 +297,7 @@ impl ServerSkillSubRunExecutor {
     ) -> Self {
         Self {
             #[cfg(any(test, feature = "e2e-hooks"))]
-            test_inference_ledger: None,
+            provider_observations: None,
             model_service: None,
             model_catalog_reader: None,
             matrixone,
@@ -626,7 +632,7 @@ impl ServerSkillSubRunExecutor {
         self.apply_execution_binding_snapshot(&mut executor);
         executor.set_invocation_ledger(invocation_ledger);
         if let Some(pool) = &self.shared_pool {
-            executor.set_context_manifest_pool(pool.clone());
+            executor.set_service_pool(pool.clone());
         }
         Ok(executor)
     }
@@ -974,7 +980,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         };
 
         let execution_result: Result<SubRunResult, String> = async {
-        let admitted_model_execution = self.inherited_model_execution(parent_run_id).await?;
+        let (admitted_model_execution, inherited_thinking) =
+            self.inherited_model_execution(parent_run_id).await?;
         let effective_model = admitted_model_execution.as_ref()
             .map(|execution| execution.model_name.clone()).or_else(|| self.default_model.clone());
         let compact_strategy = admitted_model_execution
@@ -1024,6 +1031,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             self.session_id.clone(),
         )
         .with_model(effective_model.clone())
+        .with_preserved_thinking(inherited_thinking.as_ref().is_some_and(|thinking| {
+            *thinking != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault
+        }))
         .with_model_service(self.model_service.clone())
         .with_model_catalog_reader(self.model_catalog_reader.clone())
         .with_provider_scope_bound(admitted_model_execution.as_ref().is_some_and(|execution| {
@@ -1041,8 +1051,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         .with_interaction_mode(Some(self.interaction_mode));
 
         #[cfg(any(test, feature = "e2e-hooks"))]
-        if let Some(ledger) = self.test_inference_ledger.as_ref() {
-            builder = builder.with_test_inference_ledger(ledger.clone());
+        if let Some(ledger) = self.provider_observations.as_ref() {
+            builder = builder.with_provider_observations(ledger.clone());
         }
         if let Some(snapshot) = &self.execution_binding_snapshot {
             builder = builder.with_execution_binding_snapshot(snapshot.clone());
@@ -1117,11 +1127,12 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
 
         let mut state = AgenticLoopState {
             messages,
+            thinking: inherited_thinking.unwrap_or_default(),
             current_session_id: Some(self.session_id.clone()),
             current_run_id: Some(parent_run_id.to_string()),
             current_run_owner_generation: Some(parent_owner_generation),
-            context_manifest_user_id: Some(self.user_id.clone()),
-            context_manifest_model_name: effective_model.clone(),
+            owner_user_id: Some(self.user_id.clone()),
+            policy_model_name: effective_model.clone(),
             recursion_depth: child_recursion_depth,
             max_turns: initial_turns,
             remaining_turns: initial_turns,
@@ -1160,6 +1171,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 flag: None,
                 pause_flag: None,
                 token: self.cancel_token.clone(),
+                inference_token: None,
                 execution_lease_lost: self.execution_lease_lost.clone(),
                 resolved_origin: None,
             },
@@ -1362,7 +1374,7 @@ mod tests {
             SESSION_ID, ServiceBackedOffering, USER_ID, auto_parent_run, genesis_execution,
         };
         use crate::server::provider_test_support::{
-            InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+            ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
         };
         const SECRET: &str = "FIRST_FORK_ONLY_FILE_EVIDENCE";
         const TASK: &str = "Explain the supplied facts without making changes.";
@@ -1426,7 +1438,7 @@ mod tests {
                 engine.clone(),
             )
             .unwrap();
-        let inference = InferenceLedgerFixture::default();
+        let inference = ProviderObservationsFixture::default();
         let mut executor = ServerSkillSubRunExecutor::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -1475,7 +1487,7 @@ mod tests {
             "fork-parent-owner".into(),
             invocation_ledger,
         );
-        executor.test_inference_ledger = Some(inference.persistence.clone());
+        executor.provider_observations = Some(inference.clone());
         for (invocation, chain, reason) in [
             (
                 None,
@@ -1537,7 +1549,7 @@ mod tests {
         assert!(error.contains("frozen parent completion contract"));
         executor.completion_checks = frozen;
         assert!(gateway.requests.lock().await.is_empty());
-        assert!(inference.admissions().is_empty());
+        assert!(inference.requests().is_empty());
         assert_eq!(inference.attempt_count(), 0);
         let mut expected_epochs = std::collections::HashSet::new();
         for (name, invocation) in [
@@ -1594,7 +1606,7 @@ mod tests {
         gateway.assert_complete();
         inference.assert_quiescent();
         assert_eq!(inference.attempt_count(), 4);
-        let admissions = inference.admissions();
+        let admissions = inference.requests();
         assert_eq!(admissions.len(), 4);
         let operations: std::collections::HashSet<_> = admissions
             .iter()
@@ -1692,7 +1704,7 @@ mod tests {
             SESSION_ID, ServiceBackedOffering, USER_ID, auto_parent_run, genesis_execution,
         };
         use crate::server::provider_test_support::{
-            InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+            ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
         };
 
         let workspace = tempfile::TempDir::new().unwrap();
@@ -1755,7 +1767,7 @@ mod tests {
                 engine.clone(),
             )
             .unwrap();
-        let inference = InferenceLedgerFixture::default();
+        let inference = ProviderObservationsFixture::default();
 
         // Model the real root restore path: session-only state is restored on
         // the root owner, then projected through the existing child boundary.
@@ -1809,7 +1821,7 @@ mod tests {
             "permission-parent-owner".into(),
             invocation_ledger,
         );
-        executor.test_inference_ledger = Some(inference.persistence.clone());
+        executor.provider_observations = Some(inference.clone());
 
         let allowed_tools = vec!["write_file".to_string()];
         let result = executor
@@ -1875,7 +1887,7 @@ mod tests {
             .inherited_model_execution("auto-skill-parent")
             .await
             .unwrap();
-        assert_eq!(inherited, Some(execution));
+        assert_eq!(inherited, (Some(execution), None));
         assert_eq!(service.calls(), vec![(USER_ID.into(), OFFERING_ID.into())]);
 
         service.revoke();

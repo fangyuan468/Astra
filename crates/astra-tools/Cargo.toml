@@ -8,6 +8,7 @@ description = "Tool execution library shared by the Astra CLI and server"
 
 [dependencies]
 astra-text-utils.workspace = true
+astra-config.workspace = true
 astra-core.workspace = true
 astra-memoria.workspace = true
 astra-prompts.workspace = true
@@ -31,6 +32,9 @@ tracing.workspace = true
 uuid.workspace = true
 url = "2.5"
 scraper = "0.27"
+# Opt-in fake-IP validation: RFC 8484 DNS messages and CIDR ranges.
+hickory-proto = { version = "0.26.1", default-features = false, features = ["std"] }
+ipnet = "2.12"
 futures = "0.3"
 fs2.workspace = true
 hex.workspace = true

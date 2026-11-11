@@ -663,7 +663,10 @@ async fn run_turn(
     let event_writer = writer.clone();
     let event_task = tokio::spawn(async move {
         while let Some(event) = stream_rx.recv().await {
-            let _ = write_stream_notification(&event_writer, event).await;
+            if let Err(error) = write_stream_notification(&event_writer, event).await {
+                eprintln!("app-server stream observer unavailable: {error}");
+                break;
+            }
         }
     });
     let (approval_tx, mut approval_rx) =
@@ -742,9 +745,9 @@ async fn run_turn(
         unified_skill_registry,
         agent_spawner: None,
         root_agent_id: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         stream_event_tx: Some(stream_tx),
         stream_json_emitter: None,
         #[cfg(feature = "harness")]
@@ -790,7 +793,7 @@ async fn run_turn(
     let mut sr = match result {
         Ok(sr) => sr,
         Err(err) => {
-            let error = err.error;
+            let error = crate::cli::turn::turn_failure_reporting::turn_failure_diagnostic(&err);
             write_notification(&writer, "error", serde_json::json!({"message": error})).await?;
             write_notification(
                 &writer,
@@ -1308,6 +1311,9 @@ fn stream_event_notification(event: &StreamEvent) -> Option<(&'static str, Value
             "turn/runtimeFeedback",
             serde_json::json!({"runtimeFeedback": frame}),
         )),
+        StreamEvent::SystemWarning(message) => {
+            Some(("warning", serde_json::json!({"message": message})))
+        }
         StreamEvent::ToolStarted {
             name,
             description,
@@ -1534,6 +1540,9 @@ async fn write_json_line(writer: &JsonWriter, value: Value) -> Result<(), String
 
 async fn write_raw_json_line(writer: &JsonWriter, value: Value) -> Result<(), String> {
     let line = serde_json::to_string(&value).map_err(|e| e.to_string())?;
+    // One detached thread owns stdout, so an unread pipe neither blocks the
+    // async executor nor prevents the runtime from shutting down. Delivery
+    // remains uncertain if the deadline expires after a write started.
     let (reply, result) = oneshot::channel();
     tokio::time::timeout(Duration::from_secs(5), async {
         writer
@@ -1577,6 +1586,67 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_output_does_not_block_the_async_executor() {
+        let (started_tx, started_rx) = oneshot::channel();
+        let mut started_tx = Some(started_tx);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = JsonWriter::start(move |_| {
+            let _ = started_tx.take().unwrap().send(());
+            release_rx.recv().unwrap();
+            Ok(())
+        });
+        let task = tokio::spawn(async move {
+            super::write_json_line(&writer, serde_json::json!({"id":1})).await
+        });
+        started_rx.await.unwrap();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let error = task
+            .await
+            .unwrap()
+            .expect_err("unread output must time out");
+        assert!(error.contains("may still complete"));
+        release_tx.send(()).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_queued_output_is_not_delivered_later() {
+        let (started_tx, started_rx) = oneshot::channel();
+        let mut started_tx = Some(started_tx);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = written.clone();
+        let writer = JsonWriter::start(move |line| {
+            if let Some(started) = started_tx.take() {
+                let _ = started.send(());
+                release_rx.recv().unwrap();
+            }
+            output.lock().unwrap().push(line.to_owned());
+            Ok(())
+        });
+        let first_writer = writer.clone();
+        let first = tokio::spawn(async move {
+            super::write_json_line(&first_writer, serde_json::json!({"id":1})).await
+        });
+        started_rx.await.unwrap();
+        let second_writer = writer.clone();
+        let second = tokio::spawn(async move {
+            super::write_json_line(&second_writer, serde_json::json!({"id":2})).await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(first.await.unwrap().is_err());
+        assert!(second.await.unwrap().is_err());
+        release_tx.send(()).unwrap();
+        // The output owner is a real OS thread; let it run without Tokio's
+        // paused-clock auto-advance racing the next write's deadline.
+        tokio::time::resume();
+        super::write_json_line(&writer, serde_json::json!({"id":3}))
+            .await
+            .unwrap();
+        assert_eq!(*written.lock().unwrap(), ["{\"id\":1}", "{\"id\":3}"]);
+    }
 
     #[tokio::test]
     #[serial_test::serial]
@@ -1624,6 +1694,16 @@ mod tests {
                 .expect("runtime feedback notification");
         assert_eq!(method, "turn/runtimeFeedback");
         assert_eq!(params["runtimeFeedback"], serde_json::json!(frame));
+    }
+
+    #[test]
+    fn app_server_forwards_system_warnings() {
+        let message = "A previous tool result is unknown; inspect the state before retrying.";
+        let (method, params) =
+            stream_event_notification(&StreamEvent::SystemWarning(message.into()))
+                .expect("warning notification");
+        assert_eq!(method, "warning");
+        assert_eq!(params["message"], message);
     }
 
     #[test]

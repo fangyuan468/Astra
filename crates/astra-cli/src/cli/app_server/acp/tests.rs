@@ -484,11 +484,16 @@ async fn new_session_uses_server_identity_and_authoritative_model_catalog() {
             description: None,
             max_completion_tokens: None,
             architecture: None,
-            thinking_capability: (id == "offer-two")
-                .then_some(astra_services::models::ThinkingCapability::EffortOnly),
+            thinking_capability: Some(astra_services::models::ThinkingCapability::EffortOnly),
+            supported_reasoning_efforts: Some(if id == "offer-one" {
+                vec!["low".into(), "high".into()]
+            } else {
+                vec!["low".into(), "high".into(), "max".into()]
+            }),
             pricing: None,
-            thinking_protocol: (id == "offer-two")
-                .then_some(astra_core::model_wire::thinking::ThinkingProtocol::ReasoningEffort),
+            thinking_protocol: Some(
+                astra_core::model_wire::thinking::ThinkingProtocol::ReasoningEffort,
+            ),
         })
         .collect();
     Mock::given(method("POST"))
@@ -584,6 +589,31 @@ async fn new_session_uses_server_identity_and_authoritative_model_catalog() {
     assert_eq!(
         server.sessions[&id].model_selector().as_deref(),
         Some("offer-two")
+    );
+    server
+        .dispatch(
+            "session/set_model",
+            &json!({"sessionId":id,"modelId":"offer-one"}),
+            Some(json!(41)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        server.sessions[&id].config_options()[1]["options"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(
+        server
+            .dispatch(
+                "session/set_config_option",
+                &json!({"sessionId":id,"configId":"effort","value":"max"}),
+                Some(json!(42)),
+            )
+            .await
+            .is_err()
     );
     mock.verify().await;
 }
@@ -728,6 +758,7 @@ async fn selected_reasoning_effort_reaches_chat_admission() {
         max_completion_tokens: None,
         architecture: None,
         thinking_capability: Some(astra_services::models::ThinkingCapability::EffortOnly),
+        supported_reasoning_efforts: Some(vec!["low".into(), "high".into(), "max".into()]),
         pricing: None,
         thinking_protocol: Some(
             astra_core::model_wire::thinking::ThinkingProtocol::ReasoningEffort,

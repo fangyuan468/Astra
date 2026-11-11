@@ -14,7 +14,7 @@
 //!
 //! ```json
 //! {
-//!   "schema": "astra.context_dump/v2",
+//!   "schema": "astra.context_dump/v3",
 //!   "captured_at": "2026-05-20T11:13:00Z",
 //!   "session_id": "abc…",
 //!   "turn": 5,
@@ -27,13 +27,9 @@
 //! }
 //! ```
 //!
-//! The `trace` field serialises every byte the runtime recorded
-//! (token budget, system-prompt breakdown, tool-surface, memory,
-//! and decision traces).  `chat_history` captures
-//! the same user/assistant/reasoning text the TUI shows, so the
-//! dump reproduces what the model "saw" this turn.  This is the
-//! truth file — paste it into a bug report and the maintainer
-//! can replay the exact context you had.
+//! `trace` contains the latest recorded context observation, or null when
+//! unavailable. Visible chat history is separate display evidence; it does
+//! not reconstruct the provider's exact request or compaction history.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -44,7 +40,7 @@ use serde::Serialize;
 
 use crate::cli::session::session_state::SessionState;
 
-const SCHEMA_VERSION: &str = "astra.context_dump/v2";
+const SCHEMA_VERSION: &str = "astra.context_dump/v3";
 
 /// Wire format for the dump.  All fields use plain owned types so
 /// the file is round-trippable by other tooling (no Rc / Arc).
@@ -62,7 +58,7 @@ pub struct ContextDump {
     /// (either via the live ObservabilitySession or a persisted
     /// journal).  Missing traces land here as `None` so the dump
     /// still records the chat history.
-    pub trace: Option<serde_json::Value>,
+    pub trace: Option<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>,
     pub chat_history: Vec<ChatTurnDump>,
     pub totals: Totals,
     pub compressed_turns: Vec<u32>,
@@ -104,10 +100,7 @@ pub(crate) fn write_dump_for_repl(
 fn build_dump_from_repl(state: &SessionState, chat_history: Vec<ChatTurnDump>) -> ContextDump {
     let trace_json = state.observability_session.as_ref().and_then(|session| {
         let guard = astra_core::sync_poison::recover_rwlock_read(&session);
-        guard
-            .context_traces
-            .last()
-            .map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null))
+        guard.context_traces.last().cloned()
     });
     let compressed_turns = state
         .observability_session
@@ -239,7 +232,10 @@ pub fn print_summary(session_id: &str) -> Result<(), String> {
             .iter()
             .map(|t| t.to_string())
             .collect();
-        stdout_println!("  compaction fired on turns: {}", rendered.join(", "));
+        stdout_println!(
+            "  turns with recorded compaction markers: {}",
+            rendered.join(", ")
+        );
     }
     if dump.trace.is_none() {
         stdout_println!("  trace: (none captured in journal)");
@@ -277,7 +273,7 @@ fn build_dump_from_journal(session_id: &str) -> Result<ContextDump, String> {
 
     let mut chat = Vec::<ChatTurnDump>::new();
     let mut last_turn: u32 = 0;
-    let mut trace_json: Option<serde_json::Value> = None;
+    let mut latest_trace_event = None;
     let mut model: Option<String> = None;
     let mut cwd: Option<String> = None;
     let mut git_branch: Option<String> = None;
@@ -350,15 +346,22 @@ fn build_dump_from_journal(session_id: &str) -> Result<ContextDump, String> {
                 }
             }
             JournalEventType::ContextAssemblyRecorded => {
-                // Serialise the whole event so all the trace fields
-                // come along for the ride — serde round-trips cleanly.
-                if let Ok(v) = serde_json::to_value(ev) {
-                    trace_json = Some(v);
-                }
+                latest_trace_event = Some(ev);
             }
             _ => {}
         }
     }
+    let trace_json = latest_trace_event
+        .map(|event| {
+            let payload = event
+                .context_assembly_trace
+                .clone()
+                .ok_or_else(|| "latest context trace event has no trace payload".to_string())?;
+            serde_json::from_value(payload).map_err(|error| {
+                format!("latest context trace payload is invalid or unsupported: {error}")
+            })
+        })
+        .transpose()?;
     crate::cli::history_work::record_text_payload(
         astra_core::history_work::HistoryWorkSite::CliContextDumpJournalHistoryMaterialization,
         chat.len(),
@@ -467,6 +470,86 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn dump_writers_share_trace_payload_and_reject_invalid_latest_evidence() {
+        use astra_services::session_journal::{JournalDirGuard, JournalEvent, JournalWriter};
+        use astra_turn_core::context_assembly_trace::{
+            ContextAssemblyTrace, HistorySelectionTrace, ModelRequestTraceIdentity,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let _journal = JournalDirGuard::new(root.path());
+        let sid = "context-shared-payload";
+        let writer = JournalWriter::new(sid).unwrap();
+        writer
+            .append(&JournalEvent::session_start(Some(sid), None))
+            .unwrap();
+        let absent_path = root.path().join("absent.json");
+        super::write_dump_from_journal(sid, absent_path.to_str()).unwrap();
+        let absent: serde_json::Value =
+            serde_json::from_slice(&fs::read(absent_path).unwrap()).unwrap();
+        assert!(absent["trace"].is_null());
+        let trace = ContextAssemblyTrace {
+            turn_id: "turn-1".into(),
+            session_id: sid.into(),
+            request_identity: Some(ModelRequestTraceIdentity {
+                request_id: "request-1".into(),
+                request_hash: "hash-1".into(),
+                round: 2,
+                attempt: 1,
+                provider_response_id: None,
+            }),
+            history: Some(HistorySelectionTrace::default()),
+            ..Default::default()
+        };
+        writer
+            .append(&JournalEvent::context_assembly_recorded(
+                Some(sid),
+                1,
+                trace.to_json_value(),
+            ))
+            .unwrap();
+        let hub = astra_runtime::observability::ObservabilityHub::new();
+        let session = hub.start_session("dump-owner", sid);
+        session.write().unwrap().record_context_trace(trace.clone());
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.session_id = Some(sid.into());
+        state.observability_session = Some(session);
+        let live_path = root.path().join("live.json");
+        let persisted_path = root.path().join("persisted.json");
+        super::write_dump_for_repl(&state, Vec::new(), live_path.to_str()).unwrap();
+        super::write_dump_from_journal(sid, persisted_path.to_str()).unwrap();
+        let live: serde_json::Value =
+            serde_json::from_slice(&fs::read(live_path).unwrap()).unwrap();
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&persisted_path).unwrap()).unwrap();
+        assert_eq!(live["schema"], "astra.context_dump/v3");
+        assert_eq!(live["schema"], persisted["schema"]);
+        assert_eq!(live["trace"], persisted["trace"]);
+        assert!(persisted["trace"].get("explanations").is_none());
+        assert_eq!(
+            persisted["trace"]["request_identity"]["request_id"],
+            "request-1"
+        );
+        assert_eq!(
+            persisted["trace"]["history"],
+            serde_json::json!({"turns_retained":[], "total_tokens":0})
+        );
+        let mut legacy = trace.to_json_value();
+        legacy["history"] =
+            serde_json::json!({"turns_retained":[],"tokens_before":12,"tokens_after":12});
+        for payload in [Some(serde_json::Value::Bool(false)), Some(legacy), None] {
+            let mut invalid =
+                JournalEvent::context_assembly_recorded(Some(sid), 2, serde_json::Value::Null);
+            invalid.context_assembly_trace = payload;
+            writer.append(&invalid).unwrap();
+            assert!(
+                super::write_dump_from_journal(sid, persisted_path.to_str())
+                    .unwrap_err()
+                    .contains("latest context trace")
+            );
+        }
+    }
+
+    #[test]
     fn unknown_cost_is_null_in_live_dump() {
         let mut state = crate::cli::session::session_state::SessionState::default();
         state.total_session_cost = None;
@@ -528,7 +611,20 @@ mod tests {
             git_branch: None,
             persistence_error: None,
             trace: Some(
-                serde_json::json!({"system_prompt": {"skills_injected": [{"skill_name":"review", "tokens":42}]}}),
+                astra_turn_core::context_assembly_trace::ContextAssemblyTrace {
+                    system_prompt: astra_turn_core::context_assembly_trace::SystemPromptBreakdown {
+                        skills_injected: vec![
+                            astra_turn_core::context_assembly_trace::SkillInjection {
+                                skill_name: "review".into(),
+                                skill_version: None,
+                                tokens: 42,
+                                selection_reason: String::new(),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
             ),
             chat_history: vec![ChatTurnDump {
                 role: "user".into(),
@@ -546,7 +642,7 @@ mod tests {
         write_json(&path, &dump).unwrap();
         let raw = fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(value["schema"], "astra.context_dump/v2");
+        assert_eq!(value["schema"], "astra.context_dump/v3");
         assert!(value.get("active_skills").is_none());
         assert_eq!(
             value["trace"]["system_prompt"]["skills_injected"][0]["skill_name"],

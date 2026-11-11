@@ -1,6 +1,6 @@
 import { AstraClient, AstraApiError, chatRequestToWire } from "../client";
 import { PATH_SESSIONS } from "../paths";
-import type { SessionAuditSummary } from "../index";
+import type { RuntimeSessionResumeResponse, SessionAuditSummary } from "../index";
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
@@ -396,14 +396,27 @@ describe("AstraClient — Runs", () => {
   });
 
   test("cancelRun", async () => {
-    globalThis.fetch = mockFetch(200);
-    await createClient().cancelRun("r1");
+    globalThis.fetch = mockFetch(200, { run_id: "r1", status: "cancelled", execution_settled: true, context_not_saved: true });
+    expect(await createClient().cancelRun("r1")).toEqual({ runId: "r1", status: "cancelled", executionSettled: true, contextNotSaved: true });
     expect(
       (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
     ).toContain("/chat/runs/r1");
     expect(
       (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].method,
     ).toBe("DELETE");
+  });
+
+  test.each([
+    [{ run_id: "other", status: "cancelled", execution_settled: true }, null],
+    [{ run_id: "r1", status: "cancelled", execution_settled: true, context_not_saved: "false" }, null],
+    ["invalid json", null],
+    [{ run_id: "r1", status: "cancelled", execution_settled: true, context_not_saved: false },
+      { runId: "r1", status: "cancelled", executionSettled: true, contextNotSaved: false }],
+    [{ run_id: "r1", status: "cancellation_requested", execution_settled: false },
+      { runId: "r1", status: "cancellation_requested", executionSettled: false }],
+  ])("cancelRun preserves receipt uncertainty (%j)", async (wire, expected) => {
+    globalThis.fetch = mockFetch(200, wire);
+    expect(await createClient().cancelRun("r1")).toEqual(expected);
   });
 
   test("pauseRun", async () => {
@@ -428,11 +441,52 @@ describe("AstraClient — Runs", () => {
       'data: {"type":"turn_complete"}\n\n';
     globalThis.fetch = mockFetch(200, sse);
 
-    const events = await createClient().getRunEvents("r1", 5);
+    const client = new AstraClient({
+      baseUrl: "http://localhost:8000", pathPrefix: "/api", accessToken: "current-token",
+      headers: { accept: "application/json", AUTHORIZATION: "Bearer stale-token", "X-Custom": "preserved" },
+    });
+    const events = await client.getRunEvents("r1", 5);
     expect(events).toHaveLength(2);
     expect(
       (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
-    ).toContain("last_index=5");
+    ).toBe("http://localhost:8000/api/chat/runs/r1/stream?last_index=5");
+    const headers = new Headers((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].headers);
+    expect(headers.get("Accept")).toBe("text/event-stream");
+    expect(headers.get("Authorization")).toBe("Bearer current-token");
+    expect(headers.get("X-Custom")).toBe("preserved");
+  });
+
+  test("getRunEvents preserves structured API errors", async () => {
+    globalThis.fetch = mockFetch(429, {
+      detail: "Try later", code: "rate_limited", category: "capacity",
+      retryable: true, action_hints: ["retry_later"],
+    }, { "Content-Type": "application/json" });
+    await expect(createClient().getRunEvents("r1")).rejects.toMatchObject({
+      status: 429, body: "Try later", path: "/chat/runs/r1/stream?last_index=0",
+      code: "rate_limited", category: "capacity", retryable: true, actionHints: ["retry_later"],
+    });
+  });
+
+  test("getSessionConversation preserves typed input identity and raw cursors", async () => {
+    const body = { kind: "conversation", session: { session_id: "s1" },
+      selected_root: { run_id: "r1", status: "failed" },
+      items: [{ kind: "opening", id: "input:r1:source-1", run_id: "r1", content: " \n你好 ",
+        source_event_id: "source-1", created_at: "2026-10-25T03:00:00.123456Z" }],
+      history_loaded: true, raw_page: { next_before_seq: null, has_more: false }, truncated: false };
+    globalThis.fetch = mockFetch(200, body);
+    expect(await createClient().getSessionConversation("s1")).toEqual(body);
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain("/sessions/s1/transcript?scope=conversation&limit=200");
+  });
+
+  test("getSessionConversation sends the reusable continuation and preserves explicit history omission", async () => {
+    const body = { kind: "conversation", session: { session_id: "s1" },
+      selected_root: { run_id: "r1", status: "completed" },
+      history_loaded: false, items: [], raw_page: null, truncated: null };
+    globalThis.fetch = mockFetch(200, body);
+    expect(await createClient().getSessionConversation("s1", 200, { runId: "r1", preserveTerminal: true })).toEqual(body);
+    const url = new URL((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+    expect(url.searchParams.get("reuse_run_id")).toBe("r1");
+    expect(url.searchParams.get("reuse_terminal")).toBe("true");
   });
 
   test("getRunProjection uses bounded projection endpoint", async () => {
@@ -457,18 +511,9 @@ describe("AstraClient — Runs", () => {
       transport: "edge_ws",
       fallback_policy: "disabled",
       run_event_high_watermark: 7,
-      projection_event_idx: 6,
-      projection_updated_at: "2026-06-10T00:00:00.000Z",
-      projection_hash: "hash",
       total_prompt_tokens: 1,
       total_completion_tokens: 2,
       total_tool_calls: 3,
-      observability: {
-        has_durable_projection: true,
-        observability_available: true,
-        projection_lag_events: 1,
-        prompt_request_count: 0,
-      },
       recent_events: [
         { type: "tool_call_start", call_id: "call-1", tool: "bash" },
       ],
@@ -488,41 +533,7 @@ describe("AstraClient — Runs", () => {
     expect(url).toContain("recent_limit=25");
   });
 
-  test("repairRunProjection posts to repair endpoint", async () => {
-    globalThis.fetch = mockFetch(200, {
-      repaired: true,
-      projection: {
-        run_id: "r1",
-        session_id: "s1",
-        status: "running",
-        run_event_high_watermark: 7,
-        projection_event_idx: 7,
-        projection_updated_at: "2026-06-10T00:00:00.000Z",
-        projection_hash: "hash",
-        total_prompt_tokens: 1,
-        total_completion_tokens: 2,
-        total_tool_calls: 3,
-        observability: {
-          has_durable_projection: true,
-          observability_available: true,
-          projection_lag_events: 0,
-          prompt_request_count: 0,
-        },
-        recent_events: [],
-      },
-    });
 
-    const repaired = await createClient().repairRunProjection("r1", {
-      recentLimit: 10,
-    });
-
-    expect(repaired.repaired).toBe(true);
-    expect(repaired.projection.projection_event_idx).toBe(7);
-    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(call[0]).toContain("/chat/runs/r1/projection/repair");
-    expect(call[0]).toContain("recent_limit=10");
-    expect(call[1].method).toBe("POST");
-  });
 
   test("listRuns normalizes snake_case runs", async () => {
     globalThis.fetch = mockFetch(200, {
@@ -768,12 +779,25 @@ describe("AstraClient — Session lifecycle and reflect", () => {
     ).toContain("/sessions/sx/close");
   });
 
-  test("resumeSession", async () => {
-    globalThis.fetch = mockFetch(200, sessWire);
-    await createClient().resumeSession("sx");
-    expect(
-      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
-    ).toContain("/sessions/sx/resume");
+  test("resumeSession preserves canonical hydration without inventing Session metadata", async () => {
+    const restored: RuntimeSessionResumeResponse = {
+      session_id: "sx", turn_count: 2, last_status: "active",
+      total_tokens_in: 10, total_tokens_out: 5,
+      recent_tools: [], checkpoint_count: 0, git_branch: null,
+      model: null, title: "restored", restored_from_cloud: true,
+      resume_bundle: { schema_version: 1, source: "canonical_journal",
+        cursor: { schema_version: 1, owner_id: "owner", session_id: "sx", branch_id: "main",
+          completed_turn: 2, journal_event_seq: 2, conversation_seq: 2,
+          canonical_root_hash: "root", projection_schema: 2, compaction_generation: 0 },
+        conversation_messages: [{ role: "assistant", content: "retained" }], projections: {} },
+    };
+    globalThis.fetch = mockFetch(200, restored);
+    const result = await createClient().resumeSession("sx");
+    expect(result).toEqual(restored);
+    expect(result.resume_bundle.conversation_messages).toEqual([{ role: "assistant", content: "retained" }]);
+    expect(result).not.toHaveProperty("createdAt");
+    expect(result).not.toHaveProperty("permission_mode");
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain("/sessions/sx/resume");
   });
 
   test("cancelSession", async () => {
@@ -1015,6 +1039,10 @@ describe("AstraClient — Models", () => {
     expect(
       (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
     ).toContain("/models?limit=200");
+    expect(
+      new Headers((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].headers)
+        .get("x-astra-model-catalog-version"),
+    ).toBe("3");
   });
 
   test("listModels follows seek cursors and rejects a repeated page", async () => {
@@ -1102,6 +1130,119 @@ describe("AstraClient — Models", () => {
     expect(
       (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
     ).toContain("/model-access");
+    expect(
+      new Headers((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].headers)
+        .get("x-astra-model-catalog-version"),
+    ).toBe("3");
+  });
+
+  test("both catalog endpoints preserve the v3 subscription reasoning projection", async () => {
+    // The real production v3 projection: a ChatGPT-subscription Offering
+    // declares the Responses reasoning protocol and its effort inventory.
+    // The SDK requests v3 explicitly and must surface these fields intact —
+    // dropping them would be silent degradation back to the frozen v2 view.
+    const subscriptionOffering = {
+      offering_id: "subscription-offering",
+      access_id: "chatgpt:00000000-0000-4000-8000-000000000001",
+      access_kind: "cloud_byok",
+      access_label: "ChatGPT subscription · personal",
+      execution_placement: "server",
+      name: "coding",
+      provider: "chatgpt",
+      description: null,
+      is_active: true,
+      context_window: 128000,
+      max_completion_tokens: null,
+      architecture: null,
+      thinking_capability: "effort_only",
+      thinking_protocol: "responses_reasoning",
+      supported_reasoning_efforts: ["low", "medium", "high"],
+      pricing: null,
+    };
+    const access = {
+      id: "chatgpt:00000000-0000-4000-8000-000000000001",
+      kind: "cloud_byok",
+      label: "ChatGPT subscription · personal",
+      execution_placement: "server",
+      status: "ready",
+      reason: null,
+      usable: true,
+      retry_after_seconds: null,
+      available_model_count: 1,
+      actions: [],
+    };
+
+    globalThis.fetch = mockFetch(200, {
+      items: [subscriptionOffering],
+      next_cursor: null,
+      limit: 200,
+      total: 1,
+      catalog_revision: "sha256:catalog",
+    });
+    const models = await createClient().listModels();
+    expect(models[0].thinking_protocol).toBe("responses_reasoning");
+    expect(models[0].supported_reasoning_efforts).toEqual([
+      "low",
+      "medium",
+      "high",
+    ]);
+    expect(models[0].thinking_capability).toBe("effort_only");
+    expect(models[0].access_label).toBe("ChatGPT subscription · personal");
+    expect(
+      new Headers((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].headers)
+        .get("x-astra-model-catalog-version"),
+    ).toBe("3");
+
+    globalThis.fetch = mockFetch(200, {
+      accesses: [access],
+      offerings: [subscriptionOffering],
+      default_offering_id: "subscription-offering",
+      default_resolution: { state: "resolved", offering_id: "subscription-offering" },
+      next_cursor: null,
+      limit: 200,
+      total: 1,
+      catalog_revision: "sha256:catalog",
+      observed_at: "2026-07-20T00:00:00Z",
+    });
+    const projection = await createClient().getModelAccess();
+    expect(projection.offerings[0].thinking_protocol).toBe(
+      "responses_reasoning",
+    );
+    expect(projection.offerings[0].supported_reasoning_efforts).toEqual([
+      "low",
+      "medium",
+      "high",
+    ]);
+    expect(projection.accesses[0].usable).toBe(true);
+    expect(
+      new Headers((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].headers)
+        .get("x-astra-model-catalog-version"),
+    ).toBe("3");
+  });
+
+  test("both catalog endpoints propagate a plain HTTP 400 without a silent v2 retry", async () => {
+    // A server that does not accept the requested catalog version answers a
+    // plain 400. The SDK must surface that failure to the caller; silently
+    // re-requesting as v2 would mask the rejection behind the frozen v2 view.
+    for (const endpoint of ["listModels", "getModelAccess"] as const) {
+      const fetchMock = mockFetch(400, {
+        detail: "unsupported model catalog version",
+      });
+      globalThis.fetch = fetchMock;
+      try {
+        const client = createClient();
+        if (endpoint === "listModels") {
+          await client.listModels();
+        } else {
+          await client.getModelAccess();
+        }
+        expect.unreachable();
+      } catch (e) {
+        expect(e).toBeInstanceOf(AstraApiError);
+        expect((e as AstraApiError).status).toBe(400);
+      }
+      expect(fetchMock.mock.calls).toHaveLength(1);
+    }
   });
 
   test("getModelAccess drains pages while preserving first-page default", async () => {

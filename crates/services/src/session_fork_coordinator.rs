@@ -29,6 +29,7 @@ const MAX_REASON_BYTES: usize = 1_024;
 const MAX_LIST_LIMIT: u32 = 200;
 const MAX_WRITER_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_ABORT_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const PROVIDER_PREPARE_TTL_SECONDS: i64 = 24 * 60 * 60;
 
 #[derive(Debug, Error)]
 pub enum SessionForkCoordinatorError {
@@ -36,6 +37,21 @@ pub enum SessionForkCoordinatorError {
     Invalid(String),
     #[error("session fork was not found")]
     NotFound,
+    #[error("session fork is outside the authorized provider scope")]
+    Forbidden,
+    #[error("session creation quota exceeded: {reason}")]
+    QuotaDenied {
+        limit: crate::resource_governor::ResourceLimitKind,
+        reason: String,
+    },
+    #[error("session fork was aborted before activation")]
+    Aborted,
+    #[error("session fork cursor projection is not ready")]
+    CursorNotReady,
+    #[error("session fork cursor is no longer available")]
+    CursorUnavailable,
+    #[error("run does not support a canonical fork cursor")]
+    CursorUnsupported,
     #[error("session fork conflicts with existing child state")]
     Conflict,
     #[error("session fork idempotency key was reused for a different request")]
@@ -70,22 +86,261 @@ pub struct PrepareSessionForkV1 {
     pub reason: String,
 }
 
+/// Activated context without a writer lease or execution authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionForkContinuationV1 {
+    pub manifest: SessionForkManifestV1,
+    pub child_head: astra_turn_types::SessionContextHeadV1,
+}
+
 #[derive(Clone)]
 pub struct DatabaseSessionForkCoordinator {
     pool: SharedPool,
     context: Arc<dyn SessionContextCoordinator>,
+    scope_encryptor: Option<Arc<crate::auth::FernetTokenEncryptor>>,
 }
 
 impl DatabaseSessionForkCoordinator {
     pub fn new(pool: SharedPool, context: Arc<dyn SessionContextCoordinator>) -> Self {
-        Self { pool, context }
+        Self {
+            pool,
+            context,
+            scope_encryptor: None,
+        }
+    }
+
+    pub fn with_scope_encryptor(
+        mut self,
+        encryptor: Arc<crate::auth::FernetTokenEncryptor>,
+    ) -> Self {
+        self.scope_encryptor = Some(encryptor);
+        self
+    }
+
+    /// Resolve an exact root-run commit, never the Session's current head.
+    pub async fn resolve_run_cursor(
+        &self,
+        key: &SessionKeyV1,
+        run_id: &str,
+        provider_scope: Option<&crate::runs::ProviderRunOwner>,
+    ) -> Result<SessionCursorV1, SessionForkCoordinatorError> {
+        validate_key_and_id(key, run_id)?;
+        let run = sqlx::query(
+            "SELECT parent_run_id, root_run_id, depth, status FROM agent_runs
+             WHERE user_id = ? AND session_id = ? AND run_id = ?",
+        )
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(run_id)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| database_error("load_fork_source_run", source))?
+        .ok_or(SessionForkCoordinatorError::NotFound)?;
+        if let Some(required) = provider_scope {
+            authorize_provider_fork_session(
+                self.pool.get(),
+                &key.owner_user_id,
+                &key.session_id,
+                Some(required),
+                self.scope_encryptor.as_deref(),
+                ProviderSessionScopeRequirement::ForkSource,
+            )
+            .await?;
+        }
+        let parent: Option<String> = run
+            .try_get("parent_run_id")
+            .map_err(|source| database_error("decode_fork_source_parent", source))?;
+        let root: String = run
+            .try_get("root_run_id")
+            .map_err(|source| database_error("decode_fork_source_root", source))?;
+        let depth: i32 = run
+            .try_get("depth")
+            .map_err(|source| database_error("decode_fork_source_depth", source))?;
+        let status: String = run
+            .try_get("status")
+            .map_err(|source| database_error("decode_fork_source_status", source))?;
+        if parent.is_some() || root != run_id || depth != 0 {
+            return Err(SessionForkCoordinatorError::CursorUnsupported);
+        }
+        if status != "completed" {
+            return Err(if matches!(status.as_str(), "failed" | "cancelled") {
+                SessionForkCoordinatorError::CursorUnsupported
+            } else {
+                SessionForkCoordinatorError::CursorNotReady
+            });
+        }
+        let rows = sqlx::query(
+        "SELECT DISTINCT canonical_completed_turn, canonical_conversation_seq, canonical_root_hash
+             FROM session_transcript_items WHERE user_id = ? AND session_id = ? AND run_id = ? LIMIT 2",
+    )
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .bind(run_id)
+    .fetch_all(self.pool.get())
+    .await
+    .map_err(|source| database_error("load_fork_source_commit", source))?;
+        if rows.len() != 1 {
+            return Err(
+                if rows.is_empty() && self.context.load_head(key).await?.is_none() {
+                    SessionForkCoordinatorError::CursorUnsupported
+                } else {
+                    SessionForkCoordinatorError::CursorNotReady
+                },
+            );
+        }
+        let row = &rows[0];
+        let turn: Option<i64> = row
+            .try_get("canonical_completed_turn")
+            .map_err(|source| database_error("decode_fork_source_turn", source))?;
+        let sequence: Option<i64> = row
+            .try_get("canonical_conversation_seq")
+            .map_err(|source| database_error("decode_fork_source_sequence", source))?;
+        let root: Option<String> = row
+            .try_get("canonical_root_hash")
+            .map_err(|source| database_error("decode_fork_source_commit_root", source))?;
+        let (Some(turn), Some(sequence), Some(root)) = (turn, sequence, root) else {
+            return Err(if self.context.load_head(key).await?.is_none() {
+                SessionForkCoordinatorError::CursorUnsupported
+            } else {
+                SessionForkCoordinatorError::CursorNotReady
+            });
+        };
+        let row = sqlx::query(
+            "SELECT manifest_json FROM conversation_manifest_nodes FORCE INDEX (uq_context_manifest_root)
+             WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?
+               AND branch_id = ? AND manifest_root = ? AND reachable = 1",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .bind(&root)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| database_error("load_fork_source_manifest", source))?
+        .ok_or(SessionForkCoordinatorError::CursorUnavailable)?;
+        let node: astra_turn_types::ContextManifestNodeV1 =
+            decode_json_row(&row, "manifest_json", "fork_source_manifest")?;
+        node.validate()
+            .map_err(|error| SessionForkCoordinatorError::NeedsRepair(error.to_string()))?;
+        let cursor = node.cursor();
+        if node.key != *key
+            || cursor.canonical_root_hash != root
+            || i64::from(cursor.completed_turn) != turn
+            || i64::try_from(cursor.conversation_seq).ok() != Some(sequence)
+        {
+            return Err(SessionForkCoordinatorError::CursorUnavailable);
+        }
+        Ok(cursor)
+    }
+
+    /// The authenticated Session binding owns provider scope. Preparing the
+    /// fork separately validates this exact canonical cursor under its write
+    /// fence, so authorization does not depend on a delayed Run projection.
+    pub async fn authorize_provider_cursor(
+        &self,
+        key: &SessionKeyV1,
+        cursor: &SessionCursorV1,
+        required: &crate::runs::ProviderRunOwner,
+    ) -> Result<(), SessionForkCoordinatorError> {
+        key.validate()
+            .map_err(|error| SessionForkCoordinatorError::Invalid(error.to_string()))?;
+        if !key.validates_cursor(cursor) {
+            return Err(SessionForkCoordinatorError::Forbidden);
+        }
+        authorize_provider_fork_session(
+            self.pool.get(),
+            &key.owner_user_id,
+            &key.session_id,
+            Some(required),
+            self.scope_encryptor.as_deref(),
+            ProviderSessionScopeRequirement::ForkSource,
+        )
+        .await
+    }
+
+    /// Activate immutable context only. Ordinary chat admits fresh Run-owned Context authority.
+    pub async fn activate_for_continuation(
+        &self,
+        parent_key: &SessionKeyV1,
+        fork_id: &str,
+    ) -> Result<SessionForkContinuationV1, SessionForkCoordinatorError> {
+        let stored = self.load(parent_key, fork_id).await?;
+        self.activate_stored_fork(stored).await
+    }
+
+    async fn activate_stored_fork(
+        &self,
+        stored: SessionForkManifestV1,
+    ) -> Result<SessionForkContinuationV1, SessionForkCoordinatorError> {
+        if stored.state == SessionForkStateV1::Aborted {
+            return Err(SessionForkCoordinatorError::Aborted);
+        }
+        let child_head = if stored.state == SessionForkStateV1::Prepared {
+            match self.context.activate_fork(&stored).await {
+                Ok(head) => head,
+                Err(error) => {
+                    if self.load(&stored.parent_key, &stored.fork_id).await?.state
+                        == SessionForkStateV1::Aborted
+                    {
+                        return Err(SessionForkCoordinatorError::Aborted);
+                    }
+                    return Err(error.into());
+                }
+            }
+        } else {
+            self.context
+                .load_head(&stored.child_key)
+                .await?
+                .ok_or_else(|| {
+                    SessionForkCoordinatorError::NeedsRepair(
+                        "active fork has no child context head".into(),
+                    )
+                })?
+        };
+        if child_head.key != stored.child_key
+            || !stored.child_key.validates_cursor(&child_head.cursor)
+        {
+            return Err(SessionForkCoordinatorError::NeedsRepair(
+                "active fork child head escaped its owner".into(),
+            ));
+        }
+        let manifest = self.load(&stored.parent_key, &stored.fork_id).await?;
+        if manifest.state != SessionForkStateV1::Active {
+            return Err(SessionForkCoordinatorError::NeedsRepair(
+                "fork activation did not durably transition to active".into(),
+            ));
+        }
+        Ok(SessionForkContinuationV1 {
+            manifest,
+            child_head,
+        })
     }
 
     pub async fn prepare(
         &self,
         request: &PrepareSessionForkV1,
     ) -> Result<SessionForkManifestV1, SessionForkCoordinatorError> {
+        self.prepare_admitted(request, None, false).await
+    }
+
+    /// HTTP creation supplies only authenticated scope and uses the same
+    /// durable quota reservation as ordinary Session creation.
+    pub async fn prepare_admitted(
+        &self,
+        request: &PrepareSessionForkV1,
+        provider_owner: Option<&crate::runs::ProviderRunOwner>,
+        enforce_creation_quota: bool,
+    ) -> Result<SessionForkManifestV1, SessionForkCoordinatorError> {
         validate_prepare_request(request)?;
+        if let Some(owner) = provider_owner {
+            self.authorize_provider_cursor(
+                &request.parent_key,
+                &request.expected_parent_cursor,
+                owner,
+            )
+            .await?;
+        }
         let request_hash = stable_hash(b"astra.prepare-session-fork.v1\0", request)?;
         let idempotency_hash = identity_hash("prepare", &request.idempotency_key);
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
@@ -95,11 +350,38 @@ impl DatabaseSessionForkCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_prepare_fork", source))?;
-        crate::session_context_coordinator::admit_session_lifecycle_writes(
+        if let Err(error) = crate::session_context_coordinator::admit_session_lifecycle_writes(
             &mut tx,
             [&request.parent_key, &request.child_key],
         )
-        .await?;
+        .await
+        {
+            if let Some(row) = sqlx::query(
+                "SELECT request_hash, manifest_json FROM session_forks
+                 WHERE isolation_domain = ? AND owner_user_id = ?
+                   AND parent_session_id = ? AND parent_branch_id = ? AND idempotency_hash = ?",
+            )
+            .bind(&request.parent_key.isolation_domain)
+            .bind(&request.parent_key.owner_user_id)
+            .bind(&request.parent_key.session_id)
+            .bind(&request.parent_key.branch_id)
+            .bind(&idempotency_hash)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|source| database_error("load_aborted_prepare_retry", source))?
+            {
+                verify_request_hash(&row, &request_hash)?;
+                let manifest: SessionForkManifestV1 =
+                    decode_json_row(&row, "manifest_json", "aborted_prepare_retry")?;
+                validate_stored_manifest(&manifest, &request.parent_key)?;
+                if manifest.state == SessionForkStateV1::Aborted
+                    && manifest.provider_owner.as_ref() == provider_owner
+                {
+                    return Err(SessionForkCoordinatorError::Aborted);
+                }
+            }
+            return Err(error.into());
+        }
 
         if let Some(row) = sqlx::query(
             "SELECT request_hash, manifest_json FROM session_forks
@@ -119,6 +401,12 @@ impl DatabaseSessionForkCoordinator {
             verify_request_hash(&row, &request_hash)?;
             let manifest = decode_json_row(&row, "manifest_json", "fork_manifest")?;
             validate_stored_manifest(&manifest, &request.parent_key)?;
+            if manifest.provider_owner.as_ref() != provider_owner {
+                return Err(SessionForkCoordinatorError::Forbidden);
+            }
+            if manifest.state == SessionForkStateV1::Aborted {
+                return Err(SessionForkCoordinatorError::Aborted);
+            }
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_prepare_retry", source))?;
@@ -128,6 +416,18 @@ impl DatabaseSessionForkCoordinator {
 
         let parent_head = lock_parent_head(&mut tx, request).await?;
         ensure_child_is_empty(&mut tx, &request.child_key).await?;
+        if enforce_creation_quota {
+            let quota =
+                crate::resource_governor::DatabaseResourceGovernor::reserve_session_creation(
+                    &mut tx,
+                    &request.parent_key.owner_user_id,
+                )
+                .await
+                .map_err(|source| database_error("reserve_fork_creation_quota", source))?;
+            if let crate::resource_governor::LimitCheck::Denied { limit, reason } = quota {
+                return Err(SessionForkCoordinatorError::QuotaDenied { limit, reason });
+            }
+        }
         let now = database_now_ms(&mut tx).await?;
         let manifest = SessionForkManifestV1 {
             schema_version: SESSION_FORK_MANIFEST_SCHEMA_VERSION,
@@ -135,6 +435,7 @@ impl DatabaseSessionForkCoordinator {
             parent_key: request.parent_key.clone(),
             child_key: request.child_key.clone(),
             parent_head,
+            provider_owner: provider_owner.cloned(),
             dimensions: request.dimensions.clone(),
             excluded_authority: vec![
                 ForkExcludedAuthorityV1::Run,
@@ -176,8 +477,8 @@ impl DatabaseSessionForkCoordinator {
         sqlx::query(
             "INSERT INTO conversation_manifest_pins
              (isolation_domain, owner_user_id, pin_id, parent_session_id,
-              parent_branch_id, manifest_root, pin_state)
-             VALUES (?, ?, ?, ?, ?, ?, 'prepared')",
+              parent_branch_id, manifest_root, pin_state, grace_expires_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?)",
         )
         .bind(&manifest.parent_key.isolation_domain)
         .bind(&manifest.parent_key.owner_user_id)
@@ -185,6 +486,7 @@ impl DatabaseSessionForkCoordinator {
         .bind(&manifest.parent_key.session_id)
         .bind(&manifest.parent_key.branch_id)
         .bind(&manifest.parent_head.latest_manifest_root)
+        .bind(provider_owner.map(|_| now + PROVIDER_PREPARE_TTL_SECONDS * 1000))
         .execute(&mut *tx)
         .await
         .map_err(|source| database_error("pin_prepared_fork", source))?;
@@ -209,21 +511,9 @@ impl DatabaseSessionForkCoordinator {
         actor
             .validate_for(&stored.child_key)
             .map_err(|error| SessionForkCoordinatorError::Invalid(error.to_string()))?;
-        if stored.state == SessionForkStateV1::Aborted {
-            return Err(SessionForkCoordinatorError::Conflict);
-        }
-        let child_head = if stored.state == SessionForkStateV1::Prepared {
-            self.context.activate_fork(&stored).await?
-        } else {
-            self.context
-                .load_head(&stored.child_key)
-                .await?
-                .ok_or_else(|| {
-                    SessionForkCoordinatorError::NeedsRepair(
-                        "active fork has no child context head".into(),
-                    )
-                })?
-        };
+        let continuation = self.activate_stored_fork(stored).await?;
+        let stored = continuation.manifest;
+        let child_head = continuation.child_head;
         let writer_idempotency = identity_hash(
             "activate-writer",
             &format!("{}\0{}", stored.fork_id, actor.actor_id),
@@ -302,11 +592,25 @@ impl DatabaseSessionForkCoordinator {
             child_session_id,
             child_branch_id,
         );
-        crate::session_context_coordinator::admit_session_lifecycle_writes(
-            &mut tx,
-            [parent_key, &child_key],
-        )
-        .await?;
+        // Cancellation needs the same lock order as activation, but can replay
+        // after its own child deletion fence and after parent deletion.
+        let mut keys = [parent_key, &child_key];
+        keys.sort_unstable_by_key(|key| {
+            (&key.owner_user_id, &key.session_id, &key.isolation_domain)
+        });
+        let mut child_writable = false;
+        for key in keys {
+            let state = crate::storage::lock_agent_session_write_fence_state(
+                &mut tx,
+                &key.session_id,
+                &key.owner_user_id,
+            )
+            .await
+            .map_err(|source| database_error("lock_abort_lifecycle_fence", source))?;
+            if key == &child_key {
+                child_writable = state == crate::storage::AgentSessionWriteFenceState::Writable;
+            }
+        }
         let row = lock_fork(&mut tx, parent_key, fork_id).await?;
         let mut manifest: SessionForkManifestV1 =
             decode_json_row(&row, "manifest_json", "fork_manifest")?;
@@ -320,6 +624,31 @@ impl DatabaseSessionForkCoordinator {
         }
         if manifest.state != SessionForkStateV1::Prepared {
             return Err(SessionForkCoordinatorError::Conflict);
+        }
+        if !child_writable {
+            return Err(SessionForkCoordinatorError::Conflict);
+        }
+        if manifest.provider_owner.is_some() {
+            let used: bool = sqlx::query_scalar(
+                "SELECT (EXISTS (SELECT 1 FROM agent_runs WHERE user_id = ? AND session_id = ?))
+                     OR (EXISTS (SELECT 1 FROM session_context_heads
+                        WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ?
+                          AND (head_json IS NOT NULL OR fork_base_json IS NOT NULL
+                               OR active_writer_json IS NOT NULL OR active_reservation_json IS NOT NULL)))",
+            ).bind(&child_key.owner_user_id).bind(&child_key.session_id)
+                .bind(&child_key.isolation_domain).bind(&child_key.owner_user_id)
+                .bind(&child_key.session_id).bind(&child_key.branch_id)
+                .fetch_one(&mut *tx).await.map_err(|source| database_error("check_cancelled_child_unused", source))?;
+            if used {
+                return Err(SessionForkCoordinatorError::Conflict);
+            }
+            crate::session_lifecycle::mark_session_deleting_tx(
+                &mut tx,
+                &child_key.session_id,
+                &child_key.owner_user_id,
+            )
+            .await
+            .map_err(SessionForkCoordinatorError::NeedsRepair)?;
         }
         let now = database_now_ms(&mut tx).await?;
         let grace_expires_at_ms = checked_expiry(now, grace)?;
@@ -459,10 +788,59 @@ impl DatabaseSessionForkCoordinator {
         Ok(result.rows_affected())
     }
 
+    /// A lost provider prepare has a bounded retry window. Reuse the ordinary
+    /// Prepared -> Aborted transition and durable Session delete intent.
+    pub async fn abort_expired_provider_prepares(
+        &self,
+        limit: u32,
+    ) -> Result<u64, SessionForkCoordinatorError> {
+        if limit == 0 || limit > 10_000 {
+            return Err(SessionForkCoordinatorError::Invalid(
+                "cleanup limit must be between 1 and 10000".into(),
+            ));
+        }
+        let rows = sqlx::query(
+            "SELECT forks.manifest_json FROM conversation_manifest_pins pins
+             FORCE INDEX (idx_manifest_pins_grace)
+             JOIN session_forks forks ON forks.isolation_domain = pins.isolation_domain
+                 AND forks.owner_user_id = pins.owner_user_id AND forks.fork_id = pins.pin_id
+             WHERE pins.pin_state = 'prepared'
+               AND pins.grace_expires_at_ms <= CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED)
+             ORDER BY pins.grace_expires_at_ms ASC LIMIT ?",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|source| database_error("load_expired_provider_prepares", source))?;
+        let mut aborted = 0;
+        for row in rows {
+            let manifest: SessionForkManifestV1 =
+                decode_json_row(&row, "manifest_json", "expired_provider_prepare")?;
+            if manifest.provider_owner.is_none() {
+                continue;
+            }
+            match self
+                .abort(
+                    &manifest.parent_key,
+                    &manifest.fork_id,
+                    Duration::from_secs(1),
+                    "provider prepare expired",
+                )
+                .await
+            {
+                Ok(_) => aborted += 1,
+                Err(
+                    SessionForkCoordinatorError::Conflict | SessionForkCoordinatorError::NotFound,
+                ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(aborted)
+    }
+
     /// Collect manifest records whose owning session was deleted after every
-    /// fork retention pin was released. Segment payload GC remains a separate
-    /// owner-scoped reachability pass, so this bounded job never scans JSON or
-    /// performs per-segment refcount fanout.
+    /// fork retention pin was released. Node-local payloads are deleted with
+    /// their manifest row, without JSON scans or per-segment refcount fanout.
     pub async fn collect_unpinned_orphan_manifests(
         &self,
         limit: u32,
@@ -525,80 +903,6 @@ impl DatabaseSessionForkCoordinator {
         Ok(result.rows_affected())
     }
 
-    /// Remove normalized segment references after their manifest node is gone.
-    ///
-    /// This runs after manifest collection and is deliberately bounded so one
-    /// tenant's old history cannot monopolize a maintenance sweep.
-    pub async fn collect_orphaned_manifest_segment_references(
-        &self,
-        limit: u32,
-    ) -> Result<u64, SessionForkCoordinatorError> {
-        if limit == 0 || limit > 10_000 {
-            return Err(SessionForkCoordinatorError::Invalid(
-                "cleanup limit must be between 1 and 10000".into(),
-            ));
-        }
-        let result = sqlx::query(
-            "DELETE FROM conversation_manifest_segments
-             WHERE NOT EXISTS (
-                       SELECT 1 FROM conversation_manifest_nodes
-                       WHERE conversation_manifest_nodes.isolation_domain =
-                                 conversation_manifest_segments.isolation_domain
-                         AND conversation_manifest_nodes.owner_user_id =
-                                 conversation_manifest_segments.owner_user_id
-                         AND conversation_manifest_nodes.session_id =
-                                 conversation_manifest_segments.session_id
-                         AND conversation_manifest_nodes.branch_id =
-                                 conversation_manifest_segments.branch_id
-                         AND conversation_manifest_nodes.manifest_root =
-                                 conversation_manifest_segments.manifest_root
-                   )
-             ORDER BY created_at ASC LIMIT ?",
-        )
-        .bind(i64::from(limit))
-        .execute(self.pool.get())
-        .await
-        .map_err(|source| database_error("collect_orphan_manifest_segment_refs", source))?;
-        Ok(result.rows_affected())
-    }
-
-    /// Collect owner-deduplicated segment payloads with no manifest reference.
-    ///
-    /// A staging grace protects uploads that have not reached `commit_turn`
-    /// yet. Committed manifests install their references transactionally, so
-    /// anything older than the grace and still unreferenced is abandoned.
-    pub async fn collect_unreferenced_conversation_segments(
-        &self,
-        limit: u32,
-    ) -> Result<u64, SessionForkCoordinatorError> {
-        const STAGING_GRACE_SECS: i64 = 24 * 60 * 60;
-        if limit == 0 || limit > 10_000 {
-            return Err(SessionForkCoordinatorError::Invalid(
-                "cleanup limit must be between 1 and 10000".into(),
-            ));
-        }
-        let result = sqlx::query(
-            "DELETE FROM conversation_segments
-             WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? SECOND)
-               AND NOT EXISTS (
-                       SELECT 1 FROM conversation_manifest_segments
-                       WHERE conversation_manifest_segments.isolation_domain =
-                                 conversation_segments.isolation_domain
-                         AND conversation_manifest_segments.owner_user_id =
-                                 conversation_segments.owner_user_id
-                         AND conversation_manifest_segments.segment_hash =
-                                 conversation_segments.segment_hash
-                   )
-             ORDER BY created_at ASC LIMIT ?",
-        )
-        .bind(STAGING_GRACE_SECS)
-        .bind(i64::from(limit))
-        .execute(self.pool.get())
-        .await
-        .map_err(|source| database_error("collect_unreferenced_segments", source))?;
-        Ok(result.rows_affected())
-    }
-
     /// Remove fork metadata bottom-up after its child session is deleted.
     ///
     /// An ancestor pin is deliberately retained while a live descendant fork
@@ -628,6 +932,13 @@ impl DatabaseSessionForkCoordinator {
                        WHERE agent_sessions.user_id = session_forks.owner_user_id
                          AND agent_sessions.session_id = session_forks.child_session_id
                    )
+               AND (session_forks.state <> 'aborted'
+                    OR JSON_EXTRACT(session_forks.manifest_json, '$.provider_owner') IS NULL
+                    OR NOT EXISTS (
+                       SELECT 1 FROM agent_sessions parent
+                       WHERE parent.user_id = session_forks.owner_user_id
+                         AND parent.session_id = session_forks.parent_session_id
+                   ))
                AND NOT EXISTS (
                        SELECT 1 FROM session_forks descendants
                        WHERE descendants.isolation_domain =
@@ -752,6 +1063,142 @@ fn validate_prepare_request(
     Ok(())
 }
 
+pub fn authorize_manifest_provider(
+    manifest: &SessionForkManifestV1,
+    required: &crate::runs::ProviderRunOwner,
+) -> Result<(), SessionForkCoordinatorError> {
+    if manifest.provider_owner.as_ref() == Some(required) {
+        Ok(())
+    } else {
+        Err(SessionForkCoordinatorError::Forbidden)
+    }
+}
+
+fn provider_session_namespace(user_id: &str) -> bool {
+    user_id.starts_with("provider_authorized:")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderSessionScopeRequirement {
+    ExistingConversation,
+    ForkSource,
+}
+
+/// Common Run admission, including replay. Forks use their retained manifest;
+/// new provider Sessions use their server-authenticated scope proof. Existing
+/// unbound ordinary conversations retain their previous chat contract, but
+/// cannot become a source for a new provider fork.
+pub async fn authorize_provider_fork_session<'e, E>(
+    executor: E,
+    user_id: &str,
+    session_id: &str,
+    required: Option<&crate::runs::ProviderRunOwner>,
+    encryptor: Option<&crate::auth::FernetTokenEncryptor>,
+    requirement: ProviderSessionScopeRequirement,
+) -> Result<(), SessionForkCoordinatorError>
+where
+    E: sqlx::Executor<'e, Database = MySql>,
+{
+    // Legacy user tokens have a distinct owner namespace and retain the
+    // existing subject-owned Session contract. MOI's request-signed Sessions
+    // cannot be reached through it, and new provider fork control requires
+    // request-bound authentication rather than legacy credentials.
+    if user_id.starts_with("external_authorized:moi:") {
+        return Ok(());
+    }
+    // Local identities cannot address request-signed provider Sessions. Their
+    // ordinary admission already validates Session ownership and lifecycle.
+    if required.is_none() && !provider_session_namespace(user_id) {
+        return Ok(());
+    }
+    let key = SessionKeyV1::owner_session("server", user_id, session_id, "main");
+    let row = sqlx::query(
+        "SELECT JSON_EXTRACT(s.`metadata`, '$.__astra_provider_scope_proof_v1') IS NOT NULL AS has_scope_binding,
+                JSON_EXTRACT(s.`metadata`, '$.fork_id') IS NOT NULL AS has_fork_metadata,
+                CASE WHEN OCTET_LENGTH(JSON_UNQUOTE(JSON_EXTRACT(s.`metadata`, '$.__astra_provider_scope_proof_v1'))) = 43
+                     THEN JSON_UNQUOTE(JSON_EXTRACT(s.`metadata`, '$.__astra_provider_scope_proof_v1'))
+                     ELSE NULL END AS scope_proof,
+                CAST(f.manifest_json AS CHAR) AS scope_manifest
+         FROM agent_sessions s LEFT JOIN session_forks f
+           ON f.isolation_domain = ? AND f.owner_user_id = s.user_id
+          AND f.child_session_id = s.session_id AND f.child_branch_id = ?
+         WHERE s.user_id = ? AND s.session_id = ?",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&key.branch_id)
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_optional(executor)
+    .await
+    .map_err(|source| database_error("load_provider_session_scope", source))?;
+    let Some(row) = row else {
+        return if required.is_some() || provider_session_namespace(user_id) {
+            Err(SessionForkCoordinatorError::Forbidden)
+        } else {
+            Ok(())
+        };
+    };
+    let raw_manifest: Option<String> = row
+        .try_get("scope_manifest")
+        .map_err(|source| database_error("decode_provider_session_scope", source))?;
+    let Some(raw_manifest) = raw_manifest else {
+        let Some(owner) = required else {
+            return if provider_session_namespace(user_id) {
+                Err(SessionForkCoordinatorError::Forbidden)
+            } else {
+                Ok(())
+            };
+        };
+        let has_scope_binding: bool = row
+            .try_get("has_scope_binding")
+            .map_err(|source| database_error("decode_provider_session_scope", source))?;
+        let has_fork_metadata: bool = row
+            .try_get("has_fork_metadata")
+            .map_err(|source| database_error("decode_provider_session_scope", source))?;
+        if !has_scope_binding
+            && !has_fork_metadata
+            && requirement == ProviderSessionScopeRequirement::ExistingConversation
+        {
+            return Ok(());
+        }
+        let proof: Option<String> = row
+            .try_get("scope_proof")
+            .map_err(|source| database_error("decode_provider_session_scope", source))?;
+        return if proof
+            .as_deref()
+            .zip(encryptor)
+            .is_some_and(|(proof, encryptor)| {
+                encryptor.verify_provider_session_scope(
+                    user_id,
+                    session_id,
+                    &owner.provider_id,
+                    &owner.provider_scope_id,
+                    proof,
+                )
+            }) {
+            Ok(())
+        } else {
+            Err(SessionForkCoordinatorError::Forbidden)
+        };
+    };
+    let manifest: SessionForkManifestV1 = serde_json::from_str(&raw_manifest)
+        .map_err(|error| SessionForkCoordinatorError::NeedsRepair(error.to_string()))?;
+    validate_stored_manifest(&manifest, &manifest.parent_key)?;
+    if manifest.child_key != key {
+        return Err(SessionForkCoordinatorError::Forbidden);
+    }
+    if let Some(owner) = manifest.provider_owner.as_ref() {
+        if required != Some(owner) || manifest.state != SessionForkStateV1::Active {
+            return Err(SessionForkCoordinatorError::Forbidden);
+        }
+    } else if required.is_some() || provider_session_namespace(user_id) {
+        // A provider fork without retained scope cannot be claimed by the
+        // first request, regardless of which provider credential was used.
+        return Err(SessionForkCoordinatorError::Forbidden);
+    }
+    Ok(())
+}
+
 async fn insert_fork_child_session(
     tx: &mut Transaction<'_, MySql>,
     manifest: &SessionForkManifestV1,
@@ -817,13 +1264,28 @@ async fn lock_parent_head(
         "SELECT manifest_json, total_canonical_bytes, total_message_count
          FROM conversation_manifest_nodes
          WHERE isolation_domain = ? AND owner_user_id = ?
-           AND session_id = ? AND branch_id = ? AND manifest_root = ?
+           AND session_id = ? AND branch_id = ?
+           AND compaction_generation = ? AND conversation_seq = ? AND manifest_root = ?
            AND reachable = 1 FOR UPDATE",
     )
     .bind(&request.parent_key.isolation_domain)
     .bind(&request.parent_key.owner_user_id)
     .bind(&request.parent_key.session_id)
     .bind(&request.parent_key.branch_id)
+    .bind(
+        i64::try_from(request.expected_parent_cursor.compaction_generation).map_err(|_| {
+            SessionForkCoordinatorError::Invalid(
+                "fork generation exceeds durable integer range".into(),
+            )
+        })?,
+    )
+    .bind(
+        i64::try_from(request.expected_parent_cursor.conversation_seq).map_err(|_| {
+            SessionForkCoordinatorError::Invalid(
+                "fork sequence exceeds durable integer range".into(),
+            )
+        })?,
+    )
     .bind(&request.expected_parent_cursor.canonical_root_hash)
     .fetch_optional(&mut **tx)
     .await
@@ -1303,6 +1765,18 @@ mod tests {
             .await
             .expect("activate fork");
         assert_eq!(activation.manifest.state, SessionForkStateV1::Active);
+        let copied_transcript: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_transcript_items WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&owner)
+        .bind(&child_key.session_id)
+        .fetch_one(pool.get())
+        .await
+        .expect("read child transcript");
+        assert_eq!(
+            copied_transcript, 0,
+            "baseline must not copy parent transcript rows"
+        );
         let child_manifest_count_after: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM conversation_manifest_nodes
              WHERE isolation_domain = ? AND owner_user_id = ?
@@ -1337,6 +1811,29 @@ mod tests {
         .await
         .expect("count active retention pin");
         assert_eq!(pin_count, 1);
+
+        let grandchild_key =
+            SessionKeyV1::owner_session("fork-it", &owner, format!("grandchild-{suffix}"), "main");
+        let nested = service
+            .prepare(&PrepareSessionForkV1 {
+                idempotency_key: "nested-before-append".into(),
+                parent_key: child_key.clone(),
+                child_key: grandchild_key.clone(),
+                expected_parent_cursor: activation.child_head.cursor.clone(),
+                dimensions: dimensions(&activation.child_head.cursor),
+                reason: "capture an inherited head without copying its body".into(),
+            })
+            .await
+            .expect("prepare nested inherited head");
+        let nested = service
+            .activate(
+                &child_key,
+                &nested.fork_id,
+                &actor(&owner, "grandchild"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("activate nested inherited head");
 
         let child_reservation = match context
             .reserve_turn(
@@ -1409,6 +1906,118 @@ mod tests {
         assert_eq!(child_materialized.messages.len(), 6);
         assert_eq!(parent_materialized.messages.len(), 8);
 
+        let appended_grandchild_key = SessionKeyV1::owner_session(
+            "fork-it",
+            &owner,
+            format!("appended-grandchild-{suffix}"),
+            "main",
+        );
+        let appended_nested = service
+            .prepare(&PrepareSessionForkV1 {
+                idempotency_key: "nested-after-append".into(),
+                parent_key: child_key.clone(),
+                child_key: appended_grandchild_key.clone(),
+                expected_parent_cursor: child_cursor.clone(),
+                dimensions: dimensions(&child_cursor),
+                reason: "capture both inherited and child-local nodes".into(),
+            })
+            .await
+            .expect("prepare nested appended head");
+        let appended_nested = service
+            .activate(
+                &child_key,
+                &appended_nested.fork_id,
+                &actor(&owner, "appended-grandchild"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("activate nested appended head");
+        let prefix_content = context
+            .load_manifest_content(&parent_key, &fork_cursor.canonical_root_hash)
+            .await
+            .expect("load original body");
+        let future_root: String = sqlx::query_scalar(
+            "SELECT manifest_root FROM conversation_manifest_nodes
+             WHERE owner_user_id = ? AND session_id = ? AND conversation_seq = 3",
+        )
+        .bind(&owner)
+        .bind(&parent_key.session_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE conversation_manifest_nodes SET content_json = 'corrupt outside captured prefix'
+             WHERE owner_user_id = ? AND session_id = ? AND manifest_root = ?",
+        ).bind(&owner).bind(&parent_key.session_id).bind(&future_root)
+            .execute(pool.get()).await.unwrap();
+        for (head, expected_count) in [(&nested.child_head, 4), (&appended_nested.child_head, 6)] {
+            assert_eq!(
+                context
+                    .load_manifest_content(&head.key, &fork_cursor.canonical_root_hash)
+                    .await
+                    .expect("nested locator reads ancestor body"),
+                prefix_content
+            );
+            assert!(matches!(
+                context.load_manifest_content(&head.key, &future_root).await,
+                Err(crate::SessionContextCoordinatorError::SegmentNotFound)
+            ));
+            assert_eq!(
+                context
+                    .materialize(head)
+                    .await
+                    .expect("materialize nested fork")
+                    .messages
+                    .len(),
+                expected_count
+            );
+        }
+        assert_eq!(
+            context
+                .load_manifest_content(&appended_grandchild_key, &child_cursor.canonical_root_hash,)
+                .await
+                .expect("load intermediate parent's body")
+                .len(),
+            1
+        );
+
+        // Deleting both ancestors must retain their existing fork records and
+        // pins while live descendants still depend on their captured prefix.
+        context.release_writer(&parent_lease).await.unwrap();
+        context
+            .release_writer(&activation.writer_lease)
+            .await
+            .unwrap();
+        crate::session_lifecycle::hard_delete_session(pool.get(), &parent_key.session_id, &owner)
+            .await
+            .unwrap();
+        crate::session_lifecycle::hard_delete_session(pool.get(), &child_key.session_id, &owner)
+            .await
+            .unwrap();
+        service.collect_orphaned_fork_records(100).await.unwrap();
+        service
+            .collect_unpinned_orphan_manifests(100)
+            .await
+            .unwrap();
+        for (head, expected_count) in [(&nested.child_head, 4), (&appended_nested.child_head, 6)] {
+            assert_eq!(
+                context
+                    .load_manifest_content(&head.key, &fork_cursor.canonical_root_hash)
+                    .await
+                    .expect("retained nested body after ancestor deletion"),
+                prefix_content
+            );
+            assert_eq!(
+                context
+                    .materialize(head)
+                    .await
+                    .expect("retained nested materialization")
+                    .messages
+                    .len(),
+                expected_count
+            );
+        }
+
         let other_owner_key = SessionKeyV1::owner_session(
             "fork-it",
             format!("other-{suffix}"),
@@ -1419,6 +2028,37 @@ mod tests {
             service.load(&other_owner_key, &prepared.fork_id).await,
             Err(SessionForkCoordinatorError::NotFound)
         ));
+        context.release_writer(&nested.writer_lease).await.unwrap();
+        context
+            .release_writer(&appended_nested.writer_lease)
+            .await
+            .unwrap();
+        for key in [&grandchild_key, &appended_grandchild_key] {
+            crate::session_lifecycle::hard_delete_session(pool.get(), &key.session_id, &owner)
+                .await
+                .unwrap();
+        }
+        service.collect_orphaned_fork_records(100).await.unwrap();
+        service
+            .collect_unpinned_orphan_manifests(100)
+            .await
+            .unwrap();
+        for table in [
+            "session_forks",
+            "conversation_manifest_pins",
+            "conversation_manifest_nodes",
+        ] {
+            let sql = format!("SELECT COUNT(*) FROM {table} WHERE owner_user_id = ?");
+            let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+                .bind(&owner)
+                .fetch_one(pool.get())
+                .await
+                .unwrap();
+            assert_eq!(
+                remaining, 0,
+                "deleted fork lineage must be collectible: {table}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1473,7 +2113,7 @@ mod tests {
             ReserveTurnOutcome::Reserved(reservation) => reservation,
             other => panic!("unexpected large-prefix reservation {other:?}"),
         };
-        let large_content = "abcd".repeat(1024 * 1024);
+        let large_content = "中文🙂".repeat(630_000);
         let cursor = match context
             .commit_turn(
                 &reservation,
@@ -1498,13 +2138,13 @@ mod tests {
             CoordinatorMutationV1::Applied { cursor } => cursor,
             other => panic!("unexpected large-prefix commit {other:?}"),
         };
-        let segments_before: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM conversation_segments WHERE owner_user_id = ?",
+        let nodes_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_manifest_nodes WHERE owner_user_id = ?",
         )
         .bind(&owner)
         .fetch_one(pool.get())
         .await
-        .expect("count large-prefix segments before fork");
+        .expect("count large-prefix nodes before fork");
         let request = PrepareSessionForkV1 {
             idempotency_key: "large-prefix-prepare".into(),
             parent_key: parent_key.clone(),
@@ -1523,13 +2163,13 @@ mod tests {
             )
             .await
             .expect("activate large fork");
-        let segments_after: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM conversation_segments WHERE owner_user_id = ?",
+        let nodes_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_manifest_nodes WHERE owner_user_id = ?",
         )
         .bind(&owner)
         .fetch_one(pool.get())
         .await
-        .expect("count large-prefix segments after fork");
+        .expect("count large-prefix nodes after fork");
         let manifest_bytes: i64 = sqlx::query_scalar(
             "SELECT OCTET_LENGTH(manifest_json) FROM session_forks
              WHERE isolation_domain = ? AND owner_user_id = ? AND fork_id = ?",
@@ -1551,6 +2191,22 @@ mod tests {
         .await
         .expect("count child manifest nodes");
 
+        let restored = context
+            .materialize(&activation.child_head)
+            .await
+            .expect("materialize large shared Unicode prefix");
+        let restored_text = restored.messages[0]["content"].as_str().unwrap();
+        assert_eq!(restored_text.len(), 6_300_000);
+        assert_eq!(restored_text, large_content);
+        let located = context
+            .load_manifest_content(&child_key, &cursor.canonical_root_hash)
+            .await
+            .expect("locate full large Unicode body");
+        assert_eq!(
+            located[0].messages[0]["content"].as_str().unwrap(),
+            large_content
+        );
+
         context
             .release_writer(&activation.writer_lease)
             .await
@@ -1566,10 +2222,10 @@ mod tests {
             .await
             .expect("delete scale-test parent session");
 
-        assert_eq!(segments_before, 1);
+        assert_eq!(nodes_before, 1);
         assert_eq!(
-            segments_after, segments_before,
-            "forking a large prefix must not duplicate content-addressed segments"
+            nodes_after, nodes_before,
+            "forking a large prefix must not duplicate node content"
         );
         assert_eq!(
             child_manifest_nodes, 0,

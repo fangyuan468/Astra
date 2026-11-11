@@ -717,7 +717,11 @@ async fn connect_streamable_http(
         transport_config = transport_config.custom_headers(custom);
     }
 
-    let transport = StreamableHttpClientTransport::from_config(transport_config);
+    let transport = StreamableHttpClientTransport::with_client(
+        crate::streamable_http::BoundedHttpClient::new()
+            .map_err(|e| McpError::Initialize(format!("HTTP client: {e}")))?,
+        transport_config,
+    );
     let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new(roots);
     let running = tokio::time::timeout(
         std::time::Duration::from_secs(MCP_CONNECT_TIMEOUT_SECS),
@@ -811,9 +815,16 @@ async fn connect_ws(
         .body(())
         .map_err(|e| McpError::InvalidConfig(format!("invalid WebSocket request: {e}")))?;
 
-    let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|e| McpError::Initialize(format!("WebSocket connect to {url}: {e}")))?;
+    let (ws_stream, _response) = tokio_tungstenite::connect_async_tls_with_config(
+        request,
+        None,
+        false,
+        Some(tokio_tungstenite::Connector::Rustls(
+            astra_core::net::public_root_tls_config(),
+        )),
+    )
+    .await
+    .map_err(|e| McpError::Initialize(format!("WebSocket connect to {url}: {e}")))?;
 
     let (mut ws_sink, mut ws_read) = ws_stream.split();
 

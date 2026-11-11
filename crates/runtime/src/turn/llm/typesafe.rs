@@ -3,7 +3,7 @@ use super::client::LlmCallResult;
 use astra_core::{ClassifiedError, ErrorKind};
 use astra_turn_types::{
     JUDGMENT_SCHEMA_VERSION, JudgmentRequest, judgment_request_from_messages,
-    normalize_judgment_response, parse_unique_judgment_json,
+    normalize_judgment_response, parse_unique_json,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -63,8 +63,8 @@ pub(super) fn response(
     raw: &[u8],
     request: &JudgmentRequest,
 ) -> Result<LlmCallResult, ClassifiedError> {
-    let value = parse_unique_judgment_json(raw)
-        .map_err(|_| invalid("Malformed TypeSafe judgment response"))?;
+    let value =
+        parse_unique_json(raw).map_err(|_| invalid("Malformed TypeSafe judgment response"))?;
     let response: Response = serde_json::from_value(value)
         .map_err(|_| invalid("Malformed TypeSafe judgment response"))?;
     let native = json!({
@@ -143,6 +143,9 @@ mod tests {
     }
     fn client(base_url: String, api_key: String) -> DirectMemoryInferenceClient {
         DirectMemoryInferenceClient {
+            inference_protocol: None,
+            response_scope: None,
+            supported_reasoning_efforts: None,
             fixed_temperature: None,
             thinking_protocol: None,
             base_url,
@@ -435,7 +438,7 @@ mod tests {
                 invocation_scope: &scope,
                 messages: &messages,
                 max_output_tokens: 50,
-                temperature: 0.0,
+                preferred_temperature: 0.0,
                 deadline: std::time::Duration::from_millis(50),
             })
             .await
@@ -554,7 +557,7 @@ mod tests {
                 invocation_scope: &scope,
                 messages: &m,
                 max_output_tokens: 50,
-                temperature: 0.0,
+                preferred_temperature: 0.0,
                 deadline: std::time::Duration::from_secs(3),
             })
             .await

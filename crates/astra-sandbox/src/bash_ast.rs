@@ -18,6 +18,23 @@ pub fn parse_bash(command: &str) -> Option<Tree> {
 /// grouping, control flow, and every other shell construct fail closed.
 /// Callers must still decide whether every returned argv is semantically safe.
 pub fn parse_plain_bash_commands(command: &str) -> Option<Vec<Vec<String>>> {
+    parse_literal_bash_commands(command, None)
+}
+
+/// Reconstruct literal argv and file-write redirects for workspace analysis.
+/// The strict public parser deliberately continues to reject all redirects.
+pub(crate) fn parse_bash_commands_for_write_analysis(
+    command: &str,
+) -> Option<(Vec<Vec<String>>, Vec<String>)> {
+    let mut writes = Vec::new();
+    let commands = parse_literal_bash_commands(command, Some(&mut writes))?;
+    Some((commands, writes))
+}
+
+fn parse_literal_bash_commands(
+    command: &str,
+    mut write_targets: Option<&mut Vec<String>>,
+) -> Option<Vec<Vec<String>>> {
     const MAX_SCRIPT_BYTES: usize = 32 * 1024;
     const MAX_COMMANDS: usize = 64;
 
@@ -47,10 +64,21 @@ pub fn parse_plain_bash_commands(command: &str) -> Option<Vec<Vec<String>>> {
 
     let mut stack = vec![root];
     let mut command_nodes = Vec::new();
+    let allow_redirects = write_targets.is_some();
     while let Some(node) = stack.pop() {
         let kind = node.kind();
+        if kind == "file_redirect"
+            && let Some(writes) = write_targets.as_deref_mut()
+        {
+            if let Some(target) = literal_redirect_write_target(node, command)? {
+                writes.push(target);
+            }
+            continue;
+        }
         if node.is_named() {
-            if !ALLOWED_NAMED_KINDS.contains(&kind) {
+            if !ALLOWED_NAMED_KINDS.contains(&kind)
+                && !(allow_redirects && kind == "redirected_statement")
+            {
                 return None;
             }
             if kind == "command" {
@@ -72,9 +100,42 @@ pub fn parse_plain_bash_commands(command: &str) -> Option<Vec<Vec<String>>> {
     command_nodes.sort_by_key(Node::start_byte);
     let commands = command_nodes
         .into_iter()
-        .map(|node| parse_plain_command(node, command))
+        .map(|node| parse_plain_command(node, command, allow_redirects))
         .collect::<Option<Vec<_>>>()?;
     (!commands.is_empty()).then_some(commands)
+}
+
+fn literal_redirect_write_target(node: Node<'_>, source: &str) -> Option<Option<String>> {
+    if let Some(descriptor) = node.child_by_field_name("descriptor") {
+        let descriptor = descriptor.utf8_text(source.as_bytes()).ok()?;
+        if descriptor.is_empty() || !descriptor.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+    }
+    let mut cursor = node.walk();
+    let operator = node.children(&mut cursor).find(|child| !child.is_named())?;
+    if matches!(operator.kind(), ">&-" | "<&-") {
+        // Tree-sitter can attach a trailing command argument to a closing
+        // redirect. Bash still passes that word as argv, so do not drop it.
+        return node
+            .child_by_field_name("destination")
+            .is_none()
+            .then_some(None);
+    }
+    let mut cursor = node.walk();
+    let mut destinations = node.children_by_field_name("destination", &mut cursor);
+    let target = parse_plain_word(destinations.next()?, source)?;
+    if destinations.next().is_some() {
+        return None;
+    }
+    match operator.kind() {
+        ">" | ">>" | ">|" | "&>" | "&>>" => Some(Some(target)),
+        ">&" if target == "-" || target.bytes().all(|byte| byte.is_ascii_digit()) => Some(None),
+        ">&" => Some(Some(target)),
+        "<" => Some(None),
+        "<&" if target == "-" || target.bytes().all(|byte| byte.is_ascii_digit()) => Some(None),
+        _ => None,
+    }
 }
 
 /// Return whether the parsed shell contains an actual invocation of one of
@@ -193,7 +254,7 @@ pub fn strip_benign_bash_redirects(command: &str) -> String {
     output
 }
 
-fn parse_plain_command(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+fn parse_plain_command(node: Node<'_>, source: &str, allow_redirects: bool) -> Option<Vec<String>> {
     if node.kind() != "command" {
         return None;
     }
@@ -201,6 +262,7 @@ fn parse_plain_command(node: Node<'_>, source: &str) -> Option<Vec<String>> {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         let word = match child.kind() {
+            "file_redirect" if allow_redirects => continue,
             "command_name" => parse_plain_word(child.named_child(0)?, source)?,
             "word" | "number" | "string" | "raw_string" | "concatenation" => {
                 parse_plain_word(child, source)?

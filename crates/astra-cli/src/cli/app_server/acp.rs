@@ -443,6 +443,11 @@ impl AcpServer {
                     entry.thinking_protocol.unwrap_or_default(),
                 )
                 .into_iter()
+                .filter(|option| {
+                    option
+                        .config
+                        .is_within_declared_efforts(entry.supported_reasoning_efforts.as_deref())
+                })
                 .filter_map(|option| match option.config {
                     astra_turn_core::thinking_config::ThinkingConfig::Adaptive { effort } => {
                         Some(effort.as_str().to_string())

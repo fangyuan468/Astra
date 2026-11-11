@@ -3,7 +3,7 @@
 pub(crate) enum ExitCode {
     /// Success (0)
     Success = 0,
-    /// Tool execution failure (1) - at least one tool call failed
+    /// Tool failure (1) - a tool call failed or a required local capability is unavailable
     ToolFailure = 1,
     /// Cancellation (2) - the task was explicitly cancelled
     Cancelled = 2,

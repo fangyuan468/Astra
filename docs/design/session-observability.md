@@ -63,6 +63,11 @@ source; `LlmRound` tokens are a separate diagnostic observation. Digest, diff,
 and tree's root self totals share the same root `Turn`/`TurnError` accounting;
 neither round replays nor child terminals add to those buckets. Tree still
 rolls separately attributed child completions into its inclusive root total.
+Tree's `tool_calls` likewise sums known root terminal execution counts and
+attributed child completions. An explicit terminal zero is authoritative;
+round mirrors and child terminals do not add to the root's own count. Missing
+scalars contribute no known executions. Digest's outcome counts may also include
+rejected or reused requests, so they need not equal tree's execution count.
 Diff's `prompt` and `completion` are fresh input and output; its `total` is
 their sum, excluding prompt-cache buckets. Known terminal totals do not
 reconstruct missing usage or upgrade a historical last-round snapshot into
@@ -75,6 +80,36 @@ attached profile/account source authorization. Each source retains its own turns
 checkpoints, correction timeline and exported owner identity; ingestion metadata
 does not select a storage partition. Debug retains the CLI authentication check
 but does not discover skill catalogs or connect MCP providers.
+
+`journal diff` reports known executed tool calls from terminal `tool_count`,
+with unowned per-call execution evidence retained separately. Its ordered tool
+sequence includes executed records only; rejected, reused, suppressed and
+deferred records are not executions. Aggregate-only turns and unresolved
+executed observations without sufficient identity make the sequence incomplete.
+Runtime failures preserve the available producer run scope. Reconciliation
+requires explicit matching run and turn namespaces; call deduplication also
+uses the producer-frozen canonical invocation identity (owner, session, run,
+turn chain and invocation ID). A terminal summary does not relabel its embedded
+records. Different chains within one run remain distinct; round numbers do not
+identify invocations. Missing or malformed optional identity preserves the
+observation without proving replay. A reused turn number, a sole surviving
+call-ID witness or an identical unscoped payload does not establish ownership.
+Unscoped rounds and errors remain separate observations, as do contradictory
+execution facts. Incomplete totals combine terminal aggregates with retained
+unproven evidence and may overcount overlapping or replayed observations; they
+are not an exact physical invocation count. Unidentified executed terminal detail
+cannot establish that an external observation is additional coverage; matching
+the aggregate numerically does not resolve that possible overlap.
+When canonical invocation identity establishes duplicate observations, round-internal call
+order takes precedence over a standalone error's persistence position.
+An executed canonical invocation shared by separately counted terminal buckets,
+or by an orphan observation and a terminal bucket, prevents completeness.
+Aggregate evidence totals and retained observations are not discarded.
+Invocation identity alone does not supply a missing canonical position. When
+relocation crosses terminal detail without a comparable position and reverses
+terminal-relative order, ordering is incomplete even if all identities are known.
+Order between independent concurrent producers remains the journal projection; it is
+not a reconstructed physical execution timeline.
 
 Legacy `llm_round` records without `session_id` can inherit a file's session
 only when that same authorized source contains an explicit matching session ID
@@ -98,6 +133,12 @@ A run may appear stuck because of:
 - task waiting for child run.
 
 The projection should expose the specific reason and next action.
+
+The CLI/TUI publishes an interruption as a separate lifecycle warning even
+when the model emitted no answer text. A notice-only fallback stored in the
+final result is not evidence that a text delta was displayed. Completed tool
+output and any partial model text remain visible; the warning does not become
+a model-authored answer or change the canonical paused/recovery state.
 
 A safe provider recovery publishes its scheduled attempt before waiting again,
 without inventing task progress or adding an assistant-authored history message.
@@ -158,6 +199,11 @@ later failures retain their source-owned facts.
 
 Malformed non-critical stream events should be isolated when possible. Identity or cursor corruption should fail closed with structured error and should not corrupt durable run state.
 
+Execution inspection reports persisted run totals. Those aggregates can lag
+while a run is active and are not a live count of completed tool calls. Error
+guidance describes the failure category; the run's recovery state determines
+whether a retry is actually in progress.
+
 Edge callback HTTP failures are reported independently of tool execution and
 durable run state. A generic HTTP rejection, including a proxy/WAF HTML block
 page, is not evidence of a lifecycle contract violation. HTTP 409 alone, JSON
@@ -202,6 +248,59 @@ or result compaction. The journal retains `runtime_advisory_artifact` beside
 the bounded guidance preview; full guidance remains in that verified artifact,
 not in every future prompt or journal row.
 
+## On-demand child tool activity
+
+Ctrl+G reads tool activity from existing `agent_run_events` through
+`GET /sessions/{session_id}/runs/{run_id}/activity`. It displays this section
+separately from canonical conversation items; C1 `item_seq` and C3 `event_idx`
+are independent cursor domains and do not establish a shared chronological order.
+`A` loads older activity; `R` refreshes the conversation and latest activity.
+
+For an open child conversation, the live view renders a bounded tail while
+keeping the full received item available to search and export. Expanding an
+item shows its sanitized Markdown source; inline and separate reasoning can
+be inspected explicitly, while the ordinary preview stays collapsed. When new
+output arrives during expanded reading, the displayed snapshot stays stable
+and indicates that newer output is available; `End` returns to the live tail.
+Search and export use the latest received content. Missing live events remain
+gaps rather than being inferred from the preview, and durable history replaces
+matching live items by their model identity.
+
+Large recorded tool outputs use bounded previews; expanding one activity collapses
+the previously expanded activity. Search and export retain the full available text.
+Live tools keep their logical identity when a deferred carrier resolves. Delegation
+shows a compact control receipt, including safe failure details, instead of the
+child prompt or result. A recorded pair alone does not retire that live receipt.
+An unpaired recorded call is a request with its result not loaded; only matching
+live evidence can mark it running. Covered live requests retained to supplement a
+result-only page are best effort and bounded to 128 entries and 512 KiB per open
+view. Eviction may discard a request that was never recorded; older history is
+not guaranteed to contain it. Uncovered live results and diagnostics remain
+separate evidence and are not included in this fallback budget.
+
+The authorized child's immutable root is the C3 source. The API checks both
+Run scopes and pages the root stream, selecting only tool presentation events
+whose embedded Run identity exactly matches the child. The page's
+`source_run_id` identifies the index domain. This is always partial coverage:
+the optional live sink may drop events, and its gap notification is live-only.
+An empty page does not prove that no tool ran; a reported completion is not an
+invocation-ledger proof.
+
+The owner/session/run index serves a contiguous descending slice of at most
+65 raw rows, including non-tool facts. The first 64 scanned rows determine the
+next exclusive `before_event_idx`, even when filtering yields no tool events.
+Rows are displayed in ascending index order. Each payload is bounded to 32 KiB;
+oversized or malformed tool facts remain explicit unavailable entries. Gaps and
+compaction observations remain visible. Missing result status is unknown, never
+an inferred success. Existing immutable `(user_id, run_id, event_idx)` identifies
+a fact; `event_id` alone is not a uniqueness guarantee.
+
+Opening or paging this section adds a bounded indexed read, with no trace copies,
+new tables, execution-time writes or recurring whole-tree poll. Authentication
+and owned-session checks retain their existing boundaries. Partial and cancelled
+runs remain inspectable from the same facts; this projection cannot authorize
+replaying their operations.
+
 ## Resume and reconnect
 
 On reconnect, the client should rebuild from:
@@ -226,10 +325,29 @@ remote run remains protected by Server session-slot admission. An unconfirmed
 local execution or failed owner cleanup is not treated as a clean stream
 failure and retains its local exclusion until its own authority settles.
 
+CLI stream output, live guidance, and tool lifecycle events share their
+delivery order. If an observer remains unable to receive events, the client
+stops the physical stream with an explicit observer error; the error does not
+assert that remote work stopped or that already-started tools had no effects.
+Partial execution and the durable run remain available for reconciliation.
+
 Transcript progress is described by item sequence and committed cursor.
 Physical page counts, page high watermarks, and page lag are not exposed.
 The committed projection may honestly lag canonical context until its evidence
 has been materialized and the contiguous cursor promoted.
+
+A Session fork installs a validated shared prefix and child canonical head without
+copying parent display rows or allocating historical child runs. The child's
+first own run advances from turn N to N+1 through the existing canonical terminal
+transaction, which commits Context, raw transcript and terminal status together.
+Repeated activation cannot rewind a continued child.
+
+Nested forks use the existing canonical lineage owner. Each ancestor read remains
+within its validated owner, isolation domain, branch, generation and pinned
+sequence. Deleting an intermediate Session removes its live head and execution
+authority while existing fork records and pins retain history needed by prepared
+or active descendants. Bounded bottom-up cleanup releases those records and
+node-local payloads after the last dependent descendant is removed.
 
 ## One-shot local content privacy
 
@@ -270,6 +388,9 @@ continuation and rejects this policy before admitting a turn.
 
 ## User-facing diagnostics
 
+The stdio app-server forwards system diagnostics as `warning` notifications
+with a `message`, including uncertain tool outcomes and unsaved turn history.
+
 A user should be able to answer:
 
 - Is it running, blocked, waiting, cancelled, or complete?
@@ -286,3 +407,79 @@ A user should be able to answer:
 - Browser disconnect does not imply cancellation.
 - Cancelled tasks disappear from active task board projection.
 - Resume reconstructs status without stale UI cache.
+
+A failed canonical terminal commit emits a live-only, root-scoped
+`run_error` with `error_code=canonical_persistence_failed`. It preserves partial
+answer text and advises reopening the Session to inspect recorded state before
+retrying. This notification is not a durable terminal or evidence that an
+uncertain transaction committed or rolled back; the canonical recovery owner
+still decides that state. No successful completion is published from this path.
+
+Web keeps one genuine text/reasoning projection for the selected message in its
+existing user-scoped chat state across observer connections. Reconnect initializes
+the browser from that projection and resumes at its captured cursor; rendered
+text and failure diagnostics never substitute for raw parser state. One observer
+may write that projection at a time. Conflicting observers or missing/ahead
+continuations return an explicit observation error without failing the Run or
+replacing the saved answer. Replay-only observation remains independent. This
+state has the same process lifetime as the Web chat projection; it adds no durable
+or cross-server transcript guarantee.
+
+The Web continuation cursor is the next event not represented by the selected
+message's genuine projection. Backend status polling updates control status,
+not parser progress; a durable event count is only a starting boundary when a
+new queued message is admitted. Public control responses expose a continuation
+cursor only for a matching Session, root Run and assistant projection. Resume
+uses that server-selected assistant, including a completed paused message;
+missing local bindings are refreshed once and reported as unavailable rather
+than creating a browser-only assistant.
+
+Web admits live Run observation only from the committed selected binding. Resume
+and queued input publish that selection; the existing lifecycle owner registers
+POST creation and admits GET observers using one chat/session/run/message lease.
+Replacement and unmount retire only observation, fencing late callbacks, queued
+patches and retries. Cursor and status progress do not replace a live observer.
+
+Deferred-input conflicts refresh the selected observation only while the initiating
+chat/session/run/message still owns it. A conflict never implicitly starts a new
+Run. Unconfirmed submissions report an error and retain the Composer draft for
+review and explicit resubmission; only accepted input receives queued feedback.
+
+Plan-review approvals derive bounded correlation IDs from the Session and tool
+invocation at the existing approval producer. Native invocation IDs are unchanged;
+the review ID and its durable event keys fit the existing interaction columns.
+
+Stop uses the same selected chat/Session/root/assistant binding as observation.
+The request requires the initiating Session, root and nullable assistant; a missing
+or malformed binding is rejected, and a changed binding is a conflict before any
+cancellation is dispatched. A runtime-only root has an explicit null assistant
+and never completes another message by fallback. After dispatch, cancellation
+continues only against its captured root; delayed responses, reconciliation and
+rollback cannot mutate a successor binding or newer root facts. Browser cleanup
+belongs to the initiating operation, and Stop status reads never overlap.
+Reconciliation follows the committed cancelling lifecycle independently of ACK
+latency, including roots without an assistant message. The `cancelPending`
+response flag describes the bounded acknowledgement wait, not execution
+settlement. A scheduled or in-flight status read occupies the same operation's
+single reconciliation slot until it settles.
+
+When a committed Stop outcome restores the same attachable binding, live
+observation recovers through the existing bounded GET retry owner. This includes
+reconciliation after a pending cancellation is rejected, not only an HTTP error.
+The handoff preserves the budget and cursor, never replays the turn, and leaves
+paused/terminal outcomes to their existing lifecycle semantics.
+
+Failed and cancelled child outcomes retain available assistant output separately
+from the failure or cancellation reason. A user cancellation keeps its origin
+and no-respawn instruction even when it includes partial text; partial text is
+never a successful result. The existing terminal journal carries this text in
+its redacted `full_text` field. A cancelled Run emits its retained partial
+`text_done` in the same generation-fenced terminal event batch, without another
+per-tool write. Explicit result reads may refresh incomplete terminal evidence;
+preview staging continues to read the existing parent-owned result without SQL.
+Late same-run counters can update an archived terminal even when its status and
+event frontier are unchanged. Accounting coverage follows actual provenance:
+observed counters are `partial`, and absent accounting is `unknown`. The
+current child result wrappers can contain fallback counters, so even a terminal
+zero does not certify that no resources were used. No additional provenance
+state is inferred from those wrappers.

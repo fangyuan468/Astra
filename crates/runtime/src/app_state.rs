@@ -1,8 +1,6 @@
 use super::server::tool_transport::ToolExecutionService;
 use super::*;
-use crate::turn::services::{
-    NoopTurnAuxiliaryEventWriter, NoopTurnHookDbWriter, NoopTurnObserverWorker,
-};
+use crate::turn::services::{NoopTurnAuxiliaryEventWriter, NoopTurnObserverWorker};
 use astra_services::auth;
 
 const DEFAULT_NAME: &str = "Agent Engine API";
@@ -98,7 +96,6 @@ impl MemoriaHealth {
 
 #[derive(Clone)]
 pub(crate) struct TurnPersistenceState {
-    pub(crate) hook_db_writer: Arc<dyn TurnHookDbWriter>,
     pub(crate) observer_worker: Arc<dyn TurnObserverWorker>,
     pub(crate) auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
 }
@@ -106,7 +103,6 @@ pub(crate) struct TurnPersistenceState {
 impl Default for TurnPersistenceState {
     fn default() -> Self {
         Self {
-            hook_db_writer: Arc::new(NoopTurnHookDbWriter),
             observer_worker: Arc::new(NoopTurnObserverWorker),
             auxiliary_event_writer: Arc::new(NoopTurnAuxiliaryEventWriter),
         }
@@ -140,6 +136,7 @@ impl Default for AdminState {
 
 #[derive(Clone)]
 pub(crate) struct ExecutionServicesState {
+    pub(crate) edge_capacity_relay_origin: Option<String>,
     pub(crate) edge_registry_service: Arc<dyn EdgeRegistryService>,
     pub(crate) edge_dispatch_service: Arc<dyn EdgeDispatchService>,
     pub(crate) run_lifecycle_service: Arc<dyn RunLifecycleService>,
@@ -148,6 +145,7 @@ pub(crate) struct ExecutionServicesState {
 impl Default for ExecutionServicesState {
     fn default() -> Self {
         Self {
+            edge_capacity_relay_origin: None,
             edge_registry_service: Arc::new(UnconfiguredEdgeRegistryService),
             edge_dispatch_service: Arc::new(UnconfiguredEdgeDispatchService),
             run_lifecycle_service: Arc::new(UnconfiguredRunLifecycleService),
@@ -161,16 +159,10 @@ pub struct AppState {
     pub(crate) health_checker: Arc<dyn HealthChecker>,
     pub(crate) auth_service: Arc<dyn AuthService>,
     pub(crate) session_service: Arc<dyn SessionService>,
-    pub(crate) agent_service: Arc<dyn AgentService>,
     pub(crate) event_service: Arc<dyn EventService>,
-    pub(crate) context_service: Arc<dyn ContextService>,
-    pub(crate) decision_service: Arc<dyn DecisionService>,
     pub(crate) model_service: Arc<dyn ModelService>,
     pub(crate) model_catalog_cache: astra_services::models::AuthorizedModelCatalogCache,
-    pub(crate) sandbox_service: Arc<dyn SandboxService>,
-    pub(crate) data_versioning_service: Arc<dyn DataVersioningService>,
     pub(crate) marketplace_service: Arc<dyn MarketplaceService>,
-    pub(crate) marketplace_stats_service: Arc<dyn MarketplaceStatsService>,
     pub(crate) session_audit_service: Arc<dyn SessionAuditService>,
     pub(crate) skill_service: Arc<dyn SkillService>,
     pub(crate) skill_config_service: Arc<dyn SkillConfigService>,
@@ -243,8 +235,6 @@ pub struct AppState {
     /// Multi-agent coordination metrics — scraped into metrics_registry on each
     /// /metrics request for a unified exposition endpoint.
     pub(crate) multi_agent_metrics: astra_services::multi_agent::SharedMultiAgentMetrics,
-    #[cfg(feature = "harness")]
-    pub harness_registry: crate::server::harness::handlers::HarnessSinkRegistry,
 }
 
 impl AppState {
@@ -267,16 +257,10 @@ impl AppState {
             health_checker,
             auth_service: Arc::new(auth::UnconfiguredAuthService),
             session_service: Arc::new(auth::UnconfiguredSessionService),
-            agent_service: Arc::new(UnconfiguredAgentService),
             event_service: Arc::new(UnconfiguredEventService),
-            context_service: Arc::new(UnconfiguredContextService),
-            decision_service: Arc::new(UnconfiguredDecisionService),
             model_service: Arc::new(UnconfiguredModelService),
             model_catalog_cache: Default::default(),
-            sandbox_service: Arc::new(UnconfiguredSandboxService),
-            data_versioning_service: Arc::new(UnconfiguredDataVersioningService),
             marketplace_service: Arc::new(UnconfiguredMarketplaceService),
-            marketplace_stats_service: Arc::new(NoopMarketplaceStatsService),
             session_audit_service: Arc::new(UnconfiguredSessionAuditService),
             skill_service: Arc::new(UnconfiguredSkillService),
             skill_config_service: Arc::new(UnconfiguredSkillConfigService),
@@ -341,8 +325,6 @@ impl AppState {
             cors_origins: None,
             metrics_registry: Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new()),
             multi_agent_metrics: astra_services::multi_agent::shared_metrics(),
-            #[cfg(feature = "harness")]
-            harness_registry: crate::server::harness::handlers::HarnessSinkRegistry::new(),
         }
     }
 
@@ -482,23 +464,8 @@ impl AppState {
         self
     }
 
-    pub fn with_agent_service(mut self, agent_service: Arc<dyn AgentService>) -> Self {
-        self.agent_service = agent_service;
-        self
-    }
-
     pub fn with_event_service(mut self, event_service: Arc<dyn EventService>) -> Self {
         self.event_service = event_service;
-        self
-    }
-
-    pub fn with_context_service(mut self, context_service: Arc<dyn ContextService>) -> Self {
-        self.context_service = context_service;
-        self
-    }
-
-    pub fn with_decision_service(mut self, decision_service: Arc<dyn DecisionService>) -> Self {
-        self.decision_service = decision_service;
         self
     }
 
@@ -507,32 +474,11 @@ impl AppState {
         self
     }
 
-    pub fn with_sandbox_service(mut self, sandbox_service: Arc<dyn SandboxService>) -> Self {
-        self.sandbox_service = sandbox_service;
-        self
-    }
-
-    pub fn with_data_versioning_service(
-        mut self,
-        data_versioning_service: Arc<dyn DataVersioningService>,
-    ) -> Self {
-        self.data_versioning_service = data_versioning_service;
-        self
-    }
-
     pub fn with_marketplace_service(
         mut self,
         marketplace_service: Arc<dyn MarketplaceService>,
     ) -> Self {
         self.marketplace_service = marketplace_service;
-        self
-    }
-
-    pub fn with_marketplace_stats_service(
-        mut self,
-        marketplace_stats_service: Arc<dyn MarketplaceStatsService>,
-    ) -> Self {
-        self.marketplace_stats_service = marketplace_stats_service;
         self
     }
 
@@ -607,13 +553,6 @@ impl AppState {
         self
     }
 
-    pub fn with_turn_hook_db_writer(
-        mut self,
-        turn_hook_db_writer: Arc<dyn TurnHookDbWriter>,
-    ) -> Self {
-        self.turn_persistence.hook_db_writer = turn_hook_db_writer;
-        self
-    }
     pub fn with_turn_observer_worker(
         mut self,
         turn_observer_worker: Arc<dyn TurnObserverWorker>,
@@ -636,6 +575,15 @@ impl AppState {
     ) -> Self {
         self.execution.edge_registry_service = edge_registry_service;
         self
+    }
+
+    /// Operator-owned address of this exact node, never a load-balanced
+    /// service URL or an endpoint supplied by an Edge or invocation.
+    pub fn with_edge_capacity_relay_origin(mut self, origin: String) -> Result<Self, String> {
+        crate::server::validate_relay_origin(&origin)
+            .map_err(|_| "invalid Edge capacity node origin".to_string())?;
+        self.execution.edge_capacity_relay_origin = Some(origin);
+        Ok(self)
     }
 
     pub fn with_edge_dispatch_service(
@@ -742,13 +690,18 @@ impl AppState {
         }
     }
 
-    /// Passively drain server-owned run tasks before removing their durable
-    /// resources or closing database pools.
+    /// Begin graceful Run shutdown and drain tasks before removing durable
+    /// resources or closing pools. New Run admissions stop during this drain.
     pub async fn drain_background_runs(&self, timeout: std::time::Duration) -> bool {
-        self.execution
+        let drained = self
+            .execution
             .run_lifecycle_service
             .drain_background_tasks(timeout)
-            .await
+            .await;
+        if drained && let Some(runtime) = self.matrix_cloud_runtime.as_ref() {
+            runtime.shutdown_ingestion_and_wait().await;
+        }
+        drained
     }
 
     /// Abort server-owned run tasks after a preceding passive drain could not
@@ -1486,7 +1439,8 @@ mod tests {
     #[tokio::test]
     async fn default_tool_execution_service_does_not_bypass_durable_dispatch() {
         let state = AppState::new(ServiceInfo::default(), Arc::new(AlwaysHealthy));
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
         state.edge_connection_pool.register_with_capabilities(
             "user-1",
             "edge-selected",

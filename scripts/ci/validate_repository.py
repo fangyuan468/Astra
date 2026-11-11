@@ -29,21 +29,129 @@ def skill_body(path: Path) -> str:
     return body
 
 
+CAPABILITY_HEADER = (
+    "Capability",
+    "Status",
+    "Profiles",
+    "Default / flags",
+    "Dependencies",
+    "Implementation",
+    "Verification lane",
+    "Run evidence",
+    "Limits / tracking",
+    "Compatibility",
+)
+CORE_CAPABILITIES = frozenset(
+    {
+        "Agent chat",
+        "Durable Work",
+        "Checkpoints and recovery",
+        "Context and cache",
+        "Model access",
+        "Routing",
+        "Judgment advice",
+        "Skills and hooks",
+        "Provider admission",
+        "User Runner execution",
+        "MCP configuration",
+        "MCP tool execution",
+        "Permissions and sandbox",
+        "Replay and versioning",
+        "Observation and audit",
+        "Memory",
+        "Evaluation and learning",
+    }
+)
+
+
+def capability_reference_errors(text: str) -> list[str]:
+    """Check the editorial contract, not the semantic truth of maturity claims."""
+    rows = [
+        tuple(cell.strip() for cell in line.strip().strip("|").split("|"))
+        for line in text.splitlines()
+        if line.startswith("|")
+    ]
+    errors: list[str] = []
+    if (
+        len(rows) < 3
+        or rows[0] != CAPABILITY_HEADER
+        or any(re.fullmatch(r":?-+:?", cell) is None for cell in rows[1])
+        or len(rows[1]) != len(CAPABILITY_HEADER)
+    ):
+        return ["capability reference: missing or invalid table header"]
+    names: set[str] = set()
+    for row in rows[2:]:
+        if len(row) != len(CAPABILITY_HEADER) or any(not cell for cell in row):
+            errors.append("capability reference: empty field or wrong column count")
+            continue
+        name, status, profiles, _, _, implementation, verification, _, limits, _ = row
+        if name in names:
+            errors.append(f"capability reference: duplicate row {name}")
+        names.add(name)
+        if status not in {
+            "Beta",
+            "Partial",
+            "Experimental",
+            "Design-only",
+            "Known-broken",
+        }:
+            errors.append(f"capability reference: unsupported status for {name}")
+        if not set(map(str.strip, profiles.split(","))) <= {
+            "CLI",
+            "Server",
+            "Web",
+            "User Runner",
+            "Offline",
+        }:
+            errors.append(f"capability reference: unsupported profile for {name}")
+        for field in (implementation, verification):
+            if not re.search(r"\[[^]]+\]\((?!https?://)[^)]+\)", field):
+                errors.append(
+                    f"capability reference: missing local source/evidence link for {name}"
+                )
+        if status == "Known-broken" and not re.search(
+            r"github.com/matrixorigin/Astra/issues/[0-9]+", limits
+        ):
+            errors.append(f"capability reference: missing defect issue for {name}")
+    for name in sorted(CORE_CAPABILITIES - names):
+        errors.append(f"capability reference: missing core row {name}")
+    return errors
+
+
+def markdown_link_errors(source: Path, text: str) -> list[str]:
+    errors: list[str] = []
+    link_pattern = re.compile(r"(?<!!)\[[^]]*\]\(([^)\s]+)(?:\s+[\"'][^\"']*[\"'])?\)")
+    for target in link_pattern.findall(text):
+        target = target.strip("<>")
+        if target.startswith(("http://", "https://", "#", "mailto:", "data:")):
+            continue
+        relative = target.split("#", 1)[0]
+        if relative and not (source.parent / relative).resolve().exists():
+            errors.append(f"{source}: broken local link {target}")
+    return errors
+
+
 def main() -> None:
     files = [path for path in tracked_files() if path.exists()]
     errors: list[str] = []
 
     markdown = [path for path in files if path.suffix in {".md", ".mdc"}]
-    link_pattern = re.compile(r"(?<!!)\[[^]]*\]\(([^)\s]+)(?:\s+[\"'][^\"']*[\"'])?\)")
     for source in markdown:
-        text = source.read_text(encoding="utf-8", errors="replace")
-        for target in link_pattern.findall(text):
-            target = target.strip("<>")
-            if target.startswith(("http://", "https://", "#", "mailto:", "data:")):
-                continue
-            relative = target.split("#", 1)[0]
-            if relative and not (source.parent / relative).resolve().exists():
-                errors.append(f"{source}: broken local link {target}")
+        errors.extend(
+            markdown_link_errors(
+                source, source.read_text(encoding="utf-8", errors="replace")
+            )
+        )
+    reference = Path("docs/reference/capabilities.md")
+    if reference not in files:
+        errors.append("missing current capability reference")
+    else:
+        errors.extend(
+            capability_reference_errors(reference.read_text(encoding="utf-8"))
+        )
+    for entrypoint in (Path("README.md"), Path("docs/README.md")):
+        if "reference/capabilities.md" not in entrypoint.read_text(encoding="utf-8"):
+            errors.append(f"{entrypoint}: missing current capability reference link")
 
     parsed_json: dict[Path, object] = {}
     for source in [path for path in files if path.suffix == ".json"]:

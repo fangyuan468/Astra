@@ -27,8 +27,14 @@ use std::{
 use tower::ServiceExt;
 use uuid::Uuid;
 
+#[path = "moi_fresh_astra/fork_auth_compat.rs"]
+mod fork_auth_compat;
+#[path = "moi_fresh_astra/forks.rs"]
+mod forks;
 #[path = "moi_fresh_astra/normal_chat.rs"]
 mod normal_chat;
+#[path = "moi_fresh_astra/reasoning.rs"]
+mod reasoning;
 #[path = "moi_fresh_astra/sse.rs"]
 mod sse;
 
@@ -673,7 +679,7 @@ async fn historical_moi_works_with_fresh_astra() {
     let mut admin = MySqlConnection::connect(&settings.matrixone.database_url_with_password())
         .await
         .expect("test MatrixOne");
-    sqlx::query(&format!("CREATE DATABASE `{database}`"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE `{database}`")))
         .execute(&mut admin)
         .await
         .unwrap();
@@ -758,13 +764,14 @@ async fn historical_moi_works_with_fresh_astra() {
         );
     }
     normal_chat::exercise(&app, &endpoint, gateway_state.clone()).await;
+    reasoning::exercise(&app, &endpoint, gateway_state.clone()).await;
     assert!(
         state.drain_background_runs(Duration::from_secs(10)).await,
         "runs must settle"
     );
     state.close_database_pools().await;
     gateway_task.abort();
-    sqlx::query(&format!("DROP DATABASE `{database}`"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
         .execute(&mut admin)
         .await
         .unwrap();

@@ -4,12 +4,10 @@ use test_support::require_db_it_env;
 
 use astra_runtime::server::artifact_retention_sweeper::run_artifact_retention_gc_once;
 use astra_services::{
-    DatabaseRunStateStore, DatabaseSessionArtifactStore, DatabaseSessionService,
-    DatabaseStateProjectionStore, SessionArtifactContentChunkV1,
+    DatabaseSessionArtifactStore, DatabaseSessionService, SessionArtifactContentChunkV1,
     SessionArtifactContentDescriptorV1, SessionArtifactContentStore, SessionArtifactJsonRecord,
     SessionArtifactJsonStore, SessionArtifactReference, SessionArtifactReferenceKind,
     SessionArtifactStoreError, SessionService, build_presigned_artifact_download,
-    runs::ToolOutputBatchItem,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -70,7 +68,7 @@ struct ArtifactSeed<'a> {
     policy: &'a str,
     status: &'a str,
     retention_days: i64,
-    manifest_refs: i64,
+    citation_refs: i64,
 }
 
 async fn insert_artifact(pool: &astra_core::SharedPool, seed: ArtifactSeed<'_>) {
@@ -79,7 +77,7 @@ async fn insert_artifact(pool: &astra_core::SharedPool, seed: ArtifactSeed<'_>) 
     sqlx::query(
         "INSERT INTO session_artifacts
          (artifact_id, session_id, user_id, artifact_kind, content_json, metadata,
-          retention_policy, retention_until, status, referenced_by_manifest_count,
+          retention_policy, retention_until, status, referenced_by_citation_count,
          created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
     )
@@ -92,7 +90,7 @@ async fn insert_artifact(pool: &astra_core::SharedPool, seed: ArtifactSeed<'_>) 
     .bind(seed.policy)
     .bind(retention_until)
     .bind(seed.status)
-    .bind(seed.manifest_refs)
+    .bind(seed.citation_refs)
     .execute(pool.get())
     .await
     .unwrap();
@@ -758,93 +756,209 @@ async fn l2_49c_sealed_expiry_and_session_delete_do_not_deadlock() {
 shared_db_test! {
 
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_49d_personal_skill_activation_and_session_delete_are_fenced() {
-    let pool = setup_pool().await;
-    let (user_id, session_id, _) = ids();
-    insert_session(&pool, &user_id, &session_id).await;
-    let artifact_id = format!("state-race-artifact-{}", Uuid::new_v4());
-    insert_artifact(
-        &pool,
-        ArtifactSeed {
-            user_id: &user_id,
-            session_id: &session_id,
-            artifact_id: &artifact_id,
-            kind: "state_projection_fixture",
-            policy: "default",
-            status: "active",
-            retention_days: 1,
-            manifest_refs: 0,
-        },
-    )
-    .await;
-
-    let projection = DatabaseStateProjectionStore::new(pool.clone());
-    let skill_name = format!("activation-race-{}", Uuid::new_v4());
-    let skills = astra_services::DatabasePersonalSkillStore::new(pool.clone());
-    let version = skills.submit_version(
-        &user_id,
-        &skill_name,
-        astra_services::SubmitUserSkillVersion {
-            version: "v1".to_string(),
-            manifest_json: json!({"name": skill_name, "description": "Review changes"}),
-            content_markdown: "## Instructions\n\nReview changes.\n".to_string(),
-            status: Some("published".to_string()),
-        },
-    ).await.unwrap();
-    let service = DatabaseSessionService::new(astra_core::MatrixOneSettings::from_env())
-        .with_pool(pool.clone());
-    let (write, deleted) = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        async {
-            tokio::join!(
-                projection.activate_personal_skill_from_ui(&user_id, &session_id, &skill_name, &version.version_id),
-                service.delete_session(session_id.clone(), user_id.clone()),
+async fn l2_49d_artifact_reference_and_session_delete_are_fenced() {
+    use std::time::Duration;
+    async fn observe_fence_waiters(
+        connection: &mut sqlx::MySqlConnection,
+        actors: [(u64, &str); 2],
+        user: &str,
+        session: &str,
+    ) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut previous = [None, None];
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err("actor never reached its database barrier".into());
+            }
+            let rows = tokio::time::timeout_at(
+                deadline,
+                sqlx::query("SHOW PROCESSLIST").fetch_all(&mut *connection),
             )
-        },
-    )
-    .await
-    .expect("skill activation and Session delete must not deadlock");
-
-    deleted.expect("Session delete should succeed without saved Work");
-    if let Err(error) = write {
-        assert!(
-            matches!(error, astra_services::StateProjectionError::SessionNotActive { .. }),
-            "a losing skill activation should fail with an actionable lifecycle error: {error}"
-        );
+            .await
+            .map_err(|_| "actor never reached its database barrier".to_string())?
+            .map_err(|error| error.to_string())?;
+            let mut current = [None, None];
+            for row in rows {
+                let id = row.try_get::<u64, _>("conn_id").map_err(|error| error.to_string())?;
+                let Some(index) = actors.iter().position(|(actor, _)| *actor == id) else { continue; };
+                let command: String =
+                    row.try_get("command").map_err(|error| error.to_string())?;
+                let info: String = row.try_get("info").map_err(|error| error.to_string())?;
+                if matches!(command.as_str(), "COM_STMT_EXECUTE" | "COM_QUERY")
+                    && [actors[index].1, "agent_session_lifecycle_fences", user, session]
+                        .iter().all(|fragment| info.contains(fragment))
+                {
+                    let statement: String = row
+                        .try_get("statement_id")
+                        .map_err(|error| error.to_string())?;
+                    if !statement.is_empty() {
+                        current[index] = Some(statement);
+                    }
+                }
+            }
+            if current.iter().all(Option::is_some) && current == previous {
+                return Ok(());
+            }
+            previous = current;
+            tokio::task::yield_now().await;
+        }
     }
 
-    let row = sqlx::query(
-        "SELECT
-            (SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND session_id = ?) AS sessions,
-            (SELECT COUNT(*) FROM session_state_items WHERE user_id = ? AND session_id = ?) AS state_items,
-            (SELECT COUNT(*) FROM session_state_item_events WHERE user_id = ? AND session_id = ?) AS state_events,
-            (SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ?) AS artifacts,
-            (SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?) AS activation_events",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&user_id)
-    .bind(&session_id)
-    .fetch_one(pool.get())
-    .await
-    .unwrap();
-    assert_eq!(row.try_get::<i64, _>("sessions").unwrap(), 0);
-    assert_eq!(row.try_get::<i64, _>("state_items").unwrap(), 0);
-    assert_eq!(row.try_get::<i64, _>("state_events").unwrap(), 0);
-    assert_eq!(row.try_get::<i64, _>("artifacts").unwrap(), 0);
-    assert_eq!(row.try_get::<i64, _>("activation_events").unwrap(), 0);
-    sqlx::query("DELETE FROM user_skill_versions WHERE owner_user_id = ? AND skill_name = ?")
-        .bind(&user_id).bind(&skill_name).execute(pool.get()).await.unwrap();
-    sqlx::query("DELETE FROM user_skill_sources WHERE owner_user_id = ? AND skill_name = ?")
-        .bind(&user_id).bind(&skill_name).execute(pool.get()).await.unwrap();
+    async fn finish<T>(mut task: tokio::task::JoinHandle<T>) -> Result<T, String> {
+        match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                Err("database actor did not finish after releasing its barrier".into())
+            }
+        }
+    }
 
+    let pool = setup_pool().await;
+    let mut settings = require_db_it_env();
+    settings.db_pool_max_connections = 1;
+    settings.db_pool_min_connections = 1;
+    let writer_pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    let deletion_pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    let observer_pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    let artifacts = DatabaseSessionArtifactStore::new(settings.clone()).with_pool(writer_pool.clone());
+    let service = DatabaseSessionService::new(settings).with_pool(deletion_pool.clone());
+    let mut observer = observer_pool.get().acquire().await.unwrap();
+    for order in ["reference_first", "deletion_first", "contended"] {
+        let (user_id, session_id, _) = ids();
+        insert_session(&pool, &user_id, &session_id).await;
+        let artifact_id = Uuid::new_v4().to_string();
+        insert_artifact(
+            &pool,
+            ArtifactSeed {
+                user_id: &user_id,
+                session_id: &session_id,
+                artifact_id: &artifact_id,
+                kind: "reference_race_fixture",
+                policy: "default",
+                status: "active",
+                retention_days: 1,
+                citation_refs: 0,
+            },
+        )
+        .await;
+        let reference = SessionArtifactReference {
+            kind: SessionArtifactReferenceKind::Citation,
+            reference_id: Uuid::new_v4().to_string(),
+        };
+        if order == "reference_first" {
+            assert!(
+                artifacts
+                    .retain_json_artifact_reference(&user_id, &session_id, &artifact_id, &reference)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                artifacts
+                    .list_json_artifact_references(&user_id, &session_id, &artifact_id, 10)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            service
+                .delete_session(session_id.clone(), user_id.clone())
+                .await
+                .unwrap();
+        } else if order == "deletion_first" {
+            service
+                .delete_session(session_id.clone(), user_id.clone())
+                .await
+                .unwrap();
+        } else {
+            // Use the setup pool so the actor connections have no earlier
+            // matching statement for this unique Session in process-list history.
+            let seeded = DatabaseSessionArtifactStore::new(pool.settings().clone()).with_pool(pool.clone());
+            assert!(
+                seeded
+                    .retain_json_artifact_reference(&user_id, &session_id, &artifact_id, &reference)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                seeded
+                    .release_json_artifact_reference(
+                        &user_id,
+                        &session_id,
+                        &artifact_id,
+                        &reference
+                    )
+                    .await
+                    .unwrap()
+            );
+            // Query the physical identities on each exclusive actor pool.
+            let writer_connection: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+                .fetch_one(writer_pool.get()).await.unwrap();
+            let deletion_connection: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+                .fetch_one(deletion_pool.get()).await.unwrap();
+            assert_ne!(writer_connection, deletion_connection);
+            let mut blocker = pool.get().begin().await.unwrap();
+            astra_services::storage::lock_agent_session_write_fence(
+                &mut blocker, &session_id, &user_id,
+            ).await.unwrap();
+            let write = {
+                let artifacts = artifacts.clone();
+                let (user, session, artifact, reference) =
+                    (user_id.clone(), session_id.clone(), artifact_id.clone(), reference.clone());
+                tokio::spawn(async move {
+                    artifacts.retain_json_artifact_reference(&user, &session, &artifact, &reference).await
+                })
+            };
+            let deleted = {
+                let service = service.clone();
+                let (user, session) = (user_id.clone(), session_id.clone());
+                tokio::spawn(async move { service.delete_session(session, user).await })
+            };
+            let observed = observe_fence_waiters(
+                &mut observer,
+                [(writer_connection, "SELECT delete_requested_at"),
+                 (deletion_connection, "INSERT IGNORE INTO agent_session_lifecycle_fences")],
+                &user_id, &session_id,
+            ).await;
+            let pending = !write.is_finished() && !deleted.is_finished();
+            // Always release and join/abort both actors before reporting an
+            // observation failure, so failed evidence cannot strand a worker.
+            let released = blocker.commit().await;
+            let write = finish(write).await;
+            let deleted = finish(deleted).await;
+            observed.expect("both actors reach the held database fence");
+            assert!(pending);
+            released.unwrap();
+            deleted.unwrap().unwrap();
+            let write = write.unwrap();
+            assert!(matches!(write, Ok(true) | Err(SessionArtifactStoreError::SessionNotOwned { .. })));
+
+        }
+        assert!(matches!(
+            artifacts
+                .retain_json_artifact_reference(&user_id, &session_id, &artifact_id, &reference)
+                .await,
+            Err(SessionArtifactStoreError::SessionNotOwned { .. })
+        ));
+        for table in [
+            "agent_sessions",
+            "session_artifacts",
+            "session_artifact_references",
+        ] {
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
+            )))
+            .bind(&user_id)
+            .bind(&session_id)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+            assert_eq!(count, 0, "{order}: no orphan {table}");
+        }
+    }
 }
+
 }
 
 shared_db_test! {
@@ -863,8 +977,8 @@ async fn l2_50_gc_preserves_referenced_artifact_deadline_without_fake_cold_stora
             kind: "pg_dump",
             policy: "default",
             status: "active",
-            retention_days: 1,
-            manifest_refs: 1,
+            retention_days: -1,
+            citation_refs: 1,
         },
     )
     .await;
@@ -892,154 +1006,49 @@ async fn l2_50b_gc_honors_durable_reference_edges_without_payload_inference() {
     let pool = setup_pool().await;
     let (user_id, session_id, _) = ids();
     insert_session(&pool, &user_id, &session_id).await;
-    let artifact_id = format!("artifact-{}", Uuid::new_v4());
-    insert_artifact(
-        &pool,
-        ArtifactSeed {
+    let store = DatabaseSessionArtifactStore::new(astra_core::MatrixOneSettings::from_env()).with_pool(pool.clone());
+    assert!(sqlx::query("INSERT INTO session_artifact_references (user_id, session_id, artifact_id, reference_kind, reference_id) VALUES (?, ?, 'retired-kind', 'state_item', 'retired')")
+        .bind(&user_id).bind(&session_id).execute(pool.get()).await.is_err());
+    for kind in [
+        SessionArtifactReferenceKind::InvocationLedger,
+        SessionArtifactReferenceKind::Manifest,
+        SessionArtifactReferenceKind::Citation,
+        SessionArtifactReferenceKind::RecoveryPoint,
+        SessionArtifactReferenceKind::SessionTranscript,
+    ] {
+        let artifact_id = format!("artifact-{}", Uuid::new_v4());
+        insert_artifact(&pool, ArtifactSeed {
             user_id: &user_id,
             session_id: &session_id,
             artifact_id: &artifact_id,
             kind: "arbitrary_provider_result",
             policy: "default",
             status: "active",
-            retention_days: 1,
-            manifest_refs: 0,
-        },
-    )
-    .await;
-    sqlx::query(
-        "INSERT INTO session_artifact_references
-         (user_id, session_id, artifact_id, reference_kind, reference_id, created_at)
-         VALUES (?, ?, ?, 'invocation_ledger', ?, NOW(6))",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&artifact_id)
-    .bind(format!("invocation:{}", Uuid::new_v4()))
-    .execute(pool.get())
-    .await
-    .unwrap();
-
-    let deadline_before =
-        artifact_retention_until(&pool, &user_id, &session_id, &artifact_id).await;
-    let _outcome = run_artifact_retention_gc_once(pool.clone(), 100)
-        .await
-        .unwrap();
-    let (status, cold_ref) = artifact_status(&pool, &user_id, &session_id, &artifact_id).await;
-    let deadline_after = artifact_retention_until(&pool, &user_id, &session_id, &artifact_id).await;
-    assert_eq!(deadline_after, deadline_before);
-    assert_eq!(status, "active");
-    assert_eq!(cold_ref, None);
-}
-
-}
-
-shared_db_test! {
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_51_unknown_tool_uses_400b_fallback_without_warning_event() {
-    let pool = setup_pool().await;
-    let (user_id, session_id, run_id) = ids();
-    insert_session(&pool, &user_id, &session_id).await;
-    let store = DatabaseRunStateStore::new(pool.clone());
-    let tool_name = format!("unknown_phase6_{}", Uuid::new_v4().simple());
-    store
-        .insert_tool_output_batch(
-            &format!("batch-{}", Uuid::new_v4()),
-            &session_id,
-            &run_id,
-            &user_id,
-            &[ToolOutputBatchItem {
-                output_id: format!("out-{}", Uuid::new_v4()),
-                tool_call_id: Some("call-1".to_string()),
-                tool_name: tool_name.clone(),
-                result: astra_turn_types::ToolInvocationResultPayload::new(
-                    "x".repeat(1_200),
-                    Default::default(),
-                    None,
-                )
-                .unwrap(),
-            }],
-        )
-        .await
-        .unwrap();
-    let row = sqlx::query(
-        "SELECT
-           (SELECT preview_status FROM session_tool_outputs WHERE user_id = ? AND session_id = ? AND tool_name = ? LIMIT 1) AS preview_status,
-           (SELECT CHAR_LENGTH(preview_text) FROM session_tool_outputs WHERE user_id = ? AND session_id = ? AND tool_name = ? LIMIT 1) AS preview_len,
-           (SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type = 'preview_template_missing' AND meta_tool_name = ?) AS warning_count",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&tool_name)
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&tool_name)
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&tool_name)
-    .fetch_one(pool.get())
-    .await
-    .unwrap();
-    assert_eq!(
-        row.try_get::<String, _>("preview_status").unwrap(),
-        "fallback"
-    );
-    assert!(row.try_get::<u64, _>("preview_len").unwrap() <= 400);
-    assert_eq!(row.try_get::<i64, _>("warning_count").unwrap(), 0);
-}
-
-}
-
-shared_db_test! {
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_53_large_pg_dump_uses_artifact_ref_and_never_prompt_raw_payload() {
-    let pool = setup_pool().await;
-    let (user_id, session_id, run_id) = ids();
-    insert_session(&pool, &user_id, &session_id).await;
-    let store = DatabaseRunStateStore::new(pool.clone());
-    let output_id = format!("out-{}", Uuid::new_v4());
-    let raw = "CREATE TABLE t(a INT);\n".repeat(2_000);
-    store
-        .insert_tool_output_batch(
-            &format!("batch-{}", Uuid::new_v4()),
-            &session_id,
-            &run_id,
-            &user_id,
-            &[ToolOutputBatchItem {
-                output_id: output_id.clone(),
-                tool_call_id: Some("call-pg".to_string()),
-                tool_name: "pg_dump".to_string(),
-                result: astra_turn_types::ToolInvocationResultPayload::bounded_projection(
-                    raw,
-                    std::collections::BTreeMap::from([(
-                        "declared_size_bytes".to_string(),
-                        json!(3_221_225_472_u64),
-                    )]),
-                    None,
-                ),
-            }],
-        )
-        .await
-        .unwrap();
-    let row = sqlx::query(
-        "SELECT artifact_ref, CHAR_LENGTH(preview_text) AS preview_len, payload_bytes
-         FROM session_tool_outputs
-         WHERE user_id = ? AND session_id = ? AND output_id = ?",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&output_id)
-    .fetch_one(pool.get())
-    .await
-    .unwrap();
-    assert!(
-        row.try_get::<Option<String>, _>("artifact_ref")
-            .unwrap()
-            .as_deref()
-            .is_some_and(|value| value.starts_with("tool_output://"))
-    );
-    assert!(row.try_get::<u64, _>("preview_len").unwrap() <= 1000);
-    assert!(row.try_get::<i64, _>("payload_bytes").unwrap() > 1000);
+            retention_days: -1,
+            citation_refs: 0,
+        }).await;
+        let reference = SessionArtifactReference {
+            kind,
+            reference_id: if kind == SessionArtifactReferenceKind::SessionTranscript {
+                session_id.clone()
+            } else {
+                format!("retention-{}", Uuid::new_v4())
+            },
+        };
+        store.retain_json_artifact_reference(&user_id, &session_id, &artifact_id, &reference).await.unwrap();
+        // Retaining extends the deadline. Move it into the past to exercise
+        // expiry eligibility while the durable reference still exists.
+        sqlx::query("UPDATE session_artifacts SET retention_until = TIMESTAMPADD(DAY, -1, NOW(6)) WHERE user_id = ? AND session_id = ? AND artifact_id = ?")
+            .bind(&user_id).bind(&session_id).bind(&artifact_id).execute(pool.get()).await.unwrap();
+        let deadline = artifact_retention_until(&pool, &user_id, &session_id, &artifact_id).await;
+        run_artifact_retention_gc_once(pool.clone(), 100).await.unwrap();
+        assert_eq!(artifact_status(&pool, &user_id, &session_id, &artifact_id).await, ("active".into(), None), "{kind:?}");
+        assert_eq!(artifact_retention_until(&pool, &user_id, &session_id, &artifact_id).await, deadline);
+        store.release_json_artifact_reference(&user_id, &session_id, &artifact_id, &reference).await.unwrap();
+        run_artifact_retention_gc_once(pool.clone(), 100).await.unwrap();
+        assert_eq!(artifact_status(&pool, &user_id, &session_id, &artifact_id).await, ("expired".into(), None), "{kind:?}");
+        assert_eq!(artifact_retention_until(&pool, &user_id, &session_id, &artifact_id).await, deadline);
+    }
 }
 
 }
@@ -1061,7 +1070,7 @@ async fn l2_54_project_long_term_artifact_is_extended_not_expired() {
             policy: "project_long_term",
             status: "active",
             retention_days: -1,
-            manifest_refs: 0,
+            citation_refs: 0,
         },
     )
     .await;
@@ -1091,7 +1100,7 @@ async fn l2_54b_expiry_removes_retained_payload_bytes_instead_of_only_relabeling
             policy: "default",
             status: "active",
             retention_days: -1,
-            manifest_refs: 0,
+            citation_refs: 0,
         },
     )
     .await;
@@ -1148,95 +1157,6 @@ async fn l2_55_presigned_download_contains_ttl_and_signature() {
 
 shared_db_test! {
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l3_17_s08_dba_audit_large_artifacts_batch_and_gc() {
-    let pool = setup_pool().await;
-    let (user_id, session_id, run_id) = ids();
-    insert_session(&pool, &user_id, &session_id).await;
-    let artifact_ids = ["pg-dump", "tool-batch", "slowlog"]
-        .into_iter()
-        .map(|kind| format!("{kind}-{}", Uuid::new_v4()))
-        .collect::<Vec<_>>();
-    for (idx, artifact_id) in artifact_ids.iter().enumerate() {
-        insert_artifact(
-            &pool,
-            ArtifactSeed {
-                user_id: &user_id,
-                session_id: &session_id,
-                artifact_id,
-                kind: if idx == 2 { "slowlog" } else { "pg_dump" },
-                policy: "default",
-                status: "active",
-                retention_days: 1,
-                manifest_refs: if idx == 0 { 1 } else { 0 },
-            },
-        )
-        .await;
-    }
-
-    let store = DatabaseRunStateStore::new(pool.clone());
-    let mut items = Vec::with_capacity(500);
-    for i in 0..1_000 {
-        items.push(ToolOutputBatchItem {
-            output_id: format!("out-{i}-{}", Uuid::new_v4()),
-            tool_call_id: Some(format!("call-{i}")),
-            tool_name: "slow_query_analyzer".to_string(),
-            result: astra_turn_types::ToolInvocationResultPayload::new(
-                format!("slow query {i}"),
-                std::collections::BTreeMap::from([(
-                    "declared_size_bytes".to_string(),
-                    json!(838_860_800_u64),
-                )]),
-                None,
-            )
-            .unwrap(),
-        });
-        if items.len() == 500 {
-            store
-                .insert_tool_output_batch(
-                    &format!("batch-{i}-{}", Uuid::new_v4()),
-                    &session_id,
-                    &run_id,
-                    &user_id,
-                    &items,
-                )
-                .await
-                .unwrap();
-            items.clear();
-        }
-    }
-    let row = sqlx::query(
-        "SELECT
-          (SELECT COUNT(*) FROM session_tool_outputs FORCE INDEX (idx_tool_outputs_user_run_created) WHERE user_id = ? AND run_id = ?) AS output_count,
-          (SELECT COUNT(*) FROM session_artifacts FORCE INDEX (idx_session_artifacts_owner_kind_order) WHERE user_id = ? AND session_id = ? AND artifact_kind = 'pg_dump') AS dump_count,
-          (SELECT COUNT(*) FROM session_artifacts FORCE INDEX (idx_artifacts_retention) WHERE retention_until IS NOT NULL AND retention_until <= DATE_ADD(NOW(6), INTERVAL 7 DAY) AND (status <=> 'active' OR status <=> 'expiring')) AS retention_count",
-    )
-    .bind(&user_id)
-    .bind(&run_id)
-    .bind(&user_id)
-    .bind(&session_id)
-    .fetch_one(pool.get())
-    .await
-    .unwrap();
-    assert_eq!(row.try_get::<i64, _>("output_count").unwrap(), 1_000);
-    assert!(row.try_get::<i64, _>("dump_count").unwrap() >= 2);
-    assert!(row.try_get::<i64, _>("retention_count").unwrap() >= 1);
-
-    let deadline_before =
-        artifact_retention_until(&pool, &user_id, &session_id, &artifact_ids[0]).await;
-    let _retention = run_artifact_retention_gc_once(pool.clone(), 100)
-        .await
-        .unwrap();
-    let (_, cold_ref) = artifact_status(&pool, &user_id, &session_id, &artifact_ids[0]).await;
-    let deadline_after =
-        artifact_retention_until(&pool, &user_id, &session_id, &artifact_ids[0]).await;
-    assert_eq!(deadline_after, deadline_before);
-    assert_eq!(cold_ref, None, "sweeper must not fabricate cold storage");
-}
-
-}
-
-shared_db_test! {
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l3_18_s12_14_day_review_retention() {
     let pool = setup_pool().await;
     let (user_id, session_id, _) = ids();
@@ -1245,7 +1165,7 @@ async fn l3_18_s12_14_day_review_retention() {
     let mut insert = QueryBuilder::<MySql>::new(
         "INSERT INTO session_artifacts
          (artifact_id, session_id, user_id, artifact_kind, content_json, metadata,
-          retention_policy, retention_until, status, referenced_by_manifest_count,
+          retention_policy, retention_until, status, referenced_by_citation_count,
           created_at, updated_at) ",
     );
     insert.push_values(0..250, |mut row, i| {

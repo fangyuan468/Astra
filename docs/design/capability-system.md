@@ -36,10 +36,23 @@ visible(tool) and execute(tool_call) must come from the same provider decision.
 
 No host loop, schema builder, or executor should maintain a separate shadow allowlist.
 
-MCP registry registration retains owner-scoped metadata, encrypted credentials
-and discovered tool schemas. Server MCP connections and discovery are prepared
-from the authorized request or Agent Binding. The unused registry-to-runtime
-loader and its Rust source result type are retired; registration remains available.
+MCP registry registration retains owner-scoped metadata and encrypted binding
+credentials. Registration discovers and validates tools live, confirms the
+binding and server are still active for that owner, and returns discovered tool
+identities. The write-only `mcp_tools` snapshot and registry-to-runtime loader
+are retired. Tool schemas, descriptor versions, alias resolution and execution
+remain owned by authorized request or Agent Binding discovery. The retired
+snapshot's SQL collation and column-width checks are no longer acceptance
+rules; provider discovery and exact-name duplicate validation remain.
+
+The unused Marketplace credential bucket and its POST/DELETE
+`/marketplace/credentials` API are retired. No runtime consumed those encrypted
+values. Skill configuration/resource bindings, CLI authentication and MCP binding
+credentials keep their existing owners. Existing encrypted bucket rows are not
+automatically dropped, exported or migrated; the application no longer offers
+save or delete access to them. Owners control any existing-secret disposal
+separately. Fresh same-version deployments omit both retired tables and their
+bootstrap claims, without compatibility or migration paths.
 
 ## Concepts
 
@@ -102,7 +115,7 @@ within that root through its call-scoped `workdir`; this changes only the
 subprocess starting directory and never persists as session state. Resolution
 and symlink confinement happen at the CLI/User Runner executor before spawn,
 and, on Unix process paths with pinned-cwd support, a root-relative no-symlink
-directory-handle walk pins the identity used by policy, source capture, cache,
+directory-handle walk pins the identity used by policy, cache,
 execution, and evidence. Executors that cannot consume that pinned subdirectory
 identity (including the current managed mount boundary and non-Unix process
 path) fail closed instead of falling back to path-based execution.
@@ -113,8 +126,10 @@ Sandbox environment setup cannot reset it to the workspace root. Path checks
 resolve relative operands from that directory while retaining the existing
 workspace policy and explicitly allowed paths. Directory selection itself
 remains confined to the workspace root.
-Read-before-edit registration and inferred source capture follow the pinned
-execution directory. Declared `source_artifacts` keep workspace-root semantics.
+Read-before-edit registration follows the pinned execution directory. Local
+shell commands can run concurrently and do not claim automatic source
+preimages or rollback authority for their effects. Other execution providers
+may advertise source capture when they can own that contract.
 Outcomes carry the shared `bash_workdir` evidence for the requested and resolved
 workspace-relative directory, including started nonzero outcomes. An omitted
 `workdir` on a later call starts at the workspace root again.
@@ -146,9 +161,15 @@ set, not a catalog of every useful workflow. Artifact-result recovery through
 remain eager as compact read-only observation operations. Their resident
 projections expose only the ordinary call shape; advanced reflection fields
 remain available through explicit typed `tool_search`/`invoke_tool` selection.
+Ordinary child delegation uses automatic result delivery at the runtime completion
+barrier. The resident `agent` schema exposes spawn, status, result access, and
+messaging; explicit `wait` observation is available through typed
+`tool_search`/`invoke_tool` selection of the canonical `agent` contract. It
+observes current-run activity and accepts no child ID. This projection adds no
+waiting loop, lifecycle state, database read, or execution path.
 Fan-out, advanced memory operations, and graph-maintenance schemas remain
 discoverable through the deferred surface. The resident compact-JSON schema
-projection has an 8 KiB regression budget for the actual serialized schema
+projection has a 9 KiB regression budget for the actual serialized schema
 array, without reserving space for hypothetical future fields; explicit user-
 pinned tools may exceed it. This budget excludes the rest of the provider
 request. Ordinary workspace navigation (`read_file`,

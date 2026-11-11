@@ -581,7 +581,7 @@ fn health_response_serializes() {
         memoria: "connected".into(),
         interaction_api_major: AGENT_INTERACTION_API_MAJOR.to_string(),
         build_git_sha: "a".repeat(40),
-        build_git_dirty: astra_core::history_work_baseline::BUILD_GIT_DIRTY == "true",
+        build_git_dirty: true,
     };
     let v = serde_json::to_value(&resp).unwrap();
     assert_eq!(v["status"], "ok");
@@ -590,10 +590,7 @@ fn health_response_serializes() {
     assert!(v.get("persist_ok").is_none());
     assert!(v.get("persist_fail").is_none());
     assert_eq!(v["interaction_api_major"], AGENT_INTERACTION_API_MAJOR);
-    assert_eq!(
-        v["build_git_dirty"],
-        astra_core::history_work_baseline::BUILD_GIT_DIRTY == "true"
-    );
+    assert_eq!(v["build_git_dirty"], true);
 }
 
 #[test]
@@ -691,11 +688,13 @@ fn cancel_run_response_serializes() {
         run_id: "r1".into(),
         status: "cancelled".into(),
         execution_settled: true,
+        context_not_saved: Some(true),
     };
     let v = serde_json::to_value(&resp).unwrap();
     assert_eq!(v["run_id"], "r1");
     assert_eq!(v["status"], "cancelled");
     assert_eq!(v["execution_settled"], true);
+    assert_eq!(v["context_not_saved"], true);
 }
 
 #[test]
@@ -1135,6 +1134,7 @@ fn cancel_run_record_to_response() {
         run_id: "r1".into(),
         status: "cancelled".into(),
         execution_settled: true,
+        context_not_saved: Some(false),
     };
     let resp: CancelRunResponse = record.into();
     assert_eq!(resp.run_id, "r1");
@@ -1490,7 +1490,7 @@ fn chat_request_into_data_maps_all_fields() {
     let req = ChatRequest {
         completion_checks: Some(serde_json::from_value(declarations.clone()).unwrap()),
         message: "hello".into(),
-        conversation_authority: None,
+
         user_intent: Some("pure hello".into()),
         parts: vec![json!({"type": "text", "text": "hello"})],
         attachments: vec![json!({"id": "att-1", "kind": "file"})],
@@ -1704,7 +1704,7 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
     let req = ChatRequest {
         completion_checks: None,
         message: "do step".into(),
-        conversation_authority: None,
+
         user_intent: None,
         parts: Vec::new(),
         attachments: Vec::new(),
@@ -1752,115 +1752,6 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         ctx.get("is_plan_subtask").and_then(|v| v.as_bool()),
         Some(true)
     );
-}
-
-#[test]
-fn patch_materialization_request_is_closed_and_revision_pinned() {
-    let value = json!({
-        "request_id": "request-1",
-        "patch_artifact_id": "patch-1",
-        "expected_target_branch_revision": 4,
-        "expected_target_graph_revision": 3
-    });
-    serde_json::from_value::<WorkPatchMaterializationRequestV1>(value.clone())
-        .expect("complete materialization request");
-    let mut widened = value.clone();
-    widened
-        .as_object_mut()
-        .expect("request object")
-        .insert("provider_ref".into(), json!("must-stay-server-owned"));
-    assert!(serde_json::from_value::<WorkPatchMaterializationRequestV1>(widened).is_err());
-    let mut internal_basis = value;
-    internal_basis
-        .as_object_mut()
-        .expect("request object")
-        .insert(
-            "expected_target_subject_ref".into(),
-            json!("internal-workspace"),
-        );
-    assert!(serde_json::from_value::<WorkPatchMaterializationRequestV1>(internal_basis).is_err());
-}
-
-#[test]
-fn patch_commit_request_is_closed_revision_pinned_and_cannot_assert_identity() {
-    let value = json!({
-        "request_id": "commit-1",
-        "patch_artifact_id": "patch-1",
-        "expected_target_branch_revision": 4,
-        "expected_target_graph_revision": 3,
-        "message": "Commit reviewed changes"
-    });
-    serde_json::from_value::<WorkPatchCommitRequestV1>(value.clone())
-        .expect("complete patch commit request");
-    for internal in ["provider_ref", "policy_decision_ref", "author_email"] {
-        let mut widened = value.clone();
-        widened
-            .as_object_mut()
-            .expect("request object")
-            .insert(internal.into(), json!("caller-controlled"));
-        assert!(
-            serde_json::from_value::<WorkPatchCommitRequestV1>(widened).is_err(),
-            "{internal} must remain server-owned"
-        );
-    }
-}
-
-#[test]
-fn patch_export_request_is_closed_and_cannot_assert_provider_authority() {
-    let value = json!({
-        "request_id": "export-1",
-        "expected_branch_revision": 4,
-        "expected_graph_revision": 3
-    });
-    serde_json::from_value::<WorkPatchArtifactExportRequestV1>(value.clone())
-        .expect("complete export request");
-    let mut widened = value.clone();
-    widened
-        .as_object_mut()
-        .expect("request object")
-        .insert("provider_ref".into(), json!("caller-provider"));
-    assert!(serde_json::from_value::<WorkPatchArtifactExportRequestV1>(widened).is_err());
-    let mut internal_basis = value;
-    internal_basis
-        .as_object_mut()
-        .expect("request object")
-        .insert("expected_subject_ref".into(), json!("internal-workspace"));
-    assert!(serde_json::from_value::<WorkPatchArtifactExportRequestV1>(internal_basis).is_err());
-}
-
-#[test]
-fn patch_artifact_page_query_is_closed() {
-    let value = json!({
-        "before_created_at": "2026-08-02T12:00:00.000001Z",
-        "before_patch_artifact_id": "patch-1",
-        "limit": 20
-    });
-    serde_json::from_value::<WorkPatchArtifactsQueryV1>(value.clone())
-        .expect("complete patch artifact page query");
-    let mut widened = value;
-    widened
-        .as_object_mut()
-        .expect("query object")
-        .insert("include_content".into(), json!(true));
-    assert!(serde_json::from_value::<WorkPatchArtifactsQueryV1>(widened).is_err());
-}
-
-#[test]
-fn patch_materialization_page_query_is_closed() {
-    let value = json!({
-        "source_branch_id": "branch-alternative-1",
-        "before_created_at": "2026-08-02T12:00:00.000001Z",
-        "before_operation_id": "materialization-1",
-        "limit": 20
-    });
-    serde_json::from_value::<WorkPatchMaterializationsQueryV1>(value.clone())
-        .expect("complete materialization page query");
-    let mut widened = value;
-    widened
-        .as_object_mut()
-        .expect("query object")
-        .insert("include_executor_lease".into(), json!(true));
-    assert!(serde_json::from_value::<WorkPatchMaterializationsQueryV1>(widened).is_err());
 }
 
 #[test]

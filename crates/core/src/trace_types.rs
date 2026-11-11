@@ -15,8 +15,6 @@ pub enum TraceCategory {
     ToolCalls,
     /// Full LLM request/response payloads.
     LlmExchanges,
-    /// Context assembly and compression decisions.
-    ContextAssembly,
     /// Decision explanations (tool surface rationale).
     DecisionExplain,
     /// Phase transitions (Perceive → Plan → Execute → Evaluate → Reflect).
@@ -33,10 +31,6 @@ pub enum TraceCategory {
     MemoryRetrieval,
     /// Skill loading, execution, and teardown lifecycle.
     SkillExecution,
-    /// Durable harness/runtime hook snapshot history.
-    HarnessSnapshots,
-    /// System prompt assembly and injection decisions.
-    PromptAssembly,
     /// Safety guard evaluations and rulings.
     GuardEvaluation,
     /// Meta-category: enables all categories.
@@ -50,7 +44,6 @@ impl FromStr for TraceCategory {
         match s {
             "tool_calls" => Ok(Self::ToolCalls),
             "llm_exchanges" => Ok(Self::LlmExchanges),
-            "context_assembly" => Ok(Self::ContextAssembly),
             "decision_explain" => Ok(Self::DecisionExplain),
             "phase_transition" => Ok(Self::PhaseTransition),
             "budget" => Ok(Self::Budget),
@@ -59,8 +52,6 @@ impl FromStr for TraceCategory {
             "thinking" => Ok(Self::Thinking),
             "memory_retrieval" => Ok(Self::MemoryRetrieval),
             "skill_execution" => Ok(Self::SkillExecution),
-            "harness_snapshots" => Ok(Self::HarnessSnapshots),
-            "prompt_assembly" => Ok(Self::PromptAssembly),
             "guard_evaluation" => Ok(Self::GuardEvaluation),
             "all" => Ok(Self::All),
             _ => Err(()),
@@ -74,7 +65,6 @@ impl TraceCategory {
         &[
             TraceCategory::ToolCalls,
             TraceCategory::LlmExchanges,
-            TraceCategory::ContextAssembly,
             TraceCategory::DecisionExplain,
             TraceCategory::PhaseTransition,
             TraceCategory::Budget,
@@ -83,8 +73,6 @@ impl TraceCategory {
             TraceCategory::Thinking,
             TraceCategory::MemoryRetrieval,
             TraceCategory::SkillExecution,
-            TraceCategory::HarnessSnapshots,
-            TraceCategory::PromptAssembly,
             TraceCategory::GuardEvaluation,
         ]
     }

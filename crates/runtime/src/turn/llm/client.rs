@@ -30,6 +30,12 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
+#[path = "responses.rs"]
+mod responses;
+
+const INCOMPLETE_TOOL_CONTINUATION_MESSAGE: &str =
+    "Some previous tool results could not be verified. Check their effects, then start a new turn.";
 
 #[cfg(test)]
 use crate::prompts;
@@ -38,10 +44,7 @@ use astra_turn_core::rate_limit_cooldown::{
     RateLimitAction, is_overload_status, is_rate_limit_status, parse_retry_after_ms,
 };
 use astra_turn_core::sse_blocks::SseBlankLineUtf8Buf;
-use astra_turn_core::sse_data_lines::{
-    json_events_from_sse_event_block, validate_sse_event_block_json,
-    validated_drain_sse_data_lines, validated_finish_sse_data_buffer,
-};
+use astra_turn_core::sse_data_lines::validated_sse_event;
 use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_call_shape::tool_call_name;
@@ -68,7 +71,7 @@ fn uses_moi_model_gateway_error_contract(
     })
 }
 
-struct MoiModelGatewayError {
+struct ProviderHttpRejection {
     classified: astra_core::ClassifiedError,
     retryable: bool,
 }
@@ -82,7 +85,7 @@ fn moi_model_gateway_error(
     response_body: &str,
     header_overrides: Option<&HashMap<String, String>>,
     response_contract_version: Option<&str>,
-) -> Option<MoiModelGatewayError> {
+) -> Option<ProviderHttpRejection> {
     if !uses_moi_model_gateway_error_contract(header_overrides)
         || response_contract_version
             != Some(astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1)
@@ -112,14 +115,53 @@ fn moi_model_gateway_error(
     if let Some(action) = action {
         details["action"] = Value::String(action.to_string());
     }
-    Some(MoiModelGatewayError {
+    Some(ProviderHttpRejection {
         classified: astra_core::ClassifiedError::new(
-            astra_core::ErrorKind::Unknown,
+            match code {
+                "provider_quota_exhausted" => astra_core::ErrorKind::ProviderQuotaExhausted,
+                "provider_forbidden" => astra_core::ErrorKind::ProviderForbidden,
+                "provider_authentication_failed" => astra_core::ErrorKind::Auth,
+                _ => astra_core::ErrorKind::Unknown,
+            },
             format!("MOI model gateway rejected inference: {code}"),
         )
         .with_details_json(details.to_string()),
         retryable,
     })
+}
+
+/// Only explicit machine fields identify provider quota or credentials. A
+/// generic 403 (including upstream_forbidden) proves neither cause. Never
+/// forward provider text: even an auth error body may echo arbitrary secrets.
+fn provider_access_error(status: u16, body: &str) -> Option<astra_core::ClassifiedError> {
+    use astra_core::ErrorKind;
+    let value = serde_json::from_str::<Value>(body).ok();
+    let code = value.as_ref().and_then(|value| {
+        value
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .or_else(|| value.pointer("/error/type").and_then(Value::as_str))
+    });
+    let kind = match (status, code) {
+        (403 | 429, Some("insufficient_quota" | "insufficient_balance")) => {
+            ErrorKind::ProviderQuotaExhausted
+        }
+        (401 | 403, Some("invalid_api_key" | "invalid_token" | "authentication_error"))
+        | (401, _) => ErrorKind::Auth,
+        (403, _) => ErrorKind::ProviderForbidden,
+        _ => return None,
+    };
+    let message = match kind {
+        ErrorKind::Auth => "LLM provider authentication failed",
+        ErrorKind::ProviderQuotaExhausted => "LLM provider account balance or quota exhausted",
+        ErrorKind::ProviderForbidden => "LLM provider denied inference; the reason is not known",
+        _ => unreachable!(),
+    };
+    Some(
+        astra_core::ClassifiedError::new(kind, message).with_details_json(
+            json!({"source":"llm_provider", "http_status":status, "retryable":false}).to_string(),
+        ),
+    )
 }
 
 /// Keep the billing owner's machine-readable reason without forwarding an
@@ -170,16 +212,14 @@ const TPM_EXHAUST_DELAY_MS: u64 = 60_000;
 const LLM_CONNECT_TIMEOUT_S: u64 = 30;
 /// Non-stream request hard timeout (seconds). Override: `ASTRA_LLM_NONSTREAM_TIMEOUT_S`.
 const LLM_NONSTREAM_TIMEOUT_S: u64 = 120;
-/// Total budget across all safe retries for a single LLM call (seconds).
-/// Override: `ASTRA_LLM_TOTAL_BUDGET_S`.
+/// Default bound for request startup/retries and ledger I/O (seconds).
+/// `ASTRA_LLM_TOTAL_BUDGET_S` explicitly opts into a whole-call cap.
 const LLM_TOTAL_BUDGET_S: u64 = 300;
-/// Maximum time a streaming inference may go without yielding or advancing a
-/// deliverable answer/tool call. Reasoning is transport activity, but it does
-/// not postpone the initial actionable yield. Once delivery starts, visible
-/// text and authorized tool JSON fragments roll this deadline so a legitimate
-/// streamed tool payload is not cut off mid-object. Independent physical-idle,
-/// accumulation, and total-call budgets remain additional safety bounds.
-const LLM_SEMANTIC_PROGRESS_TIMEOUT_S: u64 = 120;
+/// Maximum time a streaming inference may go without meaningful text,
+/// reasoning, or authorized tool-call progress. Heartbeats do not refresh it.
+/// The five-minute default tolerates providers buffering long tool payloads;
+/// independent idle, accumulation, and total-call budgets still bound the call.
+const LLM_SEMANTIC_PROGRESS_TIMEOUT_S: u64 = 300;
 /// Maximum slice reserved from a logical inference budget for durable attempt
 /// terminalization. The reserve scales down for very small test/operator
 /// budgets and is never available to HTTP work or retry backoff.
@@ -196,42 +236,7 @@ use super::super::model_cooldown::rate_limit_cooldown;
 
 // ── Global HTTP Client ───────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LlmProviderProtocol {
-    OpenAiCompatible,
-    AnthropicMessages,
-    BedrockConverse,
-    TypeSafeSystemOne,
-}
-
-impl LlmProviderProtocol {
-    #[must_use]
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::OpenAiCompatible => "openai_compatible",
-            Self::AnthropicMessages => "anthropic_messages",
-            Self::BedrockConverse => "bedrock_converse",
-            Self::TypeSafeSystemOne => "typesafe_systemone",
-        }
-    }
-
-    /// Whether the concrete request builder preserves each appended provider
-    /// message as a distinct wire item. Append-only caching is invalid for
-    /// transports that merge adjacent roles and thereby rewrite the old tail.
-    #[must_use]
-    pub(crate) fn preserves_appended_message_boundaries(self) -> bool {
-        matches!(self, Self::OpenAiCompatible)
-    }
-}
-
-pub(crate) fn llm_provider_protocol(provider: &str) -> LlmProviderProtocol {
-    match provider {
-        "anthropic" => LlmProviderProtocol::AnthropicMessages,
-        "bedrock" => LlmProviderProtocol::BedrockConverse,
-        "typesafe" => LlmProviderProtocol::TypeSafeSystemOne,
-        _ => LlmProviderProtocol::OpenAiCompatible,
-    }
-}
+pub(crate) use astra_core::model_wire::{LlmProviderProtocol, llm_provider_protocol};
 
 /// Immutable identity of the exact serialized provider payload.
 ///
@@ -271,6 +276,23 @@ impl ProviderWireFingerprints {
         cache_capability: Option<CacheCapability>,
     ) -> Result<Self, astra_core::ClassifiedError> {
         let (messages, system, conversation, tools) = match protocol {
+            LlmProviderProtocol::OpenAiResponses => {
+                let items = provider_wire_items(body.get("input"));
+                (
+                    items.clone(),
+                    items
+                        .iter()
+                        .copied()
+                        .filter(|item| item["role"] == "developer")
+                        .collect(),
+                    items
+                        .iter()
+                        .copied()
+                        .filter(|item| item["role"] != "developer")
+                        .collect(),
+                    provider_wire_items(body.get("tools")),
+                )
+            }
             LlmProviderProtocol::TypeSafeSystemOne => (
                 provider_wire_items(body.get("state")),
                 provider_wire_items(body.get("questions")),
@@ -368,6 +390,10 @@ fn provider_cache_key_system_items(
     use astra_turn_core::cache_placement::{CacheProtocol, VolatilePlacement};
 
     let mut system = match protocol {
+        LlmProviderProtocol::OpenAiResponses => provider_wire_items(body.get("input"))
+            .into_iter()
+            .filter(|item| item["role"] == "developer")
+            .collect(),
         LlmProviderProtocol::TypeSafeSystemOne => provider_wire_items(body.get("questions")),
         LlmProviderProtocol::OpenAiCompatible => {
             let messages = body
@@ -422,6 +448,7 @@ fn provider_cache_key_tool_items(
     use astra_turn_core::cache_placement::CacheProtocol;
 
     let mut tools = match protocol {
+        LlmProviderProtocol::OpenAiResponses => provider_wire_items(body.get("tools")),
         LlmProviderProtocol::OpenAiCompatible
         | LlmProviderProtocol::AnthropicMessages
         | LlmProviderProtocol::TypeSafeSystemOne => provider_wire_items(body.get("tools")),
@@ -454,6 +481,7 @@ fn provider_cache_key_tool_items(
 
 fn provider_wire_tool_name(protocol: LlmProviderProtocol, tool: &Value) -> Option<&str> {
     let pointer = match protocol {
+        LlmProviderProtocol::OpenAiResponses => "/name",
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
             "/function/name"
         }
@@ -518,6 +546,22 @@ impl ProviderWireComposition {
     ) -> Result<Self, astra_core::ClassifiedError> {
         let mut composition = Self::default();
         match protocol {
+            LlmProviderProtocol::OpenAiResponses => {
+                for item in provider_wire_items(body.get("input")) {
+                    if item["role"] == "developer" {
+                        composition.system_bytes += serialized_value_bytes(item)?;
+                        composition.system_items += 1;
+                    } else {
+                        composition.conversation_bytes += serialized_value_bytes(item)?;
+                        composition.conversation_items += 1;
+                    }
+                }
+                accumulate_wire_items(
+                    body.get("tools"),
+                    &mut composition.tool_schema_bytes,
+                    &mut composition.tool_schema_items,
+                )?;
+            }
             LlmProviderProtocol::TypeSafeSystemOne => {
                 accumulate_wire_items(
                     body.get("questions"),
@@ -751,19 +795,14 @@ pub(crate) fn global_llm_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         let connect = llm_connect_timeout();
-        // This client-level ceiling is only a transport backstop. Derive it
-        // from the same effective provider-attempt configuration so an
-        // operator override cannot be silently capped by the compiled 300s
-        // default. Per-request deadlines remain authoritative below.
-        let total = llm_total_budget().saturating_add(std::time::Duration::from_secs(60));
+        // Body lifetime belongs to the streaming watchdogs or an explicit
+        // invocation budget. A client-wide timeout would cap healthy streams.
         let pool_idle = std::env::var("ASTRA_LLM_POOL_MAX_IDLE_PER_HOST")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(4usize);
         let mut builder = reqwest::Client::builder()
             .connect_timeout(connect)
-            // Use a generous timeout; per-request timeout handled via tokio::time::timeout
-            .timeout(total)
             .pool_max_idle_per_host(pool_idle);
         // Honour HTTPS_PROXY / ALL_PROXY env vars (reqwest default-features=false
         // does not auto-read system proxy, so we wire it up explicitly).
@@ -775,7 +814,6 @@ pub(crate) fn global_llm_client() -> &'static reqwest::Client {
                     target: "astra_runtime::llm_client",
                     pool_max_idle_per_host = pool_idle,
                     connect_timeout_s = connect.as_secs(),
-                    total_timeout_s = total.as_secs(),
                     "global LLM HTTP client built"
                 );
                 client
@@ -789,9 +827,7 @@ pub(crate) fn global_llm_client() -> &'static reqwest::Client {
                     error = %e,
                     "failed to build global LLM HTTP client; retrying without pool_max_idle_per_host"
                 );
-                let mut fallback_builder = reqwest::Client::builder()
-                    .connect_timeout(connect)
-                    .timeout(total);
+                let mut fallback_builder = reqwest::Client::builder().connect_timeout(connect);
                 fallback_builder = apply_env_proxy(fallback_builder);
                 match fallback_builder.build() {
                     Ok(client) => client,
@@ -860,6 +896,8 @@ fn is_tpm_exhaustion(error_text: &str) -> bool {
 /// Collected result from a single LLM streaming call.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LlmCallResult {
+    /// Replayable provider output, scoped to its connection and model.
+    pub provider_continuation: Option<Value>,
     /// Set by the executing adapter, never decoded from generated text.
     pub judgment_provenance: Option<astra_turn_types::JudgmentResponseProvenance>,
     /// Provider response identity when available on non-stream responses.
@@ -942,6 +980,7 @@ fn canonicalize_provider_tool_calls(tool_calls: &mut [Value]) {
 fn provider_request_output_limit(body: &Value) -> Option<usize> {
     [
         body.get("max_completion_tokens"),
+        body.get("max_output_tokens"),
         body.get("max_tokens"),
         body.pointer("/inferenceConfig/maxTokens"),
     ]
@@ -989,6 +1028,80 @@ pub(crate) enum LlmStreamUpdate {
     ToolCall { index: usize, tool_call: Value },
 }
 
+/// Exact transport-owned identity of one observed physical provider request.
+///
+/// This bridges transport-owned serialized bytes and the turn-level trace.
+/// Identity is allocated before dispatch for request-local diagnostics;
+/// identity alone does not prove admission, delivery or durable recovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderRequestObservation {
+    pub request_id: String,
+    pub request_hash: String,
+    pub attempt: u32,
+    pub protocol: crate::turn::llm::client::LlmProviderProtocol,
+    pub provider_wire_bytes: u64,
+    pub composition: crate::turn::llm::client::ProviderWireComposition,
+    pub fingerprints: crate::turn::llm::client::ProviderWireFingerprints,
+}
+
+impl ProviderRequestObservation {
+    pub(crate) fn from_wire(
+        request_id: String,
+        attempt: u32,
+        wire: &ProviderWireRequestIdentity,
+    ) -> Self {
+        Self {
+            request_id,
+            request_hash: wire.provider_wire_hash.clone(),
+            attempt,
+            protocol: wire.protocol,
+            provider_wire_bytes: wire.provider_wire_bytes,
+            composition: wire.composition.clone(),
+            fingerprints: wire.fingerprints.clone(),
+        }
+    }
+
+    pub(crate) fn matches_wire(&self, wire: &ProviderWireRequestIdentity) -> bool {
+        self.request_hash == wire.provider_wire_hash
+            && self.protocol == wire.protocol
+            && self.provider_wire_bytes == wire.provider_wire_bytes
+            && self.composition == wire.composition
+            && self.fingerprints == wire.fingerprints
+    }
+}
+
+/// One physical request and its terminal fact, when observed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderAttemptObservation {
+    pub request: ProviderRequestObservation,
+    /// Runtime transport observation for this physical attempt. Admission and
+    /// dispatch are separate facts; one retry starting transport must not make
+    /// another merely prepared request look sent.
+    pub dispatch_started: bool,
+    pub terminal: Option<astra_services::InferenceInvocationTerminal>,
+    /// None means not dispatched; an empty sample means dispatched, unknown.
+    pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
+    /// Inclusive physical input, independent of disjoint billing qualification.
+    pub measured_input_tokens: Option<u64>,
+}
+
+impl ProviderAttemptObservation {
+    /// Inclusive observed input, falling back to the proven lane subtotal.
+    pub(crate) fn observed_input_tokens(&self) -> u64 {
+        if !self.dispatch_started {
+            return 0;
+        }
+        let known = self.qualified_usage.map_or(0, |usage| {
+            usage
+                .input_tokens()
+                .unwrap_or(0)
+                .saturating_add(usage.cached_input_tokens().unwrap_or(0))
+                .saturating_add(usage.cache_creation_tokens().unwrap_or(0))
+        });
+        self.measured_input_tokens.unwrap_or(known)
+    }
+}
+
 pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
 
 /// Short-lived provider route material for one model call.
@@ -997,7 +1110,11 @@ pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
 /// credential and request headers, so its custom `Debug` only exposes
 /// non-secret routing facts.
 pub(crate) struct LlmExecutionRoute<'a> {
+    pub inference_protocol: Option<LlmProviderProtocol>,
+    pub response_scope: Option<&'a str>,
+    pub subscription: Option<&'a astra_services::chatgpt::ExecutionCredential>,
     pub fixed_temperature: Option<f64>,
+    pub supported_reasoning_efforts: Option<&'a [String]>,
     pub thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
     pub model_name: &'a str,
     pub wire_model_name: Option<&'a str>,
@@ -1017,7 +1134,11 @@ impl<'a> LlmExecutionRoute<'a> {
     #[must_use]
     pub(crate) fn from_admitted(execution: &'a astra_services::AdmittedModelExecution) -> Self {
         Self {
+            inference_protocol: execution.inference_protocol,
+            response_scope: execution.response_scope.as_deref(),
+            subscription: execution.subscription.as_ref(),
             fixed_temperature: execution.fixed_temperature,
+            supported_reasoning_efforts: execution.supported_reasoning_efforts.as_deref(),
             thinking_protocol: execution.thinking_protocol,
             model_name: &execution.model_name,
             wire_model_name: execution.wire_model_name.as_deref(),
@@ -1040,6 +1161,9 @@ impl<'a> LlmExecutionRoute<'a> {
 /// credentials, endpoint URLs, and header values from `Debug`.
 #[derive(Clone)]
 pub(crate) struct OwnedLlmExecutionRoute {
+    pub inference_protocol: Option<LlmProviderProtocol>,
+    pub response_scope: Option<String>,
+    pub subscription: Option<astra_services::chatgpt::ExecutionCredential>,
     pub model_name: String,
     pub wire_model_name: Option<String>,
     pub api_key: String,
@@ -1050,6 +1174,7 @@ pub(crate) struct OwnedLlmExecutionRoute {
     pub thinking_capability: Option<astra_services::models::ThinkingCapability>,
     /// Mode-independent fixed temperature admitted with the Offering.
     pub fixed_temperature: Option<f64>,
+    pub supported_reasoning_efforts: Option<Vec<String>>,
     pub thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
     pub header_overrides: HashMap<String, String>,
     pub request_body_overrides: Option<Map<String, Value>>,
@@ -1061,7 +1186,11 @@ impl OwnedLlmExecutionRoute {
     #[must_use]
     pub fn borrowed(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
+            inference_protocol: self.inference_protocol,
+            response_scope: self.response_scope.as_deref(),
+            subscription: self.subscription.as_ref(),
             fixed_temperature: self.fixed_temperature,
+            supported_reasoning_efforts: self.supported_reasoning_efforts.as_deref(),
             thinking_protocol: self.thinking_protocol,
             model_name: &self.model_name,
             wire_model_name: self.wire_model_name.as_deref(),
@@ -1120,6 +1249,21 @@ pub(crate) struct LlmCall<'a> {
     pub thinking: &'a ThinkingConfig,
 }
 
+impl LlmCall<'_> {
+    fn validate_declared_reasoning(&self) -> Result<(), astra_core::ClassifiedError> {
+        if !self
+            .thinking
+            .is_within_declared_efforts(self.route.supported_reasoning_efforts)
+        {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::InvalidRequest,
+                "reasoning effort is not supported by the admitted model",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Admission result for one physical provider request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderAttemptAdmission {
@@ -1127,9 +1271,11 @@ pub(crate) enum ProviderAttemptAdmission {
     Paused(u32),
 }
 
-/// Durable observer for physical provider requests.
+/// Execution control and observations for physical provider requests.
 ///
-/// `begin_attempt` must commit and return `Admitted` before HTTP is sent. A
+/// `begin_attempt` must validate its owner's authority and return `Admitted`
+/// before HTTP is sent. Durable accounting observers commit their admission;
+/// Run-owned agent observers use existing Run controls without a database write. A
 /// `Paused` index is retained for re-admission after the pause wait; it grants
 /// no delivery authority. Every admitted index is completed exactly once,
 /// including retryable failures. Logical invocation lifecycle remains owned
@@ -1157,6 +1303,15 @@ pub(crate) trait ProviderAttemptObserver: Send + Sync {
         terminal: &astra_services::InferenceInvocationTerminal,
     ) -> Result<(), astra_core::ClassifiedError>;
 
+    /// Replace the validated cumulative snapshot for this physical attempt.
+    fn note_usage_snapshot(
+        &self,
+        _attempt_index: u32,
+        _usage: crate::turn::token_usage::TokenUsage,
+        _presence: crate::turn::token_usage::TokenUsagePresence,
+    ) {
+    }
+
     /// Preserve provider lane presence for Explain Analyze without changing
     /// the inference ledger's normalized accounting contract.
     fn note_usage_presence(
@@ -1182,11 +1337,18 @@ async fn begin_observed_provider_attempt(
     };
     let mut retained_attempt = None;
     loop {
-        match observer.begin_attempt(wire, retained_attempt).await? {
+        match observer
+            .begin_attempt(wire, retained_attempt)
+            .await
+            .inspect_err(LlmAttemptSpan::note_error)?
+        {
             ProviderAttemptAdmission::Admitted(index) => return Ok(Some(index)),
             ProviderAttemptAdmission::Paused(index) => {
                 retained_attempt = Some(index);
-                observer.wait_for_retained_pause().await?;
+                observer
+                    .wait_for_retained_pause()
+                    .await
+                    .inspect_err(LlmAttemptSpan::note_error)?;
             }
         }
     }
@@ -1196,7 +1358,7 @@ struct ControlledProviderAttemptObserver<'a> {
     inner: &'a dyn ProviderAttemptObserver,
     started: Instant,
     work_budget: std::time::Duration,
-    logical_budget: std::time::Duration,
+    logical_budget: Option<std::time::Duration>,
     cancel: LlmCancel<'a>,
 }
 
@@ -1208,7 +1370,11 @@ impl ControlledProviderAttemptObserver<'_> {
     fn remaining_settlement(&self) -> std::time::Duration {
         // The reserve stops provider work early enough to leave time for
         // settlement; it is not a second, shorter deadline for a fast reply.
-        self.logical_budget.saturating_sub(self.started.elapsed())
+        // Without an explicit total limit, settlement gets an independent I/O
+        // budget, regardless of how long the provider streamed.
+        self.logical_budget
+            .map(|budget| budget.saturating_sub(self.started.elapsed()))
+            .unwrap_or_else(llm_total_budget)
     }
 
     fn cancellation_error(&self, stage: &str) -> astra_core::ClassifiedError {
@@ -1311,6 +1477,16 @@ impl ProviderAttemptObserver for ControlledProviderAttemptObserver<'_> {
                 Err(self.ledger_deadline_error("terminalization", Some(terminal)))
             },
         }
+    }
+
+    fn note_usage_snapshot(
+        &self,
+        attempt_index: u32,
+        usage: crate::turn::token_usage::TokenUsage,
+        presence: crate::turn::token_usage::TokenUsagePresence,
+    ) {
+        self.inner
+            .note_usage_snapshot(attempt_index, usage, presence);
     }
 
     fn note_usage_presence(
@@ -1477,7 +1653,10 @@ pub(crate) async fn finish_observed_provider_attempt(
     observer
         .finish_attempt(attempt_index, terminal)
         .await
-        .map_err(|error| attach_provider_terminal_evidence(error, terminal))
+        .map_err(|error| {
+            crate::server::run_trace::note_attempt_settlement_error(error.kind.as_str());
+            attach_provider_terminal_evidence(error, terminal)
+        })
 }
 
 fn note_observed_provider_usage_presence(
@@ -1495,6 +1674,7 @@ pub(crate) async fn finish_observed_provider_error(
     attempt_index: Option<u32>,
     error: &astra_core::ClassifiedError,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     finish_observed_provider_attempt(
         observer,
         attempt_index,
@@ -1509,6 +1689,7 @@ pub(crate) async fn finish_observed_provider_error_with_partial(
     error: &astra_core::ClassifiedError,
     partial: &LlmCallResult,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     note_observed_provider_usage_presence(observer, attempt_index, partial.usage_presence);
     finish_observed_provider_attempt(
         observer,
@@ -1524,6 +1705,7 @@ pub(crate) async fn finish_observed_provider_delivery_unknown(
     attempt_index: Option<u32>,
     error: &astra_core::ClassifiedError,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     finish_observed_provider_attempt(
         observer,
         attempt_index,
@@ -1538,6 +1720,7 @@ pub(crate) async fn finish_observed_provider_delivery_unknown_with_partial(
     error: &astra_core::ClassifiedError,
     partial: &LlmCallResult,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     note_observed_provider_usage_presence(observer, attempt_index, partial.usage_presence);
     finish_observed_provider_attempt(
         observer,
@@ -1680,6 +1863,61 @@ pub(crate) async fn wait_llm_cancel(cancel: LlmCancel<'_>) {
                     }
                 } => {}
             }
+        }
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_PREPARATION_ERROR: Option<astra_core::ErrorKind>;
+}
+
+async fn await_subscription_credential<T>(
+    acquire: impl std::future::Future<
+        Output = Result<
+            T,
+            (
+                axum::http::StatusCode,
+                axum::Json<astra_core::ErrorResponse>,
+            ),
+        >,
+    >,
+    remaining: std::time::Duration,
+    cancel: LlmCancel<'_>,
+) -> Result<T, astra_core::ClassifiedError> {
+    tokio::select! {
+        biased;
+        _ = wait_llm_cancel(cancel) => Err(responses::error(astra_core::ErrorKind::Cancelled, "cancelled")),
+        value = tokio::time::timeout(remaining, acquire) => value
+            .map_err(|_| responses::error(astra_core::ErrorKind::ProviderDeadline, "credential_deadline"))
+            .and_then(|value| value.map_err(responses::credential_error)),
+    }.inspect_err(LlmAttemptSpan::note_error)
+}
+
+async fn prepare_compatible_endpoint(
+    url: &str,
+    remaining: std::time::Duration,
+    cancel: LlmCancel<'_>,
+) -> Result<astra_services::byok_endpoint::EndpointClient, astra_core::ClassifiedError> {
+    if remaining.is_zero() {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "LLM provider deadline reached while preparing the connection",
+        ));
+    }
+    tokio::select! {
+        biased;
+        _ = wait_llm_cancel(cancel) => Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::Cancelled, "LLM call cancelled")),
+        result = tokio::time::timeout(remaining, async {
+            #[cfg(test)]
+            if let Some(kind) = TEST_PREPARATION_ERROR.try_with(|kind| *kind).ok().flatten() {
+                return Err(astra_core::ClassifiedError::new(kind, "private fixture preparation failure"));
+            }
+            astra_services::byok_endpoint::endpoint_client(url).await
+        }) => {
+            result.map_err(|_| astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ProviderDeadline, "LLM provider deadline reached while preparing the connection"))?
         }
     }
 }
@@ -1892,12 +2130,57 @@ pub(crate) fn llm_nonstream_timeout() -> std::time::Duration {
     ))
 }
 
-/// Total budget across all retries + fallback for a single LLM call. Override: `ASTRA_LLM_TOTAL_BUDGET_S`.
+/// Bound for setup/retries, auxiliary calls and individual ledger operations.
+/// A configured total budget also bounds these phases.
 pub(crate) fn llm_total_budget() -> std::time::Duration {
     std::time::Duration::from_secs(llm_secs_from_env(
         "ASTRA_LLM_TOTAL_BUDGET_S",
         LLM_TOTAL_BUDGET_S,
     ))
+}
+
+/// Only an explicit positive duration enables the stream total deadline.
+pub(crate) fn llm_stream_total_budget() -> Result<Option<Duration>, astra_core::ClassifiedError> {
+    parse_llm_stream_total_budget(std::env::var("ASTRA_LLM_TOTAL_BUDGET_S"))
+}
+
+fn parse_llm_stream_total_budget(
+    value: Result<String, std::env::VarError>,
+) -> Result<Option<Duration>, astra_core::ClassifiedError> {
+    let invalid = || {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::InvalidRequest,
+            "ASTRA_LLM_TOTAL_BUDGET_S must be unset/empty or a positive integer number of seconds within the supported deadline range",
+        )
+    };
+    let value = match value {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => return Err(invalid()),
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let duration = value
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .filter(|duration| Instant::now().checked_add(*duration).is_some())
+        .ok_or_else(invalid)?;
+    Ok(Some(duration))
+}
+
+/// A missing deadline disables only this timer, never cancellation or idle checks.
+pub(crate) async fn wait_optional_deadline(deadline: Option<TokioInstant>) -> TokioInstant {
+    match deadline {
+        Some(deadline) => {
+            tokio::time::sleep_until(deadline).await;
+            deadline
+        }
+        None => std::future::pending().await,
+    }
 }
 
 /// Deadline for producing meaningful semantic progress inside a live provider
@@ -1935,7 +2218,9 @@ pub(crate) enum StreamYieldState {
         last_semantic_activity_at: TokioInstant,
         actionable_delivery_observed: bool,
     },
-    Terminal,
+    Terminal {
+        observed_at: TokioInstant,
+    },
 }
 
 impl StreamYieldState {
@@ -1947,7 +2232,7 @@ impl StreamYieldState {
     }
 
     pub(crate) fn is_terminal(self) -> bool {
-        matches!(self, Self::Terminal)
+        matches!(self, Self::Terminal { .. })
     }
 
     pub(crate) fn has_actionable_yield(self) -> bool {
@@ -1970,7 +2255,17 @@ impl StreamYieldState {
                 last_semantic_activity_at,
                 ..
             } => Some(last_semantic_activity_at + timeout),
-            Self::Terminal => None,
+            Self::Terminal { .. } => None,
+        }
+    }
+
+    /// Tail traffic cannot move the deadline established by the first terminal.
+    pub(crate) fn terminal_deadline(self, idle_timeout: Duration) -> Option<TokioInstant> {
+        match self {
+            Self::Terminal { observed_at } => {
+                Some(observed_at + stream_terminal_drain_timeout(idle_timeout))
+            }
+            _ => None,
         }
     }
 
@@ -2006,7 +2301,7 @@ impl StreamYieldState {
                 last_semantic_activity_at: now,
                 actionable_delivery_observed,
             },
-            Self::Terminal => Self::Terminal,
+            terminal @ Self::Terminal { .. } => terminal,
         };
     }
 
@@ -2038,12 +2333,16 @@ impl StreamYieldState {
                     actionable_delivery_observed: true,
                 };
             }
-            Self::Delivering { .. } | Self::Terminal => {}
+            Self::Delivering { .. } | Self::Terminal { .. } => {}
         }
     }
 
     pub(crate) fn mark_terminal(&mut self) {
-        *self = Self::Terminal;
+        if !self.is_terminal() {
+            *self = Self::Terminal {
+                observed_at: TokioInstant::now(),
+            };
+        }
     }
 }
 
@@ -2144,6 +2443,9 @@ pub(crate) fn llm_request_url_for_provider(
 ) -> String {
     let base = base_url.trim_end_matches('/');
     match llm_provider_protocol(provider) {
+        LlmProviderProtocol::OpenAiResponses => {
+            astra_core::model_wire::responses::endpoint_url(base_url)
+        }
         LlmProviderProtocol::AnthropicMessages => {
             if base.ends_with("/v1") {
                 format!("{base}/messages")
@@ -2153,7 +2455,7 @@ pub(crate) fn llm_request_url_for_provider(
         }
         LlmProviderProtocol::BedrockConverse => bedrock_converse_url(base, model_name, streaming),
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
-            format!("{base}/chat/completions")
+            astra_core::model_wire::endpoint_url(base_url, "chat/completions")
         }
     }
 }
@@ -2549,7 +2851,7 @@ fn append_only_history_contract_error(message: &'static str) -> astra_core::Clas
 /// assistant or synthetic tool message to be replaced. Malformed/incomplete
 /// groups therefore fail before provider I/O and remain recoverable through
 /// the canonical lifecycle instead of silently changing the cache prefix.
-fn validate_append_only_openai_history(
+pub(crate) fn validate_append_only_openai_history(
     messages: &[Value],
 ) -> Result<(), astra_core::ClassifiedError> {
     let mut pending_tool_ids = HashSet::<&str>::new();
@@ -3328,13 +3630,32 @@ fn build_provider_request_body_with_cache_capability(
     };
     let marker_stripped_messages;
     let messages = if messages.iter().any(|message| {
-        crate::turn::wire_assembly::is_required_runtime_preamble(message)
+        message
+            .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+            .is_some()
+            || message
+                .get(astra_turn_types::MODEL_REPLAY_ORIGIN_FIELD)
+                .is_some()
+            || message.get(super::model_origin::FOREIGN_GROUP).is_some()
+            || message
+                .get(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
+                .is_some()
+            || crate::turn::wire_assembly::is_required_runtime_preamble(message)
             || crate::turn::wire_assembly::is_runtime_system_context(message)
             || astra_turn_types::is_runtime_owned_message(message)
             || astra_turn_types::has_append_only_runtime_authority_policy(message)
             || message
                 .get(astra_turn_core::tool::result::advisory::TOOL_RESULT_ADVISORIES_FIELD)
                 .is_some()
+            || message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| {
+                    calls.iter().any(|call| {
+                        call.get(astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD)
+                            .is_some()
+                    })
+                })
             || [
                 astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD,
                 astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
@@ -3350,6 +3671,7 @@ fn build_provider_request_body_with_cache_capability(
                 messages,
             );
             let mut cloned = messages.to_vec();
+            cloned.retain(|message| !is_incomplete_marker_only(message));
             strip_internal_runtime_markers(&mut cloned);
             cloned
         };
@@ -3401,6 +3723,9 @@ fn build_provider_request_body_with_cache_capability(
         std::borrow::Cow::Owned(owned)
     };
     match llm_provider_protocol(provider) {
+        LlmProviderProtocol::OpenAiResponses => {
+            unreachable!("Responses requests use the connection-bound streaming adapter")
+        }
         LlmProviderProtocol::BedrockConverse => {
             let repaired = repair_openai_tool_pairing(&reasoning_repaired);
             let (system, bedrock_messages) =
@@ -3559,7 +3884,9 @@ fn apply_no_tool_choice(
     tools: &[Value],
 ) -> Result<(), astra_core::ClassifiedError> {
     match llm_provider_protocol(provider) {
-        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
+        LlmProviderProtocol::OpenAiResponses
+        | LlmProviderProtocol::OpenAiCompatible
+        | LlmProviderProtocol::TypeSafeSystemOne => {
             // Keep the explicit terminal instruction even when the repair
             // request physically removed every schema. OpenAI-compatible
             // models can otherwise infer the tool protocol from conversation
@@ -3603,6 +3930,9 @@ fn apply_required_tool_choice(
     }
 
     match llm_provider_protocol(provider) {
+        LlmProviderProtocol::OpenAiResponses => {
+            body["tool_choice"] = json!({"type":"function","name":required_tool_name});
+        }
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
             body["tool_choice"] = json!({
                 "type": "function",
@@ -3872,7 +4202,7 @@ pub(crate) fn strip_empty_assistant_tool_calls(messages: &mut [Value]) {
 
 #[cfg(test)]
 pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
-    consolidate_system_messages_inner(messages, false, true)
+    consolidate_system_messages_inner(messages, false, true, false)
 }
 
 pub(crate) fn consolidate_system_messages_for_provider(
@@ -3880,25 +4210,43 @@ pub(crate) fn consolidate_system_messages_for_provider(
     provider: &str,
     explicit_cache_capability: Option<CacheCapability>,
 ) -> Vec<Value> {
-    let protocol = llm_provider_protocol(provider);
+    consolidate_system_messages_for_protocol(
+        messages,
+        provider,
+        explicit_cache_capability,
+        llm_provider_protocol(provider),
+    )
+}
+
+pub(crate) fn consolidate_system_messages_for_protocol(
+    messages: &[Value],
+    provider: &str,
+    explicit_cache_capability: Option<CacheCapability>,
+    protocol: LlmProviderProtocol,
+) -> Vec<Value> {
     let cache_cap = CacheCapability::from_explicit_or_provider(explicit_cache_capability, provider);
     let preserve_runtime_system_tail = matches!(protocol, LlmProviderProtocol::AnthropicMessages);
     let allow_suffix_dependent_history_repair = !matches!(
         cache_cap.volatile_placement,
         VolatilePlacement::AppendOnlyUserTail
     );
-    if matches!(protocol, LlmProviderProtocol::OpenAiCompatible) {
+    if matches!(
+        protocol,
+        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::OpenAiResponses
+    ) {
         let projected = crate::turn::wire_assembly::project_runtime_roles(messages);
         return consolidate_system_messages_inner(
             &projected,
             false,
             allow_suffix_dependent_history_repair,
+            matches!(protocol, LlmProviderProtocol::OpenAiResponses),
         );
     }
     consolidate_system_messages_inner(
         messages,
         preserve_runtime_system_tail,
         allow_suffix_dependent_history_repair,
+        false,
     )
 }
 
@@ -3907,8 +4255,85 @@ pub(crate) fn consolidate_system_messages_for_provider(
 const RETIRED_TOOL_RESULT_OPTIONAL_PROJECTION_FIELD: &str =
     "_astra_tool_result_optional_projection";
 
+fn provider_history_ids(messages: &[Value]) -> HashMap<String, String> {
+    use astra_turn_core::tool::args::shape::provider_tool_call_id;
+    messages
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|call| {
+            Some((
+                call.get("id")?.as_str()?.to_owned(),
+                provider_tool_call_id(call)?.to_owned(),
+            ))
+        })
+        .collect()
+}
+
 fn strip_internal_runtime_markers(messages: &mut [Value]) {
+    let provider_ids = provider_history_ids(messages);
+    strip_internal_runtime_markers_with_ids(messages, &provider_ids, false);
+}
+
+fn is_incomplete_marker_only(message: &Value) -> bool {
+    message["role"] == "assistant"
+        && message
+            .get(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
+            .is_some()
+        && message
+            .get("content")
+            .is_none_or(|content| content.is_null() || content.as_str() == Some(""))
+        && message["tool_calls"].as_array().is_none_or(Vec::is_empty)
+}
+
+fn strip_internal_runtime_markers_with_ids(
+    messages: &mut [Value],
+    provider_ids: &HashMap<String, String>,
+    preserve_responses: bool,
+) {
+    use astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD;
     for message in messages {
+        if message["role"] == "assistant" {
+            if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                for call in calls {
+                    if let Some(original) = call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| provider_ids.get(id))
+                    {
+                        call["id"] = Value::String(original.clone());
+                    }
+                    if let Some(object) = call.as_object_mut() {
+                        object.remove(PROVIDER_TOOL_CALL_ID_FIELD);
+                    }
+                }
+            }
+        } else if message["role"] == "tool" {
+            if let Some(original) = message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .and_then(|id| provider_ids.get(id))
+            {
+                message["tool_call_id"] = Value::String(original.clone());
+            }
+            // Cache annotations carry provider linkage in structural result
+            // blocks as well as the enclosing tool message. Leave result data
+            // and unknown/orphan identities to their existing owners.
+            if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
+                for block in blocks {
+                    if block["type"] == "tool_result" {
+                        if let Some(original) = block
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .and_then(|id| provider_ids.get(id))
+                        {
+                            block["tool_use_id"] = Value::String(original.clone());
+                        }
+                    }
+                }
+            }
+        }
         astra_turn_core::tool::result::advisory::project_advisories(message);
         crate::turn::wire_assembly::strip_required_runtime_preamble_marker(message);
         if let Some(object) = message.as_object_mut() {
@@ -3917,6 +4342,8 @@ fn strip_internal_runtime_markers(messages: &mut [Value]) {
             object.remove(astra_turn_types::USER_TURN_SEMANTICS_FIELD);
             object.remove(astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD);
             object.remove(astra_turn_types::MODEL_ITEM_ID_FIELD);
+            object.remove(astra_turn_types::MODEL_REPLAY_ORIGIN_FIELD);
+            object.remove(super::model_origin::FOREIGN_GROUP);
             object.remove("_compact_boundary");
             object.remove(astra_turn_core::cloud::history_summary::HISTORY_SUMMARY_FIELD);
             // These fields are compaction/checkpoint bookkeeping. They are
@@ -3924,6 +4351,8 @@ fn strip_internal_runtime_markers(messages: &mut [Value]) {
             // message contract and only add round-specific bytes to the
             // prompt cache suffix.
             for key in [
+                astra_core::model_wire::responses::CONTINUATION_KEY,
+                astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD,
                 "_round_index",
                 astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD,
                 "_timestamp",
@@ -3936,56 +4365,21 @@ fn strip_internal_runtime_markers(messages: &mut [Value]) {
                 astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
                 RETIRED_TOOL_RESULT_OPTIONAL_PROJECTION_FIELD,
             ] {
+                if preserve_responses && key == astra_core::model_wire::responses::CONTINUATION_KEY
+                {
+                    continue;
+                }
                 object.remove(key);
             }
         }
     }
 }
 
-/// Project canonical messages through provider presentation and metadata removal.
-///
-/// Canonical history retains typed provenance so intent, recovery, and
-/// append-only authority consumers can distinguish runtime-owned messages.
-/// Provider requests render per-tool guidance and remove internal metadata.
-/// Equality checks across these representations must use this same projection,
-/// including its derived content, roles, ordering, and provider-visible fields.
-fn project_provider_message_metadata(messages: &[Value]) -> Vec<Value> {
-    let mut projected = messages.to_vec();
-    for message in &mut projected {
-        crate::turn::wire_assembly::strip_required_runtime_preamble_marker(message);
-    }
-    strip_internal_runtime_markers(&mut projected);
-    projected
-}
-
-/// Return whether the request ends in the exact provider-visible projection
-/// of a staged canonical append.
-///
-/// This is intentionally a shape check, not a content classifier: the only
-/// differences accounted for are the same typed metadata and derived guidance
-/// presentation handled at the provider boundary.
-pub(crate) fn provider_request_preserves_projected_canonical_suffix(
-    provider_messages: &[Value],
-    canonical_appended: &[Value],
-) -> bool {
-    if canonical_appended.is_empty() {
-        return true;
-    }
-    let Some(suffix_start) = provider_messages
-        .len()
-        .checked_sub(canonical_appended.len())
-    else {
-        return false;
-    };
-    let provider_suffix = &provider_messages[suffix_start..];
-    project_provider_message_metadata(provider_suffix)
-        == project_provider_message_metadata(canonical_appended)
-}
-
 fn consolidate_system_messages_inner(
     messages: &[Value],
     preserve_runtime_system_tail: bool,
     allow_suffix_dependent_history_repair: bool,
+    preserve_responses: bool,
 ) -> Vec<Value> {
     let mut system_parts: Vec<String> = Vec::new();
     let mut system_blocks: Vec<Value> = Vec::new();
@@ -4060,9 +4454,23 @@ fn consolidate_system_messages_inner(
         out.push(json!({"role": "system", "content": system_parts.join("\n\n")}));
     }
     out.extend(rest);
-    strip_internal_runtime_markers(&mut out);
-
+    if !preserve_responses {
+        // A Responses-only reasoning item has no content on another wire.
+        // Keep it in canonical history for same-scope replay, but do not send
+        // an empty assistant turn to providers that cannot consume it.
+        out.retain(|message| {
+            !is_incomplete_marker_only(message)
+                && !(message["role"] == "assistant"
+                    && message
+                        .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+                        .is_some()
+                    && message["content"].as_str().is_some_and(str::is_empty)
+                    && message["tool_calls"].as_array().is_none_or(Vec::is_empty))
+        });
+    }
     if !allow_suffix_dependent_history_repair {
+        let provider_ids = provider_history_ids(&out);
+        strip_internal_runtime_markers_with_ids(&mut out, &provider_ids, preserve_responses);
         return out;
     }
 
@@ -4129,6 +4537,8 @@ fn consolidate_system_messages_inner(
         }
     }
 
+    let provider_ids = provider_history_ids(&out);
+    strip_internal_runtime_markers_with_ids(&mut out, &provider_ids, preserve_responses);
     out
 }
 
@@ -4745,6 +5155,7 @@ pub(crate) async fn call_llm_and_collect(
 
 /// Execute one logical provider boundary with explicit tool authority and optional budget.
 /// An explicit budget is a new logical invocation, never a hidden transport retry.
+#[cfg(test)]
 pub(crate) async fn call_llm_and_collect_with_stream_callback(
     call: LlmCall<'_>,
     cancel: LlmCancel<'_>,
@@ -4753,16 +5164,12 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
     tool_choice: RuntimeToolChoice,
     total_budget: Option<std::time::Duration>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    let total_budget = total_budget.unwrap_or_else(|| match tool_choice {
-        RuntimeToolChoice::Auto => llm_total_budget(),
-        RuntimeToolChoice::None => auxiliary_execution_budget(call.purpose, llm_total_budget()),
-    });
-    call_llm_and_collect_with_total_budget(
-        call,
+    let prepared = prepare_streaming_call(call, tool_choice)?;
+    call_prepared_llm_and_collect_with_stream_callback(
+        prepared,
         cancel,
         stream_callback,
         attempt_observer,
-        tool_choice,
         total_budget,
     )
     .await
@@ -4771,7 +5178,9 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
 pub(crate) fn provider_supports_no_tool_choice(provider: &str) -> bool {
     matches!(
         llm_provider_protocol(provider),
-        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::AnthropicMessages
+        LlmProviderProtocol::OpenAiResponses
+            | LlmProviderProtocol::OpenAiCompatible
+            | LlmProviderProtocol::AnthropicMessages
     )
 }
 
@@ -4818,34 +5227,117 @@ fn discrete_judgment_provenance(
     .then_some(astra_turn_types::JudgmentResponseProvenance::DiscreteDecision)
 }
 
-async fn call_llm_and_collect_with_total_budget(
+/// A fully projected streaming request. Observations and transport share these
+/// exact serialized bytes; preparing a request grants no execution authority.
+pub(crate) struct PreparedStreamingCall<'a> {
+    purpose: astra_turn_types::InferencePurpose,
+    route: LlmExecutionRoute<'a>,
+    request: PreparedProviderRequest,
+    wire_output_limit: Option<usize>,
+    authorized_tool_names: HashSet<String>,
+    url: String,
+    judgment_provenance: Option<astra_turn_types::JudgmentResponseProvenance>,
+    preparation_elapsed: std::time::Duration,
+}
+
+impl PreparedStreamingCall<'_> {
+    #[cfg(test)]
+    pub(crate) fn identity(&self) -> &ProviderWireRequestIdentity {
+        self.request.identity()
+    }
+}
+
+pub(crate) fn prepare_streaming_call(
     call: LlmCall<'_>,
-    cancel: LlmCancel<'_>,
-    mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
-    attempt_observer: Option<&dyn ProviderAttemptObserver>,
     tool_choice: RuntimeToolChoice,
-    total_budget: std::time::Duration,
-) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+) -> Result<PreparedStreamingCall<'_>, astra_core::ClassifiedError> {
+    prepare_streaming_call_with_origin(call, tool_choice, None)
+}
+
+pub(crate) fn prepare_streaming_call_with_origin<'a>(
+    call: LlmCall<'a>,
+    tool_choice: RuntimeToolChoice,
+    scope: Option<&super::model_origin::ReplayScope<'_>>,
+) -> Result<PreparedStreamingCall<'a>, astra_core::ClassifiedError> {
+    let preparation_started = Instant::now();
+    if let Some(scope) = scope {
+        super::model_origin::verify_projected(scope, call.messages)?;
+    } else if call
+        .messages
+        .iter()
+        .any(|message| message.get(super::model_origin::FOREIGN_GROUP).is_some())
+    {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::InvalidRequest,
+            "Unverified model history",
+        ));
+    }
+    let default_protocol = llm_provider_protocol(call.route.provider);
+    if call.route.inference_protocol.is_some_and(|protocol| {
+        protocol != default_protocol
+            && !(protocol == LlmProviderProtocol::OpenAiResponses
+                && default_protocol == LlmProviderProtocol::OpenAiCompatible)
+    }) {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::InvalidRequest,
+            "The selected inference protocol is incompatible with this provider",
+        ));
+    }
+    if call
+        .messages
+        .iter()
+        .rev()
+        .take_while(|message| !astra_turn_types::is_human_user_message(message))
+        .any(|message| {
+            message["role"] == "assistant"
+                && message
+                    .get(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
+                    .is_some()
+        })
+    {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::InvalidRequest,
+            INCOMPLETE_TOOL_CONTINUATION_MESSAGE,
+        )
+        .with_details_json(
+            json!({"source":"runtime","code":"tool_continuation_incomplete"}).to_string(),
+        ));
+    }
+    if call
+        .route
+        .inference_protocol
+        .unwrap_or_else(|| llm_provider_protocol(call.route.provider))
+        == LlmProviderProtocol::OpenAiResponses
+    {
+        return responses::prepare(call, tool_choice, preparation_started, scope.is_some());
+    }
+    if call
+        .messages
+        .iter()
+        .rev()
+        .take_while(|message| !astra_turn_types::is_human_user_message(message))
+        .any(astra_core::model_wire::responses::has_tool_continuation)
+    {
+        return Err(responses::error(
+            astra_core::ErrorKind::InvalidRequest,
+            "responses_continuation_scope_changed",
+        ));
+    }
     if call.route.provider == "typesafe" {
         return Err(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::InvalidRequest,
             "TypeSafe supports typed nonstream judgments only",
         ));
     }
+    call.validate_declared_reasoning()?;
     let judgment_provenance = discrete_judgment_provenance(&call);
-    let logical_total_budget = total_budget;
-    let settlement_reserve = llm_mandatory_settlement_reserve(logical_total_budget);
-    let total_budget = logical_total_budget.saturating_sub(settlement_reserve);
-    let LlmCall {
-        purpose,
-        messages,
-        tools,
-        cache_capability,
-        route,
-        max_output_tokens,
-        temperature,
-        thinking,
-    } = call;
+    let messages = call.messages;
+    let tools = call.tools;
+    let cache_capability = call.cache_capability;
+    let route = &call.route;
+    let max_output_tokens = call.max_output_tokens;
+    let temperature = call.temperature;
+    let thinking = call.thinking;
     let configured_temperature = astra_core::model_wire::thinking::configured_temperature(
         route.request_body_overrides,
         route.fixed_temperature,
@@ -4858,40 +5350,13 @@ async fn call_llm_and_collect_with_total_budget(
     } else {
         temperature
     };
-    let LlmExecutionRoute {
-        fixed_temperature: _,
-        thinking_protocol,
-        model_name,
-        wire_model_name,
-        api_key,
-        base_url,
-        provider,
-        header_overrides,
-        request_body_overrides,
-        completions_url_override,
-        request_timeout,
-    } = route;
-    let cooldown = rate_limit_cooldown();
-    // `model_key` indexes rate-limit state on the local row name.
-    let model_key = model_name;
-    // `upstream_name` is what goes in the outbound request body + URL.
-    let upstream_name = wire_model_name.unwrap_or(model_name);
+    let provider = route.provider;
+    let model_name = route.model_name;
+    let upstream_name = route.wire_model_name.unwrap_or(model_name);
+    let base_url = route.base_url;
+    let request_body_overrides = route.request_body_overrides;
+    let thinking_protocol = route.thinking_protocol;
     validate_request_body_overrides(request_body_overrides)?;
-
-    let started = Instant::now();
-    let controlled_attempt_observer =
-        attempt_observer.map(|inner| ControlledProviderAttemptObserver {
-            inner,
-            started,
-            work_budget: total_budget,
-            logical_budget: logical_total_budget,
-            cancel,
-        });
-    let attempt_observer = controlled_attempt_observer
-        .as_ref()
-        .map(|observer| observer as &dyn ProviderAttemptObserver);
-    let client = global_llm_client();
-
     // Project system messages according to the declared transport/cache shape.
     // A current-user-only capability consolidates them at the head; protocols
     // that admit a runtime system suffix preserve that boundary.
@@ -4955,17 +5420,305 @@ async fn call_llm_and_collect_with_total_budget(
 
     let url = llm_request_url(
         base_url,
-        completions_url_override,
+        route.completions_url_override,
         provider,
         upstream_name,
         true,
     );
-    let _registered_endpoint_permit =
-        acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
+    Ok(PreparedStreamingCall {
+        purpose: call.purpose,
+        route: call.route,
+        request: prepared_request,
+        wire_output_limit,
+        authorized_tool_names,
+        url,
+        judgment_provenance,
+        preparation_elapsed: preparation_started.elapsed(),
+    })
+}
 
+#[cfg(test)]
+async fn call_llm_and_collect_with_total_budget(
+    call: LlmCall<'_>,
+    cancel: LlmCancel<'_>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    tool_choice: RuntimeToolChoice,
+    total_budget: std::time::Duration,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    let prepared = prepare_streaming_call(call, tool_choice)?;
+    call_prepared_llm_with_total_budget(
+        prepared,
+        cancel,
+        stream_callback,
+        attempt_observer,
+        Some(total_budget),
+    )
+    .await
+}
+
+pub(crate) async fn call_prepared_llm_and_collect_with_stream_callback(
+    prepared: PreparedStreamingCall<'_>,
+    cancel: LlmCancel<'_>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    total_budget: Option<std::time::Duration>,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    let configured_budget = llm_stream_total_budget()?;
+    let total_budget = total_budget.or_else(|| match prepared.purpose {
+        astra_turn_types::InferencePurpose::PrimaryAgent
+        | astra_turn_types::InferencePurpose::SubAgent => configured_budget,
+        purpose => Some(auxiliary_execution_budget(purpose, llm_total_budget())),
+    });
+    call_prepared_llm_with_total_budget(
+        prepared,
+        cancel,
+        stream_callback,
+        attempt_observer,
+        total_budget,
+    )
+    .await
+}
+
+async fn wait_connection_cancel(lease: Option<&astra_services::chatgpt::CredentialLease>) {
+    match lease {
+        Some(lease) => lease.cancel.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+enum ProviderErrorBody {
+    Transport(reqwest::Error),
+    TooLarge,
+}
+
+async fn read_provider_error_body(
+    mut response: reqwest::Response,
+    limit: Option<usize>,
+) -> Result<String, ProviderErrorBody> {
+    let Some(limit) = limit else {
+        return response.text().await.map_err(ProviderErrorBody::Transport);
+    };
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(ProviderErrorBody::Transport)?
+    {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(ProviderErrorBody::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+struct LlmAttemptSpan {
+    span: tracing::Span,
+    failed: bool,
+    phase: &'static str,
+    reason: Option<&'static str>,
+}
+
+impl LlmAttemptSpan {
+    fn start(retry_attempt: u32) -> Self {
+        crate::server::run_trace::clear_attempt_code();
+        let span = astra_logging::trace_context::llm_span(retry_attempt);
+        crate::server::run_trace::parent_to_active_run(&span);
+        Self {
+            span,
+            failed: true,
+            phase: "request",
+            reason: None,
+        }
+    }
+
+    fn received_response(&mut self, response: &reqwest::Response) {
+        self.span
+            .record("http.response.status_code", response.status().as_u16());
+        self.phase = "response_body";
+    }
+
+    fn begin_request(&mut self) {
+        crate::server::run_trace::clear_attempt_code();
+        self.phase = "request";
+    }
+
+    fn begin_admission(&mut self) {
+        crate::server::run_trace::clear_attempt_code();
+        self.phase = "admission";
+    }
+
+    fn note_error(error: &astra_core::ClassifiedError) {
+        crate::server::run_trace::note_attempt_code(error.kind.as_str());
+    }
+
+    fn transport_error(&mut self, error: &reqwest::Error) {
+        self.reason = Some(llm_transport_error_reason(error));
+    }
+
+    fn succeed(&mut self) {
+        self.failed = false;
+        crate::server::run_trace::clear_attempt_code();
+    }
+}
+
+impl Drop for LlmAttemptSpan {
+    fn drop(&mut self) {
+        if self.failed {
+            let code = crate::server::run_trace::attempt_code().unwrap_or("unknown");
+            let (phase, reason) = match crate::server::run_trace::attempt_settlement_error() {
+                Some(code) => ("settlement", code),
+                None => (self.phase, self.reason.unwrap_or(code)),
+            };
+            self.span.record("error.phase", phase);
+            self.span.record("error.reason", reason);
+            astra_logging::trace_context::mark_error(&self.span, code);
+        }
+    }
+}
+
+// Inspect typed causes only. Error strings can contain credentials, URLs or
+// provider content, and are not a stable DNS/TLS classification contract.
+fn llm_transport_error_reason(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        return "timeout";
+    }
+    if let Some(reason) = llm_io_error_reason(error) {
+        return reason;
+    }
+    if error.is_connect() {
+        "connect_error"
+    } else if error.is_builder() {
+        "request_build"
+    } else if error.is_decode() {
+        "decode_error"
+    } else if error.is_body() {
+        "body_error"
+    } else {
+        "transport_error"
+    }
+}
+
+fn llm_io_error_reason(error: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+    let mut cause = Some(error);
+    while let Some(error) = cause {
+        if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            use std::io::ErrorKind;
+            let reason = match error.kind() {
+                ErrorKind::ConnectionRefused => Some("connection_refused"),
+                ErrorKind::ConnectionReset => Some("connection_reset"),
+                ErrorKind::ConnectionAborted => Some("connection_aborted"),
+                ErrorKind::BrokenPipe => Some("broken_pipe"),
+                ErrorKind::TimedOut => Some("timeout"),
+                ErrorKind::UnexpectedEof => Some("unexpected_eof"),
+                _ => None,
+            };
+            if reason.is_some() {
+                return reason;
+            }
+        }
+        cause = error.source();
+    }
+    None
+}
+
+fn call_prepared_llm_with_total_budget(
+    prepared: PreparedStreamingCall<'_>,
+    cancel: LlmCancel<'_>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    total_budget: Option<std::time::Duration>,
+) -> impl std::future::Future<Output = Result<LlmCallResult, astra_core::ClassifiedError>> {
+    crate::server::run_trace::in_llm_call(call_prepared_llm_attempts(
+        prepared,
+        cancel,
+        stream_callback,
+        attempt_observer,
+        total_budget,
+    ))
+}
+
+async fn call_prepared_llm_attempts(
+    prepared: PreparedStreamingCall<'_>,
+    cancel: LlmCancel<'_>,
+    mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    total_budget: Option<std::time::Duration>,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    let PreparedStreamingCall {
+        purpose,
+        route,
+        request: prepared_request,
+        wire_output_limit,
+        authorized_tool_names,
+        url,
+        judgment_provenance,
+        preparation_elapsed,
+        ..
+    } = prepared;
+    let LlmExecutionRoute {
+        inference_protocol: _,
+        model_name,
+        api_key,
+        base_url: _,
+        provider,
+        header_overrides,
+        request_timeout,
+        completions_url_override,
+        ..
+    } = route;
+    if (provider == astra_services::chatgpt::PROVIDER) != route.subscription.is_some() {
+        return Err(responses::error(
+            astra_core::ErrorKind::ContractViolation,
+            "subscription_route_mismatch",
+        ));
+    }
+    // Admission precedes the retry loop, but belongs to the first diagnostic
+    // span. Transfer that span into the loop without releasing the call's permit.
+    let mut llm_attempt = LlmAttemptSpan::start(0);
+    llm_attempt.begin_admission();
+    let _registered_endpoint_permit =
+        acquire_registered_endpoint_permit_for_override(&url, completions_url_override)
+            .inspect_err(LlmAttemptSpan::note_error)?;
+    llm_attempt.phase = "preparation";
+    let mut first_span = Some(llm_attempt);
+    let model_key = model_name;
+    let cooldown = rate_limit_cooldown();
+    let logical_total_budget = total_budget;
+    let stream_budget = logical_total_budget
+        .map(|budget| budget.saturating_sub(llm_mandatory_settlement_reserve(budget)));
+    // Request startup, safe retries and error bodies stay bounded even when
+    // a successful streaming response has no total lifetime cap.
+    let total_budget = stream_budget.unwrap_or_else(llm_total_budget);
+    // Count request projection against provider work, while a retained pause
+    // or database admission wait keeps its existing separate deadline owner.
+    let started = Instant::now() - preparation_elapsed;
+    let controlled_attempt_observer =
+        attempt_observer.map(|inner| ControlledProviderAttemptObserver {
+            inner,
+            started,
+            work_budget: total_budget,
+            logical_budget: logical_total_budget,
+            cancel,
+        });
+    let attempt_observer = controlled_attempt_observer
+        .as_ref()
+        .map(|observer| observer as &dyn ProviderAttemptObserver);
+    let subscription = route.subscription;
+    let subscription_client = subscription
+        .map(|binding| binding.http_client())
+        .transpose()
+        .map_err(responses::credential_error)
+        .inspect_err(LlmAttemptSpan::note_error)?;
+    let client = subscription_client
+        .as_ref()
+        .unwrap_or_else(|| global_llm_client());
+    let mut rejected_version = None;
+    let mut auth_retried = false;
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
-    let mut last_model_gateway_error = None;
+    let mut last_structured_error = None;
     let max_retries = LLM_MAX_RETRIES;
     let mut retry_delay_override_ms = None;
     // Read idle timeouts once before the retry loop to avoid env-var races between
@@ -4982,7 +5735,8 @@ async fn call_llm_and_collect_with_total_budget(
             return Err(astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::Cancelled,
                 "LLM call cancelled",
-            ));
+            ))
+            .inspect_err(LlmAttemptSpan::note_error);
         }
         // Provider work deadline guard: abort if we've already spent too long across retries.
         if started.elapsed() >= total_budget {
@@ -4992,7 +5746,8 @@ async fn call_llm_and_collect_with_total_budget(
                     "LLM provider work deadline reached ({:.0}s): {last_err}",
                     total_budget.as_secs_f64()
                 ),
-            ));
+            ))
+            .inspect_err(LlmAttemptSpan::note_error);
         }
         if attempt > 0 {
             // A provider/cooldown hint owns the next delay when present.
@@ -5043,40 +5798,68 @@ async fn call_llm_and_collect_with_total_budget(
                     "LLM provider work deadline reached ({:.0}s) before provider retry request",
                     total_budget.as_secs_f64()
                 ),
-            ));
+            ))
+            .inspect_err(LlmAttemptSpan::note_error);
         }
 
         // Every configured observer is wrapped by
         // `ControlledProviderAttemptObserver` above. Keep deadline ownership in
         // that single layer so a durable-admission stall is classified as an
         // inference-ledger failure instead of racing an outer provider timer.
+        let mut llm_attempt = first_span
+            .take()
+            .unwrap_or_else(|| LlmAttemptSpan::start(attempt));
+        llm_attempt.phase = "preparation";
         let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
-            Some(
-                astra_services::byok_endpoint::endpoint_client(&url)
-                    .await
-                    .map_err(|error| {
-                        astra_core::ClassifiedError::new(
-                            astra_core::ErrorKind::InvalidRequest,
-                            error,
-                        )
-                    })?,
+            match prepare_compatible_endpoint(
+                &url,
+                total_budget.saturating_sub(started.elapsed()),
+                cancel,
             )
+            .await
+            .inspect_err(LlmAttemptSpan::note_error)
+            {
+                Ok(client) => Some(client),
+                Err(error)
+                    if error.kind == astra_core::ErrorKind::Network && attempt < max_retries =>
+                {
+                    last_err = error.message;
+                    last_kind = error.kind;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };
         let client = compatible_client.as_deref().unwrap_or(client);
+        let lease = if let Some(binding) = subscription {
+            let remaining = total_budget.saturating_sub(started.elapsed());
+            Some(
+                await_subscription_credential(
+                    binding.acquire(rejected_version.take()),
+                    remaining,
+                    cancel,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        llm_attempt.begin_admission();
         let observed_attempt =
             begin_observed_provider_attempt(attempt_observer, prepared_request.identity()).await?;
+        llm_attempt.phase = "preparation";
         let mut req = client.post(&url).header("content-type", "application/json");
-        req = apply_provider_auth(req, provider, api_key, header_overrides);
-        req = apply_llm_header_overrides(req, header_overrides);
-        // `total_budget` is the provider-work wall-clock bound, not merely a retry-loop
-        // check.  Previously a streaming request without an offering-specific
-        // timeout could remain inside one `send`/response body beyond the
-        // advertised 300s budget, holding an entire foreground fanout group
-        // hostage.  Reqwest carries this timeout into response-body streaming,
-        // while the SSE idle watchdog still provides the more precise
-        // pre/post-progress classification.
+        req = if let Some(lease) = &lease {
+            req.bearer_auth(lease.bearer())
+        } else {
+            apply_llm_header_overrides(
+                apply_provider_auth(req, provider, api_key, header_overrides),
+                header_overrides,
+            )
+        };
+        // Bound response startup separately from a successful streaming body.
         let remaining_total_budget = total_budget.saturating_sub(started.elapsed());
         if remaining_total_budget.is_zero() {
             let error = astra_core::ClassifiedError::new(
@@ -5095,12 +5878,11 @@ async fn call_llm_and_collect_with_total_budget(
         let request_deadline = request_timeout
             .map(|timeout| timeout.min(remaining_total_budget))
             .unwrap_or(remaining_total_budget);
-        // Reqwest's request timeout covers the response body as well as
-        // headers. Keep that transport deadline at the hard remaining total;
-        // the offering-specific response-start limit is enforced only by the
-        // `send()` select below. A healthy progressing stream may therefore
-        // outlive its header deadline without outliving total/idle budgets.
-        req = req.timeout(remaining_total_budget);
+        // A request timeout also covers the body. Apply it only when the
+        // caller or deployment explicitly supplied a total budget.
+        if stream_budget.is_some() {
+            req = req.timeout(remaining_total_budget);
+        }
 
         tracing::debug!(
             target: "astra_runtime::llm_client",
@@ -5114,14 +5896,19 @@ async fn call_llm_and_collect_with_total_budget(
         // Keep the dispatch marker inside the future selected below. If a
         // cancellation branch wins before the send future is ever polled,
         // diagnostics must not claim that transport execution started.
+        let send_span = llm_attempt.span.clone();
         let send_request = async {
+            llm_attempt.begin_request();
             if let Some(attempt_index) = observed_attempt {
                 attempt_observer
                     .expect("observed attempt requires observer")
                     .note_dispatch_started(attempt_index);
             }
-            req.body(prepared_request.body()).send().await
+            let mut request = req.body(prepared_request.body()).build()?;
+            crate::server::outbound_trace::rewrite(&mut request);
+            client.execute(request).await
         };
+        let send_request = send_request.instrument(send_span);
         let send_result = tokio::select! {
             biased;
             _ = wait_llm_cancel(cancel) => {
@@ -5137,10 +5924,16 @@ async fn call_llm_and_collect_with_total_budget(
                 .await?;
                 return Err(error);
             }
+            _ = wait_connection_cancel(lease.as_ref()) => {
+                let error = responses::error(astra_core::ErrorKind::Cancelled, "model_connection_unavailable");
+                finish_observed_provider_delivery_unknown(attempt_observer, observed_attempt, &error).await?;
+                return Err(error);
+            }
             result = tokio::time::timeout(request_deadline, send_request) => result,
         };
         let response = match send_result {
             Err(_) => {
+                llm_attempt.reason = Some("timeout");
                 let (kind, message) = if total_budget_owns_deadline {
                     (
                         astra_core::ErrorKind::ProviderDeadline,
@@ -5177,6 +5970,7 @@ async fn call_llm_and_collect_with_total_budget(
                 r
             }
             Ok(Err(e)) => {
+                llm_attempt.transport_error(&e);
                 tracing::warn!(
                     target: "astra_runtime::llm_client",
                     url = %url,
@@ -5216,7 +6010,7 @@ async fn call_llm_and_collect_with_total_budget(
                 // This transport failure is the newest provider attempt outcome.
                 // Do not let structured metadata from an earlier gateway response
                 // replace the final connection failure after retries are exhausted.
-                last_model_gateway_error = None;
+                last_structured_error = None;
                 last_err = error.message.clone();
                 last_kind = error.kind;
                 if retry_safe {
@@ -5226,20 +6020,23 @@ async fn call_llm_and_collect_with_total_budget(
             }
         };
 
+        llm_attempt.received_response(&response);
         let status = response.status().as_u16();
         if response.status().is_success() {
-            // Success — record to cooldown tracker
-            cooldown.with(model_key, |c| c.record_success());
+            if subscription.is_none() {
+                cooldown.with(model_key, |c| c.record_success());
+            }
             if provider_uses_bedrock_converse(provider) {
                 match crate::turn::bedrock::transport::collect_bedrock_stream_for_wire(
                     response,
                     model_name,
                     started,
-                    total_budget,
+                    stream_budget,
                     cancel,
                     idle_pre,
                     &authorized_tool_names,
                     stream_callback.as_deref_mut(),
+                    attempt_observer.zip(observed_attempt),
                 )
                 .await
                 {
@@ -5251,6 +6048,7 @@ async fn call_llm_and_collect_with_total_budget(
                             observed_attempt,
                             result.usage_presence,
                         );
+                        llm_attempt.phase = "settlement";
                         if let Err(error) = finish_observed_provider_attempt(
                             attempt_observer,
                             observed_attempt,
@@ -5260,6 +6058,7 @@ async fn call_llm_and_collect_with_total_budget(
                         {
                             return Err(attach_llm_result_details(error, &result));
                         }
+                        llm_attempt.succeed();
                         return Ok(result);
                     }
                     Err(crate::turn::bedrock::transport::BedrockStreamError::Cancelled {
@@ -5307,6 +6106,7 @@ async fn call_llm_and_collect_with_total_budget(
                         made_semantic_progress,
                         partial,
                     }) => {
+                        llm_attempt.reason = Some("semantic_progress_timeout");
                         let details = serde_json::json!({
                             "deadline": {
                                 "scope": "provider_attempt",
@@ -5428,7 +6228,7 @@ async fn call_llm_and_collect_with_total_budget(
                         error: transport_error,
                         partial,
                     }) => {
-                        let kind = if started.elapsed() >= total_budget {
+                        let kind = if stream_budget.is_some_and(|budget| started.elapsed() >= budget) {
                             astra_core::ErrorKind::ProviderDeadline
                         } else {
                             astra_core::ErrorKind::StreamTransport
@@ -5460,35 +6260,81 @@ async fn call_llm_and_collect_with_total_budget(
                     }
                 }
             }
-            let byte_stream = response.bytes_stream();
-            let stream_result = if provider_uses_anthropic_messages(provider) {
-                collect_anthropic_llm_stream_for_wire(
-                    byte_stream,
-                    model_name,
-                    started,
-                    total_budget,
-                    cancel,
-                    idle_pre,
-                    idle_post,
+            let stream_result = if route
+                .inference_protocol
+                .unwrap_or_else(|| llm_provider_protocol(provider))
+                == LlmProviderProtocol::OpenAiResponses
+            {
+                responses::collect(
+                    response,
+                    route,
                     &authorized_tool_names,
+                    cancel,
                     stream_callback.as_deref_mut(),
+                    started,
+                    stream_budget,
+                    lease.as_ref(),
+                    attempt_observer.zip(observed_attempt),
                 )
                 .await
             } else {
-                collect_llm_stream_for_wire(
-                    byte_stream,
-                    model_name,
-                    started,
-                    total_budget,
-                    cancel,
-                    idle_pre,
-                    idle_post,
-                    &authorized_tool_names,
-                    stream_callback.as_deref_mut(),
-                )
-                .await
+                let byte_stream = response.bytes_stream();
+                if provider_uses_anthropic_messages(provider) {
+                    collect_anthropic_llm_stream_for_wire(
+                        byte_stream,
+                        model_name,
+                        started,
+                        stream_budget,
+                        cancel,
+                        idle_pre,
+                        idle_post,
+                        &authorized_tool_names,
+                        stream_callback.as_deref_mut(),
+                        attempt_observer.zip(observed_attempt),
+                    )
+                    .await
+                } else {
+                    collect_llm_stream_for_wire(
+                        byte_stream,
+                        model_name,
+                        started,
+                        stream_budget,
+                        cancel,
+                        idle_pre,
+                        idle_post,
+                        &authorized_tool_names,
+                        stream_callback.as_deref_mut(),
+                        attempt_observer.zip(observed_attempt),
+                    )
+                    .await
+                }
             };
             match stream_result {
+                Err(StreamCollectError::Provider {
+                    error,
+                    partial,
+                    rejected,
+                }) => {
+                    let error = attach_llm_result_details(error, &partial);
+                    if rejected {
+                        finish_observed_provider_error_with_partial(
+                            attempt_observer,
+                            observed_attempt,
+                            &error,
+                            &partial,
+                        )
+                        .await?;
+                    } else {
+                        finish_observed_provider_delivery_unknown_with_partial(
+                            attempt_observer,
+                            observed_attempt,
+                            &error,
+                            &partial,
+                        )
+                        .await?;
+                    }
+                    return Err(error);
+                }
                 Ok(mut result) => {
                     result.judgment_provenance = judgment_provenance;
                     reconcile_missing_output_cap_finish_reason(&mut result, wire_output_limit);
@@ -5497,6 +6343,7 @@ async fn call_llm_and_collect_with_total_budget(
                         observed_attempt,
                         result.usage_presence,
                     );
+                    llm_attempt.phase = "settlement";
                     if let Err(error) = finish_observed_provider_attempt(
                         attempt_observer,
                         observed_attempt,
@@ -5506,6 +6353,7 @@ async fn call_llm_and_collect_with_total_budget(
                     {
                         return Err(attach_llm_result_details(error, &result));
                     }
+                    llm_attempt.succeed();
                     return Ok(result);
                 }
                 Err(StreamCollectError::Cancelled { partial }) => {
@@ -5529,6 +6377,7 @@ async fn call_llm_and_collect_with_total_budget(
                     elapsed_ms,
                     partial,
                 }) => {
+                    llm_attempt.reason = Some("deadline_exceeded");
                     let error = provider_deadline_from_transport(
                         "consuming the provider stream",
                         "stream exceeded the invocation-wide provider work budget",
@@ -5545,7 +6394,7 @@ async fn call_llm_and_collect_with_total_budget(
                     return Err(error);
                 }
                 Err(StreamCollectError::Transport { error, partial }) => {
-                    let kind = if started.elapsed() >= total_budget {
+                    let kind = if stream_budget.is_some_and(|budget| started.elapsed() >= budget) {
                         astra_core::ErrorKind::ProviderDeadline
                     } else {
                         astra_core::ErrorKind::StreamTransport
@@ -5580,6 +6429,7 @@ async fn call_llm_and_collect_with_total_budget(
                     partial,
                     ..
                 }) => {
+                    llm_attempt.reason = Some("idle_timeout");
                     let observed_error = attach_partial_details(
                         astra_core::ClassifiedError::new(
                             astra_core::ErrorKind::StreamIdle,
@@ -5601,6 +6451,7 @@ async fn call_llm_and_collect_with_total_budget(
                     made_semantic_progress,
                     partial,
                 }) => {
+                    llm_attempt.reason = Some("semantic_progress_timeout");
                     let details = serde_json::json!({
                         "deadline": {
                             "scope": "provider_attempt",
@@ -5647,6 +6498,16 @@ async fn call_llm_and_collect_with_total_budget(
             .get(astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        let request_id = headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| {
+                value.strip_prefix("req_").is_some_and(|suffix| {
+                    (8..=96).contains(&suffix.len())
+                        && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+            })
+            .map(str::to_owned);
 
         let remaining = total_budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
@@ -5657,7 +6518,18 @@ async fn call_llm_and_collect_with_total_budget(
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
-        let body = response.text();
+        let is_responses = route
+            .inference_protocol
+            .unwrap_or_else(|| llm_provider_protocol(provider))
+            == LlmProviderProtocol::OpenAiResponses;
+        let compatible_bad_request = status == 400
+            && llm_provider_protocol(provider) == LlmProviderProtocol::OpenAiCompatible
+            && !uses_moi_model_gateway_error_contract(header_overrides)
+            && model_gateway_error_contract.is_none();
+        let body = read_provider_error_body(
+            response,
+            (is_responses || compatible_bad_request).then_some(1024 * 1024),
+        );
         tokio::pin!(body);
         let body_result = tokio::select! {
             biased;
@@ -5666,6 +6538,11 @@ async fn call_llm_and_collect_with_total_budget(
                     astra_core::ErrorKind::Cancelled,
                     "LLM call cancelled while reading provider error response",
                 );
+                finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+                return Err(error);
+            }
+            _ = wait_connection_cancel(lease.as_ref()) => {
+                let error = responses::error(astra_core::ErrorKind::Cancelled, "model_connection_unavailable");
                 finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
                 return Err(error);
             }
@@ -5681,7 +6558,16 @@ async fn call_llm_and_collect_with_total_budget(
         };
         let text = match body_result {
             Ok(text) => text,
-            Err(error) => {
+            Err(ProviderErrorBody::TooLarge) => {
+                let error = astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ResourceLimit,
+                    "provider error response exceeded its size limit",
+                );
+                finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+                return Err(error);
+            }
+            Err(ProviderErrorBody::Transport(error)) => {
+                llm_attempt.transport_error(&error);
                 let kind = if started.elapsed() >= total_budget {
                     astra_core::ErrorKind::ProviderDeadline
                 } else if error.is_timeout() {
@@ -5707,45 +6593,144 @@ async fn call_llm_and_collect_with_total_budget(
             }
         };
 
-        if let Some(model_gateway_error) = moi_model_gateway_error(
-            status,
-            &text,
-            header_overrides,
-            model_gateway_error_contract.as_deref(),
-        ) {
-            let error = model_gateway_error.classified;
+        llm_attempt.phase = "response_status";
+        llm_attempt.reason = Some("http_status");
+        let direct_access_error = (subscription.is_none()
+            && !uses_moi_model_gateway_error_contract(header_overrides)
+            && model_gateway_error_contract.is_none())
+        .then(|| provider_access_error(status, &text))
+        .flatten();
+        let structured_error = if let Some(classified) = direct_access_error {
+            Some(ProviderHttpRejection {
+                classified,
+                retryable: false,
+            })
+        } else if status == 402
+            && subscription.is_none()
+            && !uses_moi_model_gateway_error_contract(header_overrides)
+            && model_gateway_error_contract.is_none()
+        {
+            Some(ProviderHttpRejection {
+                classified: payment_required_error(&text),
+                retryable: false,
+            })
+        } else if let Some(lease) = &lease {
+            let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            let code = astra_services::chatgpt::provider_error_code(status, &body);
+            let refresh = status == 401 && !auth_retried;
+            if refresh {
+                rejected_version = Some(lease.version());
+                auth_retried = true;
+                retry_delay_override_ms = Some(0);
+            }
+            Some(ProviderHttpRejection {
+                classified: responses::error(provider_http_error_kind(status, code), code)
+                    .with_details_json(
+                        json!({"source":"chatgpt","code":code,"http_status":status}).to_string(),
+                    ),
+                retryable: refresh || status >= 500,
+            })
+        } else if (is_responses && !is_rate_limit_status(status) && !is_overload_status(status))
+            || compatible_bad_request
+        {
+            let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            let code = body
+                .pointer("/error/code")
+                .and_then(Value::as_str)
+                .and_then(astra_core::model_wire::responses::provider_error)
+                .map(|(code, _)| code)
+                .unwrap_or("invalid_request");
+            let parameter = body
+                .pointer("/error/param")
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    matches!(
+                        *value,
+                        "model"
+                            | "input"
+                            | "tools"
+                            | "tool_choice"
+                            | "reasoning"
+                            | "reasoning.effort"
+                            | "reasoning_effort"
+                            | "temperature"
+                            | "top_p"
+                            | "max_tokens"
+                            | "max_completion_tokens"
+                            | "max_output_tokens"
+                    )
+                });
+            let rejected_effort = (is_responses
+                && matches!(status, 400 | 422)
+                && matches!(
+                    parameter,
+                    Some("reasoning" | "reasoning.effort" | "reasoning_effort")
+                ))
+            .then(|| serde_json::from_slice::<Value>(&prepared_request.body).ok())
+            .flatten()
+            .and_then(|body| {
+                body.pointer("/reasoning/effort")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .filter(|effort| {
+                astra_core::model_wire::thinking::ThinkingProtocol::supports_responses_effort(
+                    effort,
+                )
+            });
+            let message = if let Some(effort) = rejected_effort {
+                format!(
+                    "The model provider rejected the {effort} reasoning setting. Choose another setting or Model default."
+                )
+            } else {
+                parameter.map_or_else(
+                    || format!("Model provider rejected the request (HTTP {status})"),
+                    |parameter| {
+                        format!("Model provider rejected parameter {parameter} (HTTP {status})")
+                    },
+                )
+            };
+            Some(ProviderHttpRejection {
+                classified: astra_core::ClassifiedError::new(
+                    if status == 400 && astra_core::is_llm_context_window_error(&text) {
+                        astra_core::ErrorKind::ContextWindow
+                    } else {
+                        provider_http_error_kind(status, code)
+                    },
+                    message,
+                )
+                .with_details_json(
+                    json!({"source": if is_responses {"responses"} else {"openai_compatible"},"http_status":status,"code":code,"parameter":parameter,"request_id":request_id})
+                        .to_string(),
+                ),
+                retryable: status >= 500,
+            })
+        } else {
+            moi_model_gateway_error(
+                status,
+                &text,
+                header_overrides,
+                model_gateway_error_contract.as_deref(),
+            )
+        };
+        if let Some(rejection) = structured_error {
+            let error = rejection.classified;
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
-            if model_gateway_error.retryable && status >= 500 {
+            if rejection.retryable && (status >= 500 || subscription.is_some() && status == 401) {
                 last_err = error.message.clone();
                 last_kind = error.kind;
-                last_model_gateway_error = Some(error);
+                last_structured_error = Some(error);
                 continue;
             }
             return Err(error);
         }
-        last_model_gateway_error = None;
+        last_structured_error = None;
         // A negotiated gateway route must retain its versioned error boundary;
         // do not reinterpret a missing/mismatched contract as a provider error.
         // Likewise, an unsolicited gateway header is not trusted on BYOK routes.
-        if status == 402
-            && !uses_moi_model_gateway_error_contract(header_overrides)
-            && model_gateway_error_contract.is_none()
-        {
-            let error = payment_required_error(&text);
-            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
-            return Err(error);
-        }
-
-        // Auth responses can echo arbitrary credentials; do not log the body.
-        if status == 401 || status == 403 {
-            tracing::warn!(
-                target: "astra_runtime::llm_client",
-                "LLM auth error ({status}) on {model_key}",
-            );
-            let error = astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::Auth,
-                "LLM provider authentication failed".to_string(),
-            );
+        // Missing/mismatched gateway contracts retain only HTTP facts, never
+        // a provider-body interpretation of gateway-owned billing or identity.
+        if let Some(error) = provider_access_error(status, "") {
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
@@ -5754,7 +6739,7 @@ async fn call_llm_and_collect_with_total_budget(
         // leaking secrets that providers may echo back. Retain body for 5xx
         // (helpful for diagnosing transient backend failures) and the 400
         // context-window check below (which still needs to inspect text).
-        last_err = if (400..500).contains(&status) {
+        last_err = if is_responses || (400..500).contains(&status) {
             format!("LLM request rejected: {status}")
         } else {
             format!("LLM error {status}: {text}")
@@ -5854,7 +6839,7 @@ async fn call_llm_and_collect_with_total_budget(
         return Err(error);
     }
 
-    if let Some(error) = last_model_gateway_error {
+    if let Some(error) = last_structured_error {
         return Err(error);
     }
     Err(astra_core::ClassifiedError::new(
@@ -5926,14 +6911,15 @@ async fn collect_llm_stream_for_wire(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
     model_name: &str,
     started: Instant,
-    provider_work_budget: std::time::Duration,
+    provider_work_budget: Option<std::time::Duration>,
     cancel: LlmCancel<'_>,
     idle_pre: std::time::Duration,
     idle_post: std::time::Duration,
     authorized_tool_names: &HashSet<String>,
     stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    usage_observer: Option<(&dyn ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, StreamCollectError> {
-    collect_llm_stream_with_semantic_progress_deadline_and_surface(
+    collect_llm_stream_with_usage_observer(
         stream,
         model_name,
         started,
@@ -5944,6 +6930,7 @@ async fn collect_llm_stream_for_wire(
         llm_semantic_progress_timeout(),
         Some(authorized_tool_names),
         stream_callback,
+        usage_observer,
     )
     .await
 }
@@ -5963,7 +6950,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline(
         stream,
         model_name,
         started,
-        llm_total_budget(),
+        llm_stream_total_budget().expect("valid test streaming budget"),
         cancel,
         idle_pre,
         idle_post,
@@ -5974,17 +6961,47 @@ async fn collect_llm_stream_with_semantic_progress_deadline(
     .await
 }
 
+#[cfg(test)]
 async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
     model_name: &str,
     started: Instant,
-    provider_work_budget: std::time::Duration,
+    provider_work_budget: Option<std::time::Duration>,
+    cancel: LlmCancel<'_>,
+    idle_pre: std::time::Duration,
+    idle_post: std::time::Duration,
+    semantic_progress_timeout: std::time::Duration,
+    authorized_tool_names: Option<&HashSet<String>>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+) -> Result<LlmCallResult, StreamCollectError> {
+    collect_llm_stream_with_usage_observer(
+        stream,
+        model_name,
+        started,
+        provider_work_budget,
+        cancel,
+        idle_pre,
+        idle_post,
+        semantic_progress_timeout,
+        authorized_tool_names,
+        stream_callback,
+        None,
+    )
+    .await
+}
+
+async fn collect_llm_stream_with_usage_observer(
+    stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
+    model_name: &str,
+    started: Instant,
+    provider_work_budget: Option<std::time::Duration>,
     cancel: LlmCancel<'_>,
     idle_pre: std::time::Duration,
     idle_post: std::time::Duration,
     semantic_progress_timeout: std::time::Duration,
     authorized_tool_names: Option<&HashSet<String>>,
     mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    usage_observer: Option<(&dyn ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, StreamCollectError> {
     let mut full_text = String::new();
     let mut reasoning = String::new();
@@ -6016,6 +7033,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
             .map(|(_, value)| Value::Object(value.clone()))
             .collect();
         LlmCallResult {
+            provider_continuation: None,
             judgment_provenance: None,
             response_id: response_id.clone(),
             full_text:
@@ -6039,7 +7057,8 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
 
     let sse = parse_openai_sse_json_stream(stream);
     tokio::pin!(sse);
-    let provider_work_deadline = started + provider_work_budget;
+    let provider_work_deadline =
+        provider_work_budget.map(|budget| TokioInstant::from_std(started + budget));
     loop {
         if cancel.is_triggered() {
             if yield_state.is_terminal() {
@@ -6056,9 +7075,12 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                 ),
             });
         }
-        if !yield_state.is_terminal() && started.elapsed() >= provider_work_budget {
+        if let Some(budget) = provider_work_budget
+            && !yield_state.is_terminal()
+            && started.elapsed() >= budget
+        {
             return Err(StreamCollectError::ProviderWorkDeadline {
-                elapsed_ms: provider_work_budget.as_millis() as u64,
+                elapsed_ms: budget.as_millis() as u64,
                 partial: partial_result(
                     &response_id,
                     &full_text,
@@ -6083,15 +7105,9 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                 ),
             });
         }
-        let ordinary_idle = if made_progress { idle_post } else { idle_pre };
-        let idle = if yield_state.is_terminal() {
-            stream_terminal_drain_timeout(ordinary_idle)
-        } else {
-            ordinary_idle
-        };
-        let yield_deadline = yield_state
-            .deadline(semantic_progress_timeout)
-            .unwrap_or_else(|| TokioInstant::from_std(provider_work_deadline));
+        let idle = if made_progress { idle_post } else { idle_pre };
+        let terminal_deadline = yield_state.terminal_deadline(idle);
+        let yield_deadline = yield_state.deadline(semantic_progress_timeout);
         let item = tokio::select! {
             biased;
             _ = wait_llm_cancel(cancel) => {
@@ -6109,11 +7125,9 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                     ),
                 });
             },
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
-                provider_work_deadline
-            )), if !yield_state.is_terminal() => {
+            deadline = wait_optional_deadline(provider_work_deadline), if !yield_state.is_terminal() => {
                 return Err(StreamCollectError::ProviderWorkDeadline {
-                    elapsed_ms: provider_work_budget.as_millis() as u64,
+                    elapsed_ms: deadline.duration_since(TokioInstant::from_std(started)).as_millis() as u64,
                     partial: partial_result(
                         &response_id,
                         &full_text,
@@ -6124,7 +7138,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                     ),
                 });
             },
-            _ = tokio::time::sleep_until(yield_deadline), if !yield_state.is_terminal() => {
+            _ = wait_optional_deadline(yield_deadline), if !yield_state.is_terminal() => {
                 return Err(StreamCollectError::SemanticProgressTimeout {
                     elapsed_ms: semantic_progress_timeout.as_millis() as u64,
                     made_semantic_progress: yield_state.has_actionable_yield(),
@@ -6138,6 +7152,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                     ),
                 });
             },
+            _ = wait_optional_deadline(terminal_deadline) => break,
             r = tokio::time::timeout(idle, sse.next()) => match r {
                 Ok(v) => v,
                 Err(_elapsed) => {
@@ -6198,12 +7213,18 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                 current_usage_presence(&usage_presence),
             ) {
                 replace_usage_presence(&usage_presence, observed);
+                if let Some((observer, attempt)) = usage_observer {
+                    observer.note_usage_snapshot(attempt, extracted, observed);
+                }
                 usage = extracted.to_qualified_json_map(observed);
                 made_progress = true;
             }
         }
-        if yield_state.is_terminal() && !usage.is_empty() {
-            break;
+
+        // The terminal frame owns its delta; subsequent frames may only
+        // refine usage until DONE/EOF or the fixed terminal deadline.
+        if yield_state.is_terminal() {
+            continue;
         }
 
         let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
@@ -6226,9 +7247,6 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
             .and_then(|c| c.get("delta"))
             .and_then(Value::as_object)
         else {
-            if yield_state.is_terminal() && !usage.is_empty() {
-                break;
-            }
             continue;
         };
 
@@ -6408,9 +7426,6 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                 }
             }
         }
-        if yield_state.is_terminal() && !usage.is_empty() {
-            break;
-        }
     }
 
     // A provider may close the stream immediately after a delimiter prefix
@@ -6531,6 +7546,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
     }
 
     Ok(LlmCallResult {
+        provider_continuation: None,
         judgment_provenance: None,
         response_id,
         full_text,
@@ -6573,14 +7589,15 @@ async fn collect_anthropic_llm_stream_for_wire(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
     model_name: &str,
     started: Instant,
-    provider_work_budget: std::time::Duration,
+    provider_work_budget: Option<std::time::Duration>,
     cancel: LlmCancel<'_>,
     idle_pre: std::time::Duration,
     idle_post: std::time::Duration,
     authorized_tool_names: &HashSet<String>,
     stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    usage_observer: Option<(&dyn ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, StreamCollectError> {
-    collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surface(
+    collect_anthropic_llm_stream_with_usage_observer(
         stream,
         model_name,
         started,
@@ -6591,6 +7608,7 @@ async fn collect_anthropic_llm_stream_for_wire(
         llm_semantic_progress_timeout(),
         Some(authorized_tool_names),
         stream_callback,
+        usage_observer,
     )
     .await
 }
@@ -6610,7 +7628,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline(
         stream,
         model_name,
         started,
-        llm_total_budget(),
+        llm_stream_total_budget().expect("valid test streaming budget"),
         cancel,
         idle_pre,
         idle_post,
@@ -6621,17 +7639,47 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline(
     .await
 }
 
+#[cfg(test)]
 async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surface(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
     model_name: &str,
     started: Instant,
-    provider_work_budget: std::time::Duration,
+    provider_work_budget: Option<std::time::Duration>,
+    cancel: LlmCancel<'_>,
+    idle_pre: std::time::Duration,
+    idle_post: std::time::Duration,
+    semantic_progress_timeout: std::time::Duration,
+    authorized_tool_names: Option<&HashSet<String>>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+) -> Result<LlmCallResult, StreamCollectError> {
+    collect_anthropic_llm_stream_with_usage_observer(
+        stream,
+        model_name,
+        started,
+        provider_work_budget,
+        cancel,
+        idle_pre,
+        idle_post,
+        semantic_progress_timeout,
+        authorized_tool_names,
+        stream_callback,
+        None,
+    )
+    .await
+}
+
+async fn collect_anthropic_llm_stream_with_usage_observer(
+    stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
+    model_name: &str,
+    started: Instant,
+    provider_work_budget: Option<std::time::Duration>,
     cancel: LlmCancel<'_>,
     idle_pre: std::time::Duration,
     idle_post: std::time::Duration,
     semantic_progress_timeout: std::time::Duration,
     authorized_tool_names: Option<&HashSet<String>>,
     mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    usage_observer: Option<(&dyn ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, StreamCollectError> {
     let mut full_text = String::new();
     let mut reasoning = String::new();
@@ -6669,6 +7717,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
             .map(|(_, value)| Value::Object(value.clone()))
             .collect();
         LlmCallResult {
+            provider_continuation: None,
             judgment_provenance: None,
             response_id: response_id.clone(),
             full_text: full_text.clone(),
@@ -6686,7 +7735,8 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
 
     let sse = parse_openai_sse_json_stream(stream);
     tokio::pin!(sse);
-    let provider_work_deadline = started + provider_work_budget;
+    let provider_work_deadline =
+        provider_work_budget.map(|budget| TokioInstant::from_std(started + budget));
     loop {
         if cancel.is_triggered() {
             if yield_state.is_terminal() {
@@ -6704,9 +7754,12 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                 ),
             });
         }
-        if !yield_state.is_terminal() && started.elapsed() >= provider_work_budget {
+        if let Some(budget) = provider_work_budget
+            && !yield_state.is_terminal()
+            && started.elapsed() >= budget
+        {
             return Err(StreamCollectError::ProviderWorkDeadline {
-                elapsed_ms: provider_work_budget.as_millis() as u64,
+                elapsed_ms: budget.as_millis() as u64,
                 partial: partial_result(
                     &response_id,
                     &full_text,
@@ -6733,15 +7786,8 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                 ),
             });
         }
-        let ordinary_idle = if made_progress { idle_post } else { idle_pre };
-        let idle = if yield_state.is_terminal() {
-            stream_terminal_drain_timeout(ordinary_idle)
-        } else {
-            ordinary_idle
-        };
-        let yield_deadline = yield_state
-            .deadline(semantic_progress_timeout)
-            .unwrap_or_else(|| TokioInstant::from_std(provider_work_deadline));
+        let idle = if made_progress { idle_post } else { idle_pre };
+        let yield_deadline = yield_state.deadline(semantic_progress_timeout);
         let item = tokio::select! {
             biased;
             _ = wait_llm_cancel(cancel) => {
@@ -6760,11 +7806,9 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                     ),
                 });
             },
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
-                provider_work_deadline
-            )), if !yield_state.is_terminal() => {
+            deadline = wait_optional_deadline(provider_work_deadline), if !yield_state.is_terminal() => {
                 return Err(StreamCollectError::ProviderWorkDeadline {
-                    elapsed_ms: provider_work_budget.as_millis() as u64,
+                    elapsed_ms: deadline.duration_since(TokioInstant::from_std(started)).as_millis() as u64,
                     partial: partial_result(
                         &response_id,
                         &full_text,
@@ -6776,7 +7820,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                     ),
                 });
             },
-            _ = tokio::time::sleep_until(yield_deadline), if !yield_state.is_terminal() => {
+            _ = wait_optional_deadline(yield_deadline), if !yield_state.is_terminal() => {
                 return Err(StreamCollectError::SemanticProgressTimeout {
                     elapsed_ms: semantic_progress_timeout.as_millis() as u64,
                     made_semantic_progress: yield_state.has_actionable_yield(),
@@ -6868,6 +7912,11 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                         &usage_presence,
                         usage_tokens.qualified_snapshot(retained_usage_presence).1,
                     );
+                    if let Some((observer, attempt)) = usage_observer {
+                        let (snapshot, presence) =
+                            usage_tokens.qualified_snapshot(retained_usage_presence);
+                        observer.note_usage_snapshot(attempt, snapshot, presence);
+                    }
                     made_progress = true;
                 }
             }
@@ -7090,6 +8139,11 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                         &usage_presence,
                         usage_tokens.qualified_snapshot(retained_usage_presence).1,
                     );
+                    if let Some((observer, attempt)) = usage_observer {
+                        let (snapshot, presence) =
+                            usage_tokens.qualified_snapshot(retained_usage_presence);
+                        observer.note_usage_snapshot(attempt, snapshot, presence);
+                    }
                     made_progress = true;
                 }
             }
@@ -7139,6 +8193,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
     let (usage_tokens, reported_presence) =
         usage_tokens.qualified_snapshot(retained_usage_presence);
     Ok(LlmCallResult {
+        provider_continuation: None,
         judgment_provenance: None,
         response_id,
         full_text,
@@ -7156,6 +8211,11 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
 
 #[derive(Debug)]
 enum StreamCollectError {
+    Provider {
+        error: astra_core::ClassifiedError,
+        partial: LlmCallResult,
+        rejected: bool,
+    },
     IdleTimeout {
         elapsed_ms: u64,
         partial: LlmCallResult,
@@ -7198,22 +8258,6 @@ pub(crate) async fn call_llm_nonstream(
     .await
 }
 
-#[cfg(test)]
-pub(crate) async fn call_llm_nonstream_no_tool_choice(
-    client: &reqwest::Client,
-    call: LlmCall<'_>,
-    timeout: std::time::Duration,
-) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    call_llm_nonstream_with_attempt_observer_and_tool_choice(
-        client,
-        call,
-        timeout,
-        None,
-        RuntimeToolChoice::None,
-    )
-    .await
-}
-
 pub(crate) async fn call_llm_nonstream_with_attempt_observer(
     client: &reqwest::Client,
     call: LlmCall<'_>,
@@ -7230,13 +8274,46 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
     .await
 }
 
-async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
+pub(crate) fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
+    client: &reqwest::Client,
+    call: LlmCall<'_>,
+    timeout: std::time::Duration,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    tool_choice: RuntimeToolChoice,
+) -> impl std::future::Future<Output = Result<LlmCallResult, astra_core::ClassifiedError>> {
+    crate::server::run_trace::in_llm_call(call_llm_nonstream_attempts(
+        client,
+        call,
+        timeout,
+        attempt_observer,
+        tool_choice,
+    ))
+}
+
+async fn call_llm_nonstream_attempts(
     client: &reqwest::Client,
     call: LlmCall<'_>,
     timeout: std::time::Duration,
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
     tool_choice: RuntimeToolChoice,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    if call
+        .route
+        .inference_protocol
+        .unwrap_or_else(|| llm_provider_protocol(call.route.provider))
+        == LlmProviderProtocol::OpenAiResponses
+    {
+        let prepared = prepare_streaming_call(call, tool_choice)?;
+        return call_prepared_llm_and_collect_with_stream_callback(
+            prepared,
+            LlmCancel::None,
+            None,
+            attempt_observer,
+            Some(timeout),
+        )
+        .await;
+    }
+    call.validate_declared_reasoning()?;
     let judgment_provenance = discrete_judgment_provenance(&call);
     let logical_timeout = timeout;
     let timeout = logical_timeout.saturating_sub(llm_mandatory_settlement_reserve(logical_timeout));
@@ -7263,7 +8340,11 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         temperature
     };
     let LlmExecutionRoute {
+        inference_protocol: _,
+        subscription: _,
+        response_scope: _,
         fixed_temperature: _,
+        supported_reasoning_efforts: _,
         thinking_protocol,
         model_name,
         wire_model_name,
@@ -7281,7 +8362,7 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
             inner,
             started,
             work_budget: timeout,
-            logical_budget: logical_timeout,
+            logical_budget: Some(logical_timeout),
             cancel: LlmCancel::None,
         });
     let attempt_observer = controlled_attempt_observer
@@ -7380,22 +8461,50 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     } else {
         url
     };
+    let mut llm_attempt = LlmAttemptSpan::start(0);
+    llm_attempt.begin_admission();
     let _registered_endpoint_permit =
-        acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
+        acquire_registered_endpoint_permit_for_override(&url, completions_url_override)
+            .inspect_err(LlmAttemptSpan::note_error)?;
+    llm_attempt.phase = "preparation";
     let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
-        Some(
-            astra_services::byok_endpoint::endpoint_client(&url)
+        let mut attempt = 0;
+        loop {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            match prepare_compatible_endpoint(&url, remaining, LlmCancel::None)
                 .await
-                .map_err(|error| {
-                    astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, error)
-                })?,
-        )
+                .inspect_err(LlmAttemptSpan::note_error)
+            {
+                Ok(client) => break Some(client),
+                Err(error)
+                    if error.kind == astra_core::ErrorKind::Network
+                        && attempt < LLM_MAX_RETRIES =>
+                {
+                    attempt += 1;
+                    let delay = std::time::Duration::from_millis(retry_backoff_ms(attempt));
+                    let remaining = timeout.saturating_sub(started.elapsed());
+                    if delay >= remaining {
+                        crate::server::run_trace::note_attempt_code(
+                            astra_core::ErrorKind::ProviderDeadline.as_str(),
+                        );
+                        return Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ProviderDeadline,
+                            "LLM non-stream total budget exhausted while preparing the connection",
+                        ));
+                    }
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     } else {
         None
     };
     let client = compatible_client.as_deref().unwrap_or(client);
+    llm_attempt.begin_admission();
     let observed_attempt =
         begin_observed_provider_attempt(attempt_observer, prepared_request.identity()).await?;
+    llm_attempt.phase = "preparation";
     let mut req = client.post(&url).header("content-type", "application/json");
     req = apply_provider_auth(req, provider, api_key, header_overrides);
     req = apply_llm_header_overrides(req, header_overrides);
@@ -7422,20 +8531,26 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         model_name,
         "LLM non-stream request sending"
     );
+    let send_span = llm_attempt.span.clone();
     let send_request = async {
+        llm_attempt.begin_request();
         if let Some(attempt_index) = observed_attempt {
             attempt_observer
                 .expect("observed attempt requires observer")
                 .note_dispatch_started(attempt_index);
         }
-        req.timeout(effective_timeout)
+        let mut request = req
+            .timeout(effective_timeout)
             .body(prepared_request.body())
-            .send()
-            .await
+            .build()?;
+        crate::server::outbound_trace::rewrite(&mut request);
+        client.execute(request).await
     };
+    let send_request = send_request.instrument(send_span);
     let resp = match send_request.await {
         Ok(response) => response,
         Err(e) => {
+            llm_attempt.transport_error(&e);
             let elapsed = started.elapsed();
             tracing::warn!(
                 target: "astra_runtime::llm_client",
@@ -7483,11 +8598,18 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
             return Err(error);
         }
     };
+    llm_attempt.received_response(&resp);
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
+        let response_contract_version = resp
+            .headers()
+            .get(astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let text = match resp.text().await {
             Ok(text) => text,
             Err(body_error) => {
+                llm_attempt.transport_error(&body_error);
                 let kind = if body_error.is_timeout() && total_budget_owns_deadline {
                     astra_core::ErrorKind::ProviderDeadline
                 } else if body_error.is_timeout() {
@@ -7512,25 +8634,35 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
                 return Err(error);
             }
         };
-        if status == 402 {
+        llm_attempt.phase = "response_status";
+        llm_attempt.reason = Some("http_status");
+        if let Some(rejection) = moi_model_gateway_error(
+            status,
+            &text,
+            header_overrides,
+            response_contract_version.as_deref(),
+        ) {
+            let error = rejection.classified;
+            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            return Err(error);
+        }
+        let ordinary_provider = !uses_moi_model_gateway_error_contract(header_overrides)
+            && response_contract_version.is_none();
+        if let Some(error) =
+            provider_access_error(status, if ordinary_provider { &text } else { "" })
+        {
+            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            return Err(error);
+        }
+        if status == 402 && ordinary_provider {
             let error = payment_required_error(&text);
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
-        let kind = if status == 401 || status == 403 {
-            astra_core::ErrorKind::Auth
-        } else if is_rate_limit_status(status) {
-            astra_core::ErrorKind::RateLimit
-        } else if status >= 500 {
-            astra_core::ErrorKind::ServerError
-        } else if status == 400 && astra_core::is_llm_context_window_error(&text) {
-            astra_core::ErrorKind::ContextWindow
-        } else if status == 400 {
-            astra_core::ErrorKind::InvalidRequest
-        } else {
-            astra_core::ErrorKind::Unknown
-        };
-        let message = if kind == astra_core::ErrorKind::Auth {
+        let kind = provider_http_error_kind(status, if ordinary_provider { &text } else { "" });
+        let message = if !ordinary_provider {
+            format!("LLM request rejected: {status}")
+        } else if kind == astra_core::ErrorKind::Auth {
             "LLM provider authentication failed".to_owned()
         } else {
             let detail = redact_provider_secrets(&text);
@@ -7553,6 +8685,7 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     let response_bytes = match resp.bytes().await {
         Ok(bytes) => bytes,
         Err(error) => {
+            llm_attempt.transport_error(&error);
             let kind = if error.is_timeout() && total_budget_owns_deadline {
                 astra_core::ErrorKind::ProviderDeadline
             } else if error.is_timeout() {
@@ -7584,12 +8717,14 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
             return Err(error);
         }
     };
+    llm_attempt.phase = "response_decode";
     let v = if provider == "typesafe" {
         None
     } else {
         match serde_json::from_slice::<Value>(&response_bytes) {
             Ok(value) => Some(value),
             Err(error) => {
+                llm_attempt.reason = Some("decode_error");
                 let error = astra_core::ClassifiedError::new(
                     astra_core::ErrorKind::StreamTransport,
                     error.to_string(),
@@ -7654,6 +8789,7 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         observed_attempt,
         result.usage_presence,
     );
+    llm_attempt.phase = "settlement";
     if let Err(error) = finish_observed_provider_attempt(
         attempt_observer,
         observed_attempt,
@@ -7663,6 +8799,7 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     {
         return Err(attach_llm_result_details(error, &result));
     }
+    llm_attempt.succeed();
     Ok(result)
 }
 
@@ -7754,6 +8891,7 @@ fn parse_bedrock_nonstream_response(v: &Value, model_name: &str) -> LlmCallResul
     }
 
     LlmCallResult {
+        provider_continuation: None,
         judgment_provenance: None,
         response_id: v.get("id").and_then(Value::as_str).map(String::from),
         full_text,
@@ -7839,6 +8977,7 @@ fn parse_openai_compatible_nonstream_response(v: &Value, model_name: &str) -> Ll
     }
 
     LlmCallResult {
+        provider_continuation: None,
         judgment_provenance: None,
         response_id: v.get("id").and_then(Value::as_str).map(String::from),
         full_text,
@@ -7915,6 +9054,7 @@ fn parse_anthropic_nonstream_response(v: &Value, model_name: &str) -> LlmCallRes
         .unwrap_or_default();
 
     LlmCallResult {
+        provider_continuation: None,
         judgment_provenance: None,
         response_id: v.get("id").and_then(Value::as_str).map(String::from),
         full_text,
@@ -7933,12 +9073,35 @@ fn parse_anthropic_nonstream_response(v: &Value, model_name: &str) -> LlmCallRes
     }
 }
 
+/// Canonical HTTP recovery classification shared by inference protocols.
+fn provider_http_error_kind(status: u16, body: &str) -> astra_core::ErrorKind {
+    use astra_core::ErrorKind;
+    if status == 401 {
+        ErrorKind::Auth
+    } else if status == 403 {
+        ErrorKind::ProviderForbidden
+    } else if is_rate_limit_status(status) {
+        ErrorKind::RateLimit
+    } else if status >= 500 {
+        ErrorKind::ServerError
+    } else if status == 400 && astra_core::is_llm_context_window_error(body) {
+        ErrorKind::ContextWindow
+    } else if status == 400 {
+        ErrorKind::InvalidRequest
+    } else {
+        ErrorKind::Unknown
+    }
+}
+
 pub(crate) fn parse_nonstream_response_for_provider(
     v: &Value,
     provider: &str,
     model_name: &str,
 ) -> LlmCallResult {
     match llm_provider_protocol(provider) {
+        LlmProviderProtocol::OpenAiResponses => {
+            unreachable!("Responses calls collect the streaming adapter's result")
+        }
         LlmProviderProtocol::BedrockConverse => parse_bedrock_nonstream_response(v, model_name),
         LlmProviderProtocol::AnthropicMessages => parse_anthropic_nonstream_response(v, model_name),
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
@@ -7973,19 +9136,23 @@ pub(crate) fn parse_openai_sse_json_stream(
                     return;
                 }
             };
-            let blocks = match sse_in.push_bytes(&bytes) {
-                Ok(blocks) => blocks,
-                Err(error) => {
-                    yield Err(format!("invalid UTF-8 in model SSE response: {error}"));
-                    return;
-                }
-            };
-            for block in blocks {
-                if let Err(error) = validate_sse_event_block_json(&block) {
-                    yield Err(error);
-                    return;
-                }
-                let d = json_events_from_sse_event_block(&block);
+            let mut input = bytes.as_ref();
+            while !input.is_empty() {
+                let block = match sse_in.next_frame(&mut input, Some(MAX_STREAM_ACCUMULATION_BYTES)) {
+                    Ok(Some(block)) => block,
+                    Ok(None) => break,
+                    Err(error) => {
+                        yield Err(format!("invalid model SSE response: {error}"));
+                        return;
+                    }
+                };
+                let d = match validated_sse_event(&block) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
                 for v in d.events {
                     yield Ok(ParsedSseEvent::Data(v));
                 }
@@ -7995,45 +9162,27 @@ pub(crate) fn parse_openai_sse_json_stream(
                 }
             }
         }
-        let mut buf = match sse_in.into_inner() {
-            Ok(buf) => buf,
-            Err(error) => {
-                yield Err(format!("invalid UTF-8 in model SSE response: {error}"));
-                return;
-            }
-        };
-        let tail = match validated_drain_sse_data_lines(&mut buf, "") {
-            Ok(value) => value,
-            Err(error) => {
-                yield Err(error);
-                return;
-            }
-        };
-        for v in tail.events {
-            yield Ok(ParsedSseEvent::Data(v));
-        }
-        if tail.stream_finished {
-            yield Ok(ParsedSseEvent::Done);
-            return;
-        }
-        let fin = match validated_finish_sse_data_buffer(&mut buf) {
-            Ok(value) => value,
-            Err(error) => {
-                yield Err(error);
-                return;
-            }
-        };
-        for v in fin.events {
-            yield Ok(ParsedSseEvent::Data(v));
-        }
-        if fin.stream_finished {
-            yield Ok(ParsedSseEvent::Done);
+        match sse_in.finish() {
+            Ok(Some(block)) => match validated_sse_event(&block) {
+                Ok(event) => {
+                    for value in event.events {
+                        yield Ok(ParsedSseEvent::Data(value));
+                    }
+                    if event.stream_finished {
+                        yield Ok(ParsedSseEvent::Done);
+                    }
+                }
+                Err(error) => yield Err(error),
+            },
+            Ok(None) => {},
+            Err(error) => yield Err(format!("invalid model SSE response: {error}")),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+
     #[test]
     fn payment_required_preserves_owner_codes_without_echoing_provider_secrets() {
         for code in ["insufficient_credit", "monthly_spend_limit_exceeded"] {
@@ -8062,6 +9211,38 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn compatible_endpoint_preparation_respects_policy_deadline_and_cancellation() {
+        let budget = std::time::Duration::from_secs(1);
+        for url in ["http://provider.example/v1", "https://127.0.0.1/v1"] {
+            let error = prepare_compatible_endpoint(url, budget, LlmCancel::None)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+        }
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = prepare_compatible_endpoint(
+            "https://provider.example/v1",
+            budget,
+            LlmCancel::Token(&cancel),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+        let error = prepare_compatible_endpoint(
+            "https://provider.example/v1",
+            std::time::Duration::ZERO,
+            LlmCancel::None,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.kind, astra_core::ErrorKind::ProviderDeadline);
+    }
 
     #[tokio::test]
     async fn primary_streaming_and_nonstreaming_preserve_admitted_protocol_and_sampling() {
@@ -8129,6 +9310,9 @@ mod tests {
                     overrides["reasoning_effort"] = json!("medium");
                 }
                 let route = OwnedLlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     model_name: "local-alias".into(),
                     wire_model_name: Some("upstream-fixture".into()),
                     api_key: "fixture".into(),
@@ -8136,6 +9320,7 @@ mod tests {
                     provider: "openai".into(),
                     thinking_capability: None,
                     fixed_temperature: fixed,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: Some(protocol),
                     header_overrides: HashMap::new(),
                     request_body_overrides: overrides.as_object().cloned(),
@@ -8208,6 +9393,9 @@ mod tests {
         for streaming in [false, true] {
             for invalid in [json!(-0.1), json!("NaN"), Value::Null] {
                 let route = OwnedLlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     model_name: "fixture".into(),
                     wire_model_name: None,
                     api_key: "fixture".into(),
@@ -8215,6 +9403,7 @@ mod tests {
                     provider: "openai".into(),
                     thinking_capability: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     header_overrides: HashMap::new(),
                     request_body_overrides: json!({"temperature":invalid}).as_object().cloned(),
@@ -8304,7 +9493,11 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: LlmExecutionRoute {
+                inference_protocol: None,
+                response_scope: None,
+                subscription: None,
                 fixed_temperature: None,
+                supported_reasoning_efforts: None,
                 thinking_protocol: Some(
                     astra_core::model_wire::thinking::ThinkingProtocol::Moonshot,
                 ),
@@ -8383,7 +9576,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "test-model",
                     wire_model_name: None,
@@ -8557,7 +9754,11 @@ mod tests {
         );
         headers.insert("x-workspace-id".to_string(), "workspace-secret".to_string());
         let route = LlmExecutionRoute {
+            inference_protocol: None,
+            response_scope: None,
+            subscription: None,
             fixed_temperature: None,
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             model_name: "model-a",
             wire_model_name: Some("wire-model-a"),
@@ -8602,13 +9803,182 @@ mod tests {
     }
 
     #[test]
-    fn total_budget_default_is_300s() {
+    fn startup_budget_default_is_300s() {
         let dur = llm_total_budget();
         assert_eq!(dur, std::time::Duration::from_secs(LLM_TOTAL_BUDGET_S));
     }
 
+    #[test]
+    fn streaming_total_budget_configuration_requires_an_explicit_positive_duration() {
+        assert_eq!(
+            parse_llm_stream_total_budget(Err(std::env::VarError::NotPresent)).unwrap(),
+            None
+        );
+        for value in ["", " \t\n"] {
+            assert_eq!(
+                parse_llm_stream_total_budget(Ok(value.to_string())).unwrap(),
+                None
+            );
+        }
+        for (value, seconds) in [("1", 1), (" 60 ", 60)] {
+            assert_eq!(
+                parse_llm_stream_total_budget(Ok(value.to_string())).unwrap(),
+                Some(Duration::from_secs(seconds))
+            );
+        }
+        for value in [
+            "0",
+            "-1",
+            "not-a-duration",
+            "18446744073709551616",
+            "18446744073709551615",
+        ] {
+            let error = parse_llm_stream_total_budget(Ok(value.to_string())).unwrap_err();
+            assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+            assert!(error.message.contains("ASTRA_LLM_TOTAL_BUDGET_S"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let error = parse_llm_stream_total_budget(Err(std::env::VarError::NotUnicode(
+                std::ffi::OsString::from_vec(vec![0xff]),
+            )))
+            .unwrap_err();
+            assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+        }
+    }
+
+    #[test]
+    fn default_semantic_progress_timeout_is_300s() {
+        assert_eq!(
+            llm_semantic_progress_timeout(),
+            std::time::Duration::from_secs(300)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_semantic_progress_timeout_accepts_buffered_tool_delivery() {
+        for anthropic in [false, true] {
+            let arguments = json!({"command": "x".repeat(24 * 1024)}).to_string();
+            let terminal = if anthropic {
+                [
+                    json!({"type": "content_block_start", "index": 0, "content_block": {
+                        "type": "tool_use", "id": "call-1", "name": "bash", "input": {}
+                    }}),
+                    json!({"type": "content_block_delta", "index": 0, "delta": {
+                        "type": "input_json_delta", "partial_json": arguments
+                    }}),
+                    json!({"type": "content_block_stop", "index": 0}),
+                    json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
+                    json!({"type": "message_stop"}),
+                ]
+                .into_iter()
+                .map(|chunk| format!("data: {chunk}\n\n"))
+                .collect::<String>()
+            } else {
+                let chunk = json!({"choices": [{"delta": {"tool_calls": [{
+                    "index": 0, "id": "call-1", "type": "function",
+                    "function": {"name": "bash", "arguments": arguments}
+                }]}, "finish_reason": "tool_calls"}]});
+                format!("data: {chunk}\n\ndata: [DONE]\n\n")
+            };
+            let source = Box::pin(async_stream::stream! {
+                for _ in 0..12 {
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(b": PING\n\n"));
+                }
+                yield Ok::<Bytes, reqwest::Error>(Bytes::from(terminal));
+            });
+            let started = TokioInstant::now();
+            let result = if anthropic {
+                collect_anthropic_llm_stream(
+                    source,
+                    "test-model",
+                    started.into_std(),
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    None,
+                )
+                .await
+            } else {
+                collect_llm_stream(
+                    source,
+                    "test-model",
+                    started.into_std(),
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    None,
+                )
+                .await
+            }
+            .expect(
+                "the default must allow buffered tool delivery after 180 seconds of heartbeats",
+            );
+            assert_eq!(started.elapsed(), std::time::Duration::from_secs(180));
+            assert!(result.full_text.is_empty());
+            assert_eq!(result.tool_calls.len(), 1);
+            assert_eq!(result.tool_calls[0]["function"]["name"], "bash");
+            assert_eq!(result.tool_calls[0]["function"]["arguments"], arguments);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn explicit_provider_work_budget_preserves_terminalization_reserve() {
+        for anthropic in [false, true] {
+            let source = Box::pin(async_stream::stream! {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(b": PING\n\n"));
+                }
+            });
+            let started = TokioInstant::now();
+            let total = llm_total_budget();
+            let work = total - llm_mandatory_settlement_reserve(total);
+            let result = if anthropic {
+                collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surface(
+                    source,
+                    "test-model",
+                    started.into_std(),
+                    Some(work),
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    llm_semantic_progress_timeout(),
+                    None,
+                    None,
+                )
+                .await
+            } else {
+                collect_llm_stream_with_semantic_progress_deadline_and_surface(
+                    source,
+                    "test-model",
+                    started.into_std(),
+                    Some(work),
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    llm_semantic_progress_timeout(),
+                    None,
+                    None,
+                )
+                .await
+            };
+            match result.expect_err("heartbeats must not extend the provider work budget") {
+                StreamCollectError::ProviderWorkDeadline {
+                    elapsed_ms: 290000, ..
+                } => {}
+                other => panic!("expected provider-work deadline, got {other:?}"),
+            }
+            assert_eq!(started.elapsed(), work);
+        }
+    }
+
     #[tokio::test]
     async fn streaming_request_without_catalog_timeout_obeys_total_budget() {
+        // This case targets an admitted request, not cold TLS/client initialization.
+        let _ = global_llm_client();
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
             .route(
@@ -8635,7 +10005,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -8680,7 +10054,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -8746,7 +10124,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -8772,6 +10154,241 @@ mod tests {
         .expect("response-start timeout must stop applying after headers arrive");
 
         assert_eq!(result.full_text, "first second");
+    }
+
+    #[tokio::test]
+    async fn default_streaming_call_accepts_progress_beyond_six_minutes() {
+        for purpose in [
+            astra_turn_types::InferencePurpose::PrimaryAgent,
+            astra_turn_types::InferencePurpose::SubAgent,
+        ] {
+            for tool_choice in [RuntimeToolChoice::Auto, RuntimeToolChoice::None] {
+                assert_default_streaming_call_accepts_long_output(purpose, tool_choice).await;
+            }
+        }
+    }
+
+    #[test]
+    fn empty_total_budget_environment_keeps_progressing_streams_alive() {
+        for value in ["", " \t\n"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("turn::llm::client::tests::default_streaming_call_accepts_progress_beyond_six_minutes")
+                .arg("--nocapture")
+                .env("ASTRA_LLM_TOTAL_BUDGET_S", value)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "empty total budget must behave as unset:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    async fn assert_default_streaming_call_accepts_long_output(
+        purpose: astra_turn_types::InferencePurpose,
+        tool_choice: RuntimeToolChoice,
+    ) {
+        let (frames, receiver) = tokio::sync::mpsc::channel::<String>(1);
+        let receiver = Arc::new(tokio::sync::Mutex::new(Some(receiver)));
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let receiver = receiver.clone();
+                async move {
+                    let receiver = receiver.lock().await.take().expect("one request");
+                    let body = stream::unfold(receiver, |mut receiver| async move {
+                        receiver.recv().await.map(|frame| {
+                            (
+                                Ok::<_, std::convert::Infallible>(Bytes::from(frame)),
+                                receiver,
+                            )
+                        })
+                    });
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let base = spawn_local_http_server(app).await;
+        let (updates, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut call = tokio::spawn(async move {
+            let messages = vec![json!({"role":"user","content":"write a long answer"})];
+            let observer = RecordingAttemptObserver::default();
+            let prepared = prepare_streaming_call(
+                LlmCall {
+                    purpose,
+                    messages: &messages,
+                    tools: &[],
+                    cache_capability: None,
+                    route: LlmExecutionRoute {
+                        inference_protocol: None,
+                        response_scope: None,
+                        subscription: None,
+                        fixed_temperature: None,
+                        supported_reasoning_efforts: None,
+                        thinking_protocol: None,
+                        model_name: "m",
+                        wire_model_name: None,
+                        api_key: "k",
+                        base_url: &base,
+                        provider: "openai",
+                        header_overrides: None,
+                        request_body_overrides: None,
+                        completions_url_override: None,
+                        request_timeout: None,
+                    },
+                    max_output_tokens: None,
+                    temperature: None,
+                    thinking: &ThinkingConfig::Off,
+                },
+                tool_choice,
+            )
+            .unwrap();
+            let result = call_prepared_llm_and_collect_with_stream_callback(
+                prepared,
+                LlmCancel::None,
+                Some(&mut |update| {
+                    let _ = updates.send(update);
+                }),
+                Some(&observer),
+                None,
+            )
+            .await;
+            let finished = observer.finished.lock().unwrap().clone();
+            (result, finished)
+        });
+        let frame = |text: &str| {
+            format!(
+                "data: {}\n\n",
+                json!({"choices":[{"delta":{"content":text}}]})
+            )
+        };
+        frames.send(frame("start ")).await.unwrap();
+        received.recv().await.expect("first streamed update");
+        // Keep Tokio from auto-advancing while real loopback I/O is pending.
+        // Advance only after the consumer has observed each text fragment.
+        let clock_guard = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::time::pause();
+        let mut expected = String::from("start ");
+        for index in 1..=40 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            let text = format!("part-{index} ");
+            frames.send(frame(&text)).await.unwrap();
+            tokio::select! {
+                update = received.recv() => {
+                    if update.is_none() {
+                        panic!("healthy stream ended at step {index}: {:?}", call.await);
+                    }
+                }
+                result = &mut call => panic!("healthy stream ended before completion: {result:?}"),
+            }
+            expected.push_str(&text);
+        }
+        frames.send("data: [DONE]\n\n".into()).await.unwrap();
+        drop(frames);
+        let (result, finished) = call.await.unwrap();
+        clock_guard.abort();
+        tokio::time::resume();
+        let result = result.expect("progressing default stream must not have a wall-clock cap");
+        assert_eq!(result.full_text, expected);
+        assert_eq!(
+            finished,
+            vec![(0, astra_services::InferenceTerminalStatus::Succeeded)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_collectors_allow_long_reasoning_but_reject_heartbeat_only_streams() {
+        for anthropic in [false, true] {
+            for meaningful in [true, false] {
+                let activity = if !meaningful {
+                    ": PING\n\n".to_string()
+                } else if anthropic {
+                    format!(
+                        "data: {}\n\n",
+                        json!({"type":"content_block_delta","index":0,
+                        "delta":{"type":"thinking_delta","thinking":"thinking"}})
+                    )
+                } else {
+                    format!(
+                        "data: {}\n\n",
+                        json!({"choices":[{"delta":{"reasoning_content":"thinking"}}]})
+                    )
+                };
+                let terminal = if anthropic {
+                    format!(
+                        "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+                        json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}),
+                        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+                        json!({"type":"message_stop"})
+                    )
+                } else {
+                    format!(
+                        "data: {}\n\ndata: [DONE]\n\n",
+                        json!({"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]})
+                    )
+                };
+                let source = Box::pin(async_stream::stream! {
+                    for _ in 0..40 {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        yield Ok::<Bytes, reqwest::Error>(Bytes::from(activity.clone()));
+                    }
+                    yield Ok::<Bytes, reqwest::Error>(Bytes::from(terminal));
+                });
+                let started = TokioInstant::now();
+                let result = if anthropic {
+                    collect_anthropic_llm_stream(
+                        source,
+                        "m",
+                        started.into_std(),
+                        LlmCancel::None,
+                        stream_idle_timeout(),
+                        stream_idle_timeout_after_progress(),
+                        None,
+                    )
+                    .await
+                } else {
+                    collect_llm_stream(
+                        source,
+                        "m",
+                        started.into_std(),
+                        LlmCancel::None,
+                        stream_idle_timeout(),
+                        stream_idle_timeout_after_progress(),
+                        None,
+                    )
+                    .await
+                };
+                if meaningful {
+                    let result =
+                        result.expect("active reasoning must survive the former total deadline");
+                    assert_eq!(result.full_text, "answer");
+                    assert_eq!(result.reasoning, "thinking".repeat(40));
+                    assert_eq!(started.elapsed(), Duration::from_secs(400));
+                } else {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(StreamCollectError::SemanticProgressTimeout {
+                                elapsed_ms: 300000,
+                                ..
+                            })
+                        ),
+                        "{result:?}"
+                    );
+                    assert_eq!(started.elapsed(), Duration::from_secs(300));
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -8805,7 +10422,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -8836,6 +10457,8 @@ mod tests {
 
     #[tokio::test]
     async fn successful_headers_then_body_budget_records_delivery_unknown() {
+        // Exercise the request phase after cold client initialization.
+        let _ = global_llm_client();
         let app = Router::new().route(
             "/chat/completions",
             post(|| async {
@@ -8863,7 +10486,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -8940,7 +10567,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -9008,7 +10639,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -9073,7 +10708,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -9145,7 +10784,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -9209,7 +10852,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -9252,7 +10899,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -9283,6 +10934,8 @@ mod tests {
 
     #[tokio::test]
     async fn retry_backoff_crossing_total_budget_does_not_create_ghost_attempt() {
+        // This case targets an admitted request, not cold TLS/client initialization.
+        let _ = global_llm_client();
         reset_rate_limit_cooldown_for_tests();
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
@@ -9299,7 +10952,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -9365,7 +11022,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -9456,7 +11117,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "gpt-5-mini",
                     wire_model_name: None,
@@ -9528,7 +11193,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "gpt-5-mini",
                     wire_model_name: None,
@@ -9662,7 +11331,7 @@ mod tests {
                     source,
                     "test-model",
                     TokioInstant::now().into_std(),
-                    std::time::Duration::from_secs(300),
+                    Some(std::time::Duration::from_secs(300)),
                     LlmCancel::None,
                     std::time::Duration::from_secs(60),
                     std::time::Duration::from_secs(60),
@@ -9698,7 +11367,7 @@ mod tests {
                 source,
                 "test-model",
                 TokioInstant::now().into_std(),
-                std::time::Duration::from_secs(300),
+                Some(std::time::Duration::from_secs(300)),
                 LlmCancel::None,
                 std::time::Duration::from_secs(60),
                 std::time::Duration::from_secs(60),
@@ -9737,7 +11406,7 @@ mod tests {
                 source,
                 "test-model",
                 Instant::now(),
-                std::time::Duration::from_millis(50),
+                Some(std::time::Duration::from_millis(50)),
                 LlmCancel::None,
                 std::time::Duration::from_millis(20),
                 std::time::Duration::from_millis(20),
@@ -9771,13 +11440,12 @@ mod tests {
             "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
         });
         let r = parse_nonstream_response_for_provider(&v, "openai", "test-model");
+        assert_eq!(r.usage_presence.measured_input_tokens, Some(10));
+        assert!(!r.usage_presence.fresh_input_tokens);
         assert_eq!(r.full_text, "hello");
         assert_eq!(r.reasoning, "think");
         assert_eq!(r.tool_calls.len(), 1);
-        assert_eq!(
-            r.usage.get("input_tokens").and_then(Value::as_u64),
-            Some(10)
-        );
+        assert_eq!(r.usage.get("input_tokens").and_then(Value::as_u64), None);
         assert_eq!(
             r.usage.get("output_tokens").and_then(Value::as_u64),
             Some(5)
@@ -9978,7 +11646,7 @@ mod tests {
             source,
             "test-model",
             started,
-            std::time::Duration::from_millis(30),
+            Some(std::time::Duration::from_millis(30)),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
@@ -10014,7 +11682,7 @@ mod tests {
             source,
             "test-model",
             started,
-            std::time::Duration::from_millis(30),
+            Some(std::time::Duration::from_millis(30)),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
@@ -10057,7 +11725,7 @@ mod tests {
             source,
             "test-model",
             Instant::now(),
-            std::time::Duration::from_secs(1),
+            Some(std::time::Duration::from_secs(1)),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
@@ -10089,7 +11757,7 @@ mod tests {
             source,
             "test-model",
             Instant::now(),
-            std::time::Duration::from_secs(1),
+            Some(std::time::Duration::from_secs(1)),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
@@ -10123,7 +11791,7 @@ mod tests {
                 source,
                 "test-model",
                 Instant::now(),
-                std::time::Duration::from_secs(1),
+                Some(std::time::Duration::from_secs(1)),
                 LlmCancel::None,
                 std::time::Duration::from_secs(1),
                 std::time::Duration::from_secs(1),
@@ -10144,7 +11812,7 @@ mod tests {
                 source,
                 "test-model",
                 Instant::now(),
-                std::time::Duration::from_secs(1),
+                Some(std::time::Duration::from_secs(1)),
                 LlmCancel::None,
                 std::time::Duration::from_secs(1),
                 std::time::Duration::from_secs(1),
@@ -10186,7 +11854,7 @@ mod tests {
             Box::pin(source),
             "test-model",
             Instant::now(),
-            std::time::Duration::from_secs(1),
+            Some(std::time::Duration::from_secs(1)),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
@@ -10356,7 +12024,7 @@ mod tests {
         assert!(state.timed_out(start + std::time::Duration::from_millis(36), timeout));
 
         state.mark_terminal();
-        assert_eq!(state, StreamYieldState::Terminal);
+        assert!(state.is_terminal());
         assert_eq!(state.deadline(timeout), None);
     }
 
@@ -10498,7 +12166,7 @@ mod tests {
                 source,
                 "test-model",
                 Instant::now(),
-                std::time::Duration::from_secs(30),
+                Some(std::time::Duration::from_secs(30)),
                 LlmCancel::None,
                 std::time::Duration::from_secs(1),
                 std::time::Duration::from_secs(1),
@@ -10549,7 +12217,7 @@ mod tests {
                 source,
                 "test-model",
                 Instant::now(),
-                std::time::Duration::from_secs(30),
+                Some(std::time::Duration::from_secs(30)),
                 LlmCancel::None,
                 std::time::Duration::from_secs(1),
                 std::time::Duration::from_secs(1),
@@ -10673,7 +12341,7 @@ mod tests {
             Box::pin(repeated),
             "test-model",
             Instant::now(),
-            std::time::Duration::from_secs(1),
+            Some(std::time::Duration::from_secs(1)),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
@@ -10709,7 +12377,7 @@ mod tests {
             Box::pin(repeated),
             "test-model",
             Instant::now(),
-            std::time::Duration::from_secs(1),
+            Some(std::time::Duration::from_secs(1)),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
@@ -10781,6 +12449,627 @@ mod tests {
             .send()
             .await
             .expect_err("provider that accepts but never responds should time out")
+    }
+
+    use tracing_subscriber::{Layer, layer::Context, prelude::*};
+
+    fn trace_fixture_call<'a>(
+        messages: &'a [Value],
+        base: &'a str,
+        provider: &'a str,
+    ) -> LlmCall<'a> {
+        LlmCall {
+            purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+            messages,
+            tools: &[],
+            cache_capability: None,
+            route: LlmExecutionRoute {
+                inference_protocol: None,
+                response_scope: None,
+                subscription: None,
+                fixed_temperature: None,
+                supported_reasoning_efforts: None,
+                thinking_protocol: None,
+                model_name: "trace-fixture-model",
+                wire_model_name: None,
+                api_key: "private-key",
+                base_url: base,
+                provider,
+                header_overrides: None,
+                request_body_overrides: None,
+                completions_url_override: None,
+                request_timeout: None,
+            },
+            max_output_tokens: None,
+            temperature: None,
+            thinking: &ThinkingConfig::Off,
+        }
+    }
+
+    async fn call_trace_fixture(
+        call: LlmCall<'_>,
+        streaming: bool,
+        observer: Option<&dyn ProviderAttemptObserver>,
+    ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+        if streaming {
+            call_llm_and_collect_with_stream_callback(
+                call,
+                LlmCancel::None,
+                None,
+                observer,
+                RuntimeToolChoice::Auto,
+                None,
+            )
+            .await
+        } else {
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            call_llm_nonstream_with_attempt_observer(
+                &client,
+                call,
+                std::time::Duration::from_secs(2),
+                observer,
+            )
+            .await
+        }
+    }
+
+    type CapturedLlmSpans = HashMap<u64, HashMap<String, String>>;
+    #[derive(Clone, Default)]
+    struct LlmTraceCapture(Arc<Mutex<CapturedLlmSpans>>);
+    struct LlmTraceFields<'a>(&'a mut HashMap<String, String>);
+    impl tracing::field::Visit for LlmTraceFields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().into(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().into(), value.into());
+        }
+    }
+    impl<S: tracing::Subscriber> Layer<S> for LlmTraceCapture {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::Id,
+            _: Context<'_, S>,
+        ) {
+            if attrs.metadata().name() == "llm.call" {
+                attrs.record(&mut LlmTraceFields(
+                    self.0.lock().unwrap().entry(id.into_u64()).or_default(),
+                ));
+            }
+        }
+        fn on_record(
+            &self,
+            id: &tracing::Id,
+            values: &tracing::span::Record<'_>,
+            _: Context<'_, S>,
+        ) {
+            if let Some(fields) = self.0.lock().unwrap().get_mut(&id.into_u64()) {
+                values.record(&mut LlmTraceFields(fields));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_trace_fields_follow_real_streaming_and_nonstream_responses() {
+        use tracing::instrument::WithSubscriber;
+
+        for (streaming, status, malformed, settlement_failure, expected_phase, expected_reason) in [
+            (false, 200u16, false, false, None, None),
+            (true, 200, false, false, None, None),
+            (
+                false,
+                403,
+                false,
+                false,
+                Some("response_status"),
+                Some("http_status"),
+            ),
+            (
+                true,
+                403,
+                false,
+                false,
+                Some("response_status"),
+                Some("http_status"),
+            ),
+            (
+                false,
+                200,
+                true,
+                false,
+                Some("response_decode"),
+                Some("decode_error"),
+            ),
+            (false, 200, false, true, Some("settlement"), Some("network")),
+            (true, 200, false, true, Some("settlement"), Some("network")),
+            (false, 403, false, true, Some("settlement"), Some("network")),
+            (true, 403, false, true, Some("settlement"), Some("network")),
+            (false, 200, true, true, Some("settlement"), Some("network")),
+        ] {
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move || async move {
+                    let body = if malformed || status != 200 {
+                        "private provider body".to_string()
+                    } else if streaming {
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+                            .to_string()
+                    } else {
+                        r#"{"choices":[{"message":{"content":"ok"}}]}"#.to_string()
+                    };
+                    Response::builder()
+                        .status(status)
+                        .header(
+                            "content-type",
+                            if streaming {
+                                "text/event-stream"
+                            } else {
+                                "application/json"
+                            },
+                        )
+                        .body(Body::from(body))
+                        .unwrap()
+                }),
+            );
+            let base = spawn_local_http_server(app).await;
+            let messages = [json!({"role":"user","content":"private prompt"})];
+            let call = trace_fixture_call(&messages, &base, "openai");
+            let capture = LlmTraceCapture::default();
+            let subscriber = tracing_subscriber::registry().with(capture.clone());
+            let carrier = astra_logging::trace_context::Carrier::default();
+            let failing_observer = FailingFinishAttemptObserver(astra_core::ErrorKind::Network);
+            let observer =
+                settlement_failure.then_some(&failing_observer as &dyn ProviderAttemptObserver);
+            let result = astra_logging::trace_context::bind_run(
+                &carrier,
+                call_trace_fixture(call, streaming, observer),
+            )
+            .with_subscriber(subscriber)
+            .await;
+            assert_eq!(result.is_err(), expected_phase.is_some());
+            if settlement_failure {
+                assert_eq!(result.unwrap_err().kind, astra_core::ErrorKind::Network);
+            }
+            let spans = capture.0.lock().unwrap();
+            assert_eq!(spans.len(), 1);
+            let fields = spans.values().next().unwrap();
+            assert_eq!(
+                fields.get("http.response.status_code").unwrap(),
+                &status.to_string()
+            );
+            assert_eq!(fields.get("retry.attempt").unwrap(), "0");
+            assert_eq!(
+                fields.get("error.phase").map(String::as_str),
+                expected_phase
+            );
+            assert_eq!(
+                fields.get("error.reason").map(String::as_str),
+                expected_reason
+            );
+            let rendered = format!("{fields:?}");
+            for private in [
+                &base,
+                "private-key",
+                "private prompt",
+                "private provider body",
+            ] {
+                assert!(!rendered.contains(private));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_trace_preparation_failures_cover_both_call_paths() {
+        use tracing::instrument::WithSubscriber;
+
+        let _retry_guard = set_test_retry_backoff_ms(0);
+        for streaming in [false, true] {
+            for (base, kind) in [
+                (
+                    "https://astra-trace-test.invalid/v1",
+                    astra_core::ErrorKind::Network,
+                ),
+                (
+                    "http://provider.example/v1",
+                    astra_core::ErrorKind::InvalidRequest,
+                ),
+            ] {
+                let messages = [json!({"role":"user","content":"private prompt"})];
+                let call = trace_fixture_call(
+                    &messages,
+                    base,
+                    astra_services::byok_endpoint::COMPATIBLE_PROVIDER,
+                );
+                let capture = LlmTraceCapture::default();
+                let subscriber = tracing_subscriber::registry().with(capture.clone());
+                let carrier = astra_logging::trace_context::Carrier::default();
+                // Preparation fails before durable admission or HTTP dispatch.
+                let observer = RecordingAttemptObserver::default();
+                let fixture = (kind == astra_core::ErrorKind::Network).then_some(kind);
+                let result = TEST_PREPARATION_ERROR
+                    .scope(
+                        fixture,
+                        astra_logging::trace_context::bind_run(
+                            &carrier,
+                            call_trace_fixture(call, streaming, Some(&observer)),
+                        ),
+                    )
+                    .with_subscriber(subscriber)
+                    .await;
+                assert_eq!(result.unwrap_err().kind, kind);
+                assert!(observer.began.lock().unwrap().is_empty());
+                let spans = capture.0.lock().unwrap();
+                let count = if streaming && kind == astra_core::ErrorKind::Network {
+                    LLM_MAX_RETRIES as usize + 1
+                } else {
+                    1
+                };
+                assert_eq!(spans.len(), count);
+                for fields in spans.values() {
+                    assert_eq!(fields.get("error.phase").unwrap(), "preparation");
+                    assert_eq!(fields.get("error.reason").unwrap(), kind.as_str());
+                    assert!(!fields.contains_key("http.response.status_code"));
+                    let rendered = format!("{fields:?}");
+                    for private in [base, "private-key", "private prompt"] {
+                        assert!(!rendered.contains(private));
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_trace_endpoint_saturation_is_admission_without_dispatch() {
+        use tracing::instrument::WithSubscriber;
+
+        for streaming in [false, true] {
+            let hits = Arc::new(AtomicU32::new(0));
+            let requests = hits.clone();
+            let base = spawn_local_http_server(Router::new().route(
+                "/chat/completions",
+                post(move || {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        let body = if streaming {
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+                        } else {
+                            r#"{"choices":[{"message":{"content":"ok"}}]}"#
+                        };
+                        Response::builder().status(200)
+                            .header("content-type", if streaming { "text/event-stream" } else { "application/json" })
+                            .body(Body::from(body)).unwrap()
+                    }
+                }),
+            )).await;
+            let endpoint = format!("{base}/chat/completions");
+            let mut permits = Vec::new();
+            while let Ok(Some(permit)) =
+                acquire_registered_endpoint_permit_for_override(&endpoint, Some(&endpoint))
+            {
+                permits.push(permit);
+            }
+            assert!(!permits.is_empty());
+            let messages = [json!({"role":"user","content":"private prompt"})];
+            let make_call = || {
+                let mut call = trace_fixture_call(&messages, &base, "openai");
+                call.route.completions_url_override = Some(&endpoint);
+                call
+            };
+            let capture = LlmTraceCapture::default();
+            let observer = RecordingAttemptObserver::default();
+            let error = crate::server::run_trace::bind(
+                Default::default(),
+                call_trace_fixture(make_call(), streaming, Some(&observer)),
+            )
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind, astra_core::ErrorKind::ResourceLimit);
+            assert_eq!(hits.load(Ordering::SeqCst), 0);
+            assert!(observer.began.lock().unwrap().is_empty());
+            assert!(observer.finished.lock().unwrap().is_empty());
+            {
+                let spans = capture.0.lock().unwrap();
+                assert_eq!(spans.len(), 1);
+                let fields = spans.values().next().unwrap();
+                assert_eq!(fields["retry.attempt"], "0");
+                assert_eq!(fields["error.phase"], "admission");
+                assert_eq!(fields["error.reason"], "resource_limit");
+                assert!(!fields.contains_key("http.response.status_code"));
+                let rendered = format!("{fields:?}");
+                for private in [&endpoint, &base, "private"] {
+                    assert!(!rendered.contains(private));
+                }
+            }
+            // Releasing one slot allows the unchanged request path to run;
+            // the early diagnostic span must be reused instead of duplicated.
+            drop(permits.pop().unwrap());
+            let capture = LlmTraceCapture::default();
+            let result = crate::server::run_trace::bind(
+                Default::default(),
+                call_trace_fixture(make_call(), streaming, Some(&observer)),
+            )
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await
+            .unwrap();
+            assert_eq!(result.full_text, "ok");
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            assert_eq!(observer.began.lock().unwrap().len(), 1);
+            assert_eq!(observer.finished.lock().unwrap().len(), 1);
+            let spans = capture.0.lock().unwrap();
+            assert_eq!(spans.len(), 1);
+            let fields = spans.values().next().unwrap();
+            assert_eq!(fields["http.response.status_code"], "200");
+            assert!(!fields.contains_key("error.phase"));
+            let _released_permit =
+                acquire_registered_endpoint_permit_for_override(&endpoint, Some(&endpoint))
+                    .expect("the successful call releases its endpoint permit");
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_trace_admission_failures_are_not_dispatched_requests() {
+        use tracing::instrument::WithSubscriber;
+
+        struct FailedAdmission;
+        #[async_trait]
+        impl ProviderAttemptObserver for FailedAdmission {
+            async fn begin_attempt(
+                &self,
+                _: &ProviderWireRequestIdentity,
+                _: Option<u32>,
+            ) -> Result<ProviderAttemptAdmission, astra_core::ClassifiedError> {
+                Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::DatabaseError,
+                    "private admission failure",
+                ))
+            }
+            async fn finish_attempt(
+                &self,
+                _: u32,
+                _: &astra_services::InferenceInvocationTerminal,
+            ) -> Result<(), astra_core::ClassifiedError> {
+                panic!("failed admission cannot be settled")
+            }
+        }
+        let hits = Arc::new(AtomicU32::new(0));
+        let requests = hits.clone();
+        let base = spawn_local_http_server(Router::new().route(
+            "/chat/completions",
+            post(move || {
+                requests.fetch_add(1, Ordering::SeqCst);
+                async { "unexpected dispatch" }
+            }),
+        ))
+        .await;
+        for streaming in [false, true] {
+            let capture = LlmTraceCapture::default();
+            let messages = [json!({"role":"user","content":"private prompt"})];
+            let result = crate::server::run_trace::bind(
+                Default::default(),
+                call_trace_fixture(
+                    trace_fixture_call(&messages, &base, "openai"),
+                    streaming,
+                    Some(&FailedAdmission),
+                ),
+            )
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await;
+            assert_eq!(
+                result.unwrap_err().kind,
+                astra_core::ErrorKind::DatabaseError
+            );
+            let spans = capture.0.lock().unwrap();
+            assert_eq!(spans.len(), 1);
+            let fields = spans.values().next().unwrap();
+            assert_eq!(fields["error.phase"], "admission");
+            assert_eq!(fields["error.reason"], "database_error");
+            assert!(!fields.contains_key("http.response.status_code"));
+            assert!(!format!("{fields:?}").contains("private"));
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn llm_trace_credential_failures_keep_preparation_outcomes() {
+        use tracing::instrument::WithSubscriber;
+
+        for kind in [
+            astra_core::ErrorKind::Auth,
+            astra_core::ErrorKind::ProviderDeadline,
+            astra_core::ErrorKind::Cancelled,
+        ] {
+            let capture = LlmTraceCapture::default();
+            let token = CancellationToken::new();
+            if kind == astra_core::ErrorKind::Cancelled {
+                token.cancel();
+            }
+            let result = crate::server::run_trace::in_llm_call(async {
+                let mut attempt = LlmAttemptSpan::start(0);
+                attempt.phase = "preparation";
+                await_subscription_credential::<()>(
+                    async {
+                        if kind == astra_core::ErrorKind::Auth {
+                            Err(astra_core::error_response_coded(
+                                axum::http::StatusCode::CONFLICT,
+                                "private credential error",
+                                "model_connection_expired",
+                            ))
+                        } else {
+                            std::future::pending().await
+                        }
+                    },
+                    Duration::from_millis(5),
+                    LlmCancel::Token(&token),
+                )
+                .await
+            })
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await;
+            assert_eq!(result.unwrap_err().kind, kind);
+            let spans = capture.0.lock().unwrap();
+            let fields = spans.values().next().unwrap();
+            assert_eq!(fields["error.phase"], "preparation");
+            assert_eq!(fields["error.reason"], kind.as_str());
+            assert!(!fields.contains_key("http.response.status_code"));
+            assert!(!format!("{fields:?}").contains("private"));
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_trace_joined_calls_do_not_share_settlement_outcomes() {
+        use tracing::instrument::WithSubscriber;
+
+        struct SettlementGate {
+            entered: Arc<tokio::sync::Barrier>,
+            release: tokio::sync::Notify,
+            fail: bool,
+        }
+        #[async_trait]
+        impl ProviderAttemptObserver for SettlementGate {
+            async fn begin_attempt(
+                &self,
+                _: &ProviderWireRequestIdentity,
+                _: Option<u32>,
+            ) -> Result<ProviderAttemptAdmission, astra_core::ClassifiedError> {
+                Ok(ProviderAttemptAdmission::Admitted(0))
+            }
+            async fn finish_attempt(
+                &self,
+                _: u32,
+                _: &astra_services::InferenceInvocationTerminal,
+            ) -> Result<(), astra_core::ClassifiedError> {
+                self.entered.wait().await;
+                self.release.notified().await;
+                if self.fail {
+                    Err(astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::DatabaseError,
+                        "private settlement error",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for (streaming, other_status) in [(false, 429u16), (true, 404)] {
+            let base = spawn_local_http_server(
+                Router::new()
+                    .route(
+                        "/failed/chat/completions",
+                        post(|| async {
+                            (axum::http::StatusCode::FORBIDDEN, "private provider error")
+                        }),
+                    )
+                    .route(
+                        "/other/chat/completions",
+                        post(move || async move {
+                            (
+                                axum::http::StatusCode::from_u16(other_status).unwrap(),
+                                "private provider error",
+                            )
+                        }),
+                    ),
+            )
+            .await;
+            let entered = Arc::new(tokio::sync::Barrier::new(3));
+            let failed = SettlementGate {
+                entered: entered.clone(),
+                release: Default::default(),
+                fail: true,
+            };
+            let other = SettlementGate {
+                entered: entered.clone(),
+                release: Default::default(),
+                fail: false,
+            };
+            let failed_done = tokio::sync::Notify::new();
+            let messages = [json!({"role":"user","content":"private prompt"})];
+            let failed_base = format!("{base}/failed");
+            let other_base = format!("{base}/other");
+            let capture = LlmTraceCapture::default();
+            let (failed_result, other_result, ()) =
+                crate::server::run_trace::bind(Default::default(), async {
+                    tokio::join!(
+                        async {
+                            let result = call_trace_fixture(
+                                trace_fixture_call(&messages, &failed_base, "openai"),
+                                streaming,
+                                Some(&failed),
+                            )
+                            .await;
+                            failed_done.notify_one();
+                            result
+                        },
+                        call_trace_fixture(
+                            trace_fixture_call(&messages, &other_base, "openai"),
+                            streaming,
+                            Some(&other)
+                        ),
+                        async {
+                            entered.wait().await;
+                            failed.release.notify_one();
+                            failed_done.notified().await;
+                            other.release.notify_one();
+                        },
+                    )
+                })
+                .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+                .await;
+            assert_eq!(
+                failed_result.unwrap_err().kind,
+                astra_core::ErrorKind::DatabaseError
+            );
+            assert_ne!(
+                other_result.unwrap_err().kind,
+                astra_core::ErrorKind::DatabaseError
+            );
+            let spans = capture.0.lock().unwrap();
+            assert_eq!(spans.len(), 2);
+            for fields in spans.values() {
+                let failed = fields["http.response.status_code"] == "403";
+                assert_eq!(
+                    fields["error.phase"],
+                    if failed {
+                        "settlement"
+                    } else {
+                        "response_status"
+                    }
+                );
+                assert_eq!(
+                    fields["error.reason"],
+                    if failed {
+                        "database_error"
+                    } else {
+                        "http_status"
+                    }
+                );
+                assert!(!format!("{fields:?}").contains("private"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_trace_transport_diagnostics_use_typed_causes() {
+        let refused = sample_reqwest_stream_error().await;
+        assert_eq!(llm_transport_error_reason(&refused), "connection_refused");
+        let timeout = sample_reqwest_response_timeout_error().await;
+        assert_eq!(llm_transport_error_reason(&timeout), "timeout");
+        let builder = reqwest::Client::new().get("not a URL").build().unwrap_err();
+        assert_eq!(llm_transport_error_reason(&builder), "request_build");
+
+        for (kind, expected) in [
+            (std::io::ErrorKind::ConnectionReset, "connection_reset"),
+            (std::io::ErrorKind::ConnectionAborted, "connection_aborted"),
+            (std::io::ErrorKind::BrokenPipe, "broken_pipe"),
+            (std::io::ErrorKind::UnexpectedEof, "unexpected_eof"),
+        ] {
+            let error = std::io::Error::new(kind, "private URL and credentials");
+            assert_eq!(llm_io_error_reason(&error), Some(expected));
+        }
+        // Do not infer DNS/TLS or other causes from strings.
+        let unknown = std::io::Error::other("DNS TLS connection refused secret");
+        assert_eq!(llm_io_error_reason(&unknown), None);
     }
 
     #[tokio::test]
@@ -10895,7 +13184,7 @@ mod tests {
             .await
             .expect("invalid block item")
             .expect_err("parse error");
-        assert!(err.contains("invalid JSON in SSE data line"), "{err}");
+        assert!(err.contains("invalid JSON in SSE event"), "{err}");
         assert!(st.next().await.is_none());
     }
 
@@ -10909,17 +13198,55 @@ mod tests {
             .await
             .expect("invalid tail item")
             .expect_err("parse error");
-        assert!(err.contains("invalid JSON in SSE data line"), "{err}");
+        assert!(err.contains("invalid JSON in SSE event"), "{err}");
         assert!(st.next().await.is_none());
     }
 
     #[tokio::test]
-    async fn parse_openai_sse_json_stream_tail_flush_without_final_blank_line() {
+    async fn parse_openai_sse_json_stream_decodes_valid_clean_eof_tail() {
         let parts: Vec<Result<Bytes, reqwest::Error>> = vec![Ok(Bytes::from("data: {\"z\":9}"))];
         let st = parse_openai_sse_json_stream(stream::iter(parts));
         tokio::pin!(st);
-        let ev = st.next().await.unwrap().unwrap();
-        assert_eq!(ev, ParsedSseEvent::Data(json!({"z": 9})));
+        assert_eq!(
+            st.next().await.unwrap().unwrap(),
+            ParsedSseEvent::Data(json!({"z":9}))
+        );
+        assert!(st.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_openai_sse_json_stream_joins_data_fields_across_chunks() {
+        let parts: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from("data:{\"text\":\"hello\",\r\n")),
+            Ok(Bytes::from("data: \"n\":2}\r\n\r\ndata:[DONE]\r\n\r\n")),
+        ];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        assert_eq!(
+            st.next().await.unwrap().unwrap(),
+            ParsedSseEvent::Data(json!({"text": "hello", "n": 2}))
+        );
+        assert_eq!(st.next().await.unwrap().unwrap(), ParsedSseEvent::Done);
+        assert!(st.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_openai_sse_json_stream_preserves_prefix_and_done_order() {
+        let parts: Vec<Result<Bytes, reqwest::Error>> =
+            vec![Ok(Bytes::from_static(b"data: {\"a\":1}\n\ndata: \xff\n\n"))];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        assert_eq!(
+            st.next().await.unwrap().unwrap(),
+            ParsedSseEvent::Data(json!({"a": 1}))
+        );
+        assert!(st.next().await.unwrap().is_err());
+
+        let parts: Vec<Result<Bytes, reqwest::Error>> =
+            vec![Ok(Bytes::from_static(b"data: [DONE]\n\ndata: \xff\n\n"))];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        assert_eq!(st.next().await.unwrap().unwrap(), ParsedSseEvent::Done);
         assert!(st.next().await.is_none());
     }
 
@@ -11035,6 +13362,25 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn collect_llm_stream_accepts_semantic_terminal_at_clean_eof() {
+        let terminal = json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]});
+        let byte_stream = stream::iter(vec![Ok(Bytes::from(format!("data: {terminal}\n")))]);
+        let result = collect_llm_stream(
+            byte_stream,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.full_text, "done");
+        assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn collect_llm_stream_finishes_after_semantic_terminal_without_waiting_for_eof() {
         let content = json!({"choices":[{"delta":{"content":"done"}}]});
@@ -11043,6 +13389,7 @@ mod tests {
         let byte_stream =
             stream::iter(vec![Ok(bytes)]).chain(stream::pending::<Result<Bytes, reqwest::Error>>());
 
+        let started = TokioInstant::now();
         let result = collect_llm_stream(
             byte_stream,
             "test-model",
@@ -11057,6 +13404,87 @@ mod tests {
 
         assert_eq!(result.full_text, "done");
         assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(started.elapsed(), Duration::from_millis(500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_tail_noise_does_not_restart_grace() {
+        for terminal in [
+            json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function",
+                "function":{"name":"bash","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
+        ] {
+            let repeated_terminal = json!({"choices":[{"delta":{},
+                "finish_reason":terminal["choices"][0]["finish_reason"]}]});
+            for noise in [json!({"choices":[]}), repeated_terminal] {
+                let expected_finish = terminal["choices"][0]["finish_reason"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let terminal_frame = format!("data: {terminal}\n\n");
+                let source = Box::pin(async_stream::stream! {
+                    yield Ok::<Bytes, reqwest::Error>(Bytes::from(terminal_frame));
+                    for _ in 0..10 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        yield Ok(Bytes::from(format!("data: {noise}\n\n")));
+                    }
+                    std::future::pending::<()>().await;
+                });
+                let started = TokioInstant::now();
+                let result = collect_llm_stream(
+                    source,
+                    "test-model",
+                    started.into_std(),
+                    LlmCancel::None,
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    None,
+                )
+                .await
+                .expect("completed output must not wait for a noisy open socket");
+                assert_eq!(
+                    result.finish_reason.as_deref(),
+                    Some(expected_finish.as_str())
+                );
+                assert_eq!(started.elapsed(), Duration::from_millis(500));
+                if expected_finish == "tool_calls" {
+                    assert_eq!(result.tool_calls[0]["function"]["name"], "bash");
+                    assert_eq!(result.tool_calls[0]["function"]["arguments"], "{}");
+                } else {
+                    assert_eq!(result.full_text, "done");
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_tail_preserves_usage_inside_grace() {
+        let source = Box::pin(async_stream::stream! {
+            yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n"));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            yield Ok(Bytes::from_static(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}\n\n"));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            yield Ok(Bytes::from(format!("data: {}\n\n", json!({"usage":{"prompt_tokens_details":{"cached_tokens":4,"cache_write_tokens":3}}}))));
+            std::future::pending::<()>().await;
+        });
+        let started = TokioInstant::now();
+        let result = collect_llm_stream(
+            source,
+            "test-model",
+            started.into_std(),
+            LlmCancel::None,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.full_text, "done");
+        assert_eq!(result.usage["input_tokens"], 3);
+        assert_eq!(result.usage["cached_input_tokens"], 4);
+        assert_eq!(result.usage["cache_creation_tokens"], 3);
+        assert_eq!(result.usage["output_tokens"], 3);
+        assert_eq!(started.elapsed(), Duration::from_millis(500));
     }
 
     #[tokio::test]
@@ -11120,12 +13548,11 @@ mod tests {
         )
         .await
         .expect("collect");
+        assert_eq!(res.usage_presence.measured_input_tokens, Some(3));
+        assert!(!res.usage_presence.fresh_input_tokens);
         assert_eq!(res.full_text, "Hi there");
         assert_eq!(res.reasoning, "R");
-        assert_eq!(
-            res.usage.get("input_tokens").and_then(Value::as_u64),
-            Some(3)
-        );
+        assert_eq!(res.usage.get("input_tokens").and_then(Value::as_u64), None);
         assert_eq!(
             res.usage.get("output_tokens").and_then(Value::as_u64),
             Some(4)
@@ -11140,37 +13567,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_llm_stream_null_markers_cannot_hide_raw_usage_conflicts() {
+        let mut frames = Vec::new();
+        for usage in [
+            json!({
+                "prompt_tokens":null,"completion_tokens":null,"input_tokens":4,"output_tokens":7,
+                "cache_read_input_tokens":6,"cache_creation_input_tokens":5,
+                "opencode":{"tokens":{"input":5,"output":8,"cache_read":6,"cache_write_5m":2,"cache_write_1h":3}}
+            }),
+            json!({"opencode":{"tokens":{"input":4,"output":7}}}),
+        ] {
+            frames.push(Ok(Bytes::from(format!(
+                "data: {}\n\n",
+                json!({"usage":usage})
+            ))));
+        }
+        frames.push(Ok(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )));
+        let result = collect_llm_stream(
+            stream::iter(frames),
+            "opencode-model",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            None,
+        )
+        .await
+        .expect("invalid accounting evidence must not discard the answer");
+        assert_eq!(result.full_text, "done");
+        assert!(result.usage_presence.input_invalid && result.usage_presence.output_invalid);
+        assert!(result.usage.is_empty());
+        let terminal = provider_attempt_terminal_from_result(&result);
+        assert_ne!(
+            terminal.usage_status,
+            astra_services::InferenceUsageStatus::ProviderExact
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_opencode_partial_write_conflict_respects_frame_boundary() {
+        let partial_tokens = json!({"input":4,"cache_read":6,"cache_write_5m":6});
+        for (updates, expected_usage, expected_status) in [
+            (
+                vec![
+                    json!({"prompt_tokens":15,"completion_tokens":7,"opencode":{"tokens":partial_tokens}}),
+                    json!({"prompt_tokens":16,"opencode":{"tokens":{"cache_write_1h":0}}}),
+                ],
+                json!({"output_tokens":7}),
+                astra_services::InferenceUsageStatus::ProviderPartial,
+            ),
+            (
+                vec![
+                    json!({"prompt_tokens":15,"completion_tokens":7}),
+                    json!({"opencode":{"tokens":partial_tokens}}),
+                    json!({"prompt_tokens":16,"opencode":{"tokens":{"cache_write_1h":0}}}),
+                ],
+                json!({"input_tokens":4,"cached_input_tokens":6,"cache_creation_tokens":6,"output_tokens":7,"total_tokens":23}),
+                astra_services::InferenceUsageStatus::ProviderExact,
+            ),
+        ] {
+            let mut frames: Vec<_> = updates
+                .into_iter()
+                .map(|usage| Ok(Bytes::from(format!("data: {}\n\n", json!({"usage":usage})))))
+                .collect();
+            frames.push(Ok(Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            )));
+            let result = collect_llm_stream(
+                stream::iter(frames),
+                "opencode-model",
+                Instant::now(),
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                None,
+            )
+            .await
+            .expect("usage qualification must not discard the answer");
+            assert_eq!(result.full_text, "done");
+            let terminal = provider_attempt_terminal_from_result(&result);
+            assert_eq!(terminal.usage_status, expected_status);
+            assert_eq!(Value::Object(result.usage), expected_usage);
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_opencode_usage_reaches_provider_accounting() {
+        for (usage, expected_input, expected_output) in [
+            (
+                json!({
+                    "prompt_tokens":17774, "completion_tokens":1051,
+                    "prompt_tokens_details":{"cached_tokens":9600},
+                    "opencode":{"tokens":{
+                        "input":8174,"output":1051,"reasoning":537,
+                        "cache_read":9600,"cache_write_5m":0,"cache_write_1h":0
+                    }}
+                }),
+                Some((8174, 9600, 0)),
+                1051,
+            ),
+            (
+                json!({
+                    "prompt_tokens":4,"completion_tokens":7,"cache_read_input_tokens":6,"cache_creation_input_tokens":5,
+                    "opencode":{"tokens":{"input":4,"output":7,"cache_read":6,"cache_write_5m":2,"cache_write_1h":3}}
+                }),
+                Some((4, 6, 5)),
+                7,
+            ),
+            (
+                json!({
+                    "input_tokens":4,"output_tokens":7,
+                    "opencode":{"tokens":{"input":4,"output":7,"cache_read":6,"cache_write_5m":2,"cache_write_1h":3}}
+                }),
+                Some((4, 6, 5)),
+                7,
+            ),
+            (
+                json!({
+                    "input_tokens":4,"output_tokens":7,"cache_read_input_tokens":6,"cache_creation_input_tokens":5,
+                    "opencode":{"tokens":{"input":5,"output":7,"cache_read":6,"cache_write_5m":2,"cache_write_1h":3}}
+                }),
+                None,
+                7,
+            ),
+        ] {
+            let frame = json!({
+                "choices":[{"delta":{"content":"done"},"finish_reason":"stop"}],
+                "usage":usage
+            });
+            let result = collect_llm_stream(
+                stream::iter(vec![Ok(Bytes::from(format!(
+                    "data: {frame}\n\ndata: [DONE]\n\n"
+                )))]),
+                "opencode-model",
+                Instant::now(),
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                None,
+            )
+            .await
+            .expect("OpenCode stream completes");
+            assert_eq!(result.full_text, "done");
+            assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+            let terminal = provider_attempt_terminal_from_result(&result);
+            assert_eq!(terminal.usage.output_tokens, expected_output);
+            if let Some((input, read, write)) = expected_input {
+                assert_eq!(
+                    terminal.usage_status,
+                    astra_services::InferenceUsageStatus::ProviderExact
+                );
+                assert_eq!(terminal.usage.input.fresh_input_tokens, input);
+                assert_eq!(terminal.usage.input.cache_read_tokens, read);
+                assert_eq!(result.usage["cache_creation_tokens"], write);
+            } else {
+                assert_ne!(
+                    terminal.usage_status,
+                    astra_services::InferenceUsageStatus::ProviderExact
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_preserves_usage_lanes_across_partial_chunks() {
-        for (updates, expected_fresh, expected_cached) in [
+        for (updates, expected_fresh, expected_cached, expected_creation_known) in [
             (
                 vec![
                     json!({"prompt_tokens": 100}),
                     json!({"completion_tokens": 5}),
                 ],
-                100,
                 0,
+                0,
+                false,
             ),
             (
                 vec![
                     json!({"prompt_tokens": 100}),
                     json!({"prompt_tokens_details": {"cached_tokens": 30}}),
+                    json!({"prompt_tokens_details": {"cache_write_tokens": 0}}),
                     json!({"completion_tokens": 5, "prompt_tokens": null}),
                 ],
                 70,
                 30,
+                true,
             ),
             (
                 vec![
                     json!({"prompt_tokens_details": {"cached_tokens": 30}}),
+                    json!({"prompt_tokens_details": {"cache_write_tokens": 0}}),
                     json!({"prompt_tokens": 100}),
                     json!({"completion_tokens": 5}),
                 ],
                 70,
                 30,
+                true,
             ),
         ] {
             let mut frames = vec![Ok(Bytes::from(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}\n\n",
             ))];
             for usage in updates {
                 frames.push(Ok(Bytes::from(format!(
@@ -11178,6 +13775,7 @@ mod tests {
                     json!({"usage": usage})
                 ))));
             }
+            frames.push(Ok(Bytes::from(format!("data: {}\n\n", json!({"choices":[{"delta":{"content":"late text","tool_calls":[{"index":0,"id":"late-call","type":"function","function":{"name":"bash","arguments":"{}"}}]},"finish_reason":"length"}]})))));
             frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
             let result = collect_llm_stream(
                 stream::iter(frames),
@@ -11190,18 +13788,28 @@ mod tests {
             )
             .await
             .expect("partial usage chunks must converge");
+            assert_eq!(result.full_text, "Hello");
+            assert!(result.tool_calls.is_empty());
+            assert_eq!(result.finish_reason.as_deref(), Some("stop"));
             let terminal = provider_attempt_terminal_from_result(&result);
             assert_eq!(terminal.usage.input.fresh_input_tokens, expected_fresh);
             assert_eq!(terminal.usage.input.cache_read_tokens, expected_cached);
             assert_eq!(terminal.usage.output_tokens, 5);
             assert_eq!(
                 terminal.usage_status,
-                astra_services::InferenceUsageStatus::ProviderPartial
+                if expected_creation_known {
+                    astra_services::InferenceUsageStatus::ProviderExact
+                } else {
+                    astra_services::InferenceUsageStatus::ProviderPartial
+                }
             );
-            assert!(result.usage_presence.fresh_input_tokens);
+            assert_eq!(result.usage_presence.fresh_input_tokens, expected_fresh > 0);
             assert!(result.usage_presence.output_tokens);
             assert_eq!(result.usage_presence.cache_read_tokens, expected_cached > 0);
-            assert!(!result.usage_presence.cache_creation_tokens);
+            assert_eq!(
+                result.usage_presence.cache_creation_tokens,
+                expected_creation_known
+            );
         }
     }
 
@@ -11277,7 +13885,7 @@ mod tests {
         for repaired in [false, true] {
             let mut frames = vec![Ok(Bytes::from(format!(
                 "data: {}\n\n",
-                json!({"usage":{"prompt_tokens":50,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":80}}})
+                json!({"usage":{"prompt_tokens":50,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":80,"cache_write_tokens":0}}})
             )))];
             if repaired {
                 frames.push(Ok(Bytes::from(format!(
@@ -11410,6 +14018,1240 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_llm_stream_dsml_orphan_closers_preserve_answer() {
+        let answer = "Mailbox permission is required.";
+        let content =
+            format!("{answer}</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>");
+        let mut frames = content
+            .chars()
+            .map(|ch| {
+                let event = json!({"choices":[{"delta":{"content":ch.to_string()}}]});
+                Ok(Bytes::from(format!("data: {event}\n\n")))
+            })
+            .collect::<Vec<_>>();
+        frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+        let mut updates = Vec::new();
+        let mut callback = |update| updates.push(update);
+        let result = collect_llm_stream(
+            stream::iter(frames),
+            "deepseek-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            Some(&mut callback),
+        )
+        .await
+        .expect("collect orphan protocol suffix");
+        assert_eq!(result.full_text, answer);
+        assert!(
+            result.tool_calls.is_empty(),
+            "closing tags do not identify a call"
+        );
+        let visible = updates
+            .into_iter()
+            .filter_map(|update| match update {
+                LlmStreamUpdate::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(visible, answer);
+        let nonstream = parse_openai_compatible_nonstream_response(
+            &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+            "deepseek-test",
+        );
+        assert_eq!(nonstream.full_text, answer);
+        assert!(nonstream.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_calls_use_the_existing_wire_authority() {
+        let markup = concat!(
+            " Starting.\n<｜DSML｜ calls><｜DSML｜ invoke name=\"search\">",
+            "<｜DSML｜ parameter name=\"query\" string=\"true\">123</｜DSML｜ parameter>",
+            "<｜DSML｜ parameter name=\"count\" string=\"false\">5</｜DSML｜ parameter>",
+            "</｜DSML｜ invoke><｜DSML｜ invoke name=\"undeclared\">{}",
+            "</｜DSML｜ invoke></｜DSML｜ calls>Ready. ",
+        );
+        let allowed = HashSet::from(["search".to_owned()]);
+        for native in [false, true] {
+            let mut delta = json!({"content":markup});
+            if native {
+                delta["tool_calls"] = json!([{
+                    "index":0,"id":"native-search","type":"function",
+                    "function":{"name":"search","arguments":"{\"query\":\"native\",\"count\":1}"},
+                }]);
+            }
+            let event = json!({"choices":[{"delta":delta,"finish_reason":"stop"}]});
+            let mut updates = Vec::new();
+            let mut callback = |update| updates.push(update);
+            let result = collect_llm_stream_for_wire(
+                stream::iter(vec![Ok(Bytes::from(format!(
+                    "data: {event}\n\ndata: [DONE]\n\n"
+                )))]),
+                "deepseek-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                &allowed,
+                Some(&mut callback),
+                None,
+            )
+            .await
+            .expect("collect native or recovered DSML call");
+            assert_eq!(result.full_text, " Starting.\nReady. ");
+            let nonstream = parse_openai_compatible_nonstream_response(
+                &json!({"choices":[{"message":delta,"finish_reason":"stop"}]}),
+                "deepseek-test",
+            );
+            assert_eq!(nonstream.full_text, result.full_text);
+            assert_eq!(
+                result
+                    .tool_calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                vec![Some("search")]
+            );
+            let arguments: Value = serde_json::from_str(
+                result.tool_calls[0]["function"]["arguments"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                arguments,
+                if native {
+                    json!({"query":"native","count":1})
+                } else {
+                    json!({"query":"123","count":5})
+                }
+            );
+            if native {
+                assert_eq!(result.tool_calls[0]["id"], "native-search");
+            }
+            let visible = updates
+                .into_iter()
+                .filter_map(|update| match update {
+                    LlmStreamUpdate::Text(text) => Some(text),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(visible, result.full_text);
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_invalid_input_reaches_strict_admission() {
+        let markup = "<｜DSML｜ calls><｜DSML｜ invoke name=\"search\"><｜DSML｜ parameter name=\"count\" string=\"false\">invalid</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>";
+        let event = json!({"choices":[{"delta":{"content":markup},"finish_reason":"stop"}]});
+        let allowed = HashSet::from(["search".to_owned()]);
+        let result = collect_llm_stream_for_wire(
+            stream::iter(vec![Ok(Bytes::from(format!(
+                "data: {event}\n\ndata: [DONE]\n\n"
+            )))]),
+            "deepseek-test",
+            Instant::now(),
+            None,
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            &allowed,
+            None,
+            None,
+        )
+        .await
+        .expect("retain failed named tool input");
+        assert_eq!(result.full_text, "");
+        let call = &result.tool_calls[0];
+        assert_eq!(call["function"]["name"], "search");
+        assert_eq!(
+            astra_turn_core::tool::args::shape::parse_tool_call_arguments(call),
+            Err("arguments contain incomplete or invalid JSON")
+        );
+        let edge =
+            astra_turn_core::stream_events::build_edge_tool_call_event(call.as_object().unwrap());
+        assert_eq!(edge["arguments"]["_parse_error"]["executed"], false);
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_malformed_outer_owns_nested_calls() {
+        for (content, outer_name) in [
+            (
+                r#"<||DSML||tool_calls><||DSML||invoke name=""><||DSML||invoke name="bash"><||DSML||parameter name="command">pwd</||DSML||parameter></||DSML||invoke></||DSML||invoke></||DSML||tool_calls>"#,
+                None,
+            ),
+            (
+                r#"<||DSML||tool_calls><||DSML||invoke><||DSML||invoke name="bash">{"command":"pwd"}</||DSML||invoke></||DSML||invoke></||DSML||tool_calls>"#,
+                None,
+            ),
+            (
+                r#"<｜DSML｜ calls><｜DSML｜ invoke name="write_file"><｜DSML｜ calls></｜DSML｜ calls><｜DSML｜ invoke name="bash">{"command":"pwd"}</｜DSML｜ invoke></｜DSML｜ invoke></｜DSML｜ calls>"#,
+                Some("write_file"),
+            ),
+        ] {
+            let allowed = HashSet::from(["bash".to_owned(), "write_file".to_owned()]);
+            let event = json!({"choices":[{"delta":{"content":content},"finish_reason":"stop"}]});
+            let result = collect_llm_stream_for_wire(
+                stream::iter(vec![Ok(Bytes::from(format!(
+                    "data: {event}\n\ndata: [DONE]\n\n"
+                )))]),
+                "deepseek-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                &allowed,
+                None,
+                None,
+            )
+            .await
+            .expect("collect malformed outer invocation");
+            assert_eq!(result.full_text, "");
+            assert_eq!(
+                result
+                    .tool_calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                outer_name.into_iter().map(Some).collect::<Vec<_>>()
+            );
+            for call in &result.tool_calls {
+                assert_eq!(
+                    astra_turn_core::tool::args::shape::parse_tool_call_arguments(call),
+                    Err("arguments contain incomplete or invalid JSON")
+                );
+                let edge = astra_turn_core::stream_events::build_edge_tool_call_event(
+                    call.as_object().unwrap(),
+                );
+                assert_eq!(edge["arguments"]["_parse_error"]["executed"], false);
+            }
+            let nonstream = parse_openai_compatible_nonstream_response(
+                &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                "deepseek-test",
+            );
+            assert_eq!(nonstream.full_text, result.full_text);
+            assert_eq!(
+                nonstream
+                    .tool_calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                outer_name.into_iter().map(Some).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_json_owns_markup_before_wire_admission() {
+        let args = json!({
+            "path": "example.txt",
+            "content": r#"quoted "data" \ </|DSML|invoke><|DSML|invoke name='bash'>{"command":"pwd"}</|DSML|invoke>"#
+        });
+        let content = format!(
+            "Before <|DSML|calls><|DSML|invoke name=\"write_file\">{args}</|DSML|invoke></|DSML|calls> after"
+        );
+        let frames = content
+            .chars()
+            .map(|ch| {
+                let event = json!({"choices":[{"delta":{"content":ch.to_string()}}]});
+                Ok(Bytes::from(format!("data: {event}\n\n")))
+            })
+            .chain([Ok(Bytes::from("data: [DONE]\n\n"))])
+            .collect::<Vec<_>>();
+        let mut published = String::new();
+        let mut callback = |update| {
+            if let LlmStreamUpdate::Text(text) = update {
+                published.push_str(&text);
+            }
+        };
+        let allowed = HashSet::from(["bash".to_owned(), "write_file".to_owned()]);
+        let result = collect_llm_stream_for_wire(
+            stream::iter(frames),
+            "deepseek-test",
+            Instant::now(),
+            None,
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            &allowed,
+            Some(&mut callback),
+            None,
+        )
+        .await
+        .unwrap();
+        let nonstream = parse_openai_compatible_nonstream_response(
+            &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+            "deepseek-test",
+        );
+        assert_eq!(published, "Before  after");
+        for result in [result, nonstream] {
+            assert_eq!(result.full_text, published);
+            assert_eq!(
+                result
+                    .tool_calls
+                    .iter()
+                    .map(|call| (
+                        call["function"]["name"].as_str(),
+                        astra_turn_core::tool::args::shape::parse_tool_call_arguments(call)
+                            .unwrap(),
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![(Some("write_file"), args.clone())]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_json_bodies_cannot_release_nested_calls() {
+        let embedded = r#"quoted "data" \ </|DSML|invoke><|DSML|invoke name='bash'><|DSML|parameter name='command'>pwd</|DSML|parameter></|DSML|invoke>"#;
+        let nested = json!([{"examples":[embedded]}]);
+        let genuine = r#"<|DSML|invoke name="bash">{"command":"echo sibling"}</|DSML|invoke>"#;
+        let allowed = HashSet::from(["bash".to_owned(), "write_file".to_owned()]);
+        let invalid = "arguments contain incomplete or invalid JSON";
+        let mut cases = [
+            nested.to_string(),
+            json!(embedded).to_string(),
+            format!("[,{nested}]"),
+            "true".to_owned(),
+            "-3.25e2".to_owned(),
+            "null".to_owned(),
+        ]
+        .into_iter()
+        .map(|body| (body, Err(invalid)))
+        .collect::<Vec<_>>();
+        let parameter_embedded = r#"quoted "data" \ </|DSML|parameter></|DSML|invoke><|DSML|invoke name='bash'><|DSML|parameter name='command'>pwd</|DSML|parameter></|DSML|invoke>"#;
+        let parameter_value = json!(parameter_embedded);
+        for (encoded, value) in [
+            (parameter_value.to_string(), Ok(parameter_value.clone())),
+            (
+                parameter_value.to_string().replace('<', r"\u003c"),
+                Ok(parameter_value.clone()),
+            ),
+            (
+                json!({"nested":parameter_value}).to_string(),
+                Ok(json!({"nested":parameter_value})),
+            ),
+            (
+                json!([parameter_value]).to_string(),
+                Ok(json!([parameter_value])),
+            ),
+            (format!("[,{parameter_value}]"), Err(invalid)),
+        ] {
+            cases.push((
+                format!(r#"<|DSML|parameter name="path">example.txt</|DSML|parameter><|DSML|parameter name="content" string="false">{encoded}</|DSML|parameter>"#),
+                value.map(|value| json!({"path":"example.txt","content":value})),
+            ));
+        }
+        cases.push((
+            r#"<|DSML|parameter name="path">example.txt</|DSML|parameter><|DSML|parameter name="content">{"unfinished text</|DSML|parameter>"#.to_owned(),
+            Ok(json!({"path":"example.txt","content":"{\"unfinished text"})),
+        ));
+        for (body, expected) in cases {
+            let content = format!(
+                "Before <|DSML|calls><|DSML|invoke name=\"write_file\">{body}</|DSML|invoke>{genuine}</|DSML|calls> after"
+            );
+            for fragmented in [false, true] {
+                let pieces = if fragmented {
+                    content.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()
+                } else {
+                    vec![content.clone()]
+                };
+                let frames = pieces
+                    .into_iter()
+                    .map(|piece| {
+                        let event = json!({"choices":[{"delta":{"content":piece}}]});
+                        Ok(Bytes::from(format!("data: {event}\n\n")))
+                    })
+                    .chain([Ok(Bytes::from("data: [DONE]\n\n"))]);
+                let mut published = String::new();
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Text(text) = update {
+                        published.push_str(&text);
+                    }
+                };
+                let streamed = collect_llm_stream_for_wire(
+                    stream::iter(frames),
+                    "deepseek-test",
+                    Instant::now(),
+                    None,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    &allowed,
+                    Some(&mut callback),
+                    None,
+                )
+                .await
+                .unwrap();
+                let nonstream = parse_openai_compatible_nonstream_response(
+                    &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                    "deepseek-test",
+                );
+                assert_eq!(published, "Before  after");
+                for result in [streamed, nonstream] {
+                    assert_eq!(result.full_text, published);
+                    let calls = result
+                        .tool_calls
+                        .iter()
+                        .map(|call| {
+                            (
+                                call["function"]["name"].as_str(),
+                                astra_turn_core::tool::args::shape::parse_tool_call_arguments(call),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        calls,
+                        vec![
+                            (Some("write_file"), expected.clone()),
+                            (Some("bash"), Ok(json!({"command":"echo sibling"}))),
+                        ],
+                        "{body}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_markdown_examples_remain_data() {
+        let call = r#"<｜DSML｜ invoke name="bash">{"command":"pwd"}</｜DSML｜ invoke>"#;
+        for content in [
+            format!("- ~~~xml\n\n  {call}\n  ~~~\n"),
+            format!("1. ~~~xml\n\n   {call}\n   ~~~\n"),
+            format!("> ~~~text\n> {call}\n> ~~~"),
+            format!("    {call}\n"),
+            format!("- ~~~text\n  {call}\n  ~~~"),
+            format!("1. ~~~text\n   {call}\n   ~~~"),
+            format!("> - ~~~text\n>   {call}\n>   ~~~"),
+            format!("100. ~~~text\n     {call}\n     ~~~"),
+            format!("```text\n> ```\n{call}\n```"),
+            format!("> - ~~~xml\n>\n>   {call}\n>   ~~~\n"),
+            format!(">\t~~~xml\n> {call}\n> ~~~\n"),
+            format!("\t{call}\n"),
+        ]
+        .into_iter()
+        .flat_map(|text| [text.clone(), text.replace("~~~", "```")])
+        .flat_map(|text| ["\n", "\r\n"].map(|ending| text.replace('\n', ending)))
+        {
+            for character_chunks in [false, true] {
+                let chunks = if character_chunks {
+                    content.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()
+                } else {
+                    vec![content.clone()]
+                };
+                let mut frames = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        let event = json!({"choices":[{"delta":{"content":chunk}}]});
+                        Ok(Bytes::from(format!("data: {event}\n\n")))
+                    })
+                    .collect::<Vec<_>>();
+                frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+                let mut published = String::new();
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Text(text) = update {
+                        published.push_str(&text);
+                    }
+                };
+                let result = collect_llm_stream_for_wire(
+                    stream::iter(frames),
+                    "deepseek-test",
+                    Instant::now(),
+                    None,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    &HashSet::from(["bash".to_owned()]),
+                    Some(&mut callback),
+                    None,
+                )
+                .await
+                .expect("collect Markdown example");
+                assert!(
+                    result.tool_calls.is_empty(),
+                    "Markdown is data: {content:?}"
+                );
+                assert_eq!(result.full_text, content);
+                assert_eq!(published, content);
+                let nonstream = parse_openai_compatible_nonstream_response(
+                    &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                    "deepseek-test",
+                );
+                assert_eq!(nonstream.full_text, content);
+                assert!(nonstream.tool_calls.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_non_protocol_names_remain_literal() {
+        let content =
+            r#"<|DSML|invoke-example name="bash">{"command":"pwd"}</|DSML|invoke-example>"#;
+        for character_chunks in [false, true] {
+            let chunks = if character_chunks {
+                content.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()
+            } else {
+                vec![content.to_owned()]
+            };
+            let mut frames = chunks
+                .into_iter()
+                .map(|chunk| {
+                    let event = json!({"choices":[{"delta":{"content":chunk}}]});
+                    Ok(Bytes::from(format!("data: {event}\n\n")))
+                })
+                .collect::<Vec<_>>();
+            frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+            let mut published = String::new();
+            let mut callback = |update| {
+                if let LlmStreamUpdate::Text(text) = update {
+                    published.push_str(&text);
+                }
+            };
+            let result = collect_llm_stream_for_wire(
+                stream::iter(frames),
+                "deepseek-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                &HashSet::from(["bash".to_owned()]),
+                Some(&mut callback),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(result.tool_calls.is_empty());
+            assert_eq!(result.full_text, content);
+            assert_eq!(published, content);
+            let nonstream = parse_openai_compatible_nonstream_response(
+                &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                "deepseek-test",
+            );
+            assert_eq!(nonstream.full_text, content);
+            assert!(nonstream.tool_calls.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_inline_code_continuation_resumes_call_recovery() {
+        let content = "Before `foo\n    bar`\n<|DSML|invoke name=\"bash\">{\"command\":\"pwd\"}</|DSML|invoke>";
+        for character_chunks in [false, true] {
+            let chunks = if character_chunks {
+                content.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()
+            } else {
+                vec![content.to_owned()]
+            };
+            let mut frames = chunks
+                .into_iter()
+                .map(|chunk| {
+                    let event = json!({"choices":[{"delta":{"content":chunk}}]});
+                    Ok(Bytes::from(format!("data: {event}\n\n")))
+                })
+                .collect::<Vec<_>>();
+            frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+            let mut published = String::new();
+            let mut callback = |update| {
+                if let LlmStreamUpdate::Text(text) = update {
+                    published.push_str(&text);
+                }
+            };
+            let result = collect_llm_stream_for_wire(
+                stream::iter(frames),
+                "deepseek-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                &HashSet::from(["bash".to_owned()]),
+                Some(&mut callback),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.full_text, "Before `foo\n    bar`\n");
+            assert_eq!(published, result.full_text);
+            assert_eq!(
+                result
+                    .tool_calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                vec![Some("bash")]
+            );
+            assert_eq!(
+                astra_turn_core::tool::args::shape::parse_tool_call_arguments(
+                    &result.tool_calls[0]
+                )
+                .unwrap(),
+                json!({"command":"pwd"})
+            );
+            let nonstream = parse_openai_compatible_nonstream_response(
+                &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                "deepseek-test",
+            );
+            assert_eq!(nonstream.full_text, result.full_text);
+            assert_eq!(nonstream.tool_calls[0]["function"]["name"], "bash");
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_fragmented_long_prefixes_are_preserved_or_hidden() {
+        let fence_info = format!(
+            "~~~{}\n<|DSML|invoke name=\"bash\">{{\"command\":\"pwd\"}}</|DSML|invoke>\n~~~\n",
+            "x`".repeat(32_000)
+        );
+        let lazy_quotes = format!("{}first\n{}", "> ".repeat(3_200), "!x\n".repeat(3_200));
+        for (content, expected) in [
+            (fence_info.clone(), fence_info),
+            (lazy_quotes.clone(), lazy_quotes),
+            (" ".repeat(512 * 1024), " ".repeat(512 * 1024)),
+            (
+                format!("<|DSML|invoke name=\"{}", "a".repeat(512 * 1024)),
+                String::new(),
+            ),
+        ] {
+            let mut frames=content.as_bytes().chunks(16).map(|chunk| {
+                let event=json!({"choices":[{"delta":{"content":std::str::from_utf8(chunk).unwrap()}}]});
+                Ok(Bytes::from(format!("data: {event}\n\n")))
+            }).collect::<Vec<_>>();
+            frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+            let mut published = String::new();
+            let mut callback = |update| {
+                if let LlmStreamUpdate::Text(text) = update {
+                    published.push_str(&text);
+                }
+            };
+            let result = collect_llm_stream_for_wire(
+                stream::iter(frames),
+                "deepseek-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                &HashSet::from(["bash".to_owned()]),
+                Some(&mut callback),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.full_text, expected);
+            assert_eq!(published, expected);
+            assert!(result.tool_calls.is_empty());
+            let nonstream = parse_openai_compatible_nonstream_response(
+                &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                "deepseek-test",
+            );
+            assert_eq!(nonstream.full_text, expected);
+            assert!(nonstream.tool_calls.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_markdown_blocks_and_physical_lines() {
+        let call = r#"<|DSML|invoke name="read_file">{"path":"README.md"}</|DSML|invoke>"#;
+        let wrapped = format!("<|DSML|calls>{call}</|DSML|calls>");
+        let first = r#"<||DSML||tool_calls><||DSML||invoke name="read_file">{"path":"a.txt"}</||DSML||invoke></||DSML||
+ tool_calls>"#;
+        let second = r#"<||DSML||tool_calls><||DSML||invoke name="read_file">{"path":"b.txt"}</||DSML||invoke></||DSML||tool_calls>"#;
+        for (content, expected, paths) in [
+            (
+                "<|DSML|invoke name=\"read_file\"><|DSML|parameter name=\"path\" string=\"true\">line1\rline2\nline3</|DSML|parameter></|DSML|invoke>".to_owned(),
+                String::new(),
+                vec!["line1\rline2\nline3"],
+            ),
+            (
+                format!("```example```\n{call}"),
+                "```example```\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("``example``\n{call}"),
+                "``example``\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("Text ```example```\n{call}"),
+                "Text ```example```\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("x ` y\n```{call}`"),
+                format!("x ` y\n```{call}`"),
+                vec![],
+            ),
+            (
+                format!("x `` y\n```text ` {call}``"),
+                format!("x `` y\n```text ` {call}``"),
+                vec![],
+            ),
+            (
+                format!("x ` y\n```text\n{call}\n```\n{call}"),
+                format!("x ` y\n```text\n{call}\n```\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("```text\n{call}\n```\n{call}"),
+                format!("```text\n{call}\n```\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("<pre>\n{call}\n</pre>\n{call}"),
+                format!("<pre>\n{call}\n</pre>\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("<!--\n{call}\n-->\n{call}"),
+                format!("<!--\n{call}\n-->\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("<div>\n{call}\n</div>\n\n{call}"),
+                format!("<div>\n{call}\n</div>\n\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("<div>\n{call}\n</div>\n{call}"),
+                format!("<div>\n{call}\n</div>\n{call}"),
+                vec![],
+            ),
+            (
+                format!("Answer <code>{call}</code>. {call}"),
+                format!("Answer <code>{call}</code>. "),
+                vec!["README.md"],
+            ),
+            (
+                format!("Answer <br>{call}"),
+                "Answer <br>".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("> <pre>\n> example\n{call}"),
+                "> <pre>\n> example\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("> <!--\n> example\n{call}"),
+                "> <!--\n> example\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("Use a ` character\n===\n`{call}`"),
+                format!("Use a ` character\n===\n`{call}`"),
+                vec![],
+            ),
+            (
+                format!("Use a ` character\n===\n{call}"),
+                "Use a ` character\n===\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("Text\n    `example\n{call}`"),
+                format!("Text\n    `example\n{call}`"),
+                vec![],
+            ),
+            (
+                format!("Text\n\n    `example\n    {call}`\n"),
+                format!("Text\n\n    `example\n    {call}`\n"),
+                vec![],
+            ),
+            (
+                format!("Example opener: \\<|DSML|calls>\n\n<|DSML|calls>{call}</|DSML|calls>"),
+                "Example opener: \\<|DSML|calls>\n\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!(
+                    "Example opener: \\<|DSML|invoke name=\"read_file\">\n\n<|DSML|calls>{call}</|DSML|calls>"
+                ),
+                "Example opener: \\<|DSML|invoke name=\"read_file\">\n\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("# Example opener: \\<|DSML|calls>\n<|DSML|calls>{call}</|DSML|calls>"),
+                "# Example opener: \\<|DSML|calls>\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("The literal is: \\{call}"),
+                format!("The literal is: \\{call}"),
+                vec![],
+            ),
+            (
+                format!("Use a ` character.\n\n`{call}`"),
+                format!("Use a ` character.\n\n`{call}`"),
+                vec![],
+            ),
+            (
+                format!("Use a ` character.\n\n{call}"),
+                "Use a ` character.\n\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("- Example\n  ~~~text\n  example\n~~~\n{call}\n~~~\n"),
+                format!("- Example\n  ~~~text\n  example\n~~~\n{call}\n~~~\n"),
+                vec![],
+            ),
+            (
+                format!("- Example\n  ~~~text\n  example\n{call}"),
+                "- Example\n  ~~~text\n  example\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                "one</|DSML|\ncalls>    two</|DSML|calls>three".to_owned(),
+                "one    twothree".to_owned(),
+                vec![],
+            ),
+            (
+                format!("> ~~~\n# `\n`{call}`"),
+                format!("> ~~~\n# `\n`{call}`"),
+                vec![],
+            ),
+            (
+                format!("Start `\n<!-- -->\n`{call}`"),
+                format!("Start `\n<!-- -->\n`{call}`"),
+                vec![],
+            ),
+            (
+                format!("- item\n<div>\n{call}\n</div>\n\n{call}"),
+                format!("- item\n<div>\n{call}\n</div>\n\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("</div>\n{call}\n\n{call}"),
+                format!("</div>\n{call}\n\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("Need to inspect ` README.\n{call}"),
+                "Need to inspect ` README.\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("`example\n1.\n{call}`"),
+                format!("`example\n1.\n{call}`"),
+                vec![],
+            ),
+            (
+                format!("`example\n+ \n{call}`"),
+                format!("`example\n+ \n{call}`"),
+                vec![],
+            ),
+            (
+                format!("`example\n*\n{}`", call.replace('|', "｜")),
+                format!("`example\n*\n{}`", call.replace('|', "｜")),
+                vec![],
+            ),
+            (
+                format!("Need `inspect\n1.\n    {wrapped}"),
+                "Need `inspect\n1.\n    ".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("Example `heading\n-\n{call}"),
+                "Example `heading\n-\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("- item\n-\n    ```\n  {call}\n    ```\n"),
+                format!("- item\n-\n    ```\n  {call}\n    ```\n"),
+                vec![],
+            ),
+            (
+                format!("> - item\n> - \n>     ~~~\n>   {call}\n>     ~~~\n"),
+                format!("> - item\n> - \n>     ~~~\n>   {call}\n>     ~~~\n"),
+                vec![],
+            ),
+            (
+                format!("1. item\n2.\n      ~~~\n   {call}\n      ~~~\n"),
+                format!("1. item\n2.\n      ~~~\n   {call}\n      ~~~\n"),
+                vec![],
+            ),
+            (
+                format!("- item\n-\n    `{call}`\n    {call}"),
+                format!("- item\n-\n    `{call}`\n    "),
+                vec!["README.md"],
+            ),
+            (
+                format!("- item\n-\n    {call}"),
+                "- item\n-\n    ".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("- item\n-\n\n    {call}"),
+                format!("- item\n-\n\n    {call}"),
+                vec![],
+            ),
+            (
+                format!("> - item\n> - \n>\n>     {call}"),
+                format!("> - item\n> - \n>\n>     {call}"),
+                vec![],
+            ),
+            (
+                format!("1. item\n2. \n\n    {call}"),
+                format!("1. item\n2. \n\n    {call}"),
+                vec![],
+            ),
+            (
+                format!("- item\n-\n  started\n\n  {call}"),
+                "- item\n-\n  started\n\n  ".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                "before `unmatched\n    ".to_owned(),
+                "before `unmatched\n    ".to_owned(),
+                vec![],
+            ),
+            (
+                format!("Need `inspect\n{wrapped}\n    "),
+                "Need `inspect\n\n    ".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("- > > before `open\n<br>\n{call}`"),
+                format!("- > > before `open\n<br>\n{call}`"),
+                vec![],
+            ),
+            (
+                format!("Start `{wrapped}\n-     `\n"),
+                "Start `\n-     `\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("Start `{wrapped}\n    `\n"),
+                format!("Start `{wrapped}\n    `\n"),
+                vec![],
+            ),
+            (
+                format!("Start `{wrapped}\n- next `\n"),
+                "Start `\n- next `\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("{first}    {second}"),
+                "    ".to_owned(),
+                vec!["a.txt", "b.txt"],
+            ),
+        ].into_iter().flat_map(|(content, expected, paths)| ["\n", "\r\n"].map(|ending| (
+            content.replace('\n', ending), expected.replace('\n', ending),
+            paths.iter().map(|path| path.replace('\n', ending)).collect::<Vec<_>>()
+        ))) {
+            let chars = content.chars().collect::<Vec<_>>();
+            for width in [chars.len(), 1, 4, 16, 64] {
+                let chunks = chars.chunks(width).map(|chunk| chunk.iter().collect::<String>());
+                let mut frames = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        let event = json!({"choices":[{"delta":{"content":chunk}}]});
+                        Ok(Bytes::from(format!("data: {event}\n\n")))
+                    })
+                    .collect::<Vec<_>>();
+                frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+                let mut published = String::new();
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Text(text) = update {
+                        published.push_str(&text);
+                    }
+                };
+                let result = collect_llm_stream_for_wire(
+                    stream::iter(frames),
+                    "deepseek-test",
+                    Instant::now(),
+                    None,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    &HashSet::from(["read_file".to_owned()]),
+                    Some(&mut callback),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.full_text, expected, "{content:?}");
+                assert_eq!(published, expected, "callback differs at chunk width {width}: {content:?}");
+                let arguments = result
+                    .tool_calls
+                    .iter()
+                    .map(|call| {
+                        assert_eq!(call["function"]["name"], "read_file");
+                        astra_turn_core::tool::args::shape::parse_tool_call_arguments(call).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    arguments,
+                    paths
+                        .iter()
+                        .map(|path| json!({"path":path}))
+                        .collect::<Vec<_>>()
+                );
+                let nonstream = parse_openai_compatible_nonstream_response(
+                    &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                    "deepseek-test",
+                );
+                assert_eq!(nonstream.full_text, expected);
+                assert_eq!(
+                    nonstream
+                        .tool_calls
+                        .iter()
+                        .map(
+                            |call| astra_turn_core::tool::args::shape::parse_tool_call_arguments(
+                                call
+                            )
+                            .unwrap()
+                        )
+                        .collect::<Vec<_>>(),
+                    arguments
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_degraded_markup_respects_literal_and_outer_ownership() {
+        let call = r#"<|DSML|invoke name="bash">{"command":"pwd"}</|DSML|invoke>"#;
+        let nested =
+            r#"<|DSML|invoke name="bash"><parameter name="command">pwd</parameter></|DSML|invoke>"#;
+        let legacy = "<tool_call>bash)(pwd)</tool_call>";
+        for (content, literal, expected) in [
+            (format!("<Invoke>{nested}</Invoke>"), false),
+            (format!("< invoke>{nested}</invoke>"), false),
+            (format!("<invoke>{nested}</invoke>"), false),
+            (format!("<Invoke name=\"\">{nested}</Invoke>"), false),
+            (
+                format!("<invoke label='name=\"bash\"'>{nested}</invoke>"),
+                false,
+            ),
+            (
+                format!("<invoke tool_name=\"bash\">{nested}</invoke>"),
+                false,
+            ),
+            ("<!--\n<invoke name=\"bash\">\n-->".to_owned(), true),
+            (
+                "Text <code><parameter=example> pwd</code>.".to_owned(),
+                true,
+            ),
+            (format!("<section>\n{call}\n</section>\n"), true),
+            (format!("<style>\n{call}\n</style>\n"), true),
+            (format!("<textarea>\n{call}\n</textarea>\n"), true),
+            (format!("<my-widget>\n{call}\n</my-widget>\n"), true),
+            (format!("<pre>\n{call}\n</pre>\n"), true),
+            (format!("<!--\n{call}\n-->\n"), true),
+            (format!("<pre>\nexample\n</pre>\n    {call}"), true),
+            (format!("<!--\nexample\n-->\n    {call}"), true),
+            (format!("Answer <code>{call}</code>."), true),
+            (format!("> <pre>\n> {call}\n> </pre>\n"), true),
+            (format!("<div class=\"example\">\n{call}\n</div>\n"), true),
+            (format!("<invoke name=\"\">{call}</invoke>"), false),
+            (
+                format!("<parameter name=\"example\">{call}</parameter>"),
+                false,
+            ),
+            (
+                format!("<|DSML|parameter name=\"example\">{legacy}</|DSML|parameter>"),
+                false,
+            ),
+            (format!("<|DSML|calls>{legacy}</|DSML|calls>"), false),
+        ]
+        .into_iter()
+        .map(|(content, literal)| (content, literal, None))
+        .chain(
+            [
+                r#"<Invoke name="bash"><parameter name="command">pwd</parameter></Invoke>"#,
+                r#"< invoke name="bash"><parameter name="command">pwd</parameter></invoke>"#,
+                r#"<invoke name="bash"><parameter name="command">pwd</parameter></invoke>"#,
+                r#"<invoke name='bash'><parameter name='command'>pwd</parameter></invoke>"#,
+            ]
+            .map(|content| (content.to_owned(), false, Some(json!({"command":"pwd"})))),
+        ) {
+            for character_chunks in [false, true] {
+                let chunks = if character_chunks {
+                    content.chars().map(|c| c.to_string()).collect()
+                } else {
+                    vec![content.clone()]
+                };
+                let mut frames = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        let event = json!({"choices":[{"delta":{"content":chunk}}]});
+                        Ok(Bytes::from(format!("data: {event}\n\n")))
+                    })
+                    .collect::<Vec<_>>();
+                frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+                let mut published = String::new();
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Text(text) = update {
+                        published.push_str(&text);
+                    }
+                };
+                let result = collect_llm_stream_for_wire(
+                    stream::iter(frames),
+                    "deepseek-test",
+                    Instant::now(),
+                    None,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    &HashSet::from(["bash".to_owned()]),
+                    Some(&mut callback),
+                    None,
+                )
+                .await
+                .unwrap();
+                let nonstream = parse_openai_compatible_nonstream_response(
+                    &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                    "deepseek-test",
+                );
+                for calls in [&result.tool_calls, &nonstream.tool_calls] {
+                    let actual = calls
+                        .iter()
+                        .map(|call| {
+                            assert_eq!(call["function"]["name"], "bash");
+                            astra_turn_core::tool::args::shape::parse_tool_call_arguments(call)
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual,
+                        expected.iter().cloned().collect::<Vec<_>>(),
+                        "{content:?}"
+                    );
+                }
+                if literal {
+                    assert_eq!(result.full_text, content);
+                    assert_eq!(published, content);
+                    assert_eq!(nonstream.full_text, content);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_degraded_markup_delivers_prose_before_line_or_stream_end() {
+        for pieces in [
+            &["1. This is an ordinary answer arriving incrementally."][..],
+            &["- An ordinary bullet."],
+            &["# An ordinary heading"],
+            &["(An ordinary opening parenthesis)"],
+            &[
+                "Press the `",
+                " key to continue. ",
+                "Then check the result.",
+                " No tool markup is present.",
+            ],
+        ] {
+            let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(2);
+            let (updates, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(async move {
+                let input = stream::unfold(receiver, |mut receiver| async {
+                    receiver.recv().await.map(|bytes| (Ok(bytes), receiver))
+                });
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Text(text) = update {
+                        let _ = updates.send(text);
+                    }
+                };
+                collect_llm_stream_for_wire(
+                    Box::pin(input),
+                    "deepseek-test",
+                    Instant::now(),
+                    None,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    &HashSet::new(),
+                    Some(&mut callback),
+                    None,
+                )
+                .await
+            });
+            let mut expected = String::new();
+            let mut published = String::new();
+            for piece in pieces {
+                let event = json!({"choices":[{"delta":{"content":piece}}]});
+                sender
+                    .send(Bytes::from(format!("data: {event}\n\n")))
+                    .await
+                    .unwrap();
+                expected.push_str(piece);
+                // A run at the end of a chunk still needs its delimiter width.
+                let ready = expected.trim_end_matches('`');
+                let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while published.len() < ready.len() {
+                        published.push_str(
+                            &received
+                                .recv()
+                                .await
+                                .expect("text callback while stream stays open"),
+                        );
+                    }
+                })
+                .await;
+                if delivered.is_err() {
+                    task.abort();
+                }
+                delivered.expect("ordinary prose must be delivered before newline or EOF");
+                assert_eq!(published, ready);
+            }
+            sender.send(Bytes::from("data: [DONE]\n\n")).await.unwrap();
+            let result = task.await.unwrap().unwrap();
+            assert_eq!(result.full_text, expected);
+            assert!(result.tool_calls.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_parameter_markup_preserves_answer_suffix() {
+        let content = r#"Before.<||DSML||tool_calls><||DSML||invoke name="write_file"><||DSML||parameter name="path">example.txt</||DSML||parameter><||DSML||parameter name="content"><parameter=x>hello</||DSML||parameter></||DSML||invoke></||DSML||tool_calls>After."#;
+        let mut frames = content
+            .chars()
+            .map(|ch| {
+                let event = json!({"choices":[{"delta":{"content":ch.to_string()}}]});
+                Ok(Bytes::from(format!("data: {event}\n\n")))
+            })
+            .collect::<Vec<_>>();
+        frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+        let mut published = String::new();
+        let mut callback = |update| {
+            if let LlmStreamUpdate::Text(text) = update {
+                published.push_str(&text);
+            }
+        };
+        let result = collect_llm_stream_for_wire(
+            stream::iter(frames),
+            "deepseek-test",
+            Instant::now(),
+            None,
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            &HashSet::from(["write_file".to_owned()]),
+            Some(&mut callback),
+            None,
+        )
+        .await
+        .expect("collect markup inside a string parameter");
+        assert_eq!(published, "Before.After.");
+        assert_eq!(result.full_text, published);
+        assert_eq!(
+            astra_turn_core::tool::args::shape::parse_tool_call_arguments(&result.tool_calls[0])
+                .unwrap(),
+            json!({"path":"example.txt","content":"<parameter=x>hello"})
+        );
+        let nonstream = parse_openai_compatible_nonstream_response(
+            &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+            "deepseek-test",
+        );
+        assert_eq!(nonstream.full_text, published);
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_never_publishes_degraded_dsml_markup() {
         let d1 = json!({"choices":[{"delta":{"content":"visible before\n<｜｜DS"}}]});
         let d2 = json!({"choices":[{"delta":{"content":"ML｜｜tool_calls><｜｜DSML｜｜invoke name=\"bash\">"}}]});
@@ -11463,11 +15305,12 @@ mod tests {
             stream::iter(vec![Ok(Bytes::from(body.clone()))]),
             "deepseek-test",
             Instant::now(),
-            llm_total_budget(),
+            Some(llm_total_budget()),
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
             &allowed,
+            None,
             None,
         )
         .await
@@ -11480,11 +15323,12 @@ mod tests {
             stream::iter(vec![Ok(Bytes::from(body))]),
             "deepseek-test",
             Instant::now(),
-            llm_total_budget(),
+            Some(llm_total_budget()),
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
             &no_tools,
+            None,
             None,
         )
         .await
@@ -11813,13 +15657,33 @@ mod tests {
             inner: &inner,
             started: Instant::now(),
             work_budget: logical_budget - reserve,
-            logical_budget,
+            logical_budget: Some(logical_budget),
             cancel: LlmCancel::None,
         };
         assert!(
             observer.remaining_settlement() > reserve,
             "reserving the final slice must not discard unused provider time"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uncapped_stream_terminalization_has_its_own_bounded_io_budget() {
+        let inner = PendingAttemptObserver::default();
+        let observer = ControlledProviderAttemptObserver {
+            inner: &inner,
+            started: Instant::now() - Duration::from_secs(600),
+            work_budget: llm_total_budget(),
+            logical_budget: None,
+            cancel: LlmCancel::None,
+        };
+        let terminal = provider_attempt_terminal_from_result(&LlmCallResult::default());
+        let started = TokioInstant::now();
+        let error = observer
+            .finish_attempt(0, &terminal)
+            .await
+            .expect_err("a stalled ledger must not wait forever after a long stream");
+        assert!(crate::turn::llm::durable::is_ledger_error(&error));
+        assert_eq!(started.elapsed(), llm_total_budget());
     }
 
     #[test]
@@ -11862,7 +15726,7 @@ mod tests {
             inner: &inner,
             started: Instant::now() - std::time::Duration::from_millis(980),
             work_budget: std::time::Duration::from_secs(1),
-            logical_budget: std::time::Duration::from_secs(1),
+            logical_budget: Some(std::time::Duration::from_secs(1)),
             cancel: LlmCancel::None,
         };
         let terminal = provider_attempt_terminal_from_error(&astra_core::ClassifiedError::new(
@@ -11904,7 +15768,7 @@ mod tests {
             inner: &inner,
             started: Instant::now(),
             work_budget: std::time::Duration::from_secs(7),
-            logical_budget: std::time::Duration::from_secs(8),
+            logical_budget: Some(std::time::Duration::from_secs(8)),
             cancel: LlmCancel::Token(&cancel),
         };
         let terminal = provider_attempt_terminal_from_result(&LlmCallResult::default());
@@ -11919,7 +15783,7 @@ mod tests {
             inner: &inner,
             started: Instant::now(),
             work_budget: std::time::Duration::from_millis(20),
-            logical_budget: std::time::Duration::from_millis(25),
+            logical_budget: Some(std::time::Duration::from_millis(25)),
             cancel: LlmCancel::None,
         };
         let prepared = PreparedProviderRequest::from_json(
@@ -11950,6 +15814,8 @@ mod tests {
 
     #[tokio::test]
     async fn durable_admission_timeout_never_starts_provider_transport() {
+        // This case targets an admitted request, not cold TLS/client initialization.
+        let _ = global_llm_client();
         reset_rate_limit_cooldown_for_tests();
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
@@ -11966,7 +15832,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -11993,11 +15863,14 @@ mod tests {
 
         assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
         assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(observer.began.load(Ordering::SeqCst), 1);
         assert!(!observer.dispatched.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
     async fn successful_provider_result_survives_slow_terminalization_as_partial_evidence() {
+        // Exercise the request phase after cold client initialization.
+        let _ = global_llm_client();
         let app = Router::new().route(
             "/chat/completions",
             post(|| async {
@@ -12023,7 +15896,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -12069,7 +15946,7 @@ mod tests {
             inner: &inner,
             started: Instant::now(),
             work_budget: std::time::Duration::from_millis(20),
-            logical_budget: std::time::Duration::from_millis(25),
+            logical_budget: Some(std::time::Duration::from_millis(25)),
             cancel: LlmCancel::None,
         };
         let provider_error = astra_core::ClassifiedError::new(
@@ -12372,7 +16249,11 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: LlmExecutionRoute {
+                inference_protocol: None,
+                response_scope: None,
+                subscription: None,
                 fixed_temperature: None,
+                supported_reasoning_efforts: None,
                 thinking_protocol: None,
                 model_name: "retained-pause-test",
                 wire_model_name: None,
@@ -12968,7 +16849,11 @@ mod tests {
                     tools,
                     cache_capability: Some(cache_capability),
                     route: LlmExecutionRoute {
+                        inference_protocol: None,
+                        response_scope: None,
+                        subscription: None,
                         fixed_temperature: None,
+                        supported_reasoning_efforts: None,
                         thinking_protocol: None,
                         model_name: "m",
                         wire_model_name: None,
@@ -14025,6 +17910,97 @@ mod tests {
     }
 
     #[test]
+    fn canonical_responses_retry_switches_to_anthropic_without_empty_assistant() {
+        use astra_core::model_wire::responses::{CONTINUATION_KEY, ResponseOutput, request};
+        let connection = uuid::Uuid::new_v4().to_string();
+        let mut assistant = json!({"role":"assistant", "content":""});
+        assistant[CONTINUATION_KEY] = ResponseOutput {
+            items: vec![
+                json!({"type":"reasoning", "id":"rs", "summary":[], "encrypted_content":"opaque"}),
+            ],
+            ..Default::default()
+        }
+        .continuation(&connection, "model");
+        let key = astra_services::FernetTokenEncryptor::new("responses-fixture").unwrap();
+        crate::turn::llm::private_continuation::seal(
+            &mut assistant[CONTINUATION_KEY],
+            &key,
+            "owner",
+            "session",
+        )
+        .unwrap();
+        let control = crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+            "retry required Work",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::CanonicalWorkEstablishmentRetry,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        )
+        .unwrap()
+        .unwrap();
+        for new_user in [false, true] {
+            let mut history = vec![
+                json!({"role":"user", "content":"goal"}),
+                assistant.clone(),
+                control.clone(),
+            ];
+            if new_user {
+                history.push(json!({"role":"user", "content":"new question"}));
+            }
+            let canonical = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(history).unwrap();
+            let mut opened = canonical.clone();
+            crate::turn::llm::private_continuation::open(
+                &mut opened,
+                &key,
+                "owner",
+                &HashSet::from(["session".to_string()]),
+                &connection,
+                "model",
+            )
+            .unwrap();
+            let replay = request("model", &opened, None, &connection, false, None).unwrap();
+            assert!(
+                replay["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["encrypted_content"] == "opaque")
+            );
+            let mut switched = canonical.clone();
+            let mut required =
+                crate::turn::wire_assembly::rehome_append_only_runtime_authority(&mut switched)
+                    .unwrap();
+            required.extend(switched);
+            let projected = consolidate_system_messages_for_protocol(
+                &required,
+                "anthropic",
+                None,
+                LlmProviderProtocol::AnthropicMessages,
+            );
+            let body = build_provider_request_body(
+                &projected,
+                &[],
+                "claude-test",
+                "anthropic",
+                None,
+                None,
+                false,
+                &ThinkingConfig::Off,
+            );
+            assert!(body["messages"].as_array().unwrap().iter().all(|message| {
+                message["role"] != "assistant"
+                    || message["content"]
+                        .as_array()
+                        .is_some_and(|blocks| !blocks.is_empty())
+            }));
+            assert_eq!(body.to_string().contains("retry required Work"), !new_user);
+            assert!(
+                canonical
+                    .iter()
+                    .any(|message| message.get(CONTINUATION_KEY).is_some())
+            );
+        }
+    }
+
+    #[test]
     fn canonical_continuation_tool_result_is_valid_across_provider_protocols() {
         let canonical =
             astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
@@ -14719,7 +18695,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -14782,7 +18762,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -14813,6 +18797,8 @@ mod tests {
 
     #[tokio::test]
     async fn call_llm_and_collect_cancel_during_429_backoff_sleep() {
+        // Exercise the request phase after cold client initialization.
+        let _ = global_llm_client();
         reset_rate_limit_cooldown_for_tests();
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
@@ -14831,7 +18817,11 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        inference_protocol: None,
+                        response_scope: None,
+                        subscription: None,
                         fixed_temperature: None,
+                        supported_reasoning_efforts: None,
                         thinking_protocol: None,
                         model_name: "m",
                         wire_model_name: None,
@@ -14875,7 +18865,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -14916,7 +18910,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -14942,6 +18940,8 @@ mod tests {
 
     #[tokio::test]
     async fn call_llm_and_collect_cancel_during_exponential_backoff_after_500() {
+        // Exercise the request phase after cold client initialization.
+        let _ = global_llm_client();
         reset_rate_limit_cooldown_for_tests();
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
@@ -14960,7 +18960,11 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        inference_protocol: None,
+                        response_scope: None,
+                        subscription: None,
                         fixed_temperature: None,
+                        supported_reasoning_efforts: None,
                         thinking_protocol: None,
                         model_name: "m",
                         wire_model_name: None,
@@ -15034,7 +19038,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -15065,7 +19073,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -15117,7 +19129,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -15183,7 +19199,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -15231,7 +19251,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -15283,7 +19307,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -15329,7 +19357,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -15350,7 +19382,12 @@ mod tests {
         .await
         .expect_err("should fail with context window");
         assert_eq!(err.kind, astra_core::ErrorKind::ContextWindow);
-        assert!(err.message.contains("context_length_exceeded"));
+        assert_eq!(
+            err.message,
+            "Model provider rejected the request (HTTP 400)"
+        );
+        let details: Value = serde_json::from_str(err.details_json.as_deref().unwrap()).unwrap();
+        assert_eq!(details["code"], "context_length_exceeded");
     }
 
     #[tokio::test]
@@ -15375,7 +19412,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "payment-fixture",
                     wire_model_name: None,
@@ -15495,7 +19536,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -15539,7 +19584,11 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -15682,7 +19731,11 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        inference_protocol: None,
+                        response_scope: None,
+                        subscription: None,
                         fixed_temperature: None,
+                        supported_reasoning_efforts: None,
                         thinking_protocol: None,
                         model_name: "m",
                         wire_model_name: None,
@@ -15707,8 +19760,15 @@ mod tests {
                         .await
                         .unwrap_err()
                 };
-                assert_eq!(err.kind, astra_core::ErrorKind::Auth);
-                assert_eq!(err.message, "LLM provider authentication failed");
+                assert_eq!(
+                    err.kind,
+                    if status == 401 {
+                        astra_core::ErrorKind::Auth
+                    } else {
+                        astra_core::ErrorKind::ProviderForbidden
+                    }
+                );
+                assert!(!format!("{err:?}").contains("private-credential"));
             }
             assert_eq!(
                 hits.load(std::sync::atomic::Ordering::SeqCst),
@@ -15731,6 +19791,14 @@ mod tests {
         assert_eq!(
             llm_completions_url("https://api.openai.com/v1/", None, "openai"),
             "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn completions_url_keeps_route_query_after_the_endpoint_path() {
+        assert_eq!(
+            llm_completions_url("https://gateway.example/v1?tenant=one", None, "openai"),
+            "https://gateway.example/v1/chat/completions?tenant=one"
         );
     }
 
@@ -16063,34 +20131,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_guidance_projection_preserves_canonical_suffix_and_does_not_accumulate() {
-        use astra_turn_core::tool::result::advisory::TOOL_RESULT_ADVISORIES_FIELD;
-        let canonical = vec![json!({
-            "role":"tool", "tool_call_id":"call-probe", "content":r#"{"executed":false}"#,
-            TOOL_RESULT_ADVISORIES_FIELD:["inspect the existing operation"],
-        })];
-        let projected = project_provider_message_metadata(&canonical);
-        assert!(provider_request_preserves_projected_canonical_suffix(
-            &projected, &canonical
-        ));
-        assert_eq!(project_provider_message_metadata(&projected), projected);
-        assert_eq!(canonical[0]["content"], r#"{"executed":false}"#);
-        assert!(
-            projected[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("inspect the existing operation")
-        );
-        assert!(projected[0].get(TOOL_RESULT_ADVISORIES_FIELD).is_none());
-        let mut missing_guidance = projected.clone();
-        missing_guidance[0]["content"] = canonical[0]["content"].clone();
-        assert!(!provider_request_preserves_projected_canonical_suffix(
-            &missing_guidance,
-            &canonical
-        ));
-    }
-
-    #[test]
     fn provider_projection_preserves_nested_tool_result_data() {
         let messages = vec![json!({
             "role": "user",
@@ -16115,72 +20155,6 @@ mod tests {
                 .get(astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD)
                 .is_some_and(|value| value == &json!({"unexpected": "nested"}))
         );
-    }
-
-    #[test]
-    fn canonical_suffix_check_compares_the_exact_provider_metadata_projection() {
-        let mut assistant = json!({"role": "assistant", "content": "tool result accepted"});
-        assert!(astra_turn_types::mark_turn_message(
-            &mut assistant,
-            "turn-chain-1"
-        ));
-        let work_frame =
-            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
-                "establish the admitted work graph",
-                crate::turn::wire_assembly::RuntimeAuthorityKind::CanonicalWorkEstablishmentRetry,
-                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
-            )
-            .unwrap()
-            .unwrap();
-        let budget_frame =
-            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
-                "finish before the admitted deadline",
-                crate::turn::wire_assembly::RuntimeAuthorityKind::ExecutionTimeBudget,
-                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
-            )
-            .unwrap()
-            .unwrap();
-        let canonical_appended = vec![assistant, work_frame, budget_frame.clone()];
-
-        // The main assembly was already consolidated, while the dispatch-time
-        // budget frame was appended afterward. This mixed representation is
-        // the real provider-attempt boundary that exposed the regression.
-        let mut provider_messages = vec![
-            json!({"role": "system", "content": "stable policy"}),
-            json!({"role": "user", "content": "do the task"}),
-        ];
-        provider_messages.extend(project_provider_message_metadata(
-            &canonical_appended[..canonical_appended.len() - 1],
-        ));
-        provider_messages.push(budget_frame);
-
-        assert!(!provider_messages.ends_with(&canonical_appended));
-        assert!(provider_request_preserves_projected_canonical_suffix(
-            &provider_messages,
-            &canonical_appended,
-        ));
-
-        let mut changed_content = canonical_appended.clone();
-        changed_content[0]["content"] = Value::String("different response".to_string());
-        assert!(!provider_request_preserves_projected_canonical_suffix(
-            &provider_messages,
-            &changed_content,
-        ));
-
-        let mut reordered = canonical_appended.clone();
-        reordered.swap(0, 1);
-        assert!(!provider_request_preserves_projected_canonical_suffix(
-            &provider_messages,
-            &reordered,
-        ));
-        assert!(!provider_request_preserves_projected_canonical_suffix(
-            &provider_messages[..2],
-            &canonical_appended,
-        ));
-        assert!(provider_request_preserves_projected_canonical_suffix(
-            &provider_messages,
-            &[],
-        ));
     }
 
     #[test]
@@ -19372,6 +23346,202 @@ mod tests {
     }
 
     #[test]
+    fn resident_wire_preserves_operative_control_and_work_guidance() {
+        let surface = crate::tool_registry::surface::ToolSurface::build(
+            astra_tools::schemas::all_tool_schemas(),
+            &astra_config::ToolSurfaceConfig::default(),
+            &[],
+        );
+        let tools = surface.always_load_schemas();
+        let body = build_provider_request_body(
+            &[json!({"role":"user","content":"task"})],
+            &tools,
+            "deepseek-chat",
+            "deepseek",
+            Some(128),
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        let encoded = serde_json::to_string(&body).unwrap();
+        assert!(!encoded.contains("x-astra-"));
+        let agent = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["function"]["name"] == "agent")
+            .unwrap();
+        let properties = &agent["function"]["parameters"]["properties"];
+        assert!(properties["reasoning"]["oneOf"].is_array());
+        let reasoning = properties["reasoning"]["description"].as_str().unwrap();
+        for term in ["mode=adaptive", "effort=", "mode=enabled", "budget_tokens"] {
+            assert!(reasoning.contains(term));
+        }
+        let policy = properties["requested_model_policy"]["description"]
+            .as_str()
+            .unwrap();
+        for term in [
+            "selector={",
+            "offering_id",
+            "configured_name",
+            "no config/substitution",
+        ] {
+            assert!(policy.contains(term));
+        }
+        for (name, terms) in [
+            (
+                "start_work",
+                vec!["before exploration", "initial_task", "directly"],
+            ),
+            ("run_next_work_item", vec!["unassigned", "next_task"]),
+            (
+                "settle_work_item",
+                vec!["current-attempt", "unbound/prior/control", "blocked/failed"],
+            ),
+        ] {
+            let tool = body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["function"]["name"] == name)
+                .unwrap();
+            let description = tool["function"]["description"].as_str().unwrap();
+            for term in terms {
+                assert!(description.contains(term), "{name}: {term}");
+            }
+        }
+        let mut fallback = agent["function"]["parameters"].clone();
+        strip_unsupported_schema_fields(&mut fallback);
+        assert!(fallback.get("oneOf").is_none());
+        assert_eq!(
+            fallback["properties"]["reasoning"]["description"],
+            reasoning
+        );
+        assert_eq!(
+            fallback["properties"]["requested_model_policy"]["description"],
+            policy
+        );
+    }
+
+    #[test]
+    fn resident_agent_wire_exposes_wait_and_keeps_spawn_required_fields() {
+        let surface = crate::tool_registry::surface::ToolSurface::build(
+            astra_tools::schemas::all_tool_schemas(),
+            &astra_config::ToolSurfaceConfig::default(),
+            &[],
+        );
+        let tools = surface
+            .always_load_schemas()
+            .into_iter()
+            .filter(|tool| tool["function"]["name"] == "agent")
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 1);
+        let body = build_provider_request_body(
+            &[json!({"role":"user", "content":"delegate"})],
+            &tools,
+            "deepseek-chat",
+            "deepseek",
+            Some(128),
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        let schema = &body["tools"][0]["function"]["parameters"];
+        assert!(
+            schema["properties"]["agent_id"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("get_result/list only")
+        );
+        let spawn = schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|branch| branch["properties"]["action"]["enum"] == json!(["spawn"]))
+            .unwrap();
+        assert_eq!(
+            spawn["required"],
+            json!(["action", "description", "prompt"])
+        );
+        for (arguments, accepted) in [
+            (
+                json!({"action":"spawn", "prompt":"Return a greeting"}),
+                false,
+            ),
+            (
+                json!({"action":"spawn", "description":"Greeting", "prompt":"Return a greeting"}),
+                true,
+            ),
+        ] {
+            assert_eq!(
+                astra_tools::schemas::validate_tool_arguments_against_schema(
+                    "agent",
+                    &arguments,
+                    &body["tools"][0]
+                )
+                .is_ok(),
+                accepted,
+                "{arguments}",
+            );
+        }
+        assert!(
+            schema["oneOf"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|branch| branch["properties"]["action"]["enum"] == json!(["wait"]))
+        );
+        assert!(schema["properties"].get("timeout_ms").is_some());
+        let canonical_tools = astra_tools::schemas::all_tool_schemas()
+            .into_iter()
+            .filter(|tool| tool["function"]["name"] == "agent")
+            .collect::<Vec<_>>();
+        let canonical_body = build_provider_request_body(
+            &[json!({"role":"user", "content":"explicitly observe runtime activity"})],
+            &canonical_tools,
+            "deepseek-chat",
+            "deepseek",
+            Some(128),
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        let canonical_schema = &canonical_body["tools"][0]["function"]["parameters"];
+        let wait = canonical_schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|branch| branch["properties"]["action"]["enum"] == json!(["wait"]))
+            .unwrap();
+        assert_eq!(wait["additionalProperties"], false);
+        assert!(wait["properties"].get("agent_id").is_none());
+        assert_eq!(wait["properties"]["timeout_ms"]["maximum"], 300000);
+        let observation = json!({"action":"wait", "timeout_ms":1000});
+        assert!(
+            astra_tools::schemas::validate_tool_arguments_against_schema(
+                "agent",
+                &observation,
+                &body["tools"][0],
+            )
+            .is_ok()
+        );
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "agent",
+            &observation,
+            &canonical_body["tools"][0],
+        )
+        .expect("canonical observation retains its bounded wire contract");
+        assert!(
+            astra_tools::schemas::validate_tool_arguments_against_schema(
+                "agent",
+                &json!({"action":"wait", "agent_id":"child", "timeout_ms":1000}),
+                &canonical_body["tools"][0],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn openai_action_tools_materialize_structural_per_action_contracts() {
         let tools = astra_tools::schemas::all_tool_schemas()
             .into_iter()
@@ -19668,7 +23838,6 @@ mod tests {
                     volatile_preamble: Vec::new(),
                     compacted_messages: history,
                     state: &mut state,
-                    compaction_boundary_hit: false,
                     thinking: &thinking,
                     session_id: "session",
                     provider: "openai",

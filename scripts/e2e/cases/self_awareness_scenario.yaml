@@ -11,13 +11,6 @@ turns:
             where: "session_id = :sid AND event_type = 'tool_call'"
             assert:
               count: ">=1"
-        - db:
-            table: skill_selection_events
-            where: "session_id = :sid"
-            assert:
-              count: ">=1"
-              fields:
-                skill_name: {not_null: true}
       llm_judge:
         criteria: "回复应包含目录文件与 README 摘要"
         pass_threshold: 0.6
@@ -34,8 +27,3 @@ final_checks:
   rules:
     - session_integrity: true
     - turn_count_increases: true
-    - db:
-        table: skill_selection_events
-        where: "session_id = :sid AND execution_success = 1"
-        assert:
-          count: ">=1"

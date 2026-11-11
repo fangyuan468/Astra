@@ -270,12 +270,12 @@ pub const CAPABILITY_CASES: &[CapabilityCase] = &[
         },
     },
     CapabilityCase {
-        id: "memory.cli_server.post_turn_detach",
+        id: "memory.cli_server.session_finalization",
         quadrant: CapabilityQuadrant::Memory,
         topology: Topology::CliServer,
         kind: CaseKind::Happy,
-        boundary: "terminal response is emitted before optional extraction completes",
-        system_test: "scheduled_post_loop_memory_cleanup_is_visible_to_shutdown_drain",
+        boundary: "ordinary turn completion does not schedule optional session extraction",
+        system_test: "finalize_and_render_does_not_extract_memory_on_turn_completion",
         model_validation: ModelValidation::Probe {
             case: "memory_full_lifecycle",
         },
@@ -318,8 +318,8 @@ pub const CAPABILITY_CASES: &[CapabilityCase] = &[
         quadrant: CapabilityQuadrant::Recovery,
         topology: Topology::CliServer,
         kind: CaseKind::Happy,
-        boundary: "cancelled run is terminal cancelled, not failed",
-        system_test: "cancelled_run_interrupts_thin_client_tool_result_wait",
+        boundary: "SIGINT settles the exact CLI Run and preserves its Context receipt",
+        system_test: "one_shot_sigint_settles_exact_run_without_wall_deadline",
         model_validation: ModelValidation::DeterministicOnly {
             reason: "cancellation must race an active run from an external controller",
         },

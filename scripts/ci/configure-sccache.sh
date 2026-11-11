@@ -8,7 +8,19 @@ if [[ -z "${GITHUB_ENV:-}" ]]; then
   exit 2
 fi
 
-export SCCACHE_GHA_ENABLED=true
+sccache_path="${SCCACHE_PATH:-sccache}"
+if [[ "${ASTRA_CI_RUNNER_ENVIRONMENT:-}" == self-hosted ]]; then
+  # Persistent runners keep a bounded disk cache within their isolated account.
+  # A read-only GHA backend cannot warm itself after a miss. Restart an old
+  # daemon so its previous backend or job credentials do not survive the switch.
+  "${sccache_path}" --stop-server >/dev/null 2>&1 || true
+  export SCCACHE_GHA_ENABLED=false
+  # Hash C/C++ inputs normally, including newly created headers.
+  export SCCACHE_DIRECT=false
+  echo "SCCACHE_DIRECT=${SCCACHE_DIRECT}" >> "${GITHUB_ENV}"
+else
+  export SCCACHE_GHA_ENABLED=true
+fi
 export SCCACHE_CACHE_SIZE=5G
 # This is sccache's native fail-open path for server communication failures
 # after a successful startup. The explicit probe below covers startup failures.
@@ -21,7 +33,6 @@ export SCCACHE_IGNORE_SERVER_IO_ERROR=1
 } >> "${GITHUB_ENV}"
 
 rustc_path="$(command -v rustc)"
-sccache_path="${SCCACHE_PATH:-sccache}"
 
 if "${sccache_path}" "${rustc_path}" -vV >/dev/null; then
   echo "RUSTC_WRAPPER=${sccache_path}" >> "${GITHUB_ENV}"

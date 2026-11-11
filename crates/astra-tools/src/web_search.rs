@@ -113,10 +113,10 @@ pub fn web_search(args: &Value) -> String {
 pub async fn perform_web_search(
     args: &Value,
     cache_scope: &str,
-    transport: crate::web_fetch::FetchTransport,
+    network: &crate::web_fetch::FetchNetwork,
 ) -> ToolResult {
     perform_web_search_with(args, |fetch_args| async move {
-        crate::web_fetch::fetch_with_cache_scope(&fetch_args, cache_scope, transport).await
+        crate::web_fetch::fetch_with_cache_scope(&fetch_args, cache_scope, network).await
     })
     .await
 }

@@ -4,6 +4,7 @@ import {
   createEmptyWorkSurface,
   hydrateWorkSurface,
   resetWorkSurfaceForRun,
+  type WorkSurfaceEvent,
 } from '@/lib/work-surface';
 import { WORKSPACE_EXECUTION_BLOCKED_MESSAGE } from '@/lib/run-status-messages';
 
@@ -52,6 +53,28 @@ const taskGraph = {
 };
 
 describe('work surface reducer', () => {
+  it('keeps child lifecycle from settling parent tools and agents', () => {
+    let state = applyWorkSurfaceEvent(createEmptyWorkSurface('session', 'root'), { type: 'run_started', run_id: 'root' });
+    state = applyWorkSurfaceEvent(state, { type: 'tool_call_start', run_id: 'root', call_id: 'call', tool: 'bash' });
+    state = applyWorkSurfaceEvent(state, { type: 'agent_spawned', run_id: 'child', parent_run_id: 'root', agent_id: 'agent',
+      agent_type: 'code-review', description: 'Review the branch' });
+    const before = state;
+    for (const event of [
+      { type: 'run_started', run_id: 'child' },
+      { type: 'run_paused', run_id: 'child' },
+      { type: 'run_resumed', run_id: 'child' },
+      { type: 'run_error', run_id: 'child', error: 'child only' },
+      { type: 'run_finished', run_id: 'child', status: 'failed' },
+    ] satisfies WorkSurfaceEvent[]) {
+      state = applyWorkSurfaceEvent(state, event);
+      expect(state).toBe(before);
+    }
+    expect(state.tools).toHaveLength(1);
+    expect(state.agents).toHaveLength(1);
+    state = applyWorkSurfaceEvent(state, { type: 'run_finished', run_id: 'root', status: 'completed' });
+    expect(state.runStatus).toBe('completed');
+  });
+
   it('projects canonical interruption kinds without exposing wire codes', () => {
     expect(agentInterruptionPresentation('context_overflow')).toEqual({
       label: 'Needs compaction',
@@ -543,6 +566,32 @@ describe('work surface reducer', () => {
     });
   });
 
+  it('closes without missing tool cards and preserves only observed outcomes', () => {
+    let state = createEmptyWorkSurface('session-1');
+    for (const callId of ['missing', 'observed']) {
+      state = applyWorkSurfaceEvent(state, {
+        type: 'tool_call_start', call_id: callId, tool: 'bash',
+      });
+    }
+    state = applyWorkSurfaceEvent(state, {
+      type: 'tool_call_end', call_id: 'observed', tool: 'bash',
+      status: 'error', success: false, result: 'real failure',
+    });
+    state = applyWorkSurfaceEvent(state, {
+      type: 'run_finished', run_id: 'run-1', status: 'completed',
+    });
+    expect(state.runStatus).toBe('completed');
+    expect(state.tools).toHaveLength(1);
+    expect(state.tools[0]).toMatchObject({
+      callId: 'observed', status: 'error', result: 'real failure',
+    });
+    const cold = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
+      type: 'run_finished', run_id: 'run-1', status: 'completed',
+    });
+    expect(cold.tools).toEqual([]);
+    expect(cold.runStatus).toBe('completed');
+  });
+
   it('finalizes running tool and agent cards when a run is cancelled', () => {
     let state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
       type: 'run_started',
@@ -579,13 +628,7 @@ describe('work surface reducer', () => {
     });
 
     expect(state.runStatus).toBe('cancelled');
-    expect(state.tools[0]).toMatchObject({
-      callId: 'call-running',
-      status: 'cancelled',
-      errorKind: 'cancelled',
-      result: 'Stopped before this tool emitted a final transport result.',
-      finishedAt: 1_801_000_000_000,
-    });
+    expect(state.tools).toEqual([]);
     expect(state.agents[0]).toMatchObject({
       agentId: 'agent-running',
       status: 'cancelled',
@@ -625,13 +668,7 @@ describe('work surface reducer', () => {
     });
 
     expect(state.runStatus).toBe('failed');
-    expect(state.tools[0]).toMatchObject({
-      callId: 'call-running',
-      status: 'error',
-      errorKind: 'runtime',
-      result: 'loop crashed',
-      finishedAt: 1_801_000_000_000,
-    });
+    expect(state.tools).toEqual([]);
     expect(state.agents[0]).toMatchObject({
       agentId: 'agent-running',
       status: 'failed',
@@ -671,13 +708,7 @@ describe('work surface reducer', () => {
     });
 
     expect(state.runStatus).toBe('paused');
-    expect(state.tools[0]).toMatchObject({
-      callId: 'call-running',
-      status: 'skipped',
-      result: 'No final tool event was observed before the run paused.',
-      finishedAt: 1_801_000_000_000,
-    });
-    expect(state.tools[0]?.errorKind).toBeUndefined();
+    expect(state.tools).toEqual([]);
     expect(state.agents[0]).toMatchObject({
       agentId: 'agent-running',
       status: 'waiting',
@@ -873,11 +904,7 @@ describe('work surface reducer', () => {
     });
 
     expect(state.runStatus).toBe('cancelled');
-    expect(state.tools[0]).toMatchObject({
-      callId: 'call-stale',
-      status: 'cancelled',
-      errorKind: 'cancelled',
-    });
+    expect(state.tools).toEqual([]);
     expect(state.agents[0]).toMatchObject({
       agentId: 'agent-stale',
       status: 'cancelled',

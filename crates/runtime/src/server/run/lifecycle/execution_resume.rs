@@ -3,34 +3,83 @@
 use super::*;
 use astra_services::SessionContextCoordinator;
 
+const PREVIOUS_TOOL_ADVISORY: &str = "Earlier tool calls have unconfirmed outcomes. A call may still be running or may have changed state. Review the previous tool history and inspect the current state before repeating it.";
+
 fn invalid_resume(detail: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
-    error_response_coded(StatusCode::CONFLICT, detail, "execution_resume_unavailable")
+    invalid_resume_with_message(
+        detail,
+        "This task could not be resumed. Check its current status before continuing.",
+    )
+}
+
+fn invalid_resume_with_message(
+    detail: impl Into<String>,
+    message: &'static str,
+) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::warn!(detail = %detail.into(), "execution resume is unavailable");
+    error_response_coded(
+        StatusCode::CONFLICT,
+        message,
+        "execution_resume_unavailable",
+    )
+}
+
+/// Decode saved progress at the presentation boundary without exposing its
+/// storage format or suggesting that a status refresh repairs corruption.
+fn decode_resume_progress(
+    body: &str,
+) -> Result<server_loop_host::RuntimeExecutionHandoff, (StatusCode, Json<ErrorResponse>)> {
+    let message = "This task's saved progress could not be read. Continue the conversation to start a new turn.";
+    astra_services::runs::validate_run_checkpoint_size(body)
+        .map_err(|detail| invalid_resume_with_message(detail, message))?;
+    let astra_services::runs::DurableExecutionHandoff::V1 { heavy, .. } = serde_json::from_str::<
+        astra_services::runs::DurableExecutionHandoff<server_loop_host::RuntimeExecutionHandoff>,
+    >(body)
+    .map_err(|error| invalid_resume_with_message(error.to_string(), message))?;
+    Ok(heavy)
 }
 
 fn resume_custody_error(
     error: astra_services::SessionContextCoordinatorError,
 ) -> (StatusCode, Json<ErrorResponse>) {
     use astra_services::SessionContextCoordinatorError as Error;
-    let (status, code) = match &error {
+    let (status, code, message) = match &error {
         Error::Database {
             operation: "commit_execution_resume",
             ..
         } => (
             StatusCode::SERVICE_UNAVAILABLE,
             "execution_resume_outcome_unknown",
+            "The resume result could not be confirmed. Refresh the task status before trying again.",
         ),
-        Error::Database { .. } | Error::DatabaseJson { .. } => (
+        Error::Database { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
             "execution_resume_storage_unavailable",
+            "Task recovery is temporarily unavailable. Please try again shortly.",
         ),
-        Error::Unauthorized => (StatusCode::FORBIDDEN, "execution_resume_unauthorized"),
-        _ => (StatusCode::CONFLICT, "execution_resume_fenced"),
+        Error::DatabaseJson { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "execution_resume_storage_unavailable",
+            "This task's saved progress could not be read. Continue the conversation to start a new turn.",
+        ),
+        Error::Unauthorized => (
+            StatusCode::FORBIDDEN,
+            "execution_resume_unauthorized",
+            "You no longer have permission to resume this task.",
+        ),
+        Error::NeedsRepair(_) => (
+            StatusCode::CONFLICT,
+            "execution_resume_fenced",
+            "This task's saved progress is unavailable. Continue the conversation to start a new turn.",
+        ),
+        _ => (
+            StatusCode::CONFLICT,
+            "execution_resume_fenced",
+            "The task changed while it was being resumed. Refresh its status before trying again.",
+        ),
     };
-    error_response_coded(
-        status,
-        format!("execution custody was not confirmed: {error}"),
-        code,
-    )
+    tracing::warn!(%error, error_code = code, "execution resume was not confirmed");
+    error_response_coded(status, message, code)
 }
 
 fn admission_field<T: serde::de::DeserializeOwned>(
@@ -72,30 +121,25 @@ impl AgenticRunLifecycleService {
             .admission_source()
             .map_err(|_| invalid_resume("invalid original admission source"))?
         else {
-            return Err(invalid_resume(
+            return Err(invalid_resume_with_message(
                 "this handoff requires renewed runtime credentials and bindings",
+                "This task cannot be resumed here. Continue the conversation in the client where it started.",
             ));
         };
         if durable.depth != 0 || durable.work_binding.is_some() {
-            return Err(invalid_resume(
+            return Err(invalid_resume_with_message(
                 "this handoff requires its original parent or Work authority",
+                "This task cannot be resumed separately. Open its original conversation to continue.",
             ));
         }
-        astra_services::runs::validate_run_checkpoint_size(&checkpoint.checkpoint_json)
-            .map_err(invalid_resume)?;
-        let astra_services::runs::DurableExecutionHandoff::V1 { heavy: parked, .. } =
-            serde_json::from_str::<
-                astra_services::runs::DurableExecutionHandoff<
-                    server_loop_host::RuntimeExecutionHandoff,
-                >,
-            >(&checkpoint.checkpoint_json)
-            .map_err(|_| invalid_resume("invalid execution handoff"))?;
+        let parked = decode_resume_progress(&checkpoint.checkpoint_json)?;
         if !matches!(
             parked.primary_work,
             runtime_tool_executor::PrimaryWorkHandoff::NoBinding
         ) {
-            return Err(invalid_resume(
+            return Err(invalid_resume_with_message(
                 "this checkpoint requires its exact primary Work authority",
+                "This task cannot be resumed separately. Open its original conversation to continue.",
             ));
         }
         let pool = self
@@ -105,24 +149,104 @@ impl AgenticRunLifecycleService {
         let coordinator = Arc::new(astra_services::DatabaseSessionContextCoordinator::new(
             pool.clone(),
         ));
-        let snapshot = coordinator
-            .load_admission_snapshot(&parked.reservation.key)
-            .await
-            .map_err(|error| {
-                invalid_resume(format!("canonical authority is unavailable: {error}"))
-            })?;
         let owner = self
             .run_engine
             .execution_owner_pod_id()
             .ok_or_else(|| invalid_resume("execution owner identity is unavailable"))?;
-        let actor = astra_turn_types::ActorContextV1::owner_user(
-            &durable.user_id,
-            format!("server-run:{}:resume", durable.run_id),
-            astra_turn_types::ActorKindV1::Server,
-            astra_turn_types::SessionSurfaceV1::Server,
-            None,
-            snapshot.authority_epochs,
-        );
+        // This store-created view owns canonical provenance, but grants no
+        // execution. Fresh authentication and model admission precede custody.
+        let admission_view = self
+            .run_engine
+            .load_run_admission(&durable.user_id, &durable.run_id)
+            .await
+            .map_err(|error| Self::durable_persist_error("load execution admission", error))?
+            .ok_or_else(|| invalid_resume("original execution admission is missing"))?;
+        let admitted_run = admission_view.run();
+        if admitted_run.session_id != durable.session_id
+            || admitted_run.run_generation != durable.run_generation
+            || admitted_run.opening_hash != durable.opening_hash
+        {
+            return Err(invalid_resume(
+                "execution admission changed before recovery",
+            ));
+        }
+        let opening_hash = admitted_run
+            .opening_hash
+            .as_deref()
+            .ok_or_else(|| invalid_resume("original Run opening is missing"))?;
+        let principal = self
+            .auth_service
+            .reauthorize_execution_handoff(&admission_view)
+            .await?;
+        let admission = admitted_run
+            .original_admission_data()
+            .map_err(|_| invalid_resume("invalid original admission"))?;
+        let original_selection: ModelSelection = admission_field(admission, "model_selection")?;
+        let original_resolved: ResolvedModelSelection =
+            admission_field(admission, "resolved_model_selection")?;
+        // The immutable opening describes the first model, while these two
+        // existing run facts describe the current model. A recovery must not
+        // silently revert a user choice or an Auto decision.
+        let effective_model = self
+            .run_engine
+            .inherited_run_model(&durable.user_id, &durable.session_id, &durable.run_id)
+            .await
+            .map_err(|error| Self::durable_persist_error("load effective model", error))?;
+        let (applied, routing) = match effective_model {
+            astra_services::runs::InheritedRunModel::Explicit(choice) => (Some(choice), None),
+            astra_services::runs::InheritedRunModel::Auto(decision) => (None, Some(decision)),
+            astra_services::runs::InheritedRunModel::Original => (None, None),
+        };
+        let offering_id = applied
+            .as_ref()
+            .map(|choice| &choice.resolved.offering_id)
+            .or_else(|| {
+                routing
+                    .as_ref()
+                    .map(|decision| &decision.selected_offering_id)
+            })
+            .unwrap_or(&original_selection.offering_id);
+        let execution = self
+            .model_service
+            .admit_model_offering(admitted_run.user_id.clone(), offering_id.clone())
+            .await?;
+        astra_services::models::validate_model_execution_purpose(
+            &execution,
+            astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
+        )?;
+        if admitted_run.model_offering_id.as_deref() != Some(execution.offering_id.as_str())
+            || admitted_run.resolved_model_name.as_deref() != Some(execution.model_name.as_str())
+        {
+            return Err(invalid_resume("the effective model identity changed"));
+        }
+        if let Some(choice) = &applied {
+            if choice.selection.model.offering_id != execution.offering_id
+                || choice.resolved.model_name != execution.model_name
+                || choice.resolved.source_identity != execution.source_identity
+            {
+                return Err(invalid_resume("the selected model identity changed"));
+            }
+            let thinking =
+                astra_turn_core::thinking_config::ThinkingConfig::from(&choice.reasoning);
+            crate::server::model_execution_admission::validate_reasoning_control(
+                &execution, &thinking,
+            )
+            .map_err(invalid_resume)?;
+        } else if let Some(decision) = &routing {
+            if decision.selected_model != execution.model_name
+                || decision.selected_contract_root
+                    != crate::server::model_execution_admission::model_execution_contract_root(
+                        &execution,
+                    )
+            {
+                return Err(invalid_resume("the Auto model contract changed"));
+            }
+        } else if original_resolved.offering_id != execution.offering_id
+            || original_resolved.model_name != execution.model_name
+            || original_resolved.source_identity != execution.source_identity
+        {
+            return Err(invalid_resume("the original model identity changed"));
+        }
         let bytes = checkpoint.checkpoint_json.len() as u64;
         let work = astra_services::AdmissionWork {
             resident_bytes: bytes.saturating_mul(2),
@@ -135,28 +259,12 @@ impl AgenticRunLifecycleService {
             .weighted_admission
             .try_admit(&durable.user_id, work)
             .map_err(|error| {
+                tracing::warn!(%error, "execution resume capacity admission rejected");
                 error_response_coded(
                     StatusCode::TOO_MANY_REQUESTS,
-                    format!("execution capacity is unavailable: {error}"),
+                    "The service is busy. Please try resuming this task shortly.",
                     "weighted_session_admission_rejected",
                 )
-            })?;
-        let distributed = self
-            .distributed_weighted_admission
-            .as_ref()
-            .ok_or_else(|| invalid_resume("distributed execution capacity is unavailable"))?;
-        let capacity = distributed
-            .try_reserve(
-                &parked.reservation.key,
-                work,
-                Duration::from_secs(15 * 60),
-                &format!("server-resume:{}:{}", durable.run_id, Uuid::new_v4()),
-            )
-            .await
-            .map_err(|error| {
-                invalid_resume(format!(
-                    "distributed execution capacity is unavailable: {error}"
-                ))
             })?;
         let (mut tracked, cancel, pause, token, lease_lost) = Self::build_tracked_run_state(
             durable.run_id.clone(),
@@ -182,10 +290,9 @@ impl AgenticRunLifecycleService {
                 run_id: &durable.run_id,
                 expected_owner_generation: durable.run_generation,
                 checkpoint_id: &checkpoint.checkpoint_id,
-                source: &parked.reservation,
-                actor: &actor,
+                source: &parked.context_authority,
+                opening_hash,
                 owner_pod_id: owner,
-                ttl: Duration::from_secs(15 * 60),
             };
         let mut acquired = coordinator.resume_execution_turn(resume_request()).await;
         if matches!(
@@ -218,20 +325,15 @@ impl AgenticRunLifecycleService {
         let generation = proof.run().run_generation;
         let mut canonical = CanonicalTurnAdmission {
             coordinator,
-            inference_pool: pool.clone(),
-            lease: proof.receipt().writer_lease.clone(),
-            reservation: proof.receipt().turn_reservation.clone(),
+            authority: proof.receipt().authority.clone(),
+            opening_hash: proof.run().opening_hash.clone(),
             prior_messages: Vec::new(),
-            had_canonical_head: snapshot.head.is_some(),
-            release_writer_on_finish: true,
-            release_started: Arc::new(AtomicBool::new(false)),
-            renewal_cancel: CancellationToken::new(),
+            authorized_session_ids: None,
+            had_canonical_head: proof.receipt().authority.base_head.is_some(),
             _weighted_permit: weighted,
-            distributed_permit: capacity,
         };
         let mut heartbeat = None;
         let preparation = async {
-            self.start_canonical_turn_renewal(&canonical, (*token).clone())?;
             let confirmed = self
                 .run_engine
                 .confirm_execution_authority(
@@ -258,19 +360,27 @@ impl AgenticRunLifecycleService {
                 lease_lost.clone(),
                 token.clone(),
             );
-            if let Some(head) = snapshot.head.as_ref() {
-                if Some(&head.cursor) != canonical.reservation.expected_cursor.as_ref() {
-                    return Err(invalid_resume("canonical base changed before recovery"));
-                }
-                canonical.prior_messages = canonical
+            if let Some(head) = canonical.authority.base_head.as_ref() {
+                let materialized = canonical
                     .coordinator
                     .materialize(head)
                     .await
-                    .map_err(|error| invalid_resume(error.to_string()))?
-                    .messages;
+                    .map_err(|error| invalid_resume(error.to_string()))?;
+                canonical.prior_messages = materialized.messages;
+                canonical.authorized_session_ids = Some(materialized.authorized_session_ids);
             }
-            self.prepare_resumed_execution(&proof, &canonical, &cancel, &pause, &token, &lease_lost)
-                .await
+            self.prepare_resumed_execution(
+                &proof,
+                &canonical,
+                principal,
+                execution,
+                applied.as_ref(),
+                &cancel,
+                &pause,
+                &token,
+                &lease_lost,
+            )
+            .await
         }
         .await;
         let mut execution = match preparation {
@@ -281,11 +391,10 @@ impl AgenticRunLifecycleService {
                     // User cancellation has its own durable control owner.
                     // A cancelled preparation token is not evidence of it.
                     let unknown = |storage: String| {
+                        tracing::warn!(%storage, "execution resume preparation could not confirm saved progress");
                         error_response_coded(
                             StatusCode::SERVICE_UNAVAILABLE,
-                            format!(
-                                "execution recovery preparation failed; checkpoint custody is unconfirmed: {storage}"
-                            ),
+                            "The resume result could not be confirmed. Refresh the task status before trying again.",
                             "execution_resume_outcome_unknown",
                         )
                     };
@@ -318,36 +427,22 @@ impl AgenticRunLifecycleService {
         &self,
         proof: &astra_services::session_context_coordinator::ResumedExecutionTurn,
         canonical: &CanonicalTurnAdmission,
+        principal: astra_services::auth::AuthPrincipal,
+        execution: astra_services::models::AdmittedModelExecution,
+        applied: Option<&astra_services::runs::RunModelApplied>,
         cancel: &Arc<AtomicBool>,
         pause: &Arc<AtomicBool>,
         token: &Arc<CancellationToken>,
         lease_lost: &Arc<AtomicBool>,
     ) -> Result<OwnedBackgroundExecution, (StatusCode, Json<ErrorResponse>)> {
         let run = proof.run();
-        let principal = self
-            .auth_service
-            .reauthorize_execution_handoff(proof)
-            .await?;
+        // Reuse the pre-claim admission material without extending its clock.
         let admission = run
             .original_admission_data()
             .map_err(|_| invalid_resume("invalid original admission"))?;
-        let selection: ModelSelection = admission_field(admission, "model_selection")?;
-        let resolved: ResolvedModelSelection =
-            admission_field(admission, "resolved_model_selection")?;
-        let execution = self
-            .model_service
-            .admit_model_offering(run.user_id.clone(), selection.offering_id.clone())
-            .await?;
-        if run.model_offering_id.as_deref() != Some(selection.offering_id.as_str())
-            || run.resolved_model_name.as_deref() != Some(execution.model_name.as_str())
-            || resolved.offering_id != execution.offering_id
-            || resolved.model_name != execution.model_name
-            || resolved.source_identity != execution.source_identity
-        {
-            return Err(invalid_resume(
-                "the original model identity is no longer available",
-            ));
-        }
+        let selection = ModelSelection {
+            offering_id: execution.offering_id.clone(),
+        };
         let catalog = Some(
             astra_services::models::AuthorizedModelCatalogReader::with_cache(
                 self.model_service.clone(),
@@ -363,8 +458,13 @@ impl AgenticRunLifecycleService {
             crate::server::run::engine::durable_run_effective_interaction_mode(run)
                 .map_err(invalid_resume)?;
         let interactive: bool = admission_field(admission, "interactive_client")?;
-        let controls = crate::server::run::engine::durable_run_generation_controls(run)
+        let mut controls = crate::server::run::engine::durable_run_generation_controls(run)
             .map_err(invalid_resume)?;
+        if let Some(choice) = applied {
+            controls.thinking = (&choice.reasoning).into();
+            controls.preserve_thinking =
+                controls.thinking != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault;
+        }
         let handoff = server_loop_host::RuntimeExecutionHandoff::from_adopted(proof)
             .map_err(|error| invalid_resume(error.message))?;
         let constraints = RequestConstraints::from_durable_run(
@@ -405,15 +505,17 @@ impl AgenticRunLifecycleService {
             // Internal scratch does not acquire user-visible workspace authority.
             self.provision_server_workspace(&run.session_id)?
         } else {
-            return Err(invalid_resume(
+            return Err(invalid_resume_with_message(
                 "the original workspace needs its selected execution provider",
+                "The computer used for this task must reconnect. Continue the conversation there once it is connected.",
             ));
         };
         if bindings.executor.kind != ExecutorBindingKind::ServerLocal
             || bindings.executor.transport != ToolTransportKind::ServerLocal
         {
-            return Err(invalid_resume(
+            return Err(invalid_resume_with_message(
                 "the original executor requires a live registered connection",
+                "The computer used for this task must reconnect. Continue the conversation there once it is connected.",
             ));
         }
         let mut inherited =
@@ -509,6 +611,18 @@ impl AgenticRunLifecycleService {
             false,
             None,
         );
+        if let Some(policy) = admission.get("model_routing_policy") {
+            let policy = serde_json::from_value(policy.clone())
+                .map_err(|_| invalid_resume("invalid original model routing policy"))?;
+            // If no decision was saved, recovery conservatively retains the
+            // strong model instead of guessing the original input features.
+            host.configure_model_routing(
+                policy,
+                self.model_service.clone(),
+                self.run_engine.clone(),
+                false,
+            );
+        }
         host.restore_handoff_contracts(&handoff);
         let interaction_sink: Arc<dyn server_loop_host::HostInteractionSink> =
             Arc::new(DurableHostInteractionSink {
@@ -540,23 +654,42 @@ impl AgenticRunLifecycleService {
             &facts.hooks,
         );
         let mut state = Self::assemble_loop_state(environment, facts);
+        if let Some(origins) = canonical.authorized_session_ids.as_ref() {
+            host.set_private_reasoning_origins(origins.clone());
+        }
         state.skills.client_pipeline_skills = handoff.client_pipeline_skills.clone();
         bind_execution_owner_generation(&mut state, run.run_generation);
-        if let Some(cursor) = canonical.reservation.expected_cursor.as_ref() {
+        if let Some(cursor) = canonical
+            .authority
+            .base_head
+            .as_ref()
+            .map(|head| &head.cursor)
+        {
             state.initialize_canonical_rewrite_proof(
                 &canonical.prior_messages,
                 &cursor.canonical_root_hash,
                 cursor.compaction_generation,
             );
+        } else if canonical.prior_messages.is_empty() {
+            state.initialize_canonical_rewrite_proof(
+                &canonical.prior_messages,
+                &astra_turn_types::canonical_conversation_root(&canonical.prior_messages),
+                0,
+            );
         }
-        host.restore_handoff_wal(&mut state, &handoff, &canonical.prior_messages)
+        host.restore_handoff_continuation(&mut state, &handoff, &canonical.prior_messages)
             .await
             .map_err(|error| invalid_resume(error.message))?;
+        if proof.prior_unresolved_tool_calls() {
+            state.push_volatile(
+                crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
+                PREVIOUS_TOOL_ADVISORY.to_owned(),
+            );
+        }
         host.bind_execution_handoff(
             self.execution_handoff_requested.clone(),
             self.run_engine.clone(),
-            canonical.reservation.clone(),
-            handoff.original_user_message.clone(),
+            canonical.authority.clone(),
         );
         self.configure_host_approval_audit_context(
             &mut host,
@@ -577,11 +710,15 @@ impl AgenticRunLifecycleService {
         );
         configure_runtime_controllers(
             &self.matrixone,
-            self.shared_pool.as_ref(),
+            self.shared_pool
+                .as_ref()
+                .filter(|_| astra_services::runs::run_requested_explain_analyze(run)),
             &mut state,
             &run.user_id,
             &run.session_id,
-            self.trace_ingestion.clone(),
+            self.trace_ingestion
+                .clone()
+                .filter(|_| astra_services::runs::run_requested_explain_analyze(run)),
         )
         .await;
         let mut executor = self.build_root_runtime_tool_executor(
@@ -601,12 +738,13 @@ impl AgenticRunLifecycleService {
         executor.set_execution_binding_snapshot(bindings.clone());
         host.set_execution_metadata(executor.binding_metadata());
         let _fanout = entry.spawner.fanout_parent(&run.run_id);
-        let restored = self
-            .restore_server_dynamic_agents(&entry, &run.user_id, &run.session_id)
-            .await;
-        restored
-            .as_ref()
-            .map_err(|error| invalid_resume(error.clone()))?;
+        // Resume actually reconstructs fan-in and must restore durable children
+        // before attaching its parent scope. Fresh chat does not take this path.
+        entry
+            .spawner
+            .reconcile_durable_agent_runs()
+            .await
+            .map_err(invalid_resume)?;
         let runtime_context = ServerSpawnRuntimeContext {
             tool_executor: Arc::new(Default::default()),
             model_catalog_reader: catalog,
@@ -688,7 +826,6 @@ impl AgenticRunLifecycleService {
         let wiring = self
             .wire_authorized_server_dynamic_agent_tools(
                 &entry,
-                restored,
                 &mut executor,
                 runtime_context,
                 agent_context,
@@ -706,6 +843,7 @@ impl AgenticRunLifecycleService {
             state.session_turn,
             token.clone(),
             interactive,
+            interaction_mode,
             None,
         )
         .await;
@@ -717,7 +855,6 @@ impl AgenticRunLifecycleService {
                 .set(Arc::downgrade(executor));
         }
         Ok(OwnedBackgroundExecution {
-            resumed: true,
             user_id: run.user_id.clone(),
             session_id: run.session_id.clone(),
             run_id: run.run_id.clone(),
@@ -726,20 +863,26 @@ impl AgenticRunLifecycleService {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             agent_id: run.agent_id.clone(),
-            model_name: run.resolved_model_name.clone(),
-            user_message: handoff.original_user_message.clone(),
+            user_message: run
+                .opening
+                .loaded()
+                .unwrap()
+                .and_then(astra_services::runs::DurableRunOpening::input)
+                .ok_or_else(|| invalid_resume("original user input is missing"))?
+                .original_input
+                .clone(),
             #[cfg(feature = "e2e-hooks")]
             test_post_loop_settlement_delay_ms: 0,
             host,
             loop_state: state,
             execution_owner_generation: run.run_generation,
+            opening_control_tail: None,
             owner_lease_heartbeat: None,
             canonical_turn: None,
             root_runtime_context_guard: Some(wiring.root_runtime_context_guard),
             work_runtime_binding: None,
             tool_runtime_workspace: Some(workspace),
             cloud_workspace_record: None,
-            csl_manager: None,
             cancel_flag: cancel.clone(),
             pause_flag: pause.clone(),
             llm_cancel_token: token.clone(),
@@ -747,5 +890,74 @@ impl AgenticRunLifecycleService {
             descendant_spawner: entry.spawner.clone(),
             delivery: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+
+    #[test]
+    fn unreadable_resume_progress_explains_how_to_continue() {
+        let oversized =
+            serde_json::to_string(&"x".repeat(astra_services::runs::MAX_RUN_CHECKPOINT_BYTES + 1))
+                .unwrap();
+        for body in ["{internal_checkpoint_field", oversized.as_str()] {
+            let Err((status, Json(error))) = decode_resume_progress(body) else {
+                panic!("invalid saved progress must not be resumed");
+            };
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(
+                error.error_code.as_deref(),
+                Some("execution_resume_unavailable")
+            );
+            assert!(error.detail.contains("Continue the conversation"));
+            assert!(!error.detail.contains("internal_checkpoint_field"));
+            assert!(!error.detail.contains("check its current status"));
+        }
+    }
+
+    #[test]
+    fn resume_storage_errors_keep_recovery_actions_without_internal_details() {
+        use astra_services::SessionContextCoordinatorError as Error;
+        for (operation, code, action) in [
+            (
+                "commit_execution_resume",
+                "execution_resume_outcome_unknown",
+                "Refresh",
+            ),
+            (
+                "load_current_checkpoint",
+                "execution_resume_storage_unavailable",
+                "try again",
+            ),
+        ] {
+            let (status, Json(body)) = resume_custody_error(Error::Database {
+                operation,
+                source: sqlx::Error::Protocol("internal_checkpoint_field_and_query".into()),
+            });
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body.error_code.as_deref(), Some(code));
+            assert!(body.detail.contains(action));
+            assert!(!body.detail.contains("internal_checkpoint_field_and_query"));
+        }
+        let (status, Json(body)) = invalid_resume("opening_hash and internal admission field");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.error_code.as_deref(),
+            Some("execution_resume_unavailable")
+        );
+        assert!(!body.detail.contains("opening_hash"));
+        assert!(!body.detail.contains("admission"));
+        let (status, Json(body)) = resume_custody_error(Error::Unauthorized);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body.error_code.as_deref(),
+            Some("execution_resume_unauthorized")
+        );
+        let (_, Json(body)) =
+            resume_custody_error(Error::NeedsRepair("current_checkpoint_hash".into()));
+        assert!(!body.detail.contains("current_checkpoint_hash"));
+        assert!(body.detail.contains("Continue the conversation"));
     }
 }

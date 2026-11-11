@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use astra_services::SessionArtifactStore;
-use astra_services::session_journal::{SURGICAL_REMOVAL_TOOL_NAME, ToolCallRecord};
+use astra_services::session_journal::ToolCallRecord;
 use serde_json::Value;
 
 use astra_turn_core::headless_tool_assembly::HeadlessPreResolvedToolResult;
@@ -225,17 +225,23 @@ pub(crate) fn admit_tool_calls(
 /// never guessed from prose; this placeholder only gives downstream journal
 /// and partition code a canonical value to carry for a call that cannot be
 /// executed.
-fn canonical_rejection_placeholder(tool_call: &Value, id: &str, name: &str) -> Value {
+pub(crate) fn canonical_rejection_placeholder(tool_call: &Value, id: &str, name: &str) -> Value {
     // A call that can be normalized keeps its exact canonical representation.
-    // Only malformed/legacy-shaped calls use the typed empty-arguments
+    // Only malformed calls use the typed empty-arguments
     // placeholder below.
     astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(tool_call)
         .unwrap_or_else(|_| {
-            serde_json::json!({
-                "id": id,
-                "type": "function",
+            let mut placeholder = serde_json::json!({
+                "id": id, "type": "function",
                 "function": {"name": name, "arguments": "{}"},
-            })
+            });
+            use astra_turn_core::tool::args::shape::{
+                PROVIDER_TOOL_CALL_ID_FIELD, provider_tool_call_id,
+            };
+            if let Some(original) = provider_tool_call_id(tool_call) {
+                placeholder[PROVIDER_TOOL_CALL_ID_FIELD] = Value::String(original.to_owned());
+            }
+            placeholder
         })
 }
 
@@ -337,7 +343,8 @@ where
                     "status": "rejected",
                     "error_kind": "deferred_tool_descriptor_stale",
                     "retryable": true,
-                    "error": "The selected deferred tool is no longer bound to the same provider descriptor; select it again before invoking it.",
+                    "executed": false,
+                    "error": "The tool was not executed because its selected provider binding changed. Search for and select the tool again before making a new call.",
                 })
                 .to_string(),
             }),
@@ -360,7 +367,41 @@ where
 
 /// Validate the provider-owned identity carrier before any admission policy or
 /// executor can observe the batch. Representation normalization is allowed at
-/// the provider boundary; identity synthesis is not.
+/// the provider boundary; missing or ambiguous IDs must not be repaired.
+/// Accept one selected model response before any admission or lifecycle effects.
+/// Downstream owners use a single canonical ID. Only provider-history projection
+/// may recover the original wire linkage from the retained call metadata.
+pub(crate) fn accept_provider_tool_calls(
+    mut tool_calls: Vec<Value>,
+    user_id: &str,
+    session_id: &str,
+    run_id: Option<&str>,
+    turn_chain_id: Option<&str>,
+    round: u32,
+) -> Result<Vec<Value>, String> {
+    use astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD;
+    use sha2::{Digest, Sha256};
+
+    validate_provider_tool_call_identities(&tool_calls)?;
+    for call in &mut tool_calls {
+        let original = call["id"].as_str().expect("validated call ID").to_owned();
+        // A fixed-order serialized tuple frames arbitrary scope and ID strings.
+        let scope = serde_json::to_vec(&(
+            "astra.accepted-provider-call.v1",
+            user_id,
+            session_id,
+            run_id,
+            turn_chain_id,
+            round,
+            &original,
+        ))
+        .expect("string tuple serialization");
+        call["id"] = Value::String(format!("{:x}", Sha256::digest(&scope)));
+        call[PROVIDER_TOOL_CALL_ID_FIELD] = Value::String(original);
+    }
+    Ok(tool_calls)
+}
+
 pub(crate) fn validate_provider_tool_call_identities(tool_calls: &[Value]) -> Result<(), String> {
     let mut seen = HashSet::with_capacity(tool_calls.len());
     for tool_call in tool_calls {
@@ -535,7 +576,20 @@ pub(crate) fn request_allowlist_permits_tool(state: &AgenticLoopState, tool_name
         .request_constraints
         .allowed_tools
         .as_ref()
-        .is_none_or(|allowed| allowed.contains(tool_name))
+        .is_none_or(|allowed| {
+            allowed.contains(tool_name) || source_selection_is_allowed(state, tool_name, allowed)
+        })
+}
+
+fn source_selection_is_allowed(
+    state: &AgenticLoopState,
+    tool_name: &str,
+    allowed: &HashSet<String>,
+) -> bool {
+    state
+        .runtime_tool_executor
+        .as_ref()
+        .is_some_and(|executor| executor.request_allows_source_selection(tool_name, allowed))
 }
 
 fn optional_tool_is_enabled(state: &AgenticLoopState, tool_name: &str) -> bool {
@@ -604,6 +658,7 @@ pub(crate) fn runtime_allows_tool(state: &AgenticLoopState, tool_name: &str) -> 
         return true;
     };
     allowed_tools.contains(tool_name)
+        || source_selection_is_allowed(state, tool_name, &allowed_tools)
         || (exempt_from_skill_allowlist(tool_name)
             && request_allowlist_permits_tool(state, tool_name))
 }
@@ -640,15 +695,15 @@ pub(crate) fn runtime_tool_allowlist_notice(state: &AgenticLoopState) -> Option<
     }
 }
 
-fn intercept_disallowed_tool_calls(
+fn intercept_disallowed_tool_calls<'a>(
     state: &AgenticLoopState,
-    tool_calls: &[Value],
+    tool_calls: impl Iterator<Item = &'a Value>,
 ) -> (
     Vec<crate::turn::skill_tool::InterceptedToolResult>,
     Vec<Value>,
 ) {
     let Some(allowed_tools) = effective_runtime_allowed_tools(state) else {
-        return (Vec::new(), tool_calls.to_vec());
+        return (Vec::new(), tool_calls.cloned().collect());
     };
 
     let mut allowed_tool_names = allowed_tools.iter().cloned().collect::<Vec<_>>();
@@ -719,7 +774,18 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
     effective_tool_calls: &[Value],
     rejected_tool_calls: Vec<RejectedToolCall>,
 ) -> Result<PreparedToolRound, String> {
-    let mut deferred_activations_by_call_id = admitted_tool_calls
+    let edge_call_ids: HashSet<&str> = edge_tool_round
+        .iter()
+        .map(|result| result.request_id.as_str())
+        .filter(|id| !id.is_empty())
+        .collect();
+    if rejected_tool_calls
+        .iter()
+        .any(|call| edge_call_ids.contains(call.provider_call_id()))
+    {
+        return Err("tool round has both execution evidence and a pre-execution rejection for the same call".into());
+    }
+    let deferred_activations_by_call_id = admitted_tool_calls
         .iter()
         .filter_map(|call| {
             Some((
@@ -788,8 +854,16 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
     // canonical rejection still gets a terminal tool result, but never an
     // executable slot. Valid provider batches (including carriers) must be
     // fully represented in the ordered views above.
+    // Edge callbacks are already execution evidence. Preserve even conflicting
+    // identities for the headless custody owner to resolve or reject.
+    let pending_tool_calls = effective_tool_calls.iter().filter(|call| {
+        call.get("id")
+            .and_then(Value::as_str)
+            .is_none_or(|id| !edge_call_ids.contains(id))
+            || client_owns_skill_call(state, call)
+    });
     let (allowlist_blocked_tool_results, allowed_tool_calls) =
-        intercept_disallowed_tool_calls(state, effective_tool_calls);
+        intercept_disallowed_tool_calls(state, pending_tool_calls);
     let blocked_tool_results = allowlist_blocked_tool_results;
     // Freeze execution attribution before the skill executor can await or
     // mutate Work. The interceptor bypasses the regular tool dispatch, but
@@ -797,7 +871,7 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
     let skill_work_attribution = state
         .runtime_tool_executor
         .as_deref()
-        .zip(state.context_manifest_user_id.as_deref())
+        .zip(state.owner_user_id.as_deref())
         .zip(state.current_session_id.as_deref())
         .zip(state.current_run_id.as_deref())
         .map(|(((executor, user_id), session_id), run_id)| {
@@ -806,7 +880,6 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
         .unwrap_or_default();
     let SkillInterceptionResult {
         results: skill_results,
-        surgically_removed_ids,
         short_circuit_meta,
     } = intercept_skill_calls(state, &allowed_tool_calls).await;
 
@@ -885,10 +958,10 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
             };
         let disposition = if skill_locked_out == Some(true) {
             astra_services::session_journal::ToolCallDisposition::Rejected
-        } else if skill_reentry_count.is_some() {
+        } else if skill_reentry_count.is_some() || result.result_class.is_some() {
+            // Re-entry and skill exclusivity omit this attempt, with no queued
+            // callback for its ID. A model retry creates a new attempt.
             astra_services::session_journal::ToolCallDisposition::Suppressed
-        } else if result.result_class.is_some() {
-            astra_services::session_journal::ToolCallDisposition::Deferred
         } else {
             astra_services::session_journal::ToolCallDisposition::Executed
         };
@@ -922,79 +995,9 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
         });
     }
 
-    // Record surgically removed calls as audit-only synthetic placeholders.
-    // These are intentional context optimizations (skill took over the work),
-    // NOT tool failures — so ok=true and they are filtered out of
-    // evaluation/analytics via ToolCallRecord::is_synthetic_placeholder().
-    // The stall detector does NOT treat synthetic placeholders as real
-    // attempts either, matching the existing skipped/deferred behavior.
-
-    // Build id→name lookup so we can preserve the original tool name.
-    let tool_name_by_id: HashMap<&str, &str> = logical_tool_calls
-        .iter()
-        .filter_map(|tc| {
-            let id = tc.get("id").and_then(Value::as_str)?;
-            let name = astra_turn_core::tool::args::shape::tool_call_name(tc)?;
-            Some((id, name))
-        })
-        .collect();
-
-    for id in &surgically_removed_ids {
-        let original_name = tool_name_by_id.get(id.as_str()).map(|s| s.to_string());
-        // Preserve observability fields so surgical removal doesn't erase round tracking.
-        let (round, start_offset_ms) = match state.turn_event_buffer.as_ref() {
-            Some(buf) => (Some(buf.current_round()), Some(buf.offset_ms())),
-            None => (None, None),
-        };
-        state.stall.tool_call_records.push(ToolCallRecord {
-            tool_call_id: Some(id.clone()),
-            name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
-            ok: true,
-            ms: 0,
-            error: None,
-            input_bytes: None,
-            output_bytes: Some(0),
-            args_preview: Some(id.clone()),
-            result_preview: Some("(removed from context — skill covered this work)".to_string()),
-            file_path: None,
-            surgically_removed: Some(true),
-            original_tool_name: original_name,
-            round,
-            start_offset_ms,
-            disposition: Some(astra_services::session_journal::ToolCallDisposition::Suppressed),
-            ..Default::default()
-        });
-    }
-
     if !state.skill_produced_output && skill_results.iter().any(|r| r.result.len() > 500) {
         state.skill_produced_output = true;
     }
-
-    // Surgery: strip tool_calls whose IDs are in surgically_removed_ids.
-    // These calls will NOT appear in the assistant message or need tool results.
-    let (physical_tool_calls, logical_tool_calls) = if surgically_removed_ids.is_empty() {
-        (physical_tool_calls, logical_tool_calls)
-    } else {
-        (
-            physical_tool_calls
-                .into_iter()
-                .filter(|tc| {
-                    let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
-                    !surgically_removed_ids.contains(id)
-                })
-                .collect(),
-            logical_tool_calls
-                .into_iter()
-                .filter(|tc| {
-                    let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
-                    !surgically_removed_ids.contains(id)
-                })
-                .collect(),
-        )
-    };
-    deferred_activations_by_call_id.retain(|call_id, _| !surgically_removed_ids.contains(call_id));
-    let mut runtime_control_calls_by_id = runtime_control_calls_by_id;
-    runtime_control_calls_by_id.retain(|call_id, _| !surgically_removed_ids.contains(call_id));
 
     Ok(PreparedToolRound {
         physical_tool_calls,
@@ -1026,12 +1029,9 @@ async fn prepare_intercepted_tool_round(
     .expect("test tool round has an exhaustive provider identity partition")
 }
 
-/// Result of skill interception. `results` are pre-resolved tool results to
-/// feed back to the model. `surgically_removed_ids` are tool_call IDs that
-/// should be stripped from the assistant message entirely (no tool result needed).
+/// Pre-resolved skill and deferred sibling results for the tool round.
 struct SkillInterceptionResult {
     results: Vec<crate::turn::skill_tool::InterceptedToolResult>,
-    surgically_removed_ids: HashSet<String>,
     /// Per-tool-call re-entry metadata for short-circuited skill calls, keyed
     /// by `tool_call_id`. Callers can use this to stamp journal `ToolCallRecord`
     /// entries with `skill_reentry_count` / `skill_locked_out`.
@@ -1068,7 +1068,7 @@ pub(crate) fn dedup_skill_calls(
     let mut short_circuits = Vec::new();
     let mut fresh_tool_calls = Vec::new();
     for tc in tool_calls {
-        if crate::turn::skill_tool::is_skill_call(tc) {
+        if crate::turn::skill_tool::is_skill_activation_call(tc) {
             let skill_name = crate::turn::skill_tool::extract_skill_name(tc);
             if let Some(ref name) = skill_name
                 && let Some(prev) = state.skills.execution.invoked.get_mut(name.as_str())
@@ -1091,16 +1091,16 @@ pub(crate) fn dedup_skill_calls(
                 let message = if locked_out {
                     format!(
                         "BLOCKED: Skill '{}' is locked out for this turn after {} re-entries. \
-                         This call was NOT executed. Produce your final answer now using the \
-                         instructions already loaded (turn {}).",
+                         This call was NOT executed. Do not activate this skill again. Use the \
+                         instructions already loaded (turn {}) and continue unfinished authorized work.",
                         name, reentry, invoked_at,
                     )
                 } else if reentry >= 2 {
                     format!(
                         "STOP: Skill '{}' is already loaded (turn {}, reentry={}). \
                          You have called `skill` with this name {} times. \
-                         Do NOT call `skill` again for the remainder of this turn. \
-                         Respond to the user directly from the evidence you already have.",
+                         Do NOT call `skill` again with this name for the remainder of this turn. \
+                         Use the loaded instructions and continue unfinished authorized work.",
                         name, invoked_at, reentry, reentry,
                     )
                 } else {
@@ -1146,7 +1146,6 @@ async fn intercept_skill_calls(
     let Some(resolver) = state.skills.resolver.clone() else {
         return SkillInterceptionResult {
             results: Vec::new(),
-            surgically_removed_ids: HashSet::new(),
             short_circuit_meta: HashMap::new(),
         };
     };
@@ -1154,22 +1153,9 @@ async fn intercept_skill_calls(
     let skill_ctx = build_skill_context(state);
     let composition_ctx = crate::skills::composition::CompositionContext::root();
     let full_catalog = resolver.available_skills();
-    let is_client_owned = |tool_call: &Value| {
-        if crate::turn::skill_tool::is_discover_skills_call(tool_call) {
-            return !state.skills.client_pipeline_skills.is_empty();
-        }
-        let Some(target) = crate::turn::skill_tool::extract_skill_name(tool_call) else {
-            return false;
-        };
-        state
-            .skills
-            .client_pipeline_skills
-            .iter()
-            .any(|skill| skill.matches_selector(&target))
-    };
     let server_interceptable_calls = tool_calls
         .iter()
-        .filter(|tool_call| !is_client_owned(tool_call))
+        .filter(|tool_call| !client_owns_skill_call(state, tool_call))
         .cloned()
         .collect::<Vec<_>>();
     state.telemetry.all_selected_skills.extend(
@@ -1225,14 +1211,18 @@ async fn intercept_skill_calls(
     }
 
     let current_turn = (state.max_turns - state.remaining_turns) as u32;
-    for result in &sr {
+    for result in &mut sr {
         if let Some(tc) = fresh_tool_calls
             .iter()
             .find(|t| t.get("id").and_then(Value::as_str) == Some(result.tool_call_id.as_str()))
         {
             let name = crate::turn::skill_tool::extract_skill_name(tc);
             if let Some(name) = name {
-                if result.ok && crate::turn::skill_tool::is_skill_call(tc) {
+                if result.ok && crate::turn::skill_tool::is_skill_activation_call(tc) {
+                    result.result = astra_turn_core::tool_result_sanitize::tool_result_content_for_model_unbounded(
+                        crate::turn::skill_tool::SKILL_TOOL_NAME,
+                        &result.result,
+                    );
                     let execution_topology = crate::turn::skill_tool::declared_execution_topology(
                         resolver.as_ref(),
                         &name,
@@ -1255,85 +1245,54 @@ async fn intercept_skill_calls(
     let mut skill_results = dedup_results;
     let new_skills_fired = fresh_tool_calls
         .iter()
-        .any(|tc| crate::turn::skill_tool::is_skill_call(tc));
+        .any(|tc| crate::turn::skill_tool::is_skill_activation_call(tc));
     skill_results.extend(sr);
-    let mut surgically_removed_ids = HashSet::new();
     if new_skills_fired && !remaining.is_empty() {
-        let skill_produced_output = skill_results.iter().any(|r| r.result.len() > 500);
-        let dropped_count = remaining.len();
-
-        if skill_produced_output {
-            // Surgery: remove intercepted tool_calls from the assistant message
-            // entirely. This saves ~100 tokens per call in EVERY subsequent LLM
-            // round (the assistant message is replayed as context each time).
-            // We still record them in stall.tool_call_records for telemetry.
-            let tool_names: Vec<&str> = remaining
-                .iter()
-                .filter_map(astra_turn_core::tool::args::shape::tool_call_name)
-                .collect();
-            for tc in &remaining {
-                let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
-                surgically_removed_ids.insert(call_id.to_string());
-            }
-            // Append a note to the skill result so the model knows what was dropped.
-            // Prefer the most recently-added large result (the one that triggered
-            // the interception) — `sr` is appended last, so iterating in reverse
-            // picks the newly-run skill output rather than a leftover dedup entry.
-            if let Some(skill_result) = skill_results
-                .iter_mut()
-                .rev()
-                .find(|r| r.result.len() > 500)
-            {
-                skill_result.result.push_str(&format!(
-                    "\n\n[{} parallel tool call(s) were dropped: [{}]. \
-                     The skill output above is your complete context — do NOT re-invoke \
-                     these tools.]",
-                    dropped_count,
-                    tool_names.join(", ")
-                ));
-            }
-        } else {
-            // Skill output was short — keep deferred calls in the conversation
-            // so the model can decide whether to retry each one.
-            for tc in &remaining {
-                let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
-                let tool_name =
-                    astra_turn_core::tool::args::shape::tool_call_name(tc).unwrap_or("unknown");
-                let msg = format!(
-                    "Deferred: skill was invoked in this turn. Read the skill \
-                     instructions above, then decide whether to call `{}` again.",
-                    tool_name
-                );
-                skill_results.push(crate::turn::skill_tool::InterceptedToolResult {
-                    tool_call_id: call_id.to_string(),
-                    tool_name: tool_name.to_string(),
-                    ok: false,
-                    result_class: Some(
-                        astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.to_string(),
-                    ),
-                    result: msg,
-                });
-            }
+        // A deferred sibling still needs its own terminal result in the
+        // provider round; this preserves replay and tells the model what ran.
+        for tc in &remaining {
+            let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
+            let tool_name =
+                astra_turn_core::tool::args::shape::tool_call_name(tc).unwrap_or("unknown");
+            skill_results.push(crate::turn::skill_tool::InterceptedToolResult {
+                tool_call_id: call_id.to_string(),
+                tool_name: tool_name.to_string(),
+                ok: false,
+                result_class: Some(
+                    astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.to_string(),
+                ),
+                result: format!(
+                    "Deferred: skill was invoked in this turn. Read the skill instructions above, then decide whether to call `{tool_name}` again."
+                ),
+            });
         }
-        let verb = if skill_produced_output {
-            "surgically removed"
-        } else {
-            "deferred"
-        };
         tracing::debug!(
-            dropped_count,
-            verb,
-            "skill exclusivity: {} non-skill tool call(s) {}",
-            dropped_count,
-            verb
+            count = remaining.len(),
+            "skill exclusivity deferred sibling calls"
         );
     }
 
     SkillInterceptionResult {
         results: skill_results,
-        surgically_removed_ids,
         short_circuit_meta,
     }
+}
+
+fn client_owns_skill_call(state: &AgenticLoopState, tool_call: &Value) -> bool {
+    if crate::turn::skill_tool::is_discover_skills_call(tool_call) {
+        return !state.skills.client_pipeline_skills.is_empty();
+    }
+    if !crate::turn::skill_tool::is_skill_call(tool_call) {
+        return false;
+    }
+    let Some(target) = crate::turn::skill_tool::extract_skill_name(tool_call) else {
+        return false;
+    };
+    state
+        .skills
+        .client_pipeline_skills
+        .iter()
+        .any(|skill| skill.matches_selector(&target))
 }
 
 pub(crate) fn build_skill_context(
@@ -1540,6 +1499,97 @@ mod tests {
             .cloned()
             .map(CanonicalToolInvocation::ordinary)
             .collect()
+    }
+
+    #[test]
+    fn client_skill_ownership_does_not_claim_sibling_tool_arguments() {
+        let mut state = make_state();
+        state
+            .skills
+            .client_pipeline_skills
+            .push(astra_turn_types::SkillCatalogIdentity {
+                name: "fixture".into(),
+                aliases: Vec::new(),
+            });
+        let call = |name: &str| {
+            json!({"id":"c1","function":{
+                "name":name,"arguments":"{\"skill_name\":\"fixture\"}"
+            }})
+        };
+        assert!(client_owns_skill_call(&state, &call("skill")));
+        assert!(!client_owns_skill_call(&state, &call("read_file")));
+    }
+
+    #[test]
+    fn accepted_call_identity_is_scoped_deterministic_and_overwrites_untrusted_metadata() {
+        use astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD;
+        let raw = serde_json::json!({"id":"Ab1234567", "type":"function",
+            "function":{"name":"read_file","arguments":"{ \"path\": \"fixture\" }"},
+            PROVIDER_TOOL_CALL_ID_FIELD:"forged"});
+        let accept = |owner, session, run, chain, round| {
+            accept_provider_tool_calls(
+                vec![raw.clone()],
+                owner,
+                session,
+                Some(run),
+                Some(chain),
+                round,
+            )
+            .unwrap()
+            .remove(0)
+        };
+        let first = accept("owner", "session", "run", "chain", 7);
+        assert_eq!(first, accept("owner", "session", "run", "chain", 7));
+        assert_eq!(first["function"], raw["function"]);
+        assert_eq!(first[PROVIDER_TOOL_CALL_ID_FIELD], raw["id"]);
+        let id = first["id"].as_str().unwrap();
+        assert_eq!(id.len(), 64);
+        assert!(id.bytes().all(|c| c.is_ascii_hexdigit()));
+        for different in [
+            accept("other", "session", "run", "chain", 7),
+            accept("owner", "other", "run", "chain", 7),
+            accept("owner", "session", "other", "chain", 7),
+            accept("owner", "session", "run", "other", 7),
+            accept("owner", "session", "run", "chain", 8),
+        ] {
+            assert_ne!(first["id"], different["id"]);
+        }
+        assert!(
+            accept_provider_tool_calls(
+                vec![raw.clone(), raw.clone()],
+                "owner",
+                "session",
+                Some("run"),
+                Some("chain"),
+                7
+            )
+            .is_err()
+        );
+        let mut missing = raw;
+        missing.as_object_mut().unwrap().remove("id");
+        assert!(
+            accept_provider_tool_calls(
+                vec![missing],
+                "owner",
+                "session",
+                Some("run"),
+                Some("chain"),
+                7
+            )
+            .is_err()
+        );
+        // Already hex-looking provider IDs are still newly accepted, not replay.
+        let hex = serde_json::json!({"id":id,"function":{"name":"read_file","arguments":"{}"}});
+        let accepted = accept_provider_tool_calls(
+            vec![hex],
+            "owner",
+            "session",
+            Some("run"),
+            Some("chain"),
+            7,
+        )
+        .unwrap();
+        assert_ne!(accepted[0]["id"], first["id"]);
     }
 
     #[test]
@@ -2565,93 +2615,6 @@ mod tests {
         }));
     }
 
-    /// Verify that surgical removal stubs and skill result records preserve
-    /// round and start_offset_ms from the TurnEventBuffer.
-    #[tokio::test]
-    async fn surgical_removal_preserves_observability_fields() {
-        use astra_services::session_journal::TurnEventBuffer;
-
-        let mut state = make_state();
-        // Initialize the turn event buffer (simulates what prepare_turn_iteration does).
-        let mut buf = TurnEventBuffer::begin_turn(Some("test-session"), 1);
-        // Advance to round 2 to verify the round is captured, not always 0.
-        buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
-            prompt_tokens: 100,
-            completion_tokens: 10,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            duration_ms: 50,
-            ttft_ms: Some(5),
-            finish_reason: None,
-            tool_calls_returned: 0,
-            tool_call_names: vec![],
-            agentic_step: None,
-            source: None,
-            run_id: None,
-            parent_run_id: None,
-            tool_calls: None,
-            agent_id: None,
-            purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
-        });
-        buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
-            prompt_tokens: 200,
-            completion_tokens: 20,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            duration_ms: 60,
-            ttft_ms: Some(6),
-            finish_reason: None,
-            tool_calls_returned: 0,
-            tool_call_names: vec![],
-            agentic_step: None,
-            source: None,
-            run_id: None,
-            parent_run_id: None,
-            tool_calls: None,
-            agent_id: None,
-            purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
-        });
-        assert_eq!(buf.current_round(), 2);
-        state.turn_event_buffer = Some(buf);
-
-        // Simulate what prepare_intercepted_tool_round does for surgical removal.
-        let tool_name_by_id: HashMap<&str, &str> =
-            [("call-read-1", "read_file")].into_iter().collect();
-
-        // Push a surgical removal record (same code path as the real function).
-        {
-            let id = "call-read-1";
-            let original_name = tool_name_by_id.get(id).map(|s| s.to_string());
-            let (round, start_offset_ms) = match state.turn_event_buffer.as_ref() {
-                Some(buf) => (Some(buf.current_round()), Some(buf.offset_ms())),
-                None => (None, None),
-            };
-            state.stall.tool_call_records.push(ToolCallRecord {
-                name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
-                ok: true,
-                ms: 0,
-                surgically_removed: Some(true),
-                original_tool_name: original_name,
-                round,
-                start_offset_ms,
-                ..Default::default()
-            });
-        }
-
-        let rec = &state.stall.tool_call_records[0];
-        assert_eq!(
-            rec.round,
-            Some(2),
-            "surgical removal should capture current round"
-        );
-        assert!(
-            rec.start_offset_ms.is_some(),
-            "surgical removal should capture offset"
-        );
-        assert_eq!(rec.original_tool_name.as_deref(), Some("read_file"));
-        assert_eq!(rec.surgically_removed, Some(true));
-    }
-
     /// When the model re-invokes the same skill, the first short-circuit uses
     /// the passive "already loaded" wording; from the second re-entry onward
     /// the message escalates to a hard STOP directive. The `reentry_count`
@@ -2726,6 +2689,8 @@ mod tests {
             "STOP message should be directive, got: {}",
             res2.result
         );
+        assert!(res2.result.contains("continue unfinished authorized work"));
+        assert!(!res2.result.contains("Respond to the user directly"));
         assert_eq!(meta2.reentry_count, 2);
         assert!(
             !meta2.locked_out,
@@ -2744,6 +2709,8 @@ mod tests {
             "third re-entry should hit BLOCKED lockout, got: {}",
             res3.result
         );
+        assert!(res3.result.contains("continue unfinished authorized work"));
+        assert!(!res3.result.contains("final answer now"));
         assert!(meta3.locked_out);
         assert_eq!(meta3.reentry_count, 3);
         assert_eq!(
@@ -2950,6 +2917,61 @@ mod tests {
                 .expect("structured rejection")["error_kind"],
             "deferred_tool_activation_invalid",
             "historical evidence must not revive a capability absent from the current surface"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_carrier_name_preserves_recovery_reason_without_inferring_a_target() {
+        let args = json!({"arguments":{"query":"evidence"}});
+        let call = json!({"id":"missing-target","type":"function","function":{
+            "name":"invoke_tool","arguments":args.to_string()
+        }});
+        let selection = [DeferredToolActivation {
+            name: "web_fetch".into(),
+            schema_digest: "sha256:current".into(),
+            descriptor: None,
+        }];
+        let result = super::resolve_deferred_tool_admission(
+            super::admit_tool_calls(std::slice::from_ref(&call), Some("tool_calls")),
+            &selection,
+            |_| panic!("missing target must fail before schema lookup"),
+        );
+        assert!(
+            result.admitted.is_empty(),
+            "even one selected tool cannot supply a missing target name"
+        );
+        assert_eq!(result.rejected.len(), 1);
+        let feedback: Value = serde_json::from_str(&result.rejected[0].result).unwrap();
+        assert_eq!(feedback["error_kind"], "deferred_tool_activation_invalid");
+        assert_eq!(feedback["retryable"], true);
+        assert_eq!(
+            feedback["error"],
+            "invoke_tool requires a nonempty string name identifying the target tool",
+            "the model must receive the parser's actionable reason"
+        );
+
+        let mut state = make_state();
+        let turn_result = provider_host_turn_result(&[call]);
+        let prepared = prepare_intercepted_tool_round(
+            &mut state,
+            &turn_result,
+            &result.admitted,
+            &[],
+            result.rejected,
+        )
+        .await;
+        assert_eq!(prepared.physical_tool_calls.len(), 1);
+        assert_eq!(prepared.pre_resolved_results.len(), 1);
+        assert_eq!(prepared.pre_resolved_results[0].call_id, "missing-target");
+        assert_eq!(
+            serde_json::from_str::<Value>(&prepared.pre_resolved_results[0].content).unwrap(),
+            feedback,
+            "the same rejection must reach the model as the paired tool result"
+        );
+        assert_eq!(state.stall.tool_call_records.len(), 1);
+        assert_eq!(
+            state.stall.tool_call_records[0].disposition,
+            Some(astra_services::session_journal::ToolCallDisposition::Rejected)
         );
     }
 

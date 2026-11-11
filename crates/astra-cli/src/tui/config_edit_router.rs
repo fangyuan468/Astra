@@ -9,7 +9,7 @@
 use crate::cli::session::{session_startup, session_state::SessionState};
 use crate::tui::bottom_pane::view::ConfigEditDisposition;
 use astra_config::config_versions::{ConfigVersionStore, LocalFileStore, PutMetadata, VersionId};
-use astra_config::runtime_config::{RuntimeConfig, user_runtime_config_path};
+use astra_config::runtime_config::{RuntimeConfig, USER_ONLY_SECTIONS, user_runtime_config_path};
 use std::path::PathBuf;
 
 /// Result of resolving a config-editor completion.
@@ -149,9 +149,52 @@ fn save_and_report(
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Could not create {}: {e}", parent.display()))?;
     }
-    let pretty = toml::to_string_pretty(&parsed)
+    if scope == "project"
+        && let Some(user_path) = user_runtime_config_path()
+        && same_config_target(&path, &user_path)
+    {
+        return Err("Project and user configuration refer to the same file; save as user configuration instead".into());
+    }
+    let complete = toml::to_string_pretty(&parsed)
         .map_err(|e| format!("Could not serialize config back to TOML: {e}"))?;
-    std::fs::write(&path, &pretty).map_err(|e| format!("Write failed {}: {e}", path.display()))?;
+    let pretty = if scope == "project" {
+        let mut value: toml::Value = toml::from_str(&complete)
+            .map_err(|e| format!("Could not prepare project configuration: {e}"))?;
+        if let Some(table) = value.as_table_mut() {
+            for section in USER_ONLY_SECTIONS {
+                table.remove(*section);
+            }
+        }
+        toml::to_string_pretty(&value)
+            .map_err(|e| format!("Could not serialize project configuration: {e}"))?
+    } else {
+        complete.clone()
+    };
+    if scope == "user" {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&path)
+            .map_err(|e| format!("Write failed {}: {e}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("Could not protect {}: {e}", path.display()))?;
+        }
+        file.set_len(0)
+            .and_then(|_| file.write_all(pretty.as_bytes()))
+            .map_err(|e| format!("Write failed {}: {e}", path.display()))?;
+    } else {
+        std::fs::write(&path, &pretty)
+            .map_err(|e| format!("Write failed {}: {e}", path.display()))?;
+    }
 
     // Content-addressed put: computes the new id and dedups on repeat
     // saves. Best-effort — if the store is unavailable (no HOME, disk
@@ -167,12 +210,12 @@ fn save_and_report(
                 .put(&parsed, meta)
                 .map(|id| id.as_str().to_string())
                 .unwrap_or_else(|_| {
-                    VersionId::from_toml_bytes(pretty.as_bytes())
+                    VersionId::from_toml_bytes(complete.as_bytes())
                         .as_str()
                         .to_string()
                 })
         }
-        None => VersionId::from_toml_bytes(pretty.as_bytes())
+        None => VersionId::from_toml_bytes(complete.as_bytes())
             .as_str()
             .to_string(),
     };
@@ -184,6 +227,29 @@ fn save_and_report(
             source,
         }),
     })
+}
+
+fn same_config_target(left: &std::path::Path, right: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(left), Ok(right)) = (std::fs::metadata(left), std::fs::metadata(right))
+            && left.dev() == right.dev()
+            && left.ino() == right.ino()
+        {
+            return true;
+        }
+    }
+    fn resolve(path: &std::path::Path) -> Option<PathBuf> {
+        std::fs::canonicalize(path).ok().or_else(|| {
+            Some(
+                std::fs::canonicalize(path.parent()?)
+                    .ok()?
+                    .join(path.file_name()?),
+            )
+        })
+    }
+    matches!((resolve(left), resolve(right)), (Some(left), Some(right)) if left == right)
 }
 
 fn scope_path(scope: &str) -> Result<PathBuf, String> {
@@ -202,6 +268,100 @@ fn scope_path(scope: &str) -> Result<PathBuf, String> {
 mod tests {
     use super::finalize;
     use crate::tui::bottom_pane::view::ConfigEditDisposition;
+
+    #[test]
+    fn project_save_omits_user_only_policy_and_rejects_shared_target() {
+        const CHILD: &str = "ASTRA_TEST_PROJECT_CONFIG_SAVE";
+        if std::env::var_os(CHILD).is_some() {
+            let trusted_root = std::env::var_os("ASTRA_LOCAL_STATE_ROOT").unwrap();
+            let mut config = astra_config::RuntimeConfig::default();
+            config.memory.retrieval_top_k = 7;
+            config.web_fetch.doh_resolvers =
+                vec!["https://dns.example/private-token?key=secret".into()];
+            let body = toml::to_string_pretty(&config).unwrap();
+            finalize(ConfigEditDisposition::SaveProject, &body).unwrap();
+            let project = std::fs::read_to_string(".astra/config/runtime.toml").unwrap();
+            assert!(!project.contains("web_fetch"));
+            assert!(!project.contains("private-token"));
+            assert_eq!(
+                toml::from_str::<astra_config::RuntimeConfig>(&project)
+                    .unwrap()
+                    .memory
+                    .retrieval_top_k,
+                7
+            );
+            unsafe {
+                std::env::set_var("ASTRA_LOCAL_STATE_ROOT", ".astra");
+            }
+            assert!(
+                finalize(ConfigEditDisposition::SaveProject, &body)
+                    .unwrap_err()
+                    .contains("same file")
+            );
+            assert_eq!(
+                std::fs::read_to_string(".astra/config/runtime.toml").unwrap(),
+                project
+            );
+            #[cfg(unix)]
+            {
+                let user_file = std::path::PathBuf::from(&trusted_root).join("config/runtime.toml");
+                std::fs::create_dir_all(user_file.parent().unwrap()).unwrap();
+                std::fs::write(&user_file, "user policy").unwrap();
+                std::fs::remove_file(".astra/config/runtime.toml").unwrap();
+                std::fs::hard_link(&user_file, ".astra/config/runtime.toml").unwrap();
+                unsafe {
+                    std::env::set_var("ASTRA_LOCAL_STATE_ROOT", trusted_root);
+                }
+                assert!(
+                    finalize(ConfigEditDisposition::SaveProject, &body)
+                        .unwrap_err()
+                        .contains("same file")
+                );
+                assert_eq!(std::fs::read_to_string(user_file).unwrap(), "user policy");
+            }
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tui::config_edit_router::tests::project_save_omits_user_only_policy_and_rejects_shared_target", "--nocapture"])
+            .env(CHILD, "1")
+            .env("ASTRA_LOCAL_STATE_ROOT", state.path())
+            .current_dir(workspace.path())
+            .output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn user_save_protects_new_and_existing_configuration_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
+        unsafe {
+            std::env::set_var("ASTRA_LOCAL_STATE_ROOT", root.path());
+        }
+        let mut config = astra_config::RuntimeConfig::default();
+        config.web_fetch.doh_resolvers = vec!["https://dns.example/private-token".into()];
+        let body = toml::to_string_pretty(&config).unwrap();
+        finalize(ConfigEditDisposition::SaveUser, &body).unwrap();
+        let file = root.path().join("config/runtime.toml");
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        finalize(ConfigEditDisposition::SaveUser, &body).unwrap();
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     #[test]
     fn discard_and_cancel_produce_friendly_messages() {

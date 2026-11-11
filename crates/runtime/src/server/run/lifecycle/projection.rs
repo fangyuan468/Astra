@@ -671,7 +671,7 @@ mod tests {
 use super::spawn_observed;
 use super::{
     AttachedStreamDelivery, DURABLE_LIVE_BATCH_FLUSH_INTERVAL, DurableLiveFanoutControl,
-    DurableToolTerminalTracker, PendingDurableLiveEvents, deliver_live_fanout_event,
+    EmittedToolTerminalTracker, PendingDurableLiveEvents, deliver_live_fanout_event,
     flush_durable_live_events, flush_host_event_gap_recovery, process_ordered_live_fanout_event,
     publish_live_persistence_failure, record_unforwarded_host_event,
     record_unforwarded_host_event_tail,
@@ -698,8 +698,8 @@ impl super::AgenticRunLifecycleService {
         let (event_tx, mut fanout_rx) = event_channel;
         let (fanout_control_tx, mut fanout_control_rx) =
             mpsc::channel::<DurableLiveFanoutControl>(1);
-        let durable_tool_terminals = DurableToolTerminalTracker::default();
-        let fanout_durable_tool_terminals = durable_tool_terminals.clone();
+        let emitted_tool_terminals = EmittedToolTerminalTracker::default();
+        let fanout_emitted_tool_terminals = emitted_tool_terminals.clone();
         let (agent_live_gap_tracker, mut agent_live_gap_rx) = WorkSurfaceAgentLiveGapTracker::new();
         let (live_tx, _) = broadcast::channel::<Value>(SSE_CHANNEL_CAPACITY);
         let live_tx_for_fanout = live_tx.clone();
@@ -730,7 +730,7 @@ impl super::AgenticRunLifecycleService {
                                     &fanout_run_id,
                                     &live_tx_for_fanout,
                                     &mut client_event_tx_for_fanout,
-                                    &fanout_durable_tool_terminals,
+                                    &fanout_emitted_tool_terminals,
                                 ).await {
                                     publish_live_persistence_failure(
                                         &fanout_runs,
@@ -766,7 +766,7 @@ impl super::AgenticRunLifecycleService {
                                 &fanout_run_id,
                                 &live_tx_for_fanout,
                                 &mut client_event_tx_for_fanout,
-                                &fanout_durable_tool_terminals,
+                                &fanout_emitted_tool_terminals,
                             ).await {
                                 publish_live_persistence_failure(
                                     &fanout_runs,
@@ -787,9 +787,20 @@ impl super::AgenticRunLifecycleService {
                             }
                         }
                         control = fanout_control_rx.recv(), if control_open => {
-                            let Some(DurableLiveFanoutControl::Flush { ack }) = control else {
-                                control_open = false;
-                                continue;
+                            let ack = match control {
+                                Some(DurableLiveFanoutControl::Flush { ack }) => ack,
+                                Some(DurableLiveFanoutControl::PersistenceFailed { detail, ack }) => {
+                                    publish_live_persistence_failure(
+                                        &fanout_runs, &live_tx_for_fanout,
+                                        &mut client_event_tx_for_fanout, &fanout_user_id,
+                                        &fanout_run_id, "canonical_persistence_failed",
+                                        "Completion could not be saved. Reopen the session to check its recorded state before retrying.",
+                                        &detail,
+                                    ).await;
+                                    let _ = ack.send(());
+                                    break;
+                                }
+                                None => { control_open = false; continue; }
                             };
                             let mut result = Ok(());
                             while let Ok(event) = fanout_rx.try_recv() {
@@ -803,7 +814,7 @@ impl super::AgenticRunLifecycleService {
                                     &fanout_run_id,
                                     &live_tx_for_fanout,
                                     &mut client_event_tx_for_fanout,
-                                    &fanout_durable_tool_terminals,
+                                    &fanout_emitted_tool_terminals,
                                 ).await {
                                     publish_live_persistence_failure(
                                         &fanout_runs,
@@ -829,7 +840,7 @@ impl super::AgenticRunLifecycleService {
                                     &fanout_run_id,
                                     &live_tx_for_fanout,
                                     &mut client_event_tx_for_fanout,
-                                    &fanout_durable_tool_terminals,
+                                    &fanout_emitted_tool_terminals,
                                 ).await;
                                 if let Err(error) = &result {
                                     publish_live_persistence_failure(
@@ -860,7 +871,7 @@ impl super::AgenticRunLifecycleService {
                                 &fanout_run_id,
                                 &live_tx_for_fanout,
                                 &mut client_event_tx_for_fanout,
-                                &fanout_durable_tool_terminals,
+                                &fanout_emitted_tool_terminals,
                             ).await {
                                 publish_live_persistence_failure(
                                     &fanout_runs,
@@ -891,7 +902,7 @@ impl super::AgenticRunLifecycleService {
                                     &fanout_run_id,
                                     &live_tx_for_fanout,
                                     &mut client_event_tx_for_fanout,
-                                    &fanout_durable_tool_terminals,
+                                    &fanout_emitted_tool_terminals,
                                 ).await {
                                     publish_live_persistence_failure(
                                         &fanout_runs,
@@ -987,7 +998,7 @@ impl super::AgenticRunLifecycleService {
             super::OwnedStreamDelivery {
                 event_tx,
                 fanout_control_tx,
-                durable_tool_terminals,
+                emitted_tool_terminals,
                 host_event_bridge,
                 host_event_gap,
                 progress_bridge,

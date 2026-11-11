@@ -63,8 +63,8 @@ describe('AstraClient — streamChat', () => {
     const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
     expect(String(url).endsWith(PATH_CHAT_STREAM)).toBe(true);
     expect(init.method).toBe('POST');
-    const headers = init.headers as Record<string, string>;
-    expect(headers['Authorization']).toBe('Bearer tok-1');
+    const headers = new Headers(init.headers);
+    expect(headers.get('Authorization')).toBe('Bearer tok-1');
     expect(init.body).toBe(
       JSON.stringify(
         chatRequestToWire({

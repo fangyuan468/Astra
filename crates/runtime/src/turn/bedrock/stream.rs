@@ -181,11 +181,9 @@ impl BedrockStreamAccumulator {
         Ok(())
     }
 
-    /// True only when an exception frame has been seen — the only signal
-    /// that justifies an early exit from a transport loop. `messageStop`
-    /// alone is NOT terminal because Bedrock Converse emits the `metadata`
-    /// frame (carrying usage) AFTER `messageStop`, so draining the byte
-    /// stream until EOS is required for correct token accounting.
+    /// True only when an exception frame has been seen. Normal completion
+    /// requires both `messageStop` and its trailing usage metadata; the stop
+    /// frame alone is insufficient for correct token accounting.
     pub fn has_exception(&self) -> bool {
         self.exception.is_some()
     }
@@ -202,6 +200,13 @@ impl BedrockStreamAccumulator {
     ///
     /// `messageStop` without this fact is not a protocol-complete success:
     /// metadata is emitted after the semantic stop frame.
+    pub(crate) fn usage_snapshot(
+        &self,
+    ) -> Option<(TokenUsage, crate::turn::token_usage::TokenUsagePresence)> {
+        self.usage
+            .map(|usage| usage.qualified_snapshot(self.usage_presence))
+    }
+
     pub fn has_usage_metadata(&self) -> bool {
         self.usage_metadata_received
     }
@@ -481,6 +486,7 @@ impl BedrockStreamAccumulator {
         });
 
         LlmCallResult {
+            provider_continuation: None,
             judgment_provenance: None,
             response_id: self.provider_response_id,
             full_text: self.full_text,

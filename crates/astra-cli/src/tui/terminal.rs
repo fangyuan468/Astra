@@ -5,6 +5,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use super::markdown_render::MarkdownRow;
 use crossterm::{
     SynchronizedUpdate, cursor,
     event::{
@@ -15,8 +16,9 @@ use crossterm::{
     style::Print,
     terminal::{disable_raw_mode, enable_raw_mode, is_raw_mode_enabled},
 };
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::text::Line;
+use std::io::Write;
 
 use super::custom_terminal;
 use super::frame_requester::FrameRequester;
@@ -107,7 +109,7 @@ const MAX_LAZY_ASSISTANT_LINES_PER_BATCH: usize = 8;
 
 enum PendingHistory {
     Lines {
-        lines: VecDeque<Line<'static>>,
+        lines: VecDeque<MarkdownRow>,
         trusted_links: bool,
     },
     Assistant(QueuedAssistantHistory),
@@ -122,7 +124,7 @@ struct QueuedAssistantHistory {
     layout_preparing: Arc<AtomicBool>,
     rendered_complete: bool,
     pending_separators: usize,
-    ready: VecDeque<Line<'static>>,
+    ready: VecDeque<MarkdownRow>,
 }
 
 /// Guarantees that a completed blocking layout cannot leave the ordered
@@ -228,7 +230,7 @@ impl TerminalGuard {
         let lines = sanitize_lines_for_terminal(lines);
         if !lines.is_empty() {
             self.pending_history.push_back(PendingHistory::Lines {
-                lines: lines.into(),
+                lines: lines.into_iter().map(MarkdownRow::from).collect(),
                 trusted_links: false,
             });
         }
@@ -270,7 +272,7 @@ impl TerminalGuard {
             lines.extend(std::iter::repeat_n(Line::default(), separators));
             if !lines.is_empty() {
                 self.pending_history.push_back(PendingHistory::Lines {
-                    lines: lines.into(),
+                    lines: lines.into_iter().map(MarkdownRow::from).collect(),
                     trusted_links,
                 });
             }
@@ -472,8 +474,8 @@ impl TerminalGuard {
         Ok(needs_full_repaint)
     }
 
-    fn flush_pending_history(
-        terminal: &mut CustomTerminal,
+    fn flush_pending_history<B: Backend + Write>(
+        terminal: &mut custom_terminal::Terminal<B>,
         pending: &mut VecDeque<PendingHistory>,
         is_zellij: bool,
     ) -> io::Result<bool> {
@@ -487,9 +489,7 @@ impl TerminalGuard {
             &lines,
             trusted_links,
             is_zellij,
-        )?;
-
-        Ok(is_zellij)
+        )
     }
 
     fn pending_history_has_ready_lines(&self) -> bool {
@@ -570,41 +570,13 @@ impl TerminalGuard {
     }
 }
 
-fn take_history_batch(pending: &mut VecDeque<Line<'static>>) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let mut chars = 0usize;
-    while lines.len() < MAX_HISTORY_LINES_PER_DRAW {
-        let Some(next) = pending.front() else {
-            break;
-        };
-        let next_chars = next
-            .spans
-            .iter()
-            .map(|span| span.content.len())
-            .sum::<usize>();
-        if !lines.is_empty() && chars.saturating_add(next_chars) > MAX_HISTORY_CHARS_PER_DRAW {
-            break;
-        }
-        chars = chars.saturating_add(next_chars);
-        // Always make progress for one unusually long code/output line. The
-        // markdown and terminal wrappers handle its visual rows; retaining it
-        // indefinitely would be worse than a bounded exceptional write.
-        lines.push(
-            pending
-                .pop_front()
-                .expect("front item exists until this queue is mutated"),
-        );
-    }
-    lines
-}
-
 fn pending_line_chars(line: &Line<'static>) -> usize {
     line.spans.iter().map(|span| span.content.len()).sum()
 }
 
 enum PendingHistoryLine {
     Ready {
-        line: Line<'static>,
+        line: MarkdownRow,
         trusted_links: bool,
     },
     Waiting,
@@ -634,12 +606,15 @@ fn take_next_pending_history_line(pending: &mut VecDeque<PendingHistory>) -> Pen
                         .as_any_ref()
                         .downcast_ref::<AssistantCell>()
                         .expect("only final assistant cells enter the lazy history queue");
-                    let (lines, next_line, complete) = assistant.scrollback_lines_chunk(
+                    let (lines, next_line, complete) = assistant.scrollback_rows_chunk(
                         queued.width,
                         queued.next_line,
                         MAX_LAZY_ASSISTANT_LINES_PER_BATCH,
                     );
-                    queued.ready.extend(sanitize_lines_for_terminal(lines));
+                    queued.ready.extend(lines.into_iter().map(|mut row| {
+                        row.line = super::render::line_utils::sanitize_line_for_terminal(&row.line);
+                        row
+                    }));
                     queued.next_line = next_line;
                     queued.rendered_complete = complete;
                 }
@@ -654,7 +629,7 @@ fn take_next_pending_history_line(pending: &mut VecDeque<PendingHistory>) -> Pen
                         if queued.rendered_complete && queued.pending_separators > 0 {
                             queued.pending_separators -= 1;
                             Some(PendingHistoryLine::Ready {
-                                line: Line::default(),
+                                line: Line::default().into(),
                                 trusted_links: false,
                             })
                         } else {
@@ -670,7 +645,7 @@ fn take_next_pending_history_line(pending: &mut VecDeque<PendingHistory>) -> Pen
     }
 }
 
-fn return_pending_history_line(pending: &mut VecDeque<PendingHistory>, line: Line<'static>) {
+fn return_pending_history_line(pending: &mut VecDeque<PendingHistory>, line: MarkdownRow) {
     match pending.front_mut() {
         Some(PendingHistory::Lines { lines, .. }) => lines.push_front(line),
         Some(PendingHistory::Assistant(queued)) => queued.ready.push_front(line),
@@ -678,9 +653,7 @@ fn return_pending_history_line(pending: &mut VecDeque<PendingHistory>, line: Lin
     }
 }
 
-fn take_pending_history_batch(
-    pending: &mut VecDeque<PendingHistory>,
-) -> (Vec<Line<'static>>, bool) {
+fn take_pending_history_batch(pending: &mut VecDeque<PendingHistory>) -> (Vec<MarkdownRow>, bool) {
     let mut lines = Vec::new();
     let mut chars = 0usize;
     let mut trusted_links = None;
@@ -702,7 +675,7 @@ fn take_pending_history_batch(
             }
             PendingHistoryLine::Waiting | PendingHistoryLine::Exhausted => break,
         };
-        let next_chars = pending_line_chars(&next);
+        let next_chars = pending_line_chars(&next.line);
         if !lines.is_empty() && chars.saturating_add(next_chars) > MAX_HISTORY_CHARS_PER_DRAW {
             return_pending_history_line(pending, next);
             break;
@@ -720,11 +693,9 @@ impl Drop for TerminalGuard {
         // scrollback rather than silently discarding a reply tail when the
         // user exits immediately after it starts painting.
         while !self.pending_history.is_empty() {
-            let (lines, trusted_links) = take_pending_history_batch(&mut self.pending_history);
-            if super::insert_history::insert_history_lines_with_terminal(
+            if Self::flush_pending_history(
                 &mut self.terminal,
-                &lines,
-                trusted_links,
+                &mut self.pending_history,
                 self.is_zellij,
             )
             .is_err()
@@ -750,59 +721,517 @@ mod tests {
 
     use super::{
         MAX_HISTORY_CHARS_PER_DRAW, MAX_HISTORY_LINES_PER_DRAW, PendingHistory,
-        QueuedAssistantHistory, take_history_batch, take_pending_history_batch,
+        QueuedAssistantHistory, take_pending_history_batch,
     };
     use crate::tui::history_cell::{HistoryCell, assistant::AssistantCell};
 
-    #[test]
-    fn history_batch_is_bounded_and_preserves_fifo_order() {
-        let mut pending = (0..MAX_HISTORY_LINES_PER_DRAW + 2)
-            .map(|index| Line::raw(format!("line-{index}")))
-            .collect::<VecDeque<_>>();
+    struct RecordingBackend {
+        inner: ratatui::backend::TestBackend,
+        bytes: Vec<u8>,
+        fail_writes: bool,
+    }
 
-        let first = take_history_batch(&mut pending);
-        assert_eq!(first.len(), MAX_HISTORY_LINES_PER_DRAW);
-        assert_eq!(first[0].spans[0].content, "line-0");
+    impl std::io::Write for RecordingBackend {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_writes {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ratatui::backend::Backend for RecordingBackend {
+        type Error = std::convert::Infallible;
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.inner.draw(content)
+        }
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.hide_cursor()
+        }
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.show_cursor()
+        }
+        fn get_cursor_position(&mut self) -> Result<ratatui::layout::Position, Self::Error> {
+            self.inner.get_cursor_position()
+        }
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), Self::Error> {
+            self.inner.set_cursor_position(position)
+        }
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            self.inner.clear()
+        }
+        fn clear_region(&mut self, kind: ratatui::backend::ClearType) -> Result<(), Self::Error> {
+            self.inner.clear_region(kind)
+        }
+        fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
+            self.inner.size()
+        }
+        fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, Self::Error> {
+            self.inner.window_size()
+        }
+        fn scroll_region_up(
+            &mut self,
+            region: std::ops::Range<u16>,
+            lines: u16,
+        ) -> Result<(), Self::Error> {
+            self.inner.scroll_region_up(region, lines)
+        }
+        fn scroll_region_down(
+            &mut self,
+            region: std::ops::Range<u16>,
+            lines: u16,
+        ) -> Result<(), Self::Error> {
+            self.inner.scroll_region_down(region, lines)
+        }
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.inner.flush()
+        }
+    }
+
+    fn recording_terminal(
+        width: u16,
+        top: u16,
+    ) -> crate::tui::custom_terminal::Terminal<RecordingBackend> {
+        let backend = RecordingBackend {
+            inner: ratatui::backend::TestBackend::new(width, 40),
+            bytes: Vec::new(),
+            fail_writes: false,
+        };
+        let mut terminal = crate::tui::custom_terminal::Terminal::with_options(backend).unwrap();
+        terminal.set_viewport_area(ratatui::layout::Rect::new(0, top, width, 4));
+        terminal
+    }
+
+    fn settled_guttered_text(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    }
+
+    fn queued_assistant(source: &str, width: u16) -> VecDeque<PendingHistory> {
+        let cell: Arc<dyn HistoryCell> = Arc::new(AssistantCell::from_markdown(source.to_owned()));
+        VecDeque::from([PendingHistory::Assistant(QueuedAssistantHistory {
+            cell,
+            width,
+            next_line: 0,
+            layout_preparing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rendered_complete: false,
+            pending_separators: 0,
+            ready: VecDeque::new(),
+        })])
+    }
+
+    fn drain_and_repaint_history(
+        terminal: &mut crate::tui::custom_terminal::Terminal<RecordingBackend>,
+        pending: &mut VecDeque<PendingHistory>,
+        zellij: bool,
+        parser: &mut vt100::Parser,
+    ) {
+        while !pending.is_empty() {
+            if super::TerminalGuard::flush_pending_history(terminal, pending, zellij).unwrap() {
+                terminal.invalidate_viewport();
+            }
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    ratatui::widgets::Widget::render(
+                        ratatui::widgets::Paragraph::new("composer\n".repeat(area.height as usize)),
+                        area,
+                        frame.buffer_mut(),
+                    );
+                })
+                .unwrap();
+            parser.process(&std::mem::take(&mut terminal.backend_mut().bytes));
+        }
+    }
+
+    fn text_including_scrollback(parser: &mut vt100::Parser, width: u16) -> String {
+        parser.screen_mut().set_scrollback(usize::MAX);
+        let history = parser.screen().scrollback();
+        let mut text = String::new();
+        for offset in (1..=history).rev() {
+            parser.screen_mut().set_scrollback(offset);
+            text.push_str(&parser.screen().rows(0, width).next().unwrap());
+        }
+        parser.screen_mut().set_scrollback(0);
+        for row in parser.screen().rows(0, width) {
+            text.push_str(&row);
+        }
+        text
+    }
+
+    #[test]
+    fn multi_page_code_survives_composer_repaint_and_following_reply() {
+        for width in [40_u16, 80] {
+            for top in [12_u16, 36] {
+                for physical_rows in [2_u16, 35, 36, 37, 47, 100] {
+                    let code = format!(
+                        "{}END_OF_CODE",
+                        "x".repeat(usize::from(width) * usize::from(physical_rows - 2))
+                    );
+                    for zellij in [false, true] {
+                        let mut terminal = recording_terminal(width, top);
+                        let mut parser = vt100::Parser::new(40, width, 256);
+                        parser.process(format!("\x1b[{};1Hexisting-code", top - 1).as_bytes());
+                        for row in top..top + 4 {
+                            parser.process(format!("\x1b[{};1HSTALE-UI-TAIL", row + 1).as_bytes());
+                        }
+                        let mut pending = queued_assistant(&format!("```\n{code}\n```"), width);
+                        drain_and_repaint_history(&mut terminal, &mut pending, zellij, &mut parser);
+                        let expected_top = (top + physical_rows).min(36);
+                        assert_eq!(terminal.viewport_area.y, expected_top);
+                        assert!(
+                            parser
+                                .screen()
+                                .rows(0, width)
+                                .nth(usize::from(expected_top - 1))
+                                .unwrap()
+                                .contains("END_OF_CODE"),
+                            "tail overwritten width={width} top={top} rows={physical_rows} zellij={zellij}"
+                        );
+
+                        pending.extend(queued_assistant("```\nnext-command\n```", width));
+                        drain_and_repaint_history(&mut terminal, &mut pending, zellij, &mut parser);
+                        let text = text_including_scrollback(&mut parser, width);
+                        // vt100 discards rows scrolled out of a partial DECSTBM
+                        // region. Standard still checks visible placement and
+                        // repaint; only full-screen flow can round-trip native
+                        // scrollback through this emulator.
+                        if zellij {
+                            assert!(text.contains(&code), "code lost: {text:?}");
+                            assert_eq!(text.matches("existing-code").count(), 1);
+                        }
+                        assert_eq!(text.matches("END_OF_CODE").count(), 1);
+                        assert_eq!(text.matches("next-command").count(), 1);
+                        assert!(!text.contains("STALE-UI"), "transient UI entered history");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_height_and_empty_viewports_preserve_code_in_scrollback() {
+        for (top, height) in [(0, 40), (40, 0), (12, 0)] {
+            for zellij in [false, true] {
+                for length in [39, 40, 41, 1800, 1801] {
+                    let code = "x".repeat(length);
+                    let mut terminal = recording_terminal(40, top);
+                    terminal.set_viewport_area(ratatui::layout::Rect::new(0, top, 40, height));
+                    let mut parser = vt100::Parser::new(40, 40, 256);
+                    if top > 0 {
+                        parser.process(format!("\x1b[{top};1Hexisting-code").as_bytes());
+                    }
+                    let mut pending = queued_assistant(&format!("```\n{code}\n```"), 40);
+                    drain_and_repaint_history(&mut terminal, &mut pending, zellij, &mut parser);
+                    let text = text_including_scrollback(&mut parser, 40);
+                    assert!(
+                        text.contains(&code),
+                        "code lost top={top} height={height} zellij={zellij} length={length}"
+                    );
+                    assert_eq!(text.matches('x').count(), length + usize::from(top > 0));
+                    if top > 0 {
+                        assert!(
+                            text.contains("existing-code"),
+                            "last history row overwritten"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn settled_code_reaches_final_writer_without_hard_wraps() {
+        let command =
+            "printf '%s\\n' 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu'";
+        let long_payload = "quoted words ".repeat(16);
+        let code = format!("{command}\ncat <<'EOF'\n  {long_payload}\n\nEOF");
+        for width in [40, 80, 120] {
+            for zellij in [false, true] {
+                for language in ["", "sh"] {
+                    let source = format!("```{language}\n{code}\n```");
+                    let mut pending = queued_assistant(&source, width);
+                    let mut terminal = recording_terminal(width, 12);
+                    while !pending.is_empty() {
+                        super::TerminalGuard::flush_pending_history(
+                            &mut terminal,
+                            &mut pending,
+                            zellij,
+                        )
+                        .unwrap();
+                    }
+                    let raw = String::from_utf8(terminal.backend().bytes.clone()).unwrap();
+                    let plain = crate::cli::terminal_region::strip_ansi_codes(&raw);
+                    assert!(
+                        plain.contains(&settled_guttered_text(&code)),
+                        "logical source changed atwidth={width} zellij={zellij} lang={language}: {plain:?}"
+                    );
+                    assert!(!plain.contains('█'));
+                    let mut parser = vt100::Parser::new(40, width, 0);
+                    parser.process(raw.as_bytes());
+                    assert!(
+                        parser.screen().contents().contains(command),
+                        "emulated command was changed or overwritten"
+                    );
+                    assert_eq!(parser.screen().cursor_position(), (0, 0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn appended_batches_preserve_existing_history_and_row_positions() {
+        for zellij in [false, true] {
+            let mut terminal = recording_terminal(40, 12);
+            let mut parser = vt100::Parser::new(40, 40, 0);
+            parser.process(b"\x1b[11;1Hexisting-code");
+            let mut pending = queued_assistant("```\nfirst-A\nfirst-B\nfirst-C\n```", 40);
+            super::TerminalGuard::flush_pending_history(&mut terminal, &mut pending, zellij)
+                .unwrap();
+            parser.process(&std::mem::take(&mut terminal.backend_mut().bytes));
+            assert_eq!(
+                parser.screen().rows(0, 40).nth(10).unwrap(),
+                "existing-code",
+                "earlier history overwritten zellij={zellij}"
+            );
+            assert_eq!(parser.screen().rows(0, 40).nth(13).unwrap(), "  first-A");
+            assert_eq!(parser.screen().rows(0, 40).nth(15).unwrap(), "  first-C");
+            assert_eq!(terminal.viewport_area.y, 16);
+
+            let second = format!("second-batch-{}", "x".repeat(40));
+            pending.extend(queued_assistant(&format!("```\n{second}\n```"), 40));
+            super::TerminalGuard::flush_pending_history(&mut terminal, &mut pending, zellij)
+                .unwrap();
+            parser.process(&std::mem::take(&mut terminal.backend_mut().bytes));
+            assert_eq!(
+                parser.screen().rows(0, 40).nth(10).unwrap(),
+                "existing-code"
+            );
+            assert_eq!(
+                parser.screen().rows(0, 40).nth(13).unwrap(),
+                "  first-A",
+                "later batch overwrote previous reply zellij={zellij}",
+            );
+            assert!(
+                parser
+                    .screen()
+                    .rows(0, 40)
+                    .nth(17)
+                    .unwrap()
+                    .starts_with("  second-batch-")
+            );
+            assert!(parser.screen().contents().contains(&second));
+            assert_eq!(terminal.viewport_area.y, 19);
+        }
+    }
+
+    #[test]
+    fn code_softwrap_counts_wide_glyphs_at_current_width() {
+        for width in [40_u16, 80, 120] {
+            let code = format!(
+                "{}界{}",
+                "x".repeat(usize::from(width - 1)),
+                "y".repeat(usize::from(width - 1))
+            );
+            for top in [12, 36] {
+                for zellij in [false, true] {
+                    // The cached Markdown width deliberately differs from the
+                    // actual width after a resize. Do not reindex the cache.
+                    let mut pending = queued_assistant(&format!("```\n{code}\n```"), 160);
+                    let (rows, trusted) = take_pending_history_batch(&mut pending);
+                    assert_eq!(rows.iter().filter(|row| row.verbatim).count(), 1);
+                    let expected_rows = rows.len() as u16 + 2; // one logical code row occupies three physical rows
+                    let mut terminal = recording_terminal(width, top);
+                    crate::tui::insert_history::insert_history_lines_with_terminal(
+                        &mut terminal,
+                        &rows,
+                        trusted,
+                        zellij,
+                    )
+                    .unwrap();
+                    assert_eq!(terminal.viewport_area.y, top + expected_rows.min(36 - top));
+                    assert_eq!(terminal.visible_history_rows(), expected_rows);
+                    let mut parser = vt100::Parser::new(40, width, 0);
+                    parser.process(&terminal.backend().bytes);
+                    assert_eq!(
+                        parser
+                            .screen()
+                            .rows(0, width)
+                            .filter(|row| !row.is_empty())
+                            .count(),
+                        3,
+                        "code placement width={width} top={top} zellij={zellij}"
+                    );
+                    assert!((0..40).any(|row| parser.screen().row_wrapped(row)));
+                    assert_eq!(parser.screen().contents().matches('界').count(), 1);
+                    assert_eq!(parser.screen().cursor_position(), (0, 0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn softwrap_handles_exact_margin_and_combining_style_spans() {
+        use crate::tui::markdown_render::MarkdownRow;
+        use ratatui::text::Span;
+        for length in [39, 40, 41] {
+            let mut terminal = recording_terminal(40, 12);
+            let rows = [MarkdownRow {
+                line: Line::raw("x".repeat(length)),
+                verbatim: true,
+            }];
+            crate::tui::insert_history::insert_history_lines_with_terminal(
+                &mut terminal,
+                &rows,
+                false,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                terminal.visible_history_rows(),
+                if length > 40 { 2 } else { 1 }
+            );
+        }
+        let mut terminal = recording_terminal(40, 12);
+        let row = MarkdownRow {
+            line: Line::from(vec![
+                Span::raw(format!("{}e", "x".repeat(39))),
+                Span::raw("\u{301}"),
+                Span::raw("z"),
+            ]),
+            verbatim: true,
+        };
+        crate::tui::insert_history::insert_history_lines_with_terminal(
+            &mut terminal,
+            &[row],
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(terminal.visible_history_rows(), 2);
+        let mut terminal = recording_terminal(40, 12);
+        let row = MarkdownRow {
+            line: Line::raw(format!("{}\tyz", "x".repeat(38))),
+            verbatim: true,
+        };
+        crate::tui::insert_history::insert_history_lines_with_terminal(
+            &mut terminal,
+            &[row],
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(terminal.visible_history_rows(), 2);
+        let mut parser = vt100::Parser::new(40, 40, 0);
+        parser.process(&terminal.backend().bytes);
         assert_eq!(
-            first.last().expect("bounded batch has content").spans[0].content,
-            format!("line-{}", MAX_HISTORY_LINES_PER_DRAW - 1)
-        );
-        assert_eq!(pending.len(), 2);
-        assert_eq!(
-            pending.front().expect("tail remains").spans[0].content,
-            format!("line-{MAX_HISTORY_LINES_PER_DRAW}")
+            parser
+                .screen()
+                .rows(0, 40)
+                .filter(|row| !row.is_empty())
+                .count(),
+            2
         );
     }
 
     #[test]
-    fn history_batch_never_starves_one_oversized_line() {
-        let mut pending = VecDeque::from([Line::raw("x".repeat(32 * 1024)), Line::raw("tail")]);
-
-        let first = take_history_batch(&mut pending);
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].spans[0].content.len(), 32 * 1024);
-        assert_eq!(
-            pending.front().expect("tail remains").spans[0].content,
-            "tail"
-        );
+    fn code_rows_survive_budget_pushback_and_trust_boundaries() {
+        let mut source_rows = (0..20)
+            .map(|index| format!("row-{index}:{}", "x".repeat(1000)))
+            .collect::<Vec<_>>();
+        source_rows.insert(7, format!("oversized:{}", "y".repeat(32 * 1024)));
+        let code = source_rows.join("\n");
+        let mut pending = queued_assistant(&format!("```\n{code}\n```"), 80);
+        let lease =
+            crate::cli::terminal_hyperlinks::register_link("file:///tmp/copy-test.txt").unwrap();
+        pending.push_back(PendingHistory::Lines {
+            lines: VecDeque::from([Line::raw(crate::cli::terminal_hyperlinks::mark_link_label(
+                lease.token(),
+                "trusted-tail",
+            ))
+            .into()]),
+            trusted_links: true,
+        });
+        let mut terminal = recording_terminal(80, 12);
+        let mut oversized_batches = 0;
+        let mut total_code_rows = 0;
+        while !pending.is_empty() {
+            let (rows, trusted) = take_pending_history_batch(&mut pending);
+            assert!(rows.len() <= MAX_HISTORY_LINES_PER_DRAW);
+            let chars = rows
+                .iter()
+                .map(|row| super::pending_line_chars(&row.line))
+                .sum::<usize>();
+            if chars > MAX_HISTORY_CHARS_PER_DRAW {
+                assert_eq!(rows.len(), 1);
+                oversized_batches += 1;
+            }
+            if total_code_rows > 0 {
+                terminal.backend_mut().inner.resize(40, 40);
+                let mut area = terminal.viewport_area;
+                area.width = 40;
+                terminal.set_viewport_area(area);
+            }
+            total_code_rows += rows.iter().filter(|row| row.verbatim).count();
+            crate::tui::insert_history::insert_history_lines_with_terminal(
+                &mut terminal,
+                &rows,
+                trusted,
+                false,
+            )
+            .unwrap();
+        }
+        assert_eq!(oversized_batches, 1);
+        assert_eq!(total_code_rows, source_rows.len());
+        let raw = String::from_utf8(terminal.backend().bytes.clone()).unwrap();
+        let plain = crate::cli::terminal_region::strip_ansi_codes(&raw);
+        assert!(plain.contains(&settled_guttered_text(&code)));
+        assert_eq!(plain.matches("oversized:").count(), 1);
+        assert!(plain.ends_with("trusted-tail"));
+        assert!(raw.contains("\x1b]8;;file:///tmp/copy-test.txt\x1b\\trusted-tail"));
     }
 
     #[test]
-    fn history_batch_stops_at_the_character_budget_between_lines() {
-        let line_size = MAX_HISTORY_CHARS_PER_DRAW / 2 + 1;
-        let mut pending = VecDeque::from([
-            Line::raw("x".repeat(line_size)),
-            Line::raw("y".repeat(line_size)),
-        ]);
-
-        let first = take_history_batch(&mut pending);
-        assert_eq!(first.len(), 1);
-        assert_eq!(pending.len(), 1);
+    fn verbatim_does_not_grant_control_trust_or_hide_writer_errors() {
+        use crate::tui::markdown_render::MarkdownRow;
+        let rows = [MarkdownRow {
+            line: Line::raw("before\x1b]52;c;dGVzdA==\x07after"),
+            verbatim: true,
+        }];
+        let mut terminal = recording_terminal(40, 12);
+        crate::tui::insert_history::insert_history_lines_with_terminal(
+            &mut terminal,
+            &rows,
+            false,
+            false,
+        )
+        .unwrap();
+        let raw = String::from_utf8(terminal.backend().bytes.clone()).unwrap();
+        assert!(!raw.contains("\x1b]52;"));
+        terminal.backend_mut().fail_writes = true;
         assert_eq!(
-            pending.front().expect("second line remains").spans[0]
-                .content
-                .len(),
-            line_size
+            crate::tui::insert_history::insert_history_lines_with_terminal(
+                &mut terminal,
+                &rows,
+                false,
+                false
+            )
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::BrokenPipe
         );
     }
 
@@ -827,7 +1256,10 @@ mod tests {
         let (first, _) = take_pending_history_batch(&mut pending);
         assert_eq!(first.len(), MAX_HISTORY_LINES_PER_DRAW);
         assert!(!pending.is_empty(), "long reply tail remains queued");
-        assert!(first.iter().all(|line| line.spans[0].content == "█ "));
+        assert!(
+            first.iter().all(|row| row.line.spans[0].content == "  "),
+            "every prose row indents with plain spaces"
+        );
 
         let mut emitted = first;
         while !pending.is_empty() {
@@ -837,7 +1269,7 @@ mod tests {
             emitted.extend(batch);
         }
         assert_eq!(
-            emitted,
+            emitted.into_iter().map(|row| row.line).collect::<Vec<_>>(),
             cell.display_lines(80),
             "bounded drains preserve every row exactly once"
         );

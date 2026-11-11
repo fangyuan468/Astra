@@ -3,7 +3,6 @@
 use std::time::Instant;
 
 use super::turn_learning::TurnLearningSnapshot;
-use crate::cli::session::session_lessons;
 use crate::cli::session::session_side_effects::{enqueue_ingestion_events, enqueue_ingestion_pub};
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::{StreamResult, root_run_transcript_events};
@@ -65,7 +64,14 @@ fn cache_pending_context_assembly_trace(state: &mut SessionState, trace_json: &s
     match serde_json::from_value::<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>(
         trace_json.clone(),
     ) {
-        Ok(trace) => state.latest_context_assembly_trace = Some(trace),
+        Ok(trace) => {
+            state.latest_context_assembly_trace = Some(
+                crate::cli::session::session_state::LocalContextAssemblyTrace {
+                    local_turn: state.turn,
+                    trace,
+                },
+            );
+        }
         Err(err) => {
             astra_core::agent_warn!("context_trace", "failed to cache context trace: {err}")
         }
@@ -675,7 +681,6 @@ pub(crate) fn commit_primary_turn(
     learning_snap: &TurnLearningSnapshot,
     turn_start: Instant,
 ) -> PrimaryTurnCommit {
-    let has_stalls = !result.stall_events.is_empty();
     let mut issues = TurnCommitIssues::default();
     let mut turn_persisted = state.session_id.is_none();
     if let Some((_internal_turn, trace_json)) = &result.pending_context_assembly_trace {
@@ -745,10 +750,6 @@ pub(crate) fn commit_primary_turn(
         let persistence_error = issues.into_summary();
         state.session_persistence_error = persistence_error.clone();
 
-        if has_stalls {
-            session_lessons::checkpoint_lessons_from_runtime(state);
-        }
-
         return PrimaryTurnCommit {
             outcome: TurnCommitOutcome {
                 turn_persisted,
@@ -762,10 +763,6 @@ pub(crate) fn commit_primary_turn(
 
     let persistence_error = issues.into_summary();
     state.session_persistence_error = persistence_error.clone();
-
-    if has_stalls {
-        session_lessons::checkpoint_lessons_from_runtime(state);
-    }
 
     PrimaryTurnCommit {
         outcome: TurnCommitOutcome {
@@ -1519,8 +1516,9 @@ pub(super) mod tests {
             .latest_context_assembly_trace
             .as_ref()
             .expect("cached context trace");
-        assert_eq!(cached_trace.turn_id, "turn-99");
-        assert_eq!(cached_trace.token_budget.total_used, 12_345);
+        assert_eq!(cached_trace.local_turn, state.turn);
+        assert_eq!(cached_trace.trace.turn_id, "turn-99");
+        assert_eq!(cached_trace.trace.token_budget.total_used, 12_345);
     }
 
     #[test]

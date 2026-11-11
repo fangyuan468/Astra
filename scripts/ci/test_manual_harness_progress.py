@@ -23,6 +23,12 @@ def supervised(command):
             "--identity", "manual-progress-test", "--", *command]
 
 
+def execution_diagnostic():
+    return {"final_state":None, "interruption_kind":None, "error_kind":None,
+            "error_code":None, "server_admission_not_dispatched":False,
+            "stream":None, "journal":None}
+
+
 def row(name, status="passed"):
     checks = [{"type":"judger", "severity":"quality", "score":None,
                "passed":None, "evaluation":"unscored", "diagnostic":None},
@@ -32,8 +38,9 @@ def row(name, status="passed"):
             "has_warnings":False, "failure_class":None if status == "passed" else "Unknown",
             "exit_code":0 if status == "passed" else 1, "criteria":checks,
             "steps":[{"step_index":0, "passed":status == "passed", "duration_ms":100,
-                      "criteria":[dict(c) for c in checks]}],
-            "token_usage_coverage":None, "terminal_reported":dict.fromkeys(h.METRICS, 10)}
+                      "criteria":[dict(c) for c in checks], "execution_diagnostic":execution_diagnostic()}],
+            "token_usage_coverage":None, "terminal_reported":dict.fromkeys(h.METRICS, 10),
+            "execution_diagnostic":execution_diagnostic()}
 
 
 def events(statuses=("passed", "passed")):
@@ -58,6 +65,237 @@ def write_events(root, data, tail=b""):
 
 
 class ManualHarnessProgressTests(unittest.TestCase):
+    def test_successful_case_with_efficiency_warning_is_visible_without_regrading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = events(("passed",))
+            completed = next(event for event in data if event["type"] == "case_completed")
+            completed["row"]["has_warnings"] = True
+            completed["row"]["criteria"].append({
+                "type":"duration_between", "severity":"soft", "score":None,
+                "passed":False, "evaluation":"reported",
+                "diagnostic":{"kind":"count", "min":0, "max":90000, "actual":90001},
+            })
+            write_events(root, data)
+            (root / "execution.json").write_text(json.dumps({"exit_code":0, "termination":"finished"}))
+            replay = h.Replay(SHA)
+            with patch("builtins.print") as printed:
+                replay.read(root / "progress.jsonl", emit=True)
+            self.assertTrue(any("PASSED (WARNINGS)" in str(call) for call in printed.call_args_list))
+            code, summary = self.publish(root)
+            self.assertEqual(code, 0)
+            self.assertTrue(summary["success"])
+            self.assertEqual(summary["runs"][0]["status"], "passed")
+            published = (root / "job-summary").read_text()
+            self.assertIn("passed (warnings)", published)
+            self.assertIn("duration_between (soft)", published)
+
+    def test_execution_diagnostics_survive_failed_summary_without_regrading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = events(("failed",))
+            result = next(e["row"] for e in data if e["type"] == "case_completed")
+            diagnostic = result["execution_diagnostic"]
+            diagnostic.update(final_state="failed", error_kind="contract_violation",
+                              error_code="canonical_persistence_failed")
+            diagnostic["stream"] = {"identity_verified":True, "has_diagnostics":False, "last_event":"terminated_completed",
+                                    "event_counts":{"run_started":1, "terminated_completed":1}}
+            diagnostic["journal"] = {"skipped_lines":0, "dropped_lines":0, "integrity_errors":0,
+                                     "last_event":"turn_error", "event_counts":{"turn_error":1},
+                                     "loop_boundaries":{"llm_round":{"root":{"textless_response_retry":1}}, "child_barrier":{"root":{"results_adopted":1}}},
+                                     "last_provider_failure":{
+                                         "event":"llm_round_failed", "run_scope":"root",
+                                         "error_kind":"provider_deadline", "failure_stage":"provider",
+                                         "deadline_phase":"waiting_provider_response",
+                                         "dispatch_started":True, "provider_completed":False}}
+            write_events(root, data)
+            (root / "report.json").write_text("private-sentinel")
+            (root / "execution.json").write_text(json.dumps({"exit_code":1, "termination":"finished"}))
+            code, summary = self.publish(root, "failure", cli=True)
+            self.assertEqual(code, 1)
+            self.assertIsNone(summary["observation_error"])
+            self.assertEqual(summary["runs"][0]["execution_diagnostic"], diagnostic)
+            self.assertEqual(summary["runs"][0]["status"], "failed")
+            self.assertEqual(summary["runs"][0]["exit_code"], 1)
+            self.assertIn("contract_violation", (root / "job-summary").read_text())
+            self.assertIn("terminated_completed", (root / "job-summary").read_text())
+            self.assertIn("waiting_provider_response", (root / "job-summary").read_text())
+            self.assertIn("results_adopted", (root / "job-summary").read_text())
+            self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
+
+    def test_step_journal_diagnostics_survive_summary_without_borrowing_root_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = events(("failed",))
+            result = next(e["row"] for e in data if e["type"] == "case_completed")
+            journal = {"skipped_lines":0, "dropped_lines":0, "integrity_errors":0,
+                       "last_event":"llm_round_failed", "event_counts":{"llm_round_failed":1},
+                       "loop_boundaries":{"llm_round":{}, "child_barrier":{}},
+                       "last_provider_failure":{
+                           "event":"llm_round_failed", "run_scope":"root", "error_kind":"provider_deadline",
+                           "failure_stage":"provider", "deadline_phase":"waiting_provider_response",
+                           "dispatch_started":True, "provider_completed":False}}
+            result["steps"][0]["execution_diagnostic"]["journal"] = journal
+            result["execution_diagnostic"]["error_kind"] = "auth"
+            unknown = {**journal, "last_provider_failure":None, "integrity_errors":1, "skipped_lines":1}
+            result["steps"].append({**result["steps"][0], "step_index":1,
+                "execution_diagnostic":{**execution_diagnostic(), "journal":unknown}})
+            write_events(root, data)
+            (root / "execution.json").write_text(json.dumps({"exit_code":1, "termination":"finished"}))
+            code, summary = self.publish(root, "failure", cli=True)
+            self.assertEqual(code, 1)
+            self.assertIsNone(summary["observation_error"])
+            projected = summary["runs"][0]
+            self.assertEqual(projected["execution_diagnostic"]["error_kind"], "auth")
+            self.assertEqual(projected["steps"][0]["execution_diagnostic"]["journal"], journal)
+            self.assertEqual(projected["steps"][1]["execution_diagnostic"]["journal"], unknown)
+            self.assertIn("waiting_provider_response", (root / "job-summary").read_text())
+
+    def test_execution_diagnostics_reject_private_tags_and_extra_payload(self):
+        h.safe_execution_diagnostic(execution_diagnostic())
+        for key in ("final_state", "interruption_kind", "error_kind", "error_code", "detail"):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                h.safe_execution_diagnostic({**execution_diagnostic(), key:"private-sentinel"})
+        stream = {"identity_verified":True, "has_diagnostics":False, "last_event":"terminated_completed",
+                  "event_counts":{"terminated_completed":1}}
+        for changes in ({"last_event":"private-sentinel"}, {"reason":"private-sentinel"},
+                        {"event_counts":{"private-sentinel":1}},
+                        {"event_counts":{"terminated_completed":True}}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                h.safe_execution_diagnostic({**execution_diagnostic(), "stream":{**stream, **changes}})
+        result = row("case", "failed")
+        result["steps"][0]["execution_diagnostic"]["error_code"] = "private-sentinel"
+        with self.assertRaises(ValueError):
+            h.safe_row(result)
+        failure = {"event":"llm_round_failed", "run_scope":"root", "error_kind":"provider_deadline",
+                   "failure_stage":"provider", "deadline_phase":"waiting_provider_response",
+                   "dispatch_started":True, "provider_completed":False}
+        journal = {"skipped_lines":0, "dropped_lines":0, "integrity_errors":0,
+                   "last_event":"llm_round_failed", "event_counts":{"llm_round_failed":1},
+                   "last_provider_failure":failure, "loop_boundaries":{"llm_round":{}, "child_barrier":{}}}
+        for key in ("run_scope", "error_kind", "failure_stage", "deadline_phase", "message"):
+            with self.subTest(provider_field=key), self.assertRaises(ValueError):
+                h.safe_execution_diagnostic({**execution_diagnostic(), "journal":{
+                    **journal, "last_provider_failure":{**failure, key:"private-sentinel"}}})
+
+    def test_loop_boundaries_reject_private_scopes_reasons_and_invalid_counts(self):
+        valid = {"llm_round":{"root":{"textless_response_retry":1}},
+                 "child_barrier":{"other_run":{"results_adopted":1}}}
+        h.safe_loop_boundaries(valid)
+        for changes in ({"llm_round":{"private-sentinel":{"stop":1}}},
+                        {"llm_round":{"root":{"private-sentinel":1}}},
+                        {"child_barrier":{"root":{"results_adopted":True}}},
+                        {"child_barrier":{"root":{"results_adopted":-1}}},
+                        {"detail":"private-sentinel"}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                h.safe_loop_boundaries({**valid, **changes})
+
+    def test_cache_scope_evidence_survives_summary_without_regrading(self):
+        diagnostic = {"kind":"cache_scope", "scope":"conversation_turns",
+                      "observations":None, "post_cold_cache_read_tokens":None,
+                      "executions":[{"capture":"snapshot_pending", "run_matches":True,
+                                     "session_matches":True, "scope_count":None,
+                                     "cache_read_tokens":None}], "executions_omitted":0}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = events(("failed",))
+            result = next(e["row"] for e in data if e["type"] == "case_completed")
+            result["steps"] = []
+            result["criteria"] = [{"type":"prompt_cache_reuse_scope", "severity":"hard",
+                                   "score":None, "passed":False, "evaluation":"reported",
+                                   "diagnostic":diagnostic}]
+            write_events(root, data)
+            (root / "report.json").write_text("private-sentinel")
+            (root / "execution.json").write_text(json.dumps({"exit_code":1,"termination":"finished"}))
+            code, summary = self.publish(root, "failure", cli=True)
+            self.assertEqual(code, 1)
+            self.assertIsNone(summary["observation_error"])
+            self.assertEqual(summary["runs"][0]["criteria"][0]["diagnostic"], diagnostic)
+            self.assertIn("snapshot_pending", (root / "job-summary").read_text())
+            self.assertFalse(summary["runs"][0]["criteria"][0]["passed"])
+            self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
+
+    def test_cache_scope_projection_rejects_private_or_malformed_fields(self):
+        valid = {"kind":"cache_scope", "scope":"conversation_turns",
+                 "observations":2, "post_cold_cache_read_tokens":"9800",
+                 "executions":[], "executions_omitted":0}
+        h.safe_diagnostic(valid, 0)
+        for changes in [{"detail":"private-sentinel"}, {"scope":"private-sentinel"},
+                        {"post_cold_cache_read_tokens":"private-sentinel"},
+                        {"post_cold_cache_read_tokens":None}, {"observations":False},
+                        {"post_cold_cache_read_tokens":str(1 << 128)},
+                        {"executions":[{"capture":"private-sentinel"}]}]:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                h.safe_diagnostic(dict(valid, **changes), 0)
+
+    def test_journal_diagnostics_survive_public_summary_without_raw_payload(self):
+        diagnostics = [
+            ("journal_tool_call_count", {"kind":"journal_count", "min":1, "max":1,
+             "actual":2, "considered":5, "outcome_matches":5, "missing":1,
+             "type_mismatch":1, "value_mismatch":1}, "observed 2"),
+            ("journal_tool_success_ratio", {"kind":"journal_ratio", "min":0.9,
+             "min_calls":3, "allowed_failures":1, "terminal":4, "succeeded":2,
+             "failed":2, "pending":1, "adjusted_terminal":3}, "adjusted ratio=2/3"),
+        ]
+        for kind, diagnostic, expected in diagnostics:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                data = events(("failed",))
+                result = next(e["row"] for e in data if e["type"] == "case_completed")
+                result["criteria"] = [{"type":kind, "severity":"hard", "score":None,
+                    "passed":False, "evaluation":"reported", "diagnostic":diagnostic}]
+                write_events(root, data)
+                (root / "report.json").write_text("private-sentinel")
+                (root / "execution.json").write_text(json.dumps({"exit_code":1,"termination":"finished"}))
+                code, summary = self.publish(root, "failure", cli=True)
+                self.assertEqual(code, 1)
+                self.assertIsNone(summary["observation_error"])
+                self.assertEqual(summary["runs"][0]["criteria"][0]["diagnostic"], diagnostic)
+                self.assertIn(expected, (root / "job-summary").read_text())
+                self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
+                for changes in ({"raw":"private-sentinel"}, {"actual":"private-sentinel"},
+                                {"min":True}, {"considered":-1}):
+                    with self.assertRaises(ValueError):
+                        h.safe_diagnostic(dict(diagnostic, **changes), 0)
+
+    def test_journal_diagnostics_reject_inconsistent_accounting(self):
+        count = {"kind":"journal_count", "min":1, "max":1, "actual":0,
+                 "considered":1, "outcome_matches":1, "missing":1,
+                 "type_mismatch":0, "value_mismatch":0}
+        ratio = {"kind":"journal_ratio", "min":0.9, "min_calls":3,
+                 "allowed_failures":1, "terminal":4, "succeeded":2,
+                 "failed":2, "pending":0, "adjusted_terminal":3}
+        for value, changes in [(count, {"actual":1}), (count, {"considered":0}),
+                               (ratio, {"terminal":3}), (ratio, {"adjusted_terminal":4}),
+                               (ratio, {"min":float("nan")}), (ratio, {"min_calls":0})]:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                h.safe_diagnostic(dict(value, **changes), 0)
+
+    def test_judge_failure_accepts_only_fixed_typed_metadata(self):
+        base = {"kind":"judge", "assessment":"unavailable", "threshold":0.8,
+                "failure":{"error_kind":"provider_deadline", "stage":"completion"}}
+        h.safe_diagnostic(base, 0)
+        for failure in (None, {}, {"error_kind":{}, "stage":"completion"},
+                        {"error_kind":"unknown", "stage":[]},
+                        {"error_kind":"private-sentinel", "stage":"completion"},
+                        {"error_kind":"unknown", "stage":"private-sentinel"},
+                        {**base["failure"], "detail":"private-sentinel"}):
+            with self.subTest(failure=failure), self.assertRaises(ValueError):
+                h.safe_diagnostic({**base, "failure":failure}, 0)
+        with self.assertRaises(ValueError):
+            h.safe_diagnostic({**base, "assessment":"accepted"}, 0)
+
+    def test_captured_root_lifecycle_is_a_closed_unavailable_diagnostic(self):
+        for state in ("running", "waiting", "paused", "delegated", "interrupted", "failed", "cancelled"):
+            diagnostic = {"kind": "child_adoption", "status": "unavailable", "reason": f"root_{state}"}
+            h.safe_diagnostic(diagnostic, 0)
+            with self.assertRaises(ValueError):
+                h.safe_diagnostic({**diagnostic, "status": "contradicted"}, 0)
+            with self.assertRaises(ValueError):
+                h.safe_diagnostic({**diagnostic, "root_id": "private"}, 0)
+        with self.assertRaises(ValueError):
+            h.safe_diagnostic({"kind": "child_adoption", "status": "unavailable", "reason": "root_private_payload"}, 0)
+
     def test_failed_required_combination_explains_soft_child_without_regrading(self):
         child = {"type":"duration_between", "severity":"soft", "score":None,
                  "passed":False, "evaluation":"reported", "diagnostic":{
@@ -84,6 +322,10 @@ class ManualHarnessProgressTests(unittest.TestCase):
                      "passed":False, "evaluation":"reported", "diagnostic":{
                          "kind":"tool_count", "min":1, "max":1, "actual":0,"considered":1,
                          "expected_ok":False, "outcome_matches":1, "error_matches":None, "predicate_matches":[1,0,0],
+                         "predicate_mismatches":[
+                             {"predicate_index":index,"failure_count":1,"first_mismatch":{
+                                 "path":path,"reason":"scalar_mismatch","expected_type":"string","actual_type":"string"}}
+                             for index,path in [(1,"/error_kind"),(2,"/status")]],
                          "observed_outcomes":[{"count":1,"outcome":{"disposition":"rejected","ok":False,
                              "status":"rejected","error_kind":"tool_invalid_args","execution":"not_executed","validation":None}}],
                          "outcomes_omitted":0}}
@@ -95,6 +337,8 @@ class ManualHarnessProgressTests(unittest.TestCase):
             summary = (root / "job-summary").read_text()
             self.assertIn("expected 1..1, observed 0", summary)
             self.assertIn("[1, 0, 0]", summary)
+            self.assertIn("scalar_mismatch", summary)
+            self.assertIn("/error_kind", summary)
             self.assertIn("not configured", summary)
             self.assertIn("tool_invalid_args", summary)
             self.assertIn("Failure stage: argument validation", summary)
@@ -109,6 +353,16 @@ class ManualHarnessProgressTests(unittest.TestCase):
             self.assertIn("does not prove the requested model was checked", command.stdout)
             self.assertEqual(json.loads((root / "summary.json").read_text())["runs"][0]["criteria"][0]
                              ["diagnostic"]["observed_outcomes"], check["diagnostic"]["observed_outcomes"])
+            mismatch = check["diagnostic"]["predicate_mismatches"][0]
+            for field, bad in [("reason", "private-sentinel"), ("actual_value", "private-sentinel"),
+                               ("actual_type", {}), ("path", "/" + "x" * 512)]:
+                original = dict(mismatch["first_mismatch"])
+                mismatch["first_mismatch"][field] = bad
+                write_events(root, data)
+                _, invalid = self.publish(root, "failure")
+                self.assertEqual(invalid["observation_error"], "invalid_progress")
+                self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
+                mismatch["first_mismatch"] = original
             outcome = check["diagnostic"]["observed_outcomes"][0]["outcome"]
             outcome["validation"] = {"issues":[{"code":"required","path":"/description"}], "omitted":3}
             write_events(root, data)
@@ -134,7 +388,7 @@ class ManualHarnessProgressTests(unittest.TestCase):
                 self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
                 outcome[field] = prior
             for assessment in ("rejected", "unavailable"):
-                check.update(type="hard_judger", diagnostic={"kind":"judge", "threshold":0.8,"assessment":assessment})
+                check.update(type="hard_judger", diagnostic={"kind":"judge", "threshold":0.8,"assessment":assessment, "failure": {"error_kind":"provider_deadline", "stage":"completion"} if assessment == "unavailable" else None})
                 write_events(root, data)
                 code, _ = self.publish(root, "failure")
                 self.assertEqual(code, 1)
@@ -148,6 +402,7 @@ class ManualHarnessProgressTests(unittest.TestCase):
     def test_child_proof_reason_survives_real_summary_entrypoint(self):
         for status, reason in [("proven", None),
                                ("contradicted", "result_digest_mismatch"),
+                               ("contradicted", "mutation_mismatch"),
                                ("unavailable", "adoption_evidence_unavailable")]:
             with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -155,6 +410,8 @@ class ManualHarnessProgressTests(unittest.TestCase):
                 data = events(("passed" if passed else "failed",))
                 result = next(e["row"] for e in data if e["type"] == "case_completed")
                 diagnostic = {"kind":"child_adoption", "status":status, "reason":reason}
+                if reason == "mutation_mismatch":
+                    diagnostic["mutation"] = {"expected": "read_only", "actual": "unknown", "requested_persona": "custom"}
                 result["steps"] = []
                 result["criteria"] = [{"type":"execution_child_results_adopted",
                     "severity":"hard", "score":None, "passed":passed,
@@ -170,6 +427,24 @@ class ManualHarnessProgressTests(unittest.TestCase):
                 if not passed:
                     self.assertIn(f"{status}: {reason}", (root / "job-summary").read_text())
                 self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
+
+    def test_child_mutation_observation_is_closed_and_not_a_verdict_override(self):
+        base = {"kind": "child_adoption", "status": "contradicted", "reason": "mutation_mismatch"}
+        for actual in (None, "unknown", "read_only", "may_mutate", "must_mutate"):
+            for persona in ("omitted", "explore", "code_review", "task", "general_purpose", "custom", "unavailable"):
+                diagnostic = dict(base, mutation={"expected": "read_only", "actual": actual, "requested_persona": persona})
+                self.assertIsNone(h.safe_diagnostic(diagnostic, 0))
+                check = {"type": "execution_child_results_adopted", "severity": "hard", "score": None,
+                         "passed": False, "evaluation": "reported", "diagnostic": diagnostic}
+                self.assertIn("mutation observations", " ".join(h.check_lines([check], "root")))
+        valid = dict(base, mutation={"expected": "read_only", "actual": "unknown", "requested_persona": "omitted"})
+        for field in ("expected", "actual", "requested_persona", "private-field"):
+            bad = dict(valid, mutation=dict(valid["mutation"], **{field: "private-sentinel"}))
+            with self.assertRaises(ValueError): h.safe_diagnostic(bad, 0)
+        for reason in ("model_mismatch", None):
+            with self.assertRaises(ValueError): h.safe_diagnostic(dict(valid, reason=reason), 0)
+        for status in ("proven", "unavailable"):
+            with self.assertRaises(ValueError): h.safe_diagnostic(dict(valid, status=status), 0)
 
     def test_child_proof_diagnostic_rejects_untrusted_reasons_and_fields(self):
         valid = {"kind":"child_adoption", "status":"contradicted", "reason":"model_mismatch"}
@@ -215,6 +490,20 @@ class ManualHarnessProgressTests(unittest.TestCase):
                 _, summary = self.publish(root)
                 self.assertFalse(summary["success"])
                 self.assertNotIn("private-sentinel", (root / "summary.json").read_text())
+
+    def test_preflight_failure_without_case_progress_is_not_a_score(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "execution.json").write_text(json.dumps({"exit_code": 1, "termination": "finished"}))
+            (root / "report.preflight.json").write_text(json.dumps({"status": "failed", "failure": {
+                "stage": "execution", "final_state": "interrupted", "interruption_kind": "provider_deadline"}}))
+            code, summary = self.publish(root, "failure")
+            self.assertEqual(code, 1)
+            self.assertFalse(summary["complete"])
+            self.assertFalse(summary["success"])
+            self.assertIsNone(summary["counts"]["planned"])
+            self.assertEqual(summary["counts"]["completed"], 0)
+            self.assertEqual(summary["incomplete_reason"], "no_case_progress")
 
     def test_missing_terminal_truncation_gaps_and_malformed_records_keep_valid_prefix(self):
         data = events()
@@ -451,6 +740,44 @@ while True: time.sleep(.05)
                 self.assertNotIn("private-sentinel", stdout + stderr)
                 _, summary = self.publish(root)
                 self.assertEqual(summary["execution"]["termination"], "cancelled")
+                self.assertFalse(summary["success"])
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "CI supervisor requires Linux")
+    def test_cancel_finalization_survives_repeated_supervisor_signals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher = self.stub(root, "graceful")
+            wrapper = root / "slow_finalizer.py"
+            wrapper.write_text("import sys,time\n"
+                f"sys.path.insert(0, {str(SCRIPT.parent)!r})\n"
+                "import manual_harness as h\n"
+                "original=h.write_json\n"
+                "def write(path,value):\n"
+                "    if path.name=='execution.json' and value.get('exit_code')==130: time.sleep(.15)\n"
+                "    return original(path,value)\n"
+                "h.write_json=write\n"
+                "raise SystemExit(h.main())\n")
+            process = subprocess.Popen(supervised([sys.executable, str(wrapper), "run", "--root", str(root),
+                "--timeout-seconds", "10", "--grace-seconds", "1", "--", str(launcher)]),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env={**os.environ, "ASTRA_BUILD_SOURCE_GIT_SHA":SHA})
+            try:
+                end = time.monotonic() + 3
+                while not (root / "progress.jsonl").exists() and time.monotonic() < end:
+                    time.sleep(.01)
+                self.assertTrue((root / "progress.jsonl").exists())
+                process.send_signal(signal.SIGINT)
+                stdout, stderr = process.communicate(timeout=4)
+                self.assertEqual(process.returncode, 130, stderr)
+                self.assertNotIn("private-sentinel", stdout + stderr)
+                execution = json.loads((root / "execution.json").read_text())
+                self.assertEqual(execution, {"exit_code":130, "termination":"cancelled"})
+                summary = json.loads((root / "summary.json").read_text())
+                self.assertEqual(summary["execution"], execution)
                 self.assertFalse(summary["success"])
             finally:
                 if process.poll() is None:

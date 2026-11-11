@@ -283,6 +283,7 @@ pub(super) enum HeadlessShortCircuitJournalKind {
     HardBlocked,
     SuppressedRetry,
     Cancelled { error_kind: astra_core::ErrorKind },
+    Unavailable,
 }
 
 enum HeadlessToolSlotControl {
@@ -391,6 +392,12 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     pub max_consecutive_empty_name: u32,
     pub tool_call_records: &'a mut Vec<ToolCallRecord>,
     pub tool_event_hooks: &'a crate::skills::hooks::ToolEventHookRegistry,
+    /// Existing Skill ledger and current client catalog, borrowed by the final
+    /// result owner so recovery retains the post-hook body before truncation.
+    pub client_skill_execution: Option<(
+        &'a [astra_turn_types::SkillCatalogIdentity],
+        &'a mut crate::turn::agentic_loop::host::SkillExecutionState,
+    )>,
     pub term: &'a mut dyn HeadlessRoundTerminal,
     pub mailbox: Option<&'a mut astra_messaging::router::AgentMailbox>,
     pub permission_context: Option<&'a PermissionSyncHandle>,
@@ -863,6 +870,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         idem_key: Option<&IdempotencyKey>,
     ) {
         let tool_idem_key = idem_key
+            .filter(|_| self.ctx.runtime_tool_executor.is_none())
             .filter(|_| READ_ONLY_TOOLS.contains(&execution.name.as_str()))
             .map(IdempotencyKey::cache_key);
         let args_preview = safe_args_preview(&execution.name, &execution.args);
@@ -1145,7 +1153,7 @@ mod tests {
         harness.edge_tool_round.clear();
     }
 
-    async fn short_circuit_cached_read_file(
+    async fn execute_read_with_stale_cache(
         harness: &mut PipelineHarness,
         turn_index: usize,
         call_id: &str,
@@ -1153,20 +1161,23 @@ mod tests {
     ) {
         harness.valid_tool_names.insert("read_file".to_string());
         configure_server_read_file(harness, call_id, path);
-        seed_cached_read_file(harness, call_id, path, &format!("cached {path}"));
-
+        seed_cached_read_file(harness, call_id, path, "obsolete cached content");
         harness.call_counts.clear();
         let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join(path), format!("fresh {path}")).unwrap();
         let executor = server_executor_for_test_workspace(workspace.path(), &harness.session_id);
         let mut pipeline = harness.pipeline_with_server_executor(turn_index, Some(&executor));
-        let validated = match pipeline.validate_slot(0) {
-            HeadlessPipelineStage::Continue(validated) => validated,
-            _ => panic!("cached read_file must still pass validation"),
-        };
-        assert!(matches!(
-            pipeline.permit_execution(validated).await,
-            HeadlessPipelineStage::ShortCircuit
-        ));
+        assert!(pipeline.run_slot_with_control(0).await);
+        let record = pipeline.ctx.tool_call_records.last().unwrap();
+        assert!(record.was_executed());
+        assert!(record.execution_completion.is_none());
+        assert!(
+            record
+                .result_full
+                .as_ref()
+                .unwrap()
+                .contains(&format!("fresh {path}"))
+        );
     }
 
     fn begin_recorded_turn(harness: &mut PipelineHarness, tool_count: usize) {
@@ -1237,6 +1248,14 @@ mod tests {
             crate::server::tool_execution_binding::WorkspaceBinding::server_sandbox(workspace),
             crate::server::tool_execution_binding::ExecutorBinding::server_local(),
         );
+        executor.set_current_selected_tool_offers(HashMap::from([(
+            "read_file".into(),
+            crate::server::tool_execution_binding::SelectedToolOfferSnapshot::new_with_route(
+                "read_file",
+                "server-sandbox",
+                crate::server::tool_route_selection::ToolExecutionRouteKind::ServerLocal,
+            ),
+        )]));
         executor.enable_durable_invocations();
         executor
     }
@@ -1422,6 +1441,7 @@ mod tests {
                     max_consecutive_empty_name: self.max_consecutive_empty_name,
                     tool_call_records: &mut self.tool_call_records,
                     tool_event_hooks: &self.tool_event_hooks,
+                    client_skill_execution: None,
                     term: &mut self.term,
                     mailbox: None,
                     permission_context: self.permission_context.as_ref(),
@@ -1573,13 +1593,18 @@ mod tests {
             &result.result.output,
         );
         let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("unused.txt"),
+            "current readonly result",
+        )
+        .unwrap();
         let executor = server_executor_for_test_workspace(workspace.path(), &cached.session_id);
         let mut pipeline = cached.pipeline_with_server_executor(0, Some(&executor));
         assert!(pipeline.run_slot_with_control(0).await);
         assert!(pipeline.into_round_outcome().accepted_sends.is_empty());
         assert_eq!(
             cached.tool_call_records.last().unwrap().disposition,
-            Some(astra_services::session_journal::ToolCallDisposition::Reused)
+            Some(astra_services::session_journal::ToolCallDisposition::Executed)
         );
     }
 
@@ -2370,7 +2395,7 @@ mod tests {
     async fn production_dispatch_control_stops_serial_provider_execution_and_later_claims() {
         let mut harness = PipelineHarness::new();
         harness.edge_tool_round.clear();
-        harness.valid_tool_names.insert("read_file".to_string());
+        harness.valid_tool_names.insert("write_file".to_string());
         harness.tool_calls = [
             ("call-a", "a.txt"),
             ("call-b", "b.txt"),
@@ -2382,8 +2407,8 @@ mod tests {
                 "id": id,
                 "type": "function",
                 "function": {
-                    "name": "read_file",
-                    "arguments": serde_json::to_string(&json!({"path": path})).unwrap(),
+                    "name": "write_file",
+                    "arguments": serde_json::to_string(&json!({"path": path, "content": format!("written {path}")})).unwrap(),
                 }
             })
         })
@@ -2391,17 +2416,6 @@ mod tests {
         begin_recorded_turn(&mut harness, 3);
 
         let workspace = tempfile::tempdir().unwrap();
-        std::fs::write(workspace.path().join("a.txt"), "provider-effect-a").unwrap();
-        std::fs::write(
-            workspace.path().join("b.txt"),
-            "provider-effect-b-must-not-run",
-        )
-        .unwrap();
-        std::fs::write(
-            workspace.path().join("c.txt"),
-            "provider-effect-c-must-not-run",
-        )
-        .unwrap();
         let mut executor =
             server_executor_for_test_workspace(workspace.path(), harness.session_id.as_str());
         executor.enable_durable_invocations();
@@ -2430,16 +2444,12 @@ mod tests {
             assert!(pipeline.action_fence_error().is_some());
         }
 
-        let visible = format!("{:?}{:?}", harness.messages, harness.tool_results);
-        assert!(visible.contains("provider-effect-a"), "{visible}");
-        assert!(
-            !visible.contains("provider-effect-b-must-not-run"),
-            "{visible}"
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("a.txt")).unwrap(),
+            "written a.txt\n"
         );
-        assert!(
-            !visible.contains("provider-effect-c-must-not-run"),
-            "{visible}"
-        );
+        assert!(!workspace.path().join("b.txt").exists());
+        assert!(!workspace.path().join("c.txt").exists());
         assert_eq!(
             harness.tool_call_records.len(),
             2,
@@ -2681,7 +2691,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_new_read_invocation_observes_external_workspace_changes() {
+    async fn repeated_server_reads_observe_current_workspace_contents() {
         let mut harness = PipelineHarness::new();
         harness.valid_tool_names.insert("read_file".to_string());
         let workspace = tempfile::tempdir().unwrap();
@@ -2714,11 +2724,8 @@ mod tests {
                 .to_string()
                 .contains("V1 first observation")
         );
-        assert_eq!(
-            harness.tool_call_records[1].disposition,
-            Some(astra_services::session_journal::ToolCallDisposition::Reused),
-            "a completed invocation retry should replay its own confirmed result"
-        );
+        assert!(harness.tool_call_records[1].was_executed());
+        assert!(harness.tool_call_records[1].execution_completion.is_none());
 
         std::fs::write(&path, "V2 externally updated observation").unwrap();
         configure_server_read_file(&mut harness, "call-read-v2", "shared.txt");
@@ -2750,13 +2757,37 @@ mod tests {
         assert!(
             harness.tool_results[3]
                 .to_string()
-                .contains("V1 first observation")
+                .contains("V2 externally updated observation")
         );
-        assert_eq!(
-            harness.tool_call_records[3].disposition,
-            Some(astra_services::session_journal::ToolCallDisposition::Reused),
-            "a retry after an external edit must remain bound to its original outcome"
+        assert!(harness.tool_call_records[3].was_executed());
+        assert!(harness.tool_call_records[3].execution_completion.is_none());
+        assert!(
+            harness
+                .idempotency_cache
+                .check(&read_cache_key_for_invocation(
+                    &harness,
+                    "call-read-v1",
+                    "shared.txt"
+                ))
+                .is_none()
         );
+
+        // Reusing a public call ID with a different read is another observation,
+        // not a durable identity reservation or an old result replay.
+        std::fs::write(workspace.path().join("other.txt"), "different current file").unwrap();
+        configure_server_read_file(&mut harness, "call-read-v1", "other.txt");
+        begin_recorded_turn(&mut harness, 1);
+        harness.call_counts.clear();
+        {
+            let mut pipeline = harness.pipeline_with_server_executor(4, Some(&executor));
+            assert!(pipeline.run_slot_with_control(0).await);
+        }
+        assert!(
+            harness.tool_results[4]
+                .to_string()
+                .contains("different current file")
+        );
+        assert!(harness.tool_call_records[4].was_executed());
     }
 
     #[tokio::test]
@@ -2874,6 +2905,96 @@ mod tests {
         }
     }
 
+    fn assert_short_circuit_documents(harness: &PipelineHarness) {
+        assert!(!harness.tool_call_records.is_empty());
+        for record in &harness.tool_call_records {
+            let id = record
+                .tool_call_id
+                .as_deref()
+                .expect("provider call identity");
+            let request = harness
+                .tool_calls
+                .iter()
+                .find(|call| call["id"] == id)
+                .expect("original request");
+            let arguments: Value =
+                serde_json::from_str(request["function"]["arguments"].as_str().unwrap()).unwrap();
+            let expected = record::safe_tool_arguments_for_record(&record.name, &arguments).0;
+            let message = harness
+                .messages
+                .iter()
+                .find(|message| message["tool_call_id"] == id)
+                .expect("returned tool message");
+            let response = message["content"].as_str().unwrap();
+            let persisted: ToolCallRecord =
+                serde_json::from_str(&serde_json::to_string(record).unwrap()).unwrap();
+            assert_eq!(persisted.args_full, expected, "{id}: full request");
+            assert_eq!(
+                persisted.result_full.as_deref(),
+                Some(response),
+                "{id}: actual response, not reason/preview"
+            );
+            assert!(
+                !persisted.was_executed(),
+                "{id}: documents do not grant execution"
+            );
+        }
+    }
+
+    #[test]
+    fn short_circuit_emitter_preserves_complete_safe_documents_without_dispatch() {
+        for kind in [
+            HeadlessShortCircuitJournalKind::HardBlocked,
+            HeadlessShortCircuitJournalKind::SuppressedRetry,
+            HeadlessShortCircuitJournalKind::Cancelled {
+                error_kind: astra_core::ErrorKind::ToolTimeout,
+            },
+        ] {
+            let mut harness = PipelineHarness::new();
+            begin_recorded_turn(&mut harness, 1);
+            let args = json!({"action":"get_result","agent_id":"child-owned","detail":"界".repeat(1000),"api_key":"sk-private-credential-that-must-not-persist"});
+            let response = format!("actual returned response {}", "fact ".repeat(150));
+            policy::emit_blocked_tool_result(
+                HeadlessBlockedTool {
+                    id: "call-control",
+                    name: "agent",
+                    args: &args,
+                    reason_code: "retry_deferred",
+                    journal_kind: kind,
+                    err_msg: response.clone(),
+                    journal_reason: "different private reason".into(),
+                    early_exit_ms: 0,
+                    status_line: None,
+                },
+                &mut harness.step_recorder,
+                true,
+                &mut harness.term,
+                &mut harness.messages,
+                &mut harness.tool_results,
+                &mut harness.tool_call_records,
+            );
+            let persisted: ToolCallRecord = serde_json::from_str(
+                &serde_json::to_string(&harness.tool_call_records[0]).unwrap(),
+            )
+            .unwrap();
+            let saved: Value = serde_json::from_str(persisted.args_full.as_ref().unwrap()).unwrap();
+            assert_eq!(saved["detail"], args["detail"]);
+            assert_eq!(saved["agent_id"], args["agent_id"]);
+            assert!(
+                !serde_json::to_string(&persisted)
+                    .unwrap()
+                    .contains("sk-private-credential-that-must-not-persist")
+            );
+            assert_eq!(persisted.result_full.as_deref(), Some(response.as_str()));
+            assert_eq!(harness.messages[0]["content"], response);
+            assert!(!persisted.was_executed());
+            assert_eq!(
+                tool_trace_events(&harness).last().unwrap().0,
+                astra_pipeline::step_protocol::StepEventType::ToolCallSkipped
+            );
+        }
+    }
+
     #[tokio::test]
     async fn turn_budget_short_circuit_records_step_skip_trace() {
         let mut harness = PipelineHarness::new();
@@ -2917,77 +3038,7 @@ mod tests {
             record.effective_disposition(),
             astra_services::session_journal::ToolCallDisposition::Suppressed
         );
-    }
-
-    #[tokio::test]
-    async fn same_invocation_replay_records_explicit_trace_payload() {
-        let mut harness = PipelineHarness::new();
-        begin_recorded_turn(&mut harness, 1);
-
-        short_circuit_cached_read_file(&mut harness, 1, "call-read-a-1", "a.txt").await;
-
-        let tool_events = tool_trace_events(&harness);
-        assert_eq!(
-            tool_events.len(),
-            2,
-            "same-invocation replay should emit started+completed trace events"
-        );
-        assert!(matches!(
-            tool_events[0].0,
-            astra_pipeline::step_protocol::StepEventType::ToolCallStarted
-        ));
-        let started_payload = tool_events[0].1.as_ref().expect("started payload");
-        assert_eq!(
-            started_payload.get("tool_name").and_then(Value::as_str),
-            Some("read_file")
-        );
-        assert_eq!(
-            started_payload.get("call_id").and_then(Value::as_str),
-            Some("call-read-a-1")
-        );
-        assert!(
-            started_payload
-                .get("args_preview")
-                .and_then(Value::as_str)
-                .is_some_and(|preview| preview.contains("a.txt")),
-            "started trace should include args preview, got: {started_payload:?}"
-        );
-
-        assert!(matches!(
-            tool_events[1].0,
-            astra_pipeline::step_protocol::StepEventType::ToolCallCompleted
-        ));
-        let completed_payload = tool_events[1].1.as_ref().expect("completed payload");
-        assert_eq!(
-            completed_payload.get("reason").and_then(Value::as_str),
-            Some("cached_same_invocation")
-        );
-        assert_eq!(
-            completed_payload.get("cached").and_then(Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            completed_payload.get("is_error").and_then(Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            completed_payload.get("call_id").and_then(Value::as_str),
-            Some("call-read-a-1")
-        );
-        assert!(
-            completed_payload
-                .get("args_preview")
-                .and_then(Value::as_str)
-                .is_some_and(|preview| preview.contains("a.txt")),
-            "completed trace should include args preview, got: {completed_payload:?}"
-        );
-        assert!(
-            completed_payload
-                .get("output")
-                .and_then(Value::as_str)
-                .is_some_and(|output| output.contains("cached a.txt")),
-            "completed cache-hit trace should carry cached output, got: {completed_payload:?}"
-        );
+        assert_short_circuit_documents(&harness);
     }
 
     #[tokio::test]
@@ -3044,6 +3095,66 @@ mod tests {
             harness.idempotency_cache.check(&fresh_key).is_none(),
             "a new read invocation must not reuse the pre-mutation result"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_started_writer_invalidates_observations_but_rejected_writer_does_not() {
+        for started in [false, true] {
+            let mut harness = PipelineHarness::new();
+            begin_recorded_turn(&mut harness, 1);
+            let read_args = json!({"path":"a.txt"});
+            let output = "the previous observed file content";
+            harness.semantic_dedup.check_and_record_with_generation(
+                "read_file",
+                &read_args,
+                output,
+                0,
+                0,
+            );
+            let mut pipeline = harness.pipeline();
+            pipeline
+                .record_execution(ExecutedExecution {
+                    execution: HeadlessResolvedExecution {
+                        id: "call-timeout".into(),
+                        name: "bash".into(),
+                        args: json!({"command":"printf changed > a.txt; sleep 1"}),
+                        result_str: "command timed out".into(),
+                        tool_result_fields: Some(serde_json::Map::from_iter([(
+                            "execution_started".into(),
+                            json!(started),
+                        )])),
+                        authoritative_is_error: Some(true),
+                        pending_runtime_completion: None,
+                        accepted_send: None,
+                        confirmed_invocation: None,
+                        edge_duration_ms: 1,
+                        is_edge_tool: true,
+                        edge_result_missing: false,
+                        edge_terminal_authority: true,
+                        early_exit_ms: 0,
+                    },
+                    idem_key: None,
+                    pre_tool_context: None,
+                    is_err: true,
+                    error_kind: None,
+                    executed_ms: 1,
+                })
+                .await;
+            drop(pipeline);
+
+            assert_eq!(harness.turn_guard.workspace_epoch(), u64::from(started));
+            let duplicate = harness
+                .semantic_dedup
+                .near_duplicate_hint_for_observation_with_generation(
+                    output,
+                    "read_file",
+                    &read_args,
+                    1,
+                    0,
+                );
+            assert_eq!(duplicate.is_none(), started);
+            assert!(!harness.tool_call_records[0].ok);
+        }
     }
 
     #[tokio::test]
@@ -3540,6 +3651,7 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("cancelled_tool"))
         );
+        assert_short_circuit_documents(&harness);
     }
 
     #[tokio::test]
@@ -3567,7 +3679,7 @@ mod tests {
 
         let workspace = tempfile::tempdir().unwrap();
         let mut executor = server_executor_for_test_workspace(workspace.path(), "test-session");
-        executor.set_context_manifest_pool(pool.clone());
+        executor.set_service_pool(pool.clone());
         let shared_ids = {
             let mut pipeline = harness.pipeline_with_server_executor(0, Some(&executor));
             pipeline.run_slot_with_control(0).await;
@@ -3861,6 +3973,7 @@ mod tests {
         use astra_services::models::{ModelAccessKind, ModelExecutionPlacement, ModelListItem};
         use astra_turn_core::model_catalog::{ModelCatalogRequest, catalog_page};
         let item = ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: "fixture-offering".into(),
             name: "fixture-model".into(),
@@ -4088,6 +4201,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_bounded_result_stays_inline_until_final_budgeting() {
+        use astra_turn_core::tool_result_storage;
+
+        let journal = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
+        begin_recorded_turn(&mut harness, 1);
+        let executor = server_executor_for_test_workspace(workspace.path(), &harness.session_id);
+        let content = json!({"observation":"fixture", "data":"evidence ".repeat(700)}).to_string();
+        assert!(content.len() < tool_result_storage::PERSIST_THRESHOLD_CHARS);
+        let (_, mut executed) = catalog_record_fixture();
+        executed.execution.id = "budgeted-result".into();
+        executed.execution.name = "introspect".into();
+        executed.execution.result_str = content.clone();
+        let mut pipeline = harness.pipeline_with_server_executor(0, Some(&executor));
+        pipeline.record_execution(executed).await;
+        assert_eq!(pipeline.ctx.messages.last().unwrap()["content"], content);
+        assert!(pipeline.ctx.tool_call_records[0].result_artifact.is_none());
+        let (_, mut fitting) = catalog_record_fixture();
+        fitting.execution.id = "fitting-result".into();
+        fitting.execution.name = "introspect".into();
+        fitting.execution.result_str = json!({"data":"ok ".repeat(1000)}).to_string();
+        pipeline.record_execution(fitting).await;
+        assert!(
+            pipeline.ctx.tool_call_records[1].result_artifact.is_none(),
+            "a result that fits alongside empty guidance should remain inline"
+        );
+        let (_, mut generic) = catalog_record_fixture();
+        generic.execution.id = "generic-fitting-result".into();
+        generic.execution.name = "grep".into();
+        generic.execution.tool_result_fields = None;
+        generic.execution.result_str = "x".repeat(7000);
+        pipeline.record_execution(generic).await;
+        assert_eq!(
+            pipeline.ctx.messages.last().unwrap()["content"],
+            "x".repeat(7000)
+        );
+        assert!(pipeline.ctx.tool_call_records[2].result_artifact.is_none());
+    }
+
+    #[tokio::test]
+    async fn artifact_conflict_preserves_successful_writer_evidence() {
+        use astra_services::SessionArtifactStore;
+        use astra_turn_core::tool_result_storage;
+
+        let journal = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
+        begin_recorded_turn(&mut harness, 1);
+        let executor = server_executor_for_test_workspace(workspace.path(), &harness.session_id);
+        let session_dir = astra_services::local_session_artifact_store()
+            .session_dir_for_owner(
+                &astra_services::OwnerScope::user("test-user").unwrap(),
+                &harness.session_id,
+            )
+            .unwrap();
+        tool_result_storage::persist_tool_result_with_descriptor(
+            &session_dir,
+            "test-run",
+            "conflicting-write",
+            "write_file",
+            "previous result",
+        )
+        .unwrap();
+        let (_, mut executed) = catalog_record_fixture();
+        executed.execution.id = "conflicting-write".into();
+        executed.execution.name = "write_file".into();
+        executed.execution.args = json!({"path":"file.txt", "content":"new"});
+        executed.execution.result_str = "new result ".repeat(5000);
+        executed.execution.is_edge_tool = true;
+        executed.execution.edge_terminal_authority = true;
+        executed.execution.tool_result_fields = Some(serde_json::Map::from_iter([
+            (
+                astra_tools::workspace_observation::WRITER_APPLIED_BOUND_FIELD.to_string(),
+                json!(true),
+            ),
+            ("execution_started".to_string(), json!(true)),
+        ]));
+        let mut pipeline = harness.pipeline_with_server_executor(0, Some(&executor));
+        let epoch = pipeline.ctx.turn_guard.workspace_epoch();
+        pipeline.record_execution(executed).await;
+        let record = &pipeline.ctx.tool_call_records[0];
+        assert!(!record.ok, "delivery failed");
+        assert_eq!(record.execution_ok, Some(true));
+        assert_eq!(record.workspace_writer_applied_bound, Some(true));
+        assert_eq!(pipeline.ctx.turn_guard.workspace_epoch(), epoch + 1);
+        assert!(
+            pipeline.ctx.messages.last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains("durable")
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_io_failure_reports_delivery_without_undoing_execution() {
+        use astra_services::SessionArtifactStore;
+        use astra_turn_core::tool_result_storage;
+
+        let journal = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal.path());
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
+        begin_recorded_turn(&mut harness, 1);
+        let session_dir = astra_services::local_session_artifact_store()
+            .session_dir_for_owner(
+                &astra_services::OwnerScope::user("test-user").unwrap(),
+                &harness.session_id,
+            )
+            .unwrap();
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            tool_result_storage::tool_results_dir(&session_dir),
+            "not a directory",
+        )
+        .unwrap();
+        let (_, mut executed) = catalog_record_fixture();
+        executed.execution.id = "write-io-failure".into();
+        executed.execution.name = "write_file".into();
+        executed.execution.args = json!({"path":"file.txt", "content":"new"});
+        executed.execution.result_str = "large result ".repeat(5000);
+        executed.execution.tool_result_fields = Some(serde_json::Map::from_iter([(
+            "execution_started".to_string(),
+            json!(true),
+        )]));
+        let mut pipeline = harness.pipeline();
+        pipeline.record_execution(executed).await;
+        let record = &pipeline.ctx.tool_call_records[0];
+        assert!(!record.ok);
+        assert_eq!(record.execution_ok, Some(true));
+        assert!(record.error.as_deref().unwrap().contains("delivered"));
+        let message = pipeline.ctx.messages.last().unwrap();
+        assert_eq!(
+            pipeline.ctx.tool_results.last().unwrap()["status"],
+            "failed"
+        );
+        assert!(
+            message["content"]
+                .as_str()
+                .unwrap()
+                .contains("result_delivery_unavailable")
+        );
+    }
+
+    #[tokio::test]
     async fn same_invocation_model_catalog_replay_keeps_complete_json() {
         let mut harness = PipelineHarness::new();
         let (page, _) = catalog_record_fixture();
@@ -4124,9 +4386,14 @@ mod tests {
                 context_signature: key.context_signature.clone(),
             },
         );
-        let workspace = tempfile::tempdir().unwrap();
-        let executor = server_executor_for_test_workspace(workspace.path(), &harness.session_id);
-        let mut pipeline = harness.pipeline_with_server_executor(1, Some(&executor));
+        let session_id = harness.session_id.clone();
+        let run_id = harness.run_id.clone();
+        let chain_id = harness.turn_chain_id.clone();
+        let mut pipeline = harness.pipeline_with_server_executor(1, None);
+        pipeline.ctx.current_user_id = Some("test-user");
+        pipeline.ctx.current_session_id = Some(&session_id);
+        pipeline.ctx.current_run_id = Some(&run_id);
+        pipeline.ctx.current_turn_chain_id = Some(&chain_id);
         let validated = match pipeline.validate_slot(0) {
             HeadlessPipelineStage::Continue(validated) => validated,
             _ => panic!("catalog replay must pass validation"),
@@ -4174,11 +4441,17 @@ mod tests {
     #[tokio::test]
     async fn durable_completion_waits_for_post_tool_governance_and_redaction() {
         let mut harness = PipelineHarness::new();
-        harness.valid_tool_names.insert("read_file".to_string());
-        configure_server_read_file(&mut harness, "call-governed", "governed.txt");
+        harness.valid_tool_names.insert("write_file".to_string());
+        harness.edge_tool_round.clear();
+        harness.tool_calls = vec![json!({
+            "id":"call-governed", "type":"function",
+            "function":{"name":"write_file","arguments":serde_json::to_string(&json!({
+                "path":"governed.txt","content":"written once\n"
+            })).unwrap()}
+        })];
         harness.tool_event_hooks = ToolEventHookRegistry::new(vec![ToolEventHook {
             event: ToolEventKind::PostToolUse,
-            matcher: "read_file".into(),
+            matcher: "write_file".into(),
             action: HookAction::Shell {
                 command: r#"echo '{"output":"hooked AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"}'"#
                     .into(),
@@ -4190,11 +4463,6 @@ mod tests {
             priority: 0,
         }]);
         let workspace = tempfile::tempdir().unwrap();
-        std::fs::write(
-            workspace.path().join("governed.txt"),
-            "raw provider AWS_ACCESS_KEY_ID=AKIA1234567890ABCDEF",
-        )
-        .unwrap();
         let mut executor =
             server_executor_for_test_workspace(workspace.path(), harness.session_id.as_str());
         executor.enable_durable_invocations();
@@ -4206,17 +4474,14 @@ mod tests {
             "call-governed",
         )
         .unwrap();
-        let governed_cache_key =
-            read_cache_key_for_invocation(&harness, "call-governed", "governed.txt");
-
         let mut pipeline = harness.durable_pipeline_with_server_executor(&executor);
         let validated = match pipeline.validate_slot(0) {
             HeadlessPipelineStage::Continue(validated) => validated,
-            _ => panic!("expected validated durable read"),
+            _ => panic!("expected validated durable write"),
         };
         let permitted = match pipeline.permit_execution(validated).await {
             HeadlessPipelineStage::Continue(permitted) => permitted,
-            _ => panic!("expected permitted durable read"),
+            _ => panic!("expected permitted durable write"),
         };
         let executed = pipeline.execute_execution(permitted).await;
         assert!(executed.execution.pending_runtime_completion.is_some());
@@ -4277,24 +4542,22 @@ mod tests {
                 .as_deref()
                 .is_none_or(|value| !value.contains("AKIA1234567890ABCDEF"))
         );
-        let cached = pipeline
-            .ctx
-            .idempotency_cache
-            .check(&governed_cache_key)
-            .expect("successful read should populate the observation cache");
-        assert!(cached.output.contains("[REDACTED:"), "{}", cached.output);
-        assert!(!cached.output.contains("AKIA1234567890ABCDEF"));
+        assert_eq!(record.invocation_identity.as_ref(), Some(&identity));
         drop(pipeline);
 
-        // Rebuild the pipeline without its local observation cache. The same
-        // durable identity must replay, even after the provider file is gone.
+        // The ledger replays a confirmed effect without executing it again.
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("governed.txt")).unwrap(),
+            "written once\n"
+        );
         std::fs::remove_file(workspace.path().join("governed.txt")).unwrap();
         let mut replay_harness = PipelineHarness::new();
-        replay_harness.valid_tool_names.insert("read_file".into());
-        configure_server_read_file(&mut replay_harness, "call-governed", "governed.txt");
+        replay_harness.valid_tool_names.insert("write_file".into());
+        replay_harness.edge_tool_round.clear();
+        replay_harness.tool_calls = harness.tool_calls.clone();
         replay_harness.tool_event_hooks = ToolEventHookRegistry::new(vec![ToolEventHook {
             event: ToolEventKind::PostToolUse,
-            matcher: "read_file".into(),
+            matcher: "write_file".into(),
             action: HookAction::Shell {
                 command: r#"echo '{"output":"new replay presentation"}'"#.into(),
             },
@@ -4318,6 +4581,7 @@ mod tests {
         assert!(replayed.execution.confirmed_invocation.is_some());
         replay_pipeline.record_execution(replayed).await;
         let replay_record = replay_pipeline.ctx.tool_call_records.last().unwrap();
+        assert_eq!(replay_record.invocation_identity.as_ref(), Some(&identity));
         assert_eq!(
             replay_record
                 .execution_completion
@@ -4331,6 +4595,10 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("new replay presentation")
+        );
+        assert!(
+            !workspace.path().join("governed.txt").exists(),
+            "replay must not repeat the write"
         );
         let unchanged = executor
             .durable_invocation_record_for_test(&identity)
@@ -4385,14 +4653,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_post_tool_hook_transforms_same_invocation_replay() {
+    async fn server_read_ignores_stale_cache_and_applies_current_post_tool_governance() {
         let mut harness = PipelineHarness::new();
         harness.valid_tool_names.insert("read_file".to_string());
         harness.tool_event_hooks = ToolEventHookRegistry::new(vec![ToolEventHook {
             event: ToolEventKind::PostToolUse,
             matcher: "read_file".into(),
             action: HookAction::Shell {
-                command: r#"echo '{"output":"currently transformed cached result"}'"#.into(),
+                command: r#"echo '{"output":"currently transformed AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"}'"#.into(),
             },
             timeout_secs: 5,
             is_async: false,
@@ -4409,23 +4677,25 @@ mod tests {
         );
 
         let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("cached.txt"),
+            "fresh raw provider observation",
+        )
+        .unwrap();
         let executor = server_executor_for_test_workspace(workspace.path(), &harness.session_id);
         let mut pipeline = harness.pipeline_with_server_executor(0, Some(&executor));
-        let validated = match pipeline.validate_slot(0) {
-            HeadlessPipelineStage::Continue(validated) => validated,
-            _ => panic!("cache presence must not replace validation"),
-        };
-        assert!(matches!(
-            pipeline.permit_execution(validated).await,
-            HeadlessPipelineStage::ShortCircuit
-        ));
+        assert!(pipeline.run_slot_with_control(0).await);
         drop(pipeline);
 
         let model_visible = format!("{:?}{:?}", harness.messages, harness.tool_results);
-        assert!(model_visible.contains("currently transformed cached result"));
+        assert!(model_visible.contains("currently transformed"));
+        assert!(model_visible.contains("[REDACTED:"));
+        assert!(!model_visible.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(harness.tool_call_records[0].was_executed());
+        assert!(harness.tool_call_records[0].execution_completion.is_none());
         assert!(
             !model_visible.contains("raw-cached-observation-that-must-be-transformed"),
-            "the current PostTool hook must govern reused output: {model_visible}"
+            "the current PostTool hook must govern fresh output: {model_visible}"
         );
         assert_eq!(
             harness
@@ -4437,7 +4707,7 @@ mod tests {
                 ))
                 .map(|cached| cached.output.as_str()),
             Some("raw-cached-observation-that-must-be-transformed"),
-            "per-invocation hook transforms must not mutate the observation cache"
+            "Server observations must neither replay nor fill the generic cache"
         );
     }
 
@@ -4478,22 +4748,15 @@ mod tests {
         assert!(!executed.is_err);
         assert!(executed.execution.pending_runtime_completion.is_some());
         pipeline.record_execution(executed).await;
-        let completed = executor
-            .durable_invocation_record_for_test(&identity)
-            .await
-            .unwrap();
-        assert_eq!(
-            completed.state,
-            astra_turn_types::ToolInvocationState::Succeeded
-        );
-        let outcome = completed.outcome.unwrap();
         assert!(
-            !serde_json::to_string(outcome.result())
-                .unwrap()
-                .contains("HOOK-BEGIN")
+            executor
+                .durable_invocation_record_for_test(&identity)
+                .await
+                .is_none()
         );
         let record = pipeline.ctx.tool_call_records.last().unwrap();
         assert!(record.ok);
+        assert!(record.execution_completion.is_none());
         let original = record.result_full.as_deref().unwrap();
         assert!(original.contains("RESULT-ONLY"));
         assert!(!original.contains("HOOK-BEGIN"));
@@ -4588,64 +4851,297 @@ mod tests {
                     "call-read-context",
                     "context.txt",
                 ))
-                .expect("fresh provider observation must replace the old cache entry");
-            assert!(cached.output.contains("fresh provider observation"));
+                .expect("Server execution leaves the obsolete cache entry untouched");
+            assert_eq!(
+                cached.output,
+                "stale-cache-that-context-sensitive-calls-must-not-reuse"
+            );
             assert!(!cached.output.contains("current policy context"));
         }
     }
 
     #[tokio::test]
+    async fn same_run_guidance_chains_preserve_distinct_record_identities() {
+        use astra_services::session_journal::{
+            JournalDirGuard, JournalEventType, read_journal_for_user,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(dir.path());
+        let sid = uuid::Uuid::new_v4().to_string();
+        let mut identities = Vec::new();
+        for chain in ["original", "guided"] {
+            let mut harness = PipelineHarness::new();
+            harness.session_id = sid.clone();
+            harness.edge_tool_round[0].status = "failed".into();
+            let mut pipeline = harness.pipeline();
+            pipeline.ctx.current_user_id = Some("owner");
+            pipeline.ctx.current_session_id = Some(&sid);
+            pipeline.ctx.current_run_id = Some("same-run");
+            pipeline.ctx.current_turn_chain_id = Some(chain);
+            let HeadlessPipelineStage::Continue(validated) = pipeline.validate_slot(0) else {
+                panic!("expected valid tool");
+            };
+            let HeadlessPipelineStage::Continue(permitted) =
+                pipeline.permit_execution(validated).await
+            else {
+                panic!("expected permitted tool");
+            };
+            let executed = pipeline.execute_execution(permitted).await;
+            assert!(executed.is_err);
+            pipeline.record_execution(executed).await;
+            identities.push(
+                pipeline
+                    .ctx
+                    .tool_call_records
+                    .last()
+                    .unwrap()
+                    .invocation_identity
+                    .clone()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(identities[0].run_id, identities[1].run_id);
+        assert_eq!(identities[0].invocation_id, identities[1].invocation_id);
+        assert_ne!(identities[0].storage_key(), identities[1].storage_key());
+        let emitted: Vec<_> = read_journal_for_user("owner", &sid)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == JournalEventType::ToolCallError)
+            .map(|event| {
+                event
+                    .tool_calls
+                    .unwrap()
+                    .remove(0)
+                    .invocation_identity
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(emitted, identities);
+    }
+
+    #[tokio::test]
     async fn failed_edge_terminal_status_marks_denial_as_error_without_text_matching() {
-        let mut harness = PipelineHarness::new();
-        harness.edge_tool_round[0].output = "Tool execution denied or timed out".to_string();
-        harness.edge_tool_round[0].status = "failed".to_string();
-
-        let mut pipeline = harness.pipeline();
-        let validated = match pipeline.validate_slot(0) {
-            HeadlessPipelineStage::Continue(validated) => validated,
-            _ => panic!("expected validated execution"),
-        };
-        let permitted = match pipeline.permit_execution(validated).await {
-            HeadlessPipelineStage::Continue(permitted) => permitted,
-            _ => panic!("expected permitted execution"),
+        use astra_services::session_journal::{
+            JournalDirGuard, JournalEventType, read_journal, read_journal_for_user,
         };
 
-        let executed = pipeline.execute_execution(permitted).await;
-        assert!(executed.is_err, "got: {}", executed.execution.result_str);
-        assert_eq!(
-            pipeline.ctx.turn_guard.errors.total_errors, 1,
-            "one failed execution must have exactly one accounting owner"
-        );
-        assert_eq!(
-            pipeline
+        let journal = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(journal.path());
+        for (run, user, has_session, chain) in [
+            (Some("failed-run"), None, true, Some("chain-a")),
+            (
+                Some("failed-run"),
+                Some("failure-owner"),
+                true,
+                Some("chain-a"),
+            ),
+            (
+                Some("failed-run"),
+                Some("failure-owner"),
+                true,
+                Some("chain-b"),
+            ),
+            (Some("failed-run"), Some("failure-owner"), true, None),
+            (Some("failed-run"), Some("failure-owner"), true, Some(" ")),
+            (None, None, true, Some("chain-a")),
+            (Some("   "), Some("failure-owner"), true, Some("chain-a")),
+            (
+                Some("failed-run"),
+                Some("failure-owner"),
+                false,
+                Some("chain-a"),
+            ),
+        ] {
+            let mut harness = PipelineHarness::new();
+            harness.session_id = uuid::Uuid::new_v4().to_string();
+            let sid = harness.session_id.clone();
+            harness.edge_tool_round[0].output = "Tool execution denied or timed out".to_string();
+            harness.edge_tool_round[0].status = "failed".to_string();
+
+            let mut pipeline = harness.pipeline();
+            pipeline.ctx.current_session_id = has_session.then_some(&sid);
+            pipeline.ctx.current_user_id = user;
+            pipeline.ctx.current_run_id = run;
+            pipeline.ctx.current_turn_chain_id = chain;
+            let validated = match pipeline.validate_slot(0) {
+                HeadlessPipelineStage::Continue(validated) => validated,
+                _ => panic!("expected validated execution"),
+            };
+            let permitted = match pipeline.permit_execution(validated).await {
+                HeadlessPipelineStage::Continue(permitted) => permitted,
+                _ => panic!("expected permitted execution"),
+            };
+
+            let executed = pipeline.execute_execution(permitted).await;
+            assert!(executed.is_err, "got: {}", executed.execution.result_str);
+            assert_eq!(
+                pipeline.ctx.turn_guard.errors.total_errors, 1,
+                "one failed execution must have exactly one accounting owner"
+            );
+            assert_eq!(
+                pipeline
+                    .ctx
+                    .turn_guard
+                    .health
+                    .get("grep")
+                    .map(|health| health.total_failures),
+                Some(1),
+                "one failed execution must advance tool health exactly once"
+            );
+            pipeline.record_execution(executed).await;
+            let record = pipeline
                 .ctx
-                .turn_guard
-                .health
-                .get("grep")
-                .map(|health| health.total_failures),
-            Some(1),
-            "one failed execution must advance tool health exactly once"
+                .tool_call_records
+                .last()
+                .expect("denied edge execution must be journaled");
+            assert!(
+                !record.ok,
+                "typed edge failure must not be journaled as success"
+            );
+            assert_eq!(
+                record
+                    .result_preview
+                    .as_deref()
+                    .map(|preview| preview.starts_with("Tool execution denied or timed out")),
+                Some(true)
+            );
+            assert_eq!(
+                pipeline.ctx.turn_guard.errors.total_errors, 1,
+                "persisting the already-accounted result must not count it again"
+            );
+            let frozen_identity = record.invocation_identity.clone();
+            let expected_identity = has_session
+                .then_some(user)
+                .flatten()
+                .zip(run)
+                .zip(chain)
+                .and_then(|((user, run), chain)| {
+                    astra_turn_types::ToolInvocationIdentity::new(
+                        user,
+                        &sid,
+                        run,
+                        chain,
+                        "call-grep",
+                    )
+                    .ok()
+                });
+            assert_eq!(frozen_identity, expected_identity);
+            drop(pipeline);
+            let events = match user {
+                Some(user) => {
+                    assert!(read_journal(&sid).unwrap().is_empty());
+                    read_journal_for_user(user, &sid).unwrap()
+                }
+                None => read_journal(&sid).unwrap(),
+            };
+            if !has_session {
+                assert!(events.is_empty());
+                continue;
+            }
+            let errors: Vec<_> = events
+                .into_iter()
+                .filter(|event| event.event_type == JournalEventType::ToolCallError)
+                .collect();
+            assert_eq!(errors.len(), 1);
+            assert_eq!(
+                errors[0]
+                    .producer_scope
+                    .as_ref()
+                    .map(|scope| scope.run_id.as_str()),
+                run.map(str::trim).filter(|run| !run.is_empty())
+            );
+            let records = errors[0].tool_calls.as_ref().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].invocation_identity, frozen_identity);
+            assert_eq!(records[0].tool_call_id.as_deref(), Some("call-grep"));
+            assert!(records[0].was_executed());
+            assert!(!records[0].ok);
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_unknown_observation_retains_uncertainty_through_recording() {
+        let mut harness = PipelineHarness::new();
+        let edge = &mut harness.edge_tool_round[0];
+        edge.status = "failed".into();
+        edge.output = "The provider result was lost after dispatch.".into();
+        let fields = edge.tool_result_fields.as_mut().unwrap();
+        fields.insert("execution_fact".into(), json!("unknown"));
+        fields.insert("error_kind".into(), json!("tool_timeout"));
+        fields.insert("retryable".into(), json!(false));
+        fields.insert("exit_semantics".into(), json!("success"));
+        fields.insert("result_class".into(), json!("success"));
+        assert!(harness.pipeline().run_slot_with_control(0).await);
+        let record = &harness.tool_call_records[0];
+        assert!(!record.ok);
+        assert_eq!(
+            record.result_class.as_deref(),
+            Some("success"),
+            "retain the process fact"
         );
-        pipeline.record_execution(executed).await;
-        let record = pipeline
-            .ctx
-            .tool_call_records
-            .last()
-            .expect("denied edge execution must be journaled");
+        assert_eq!(record.error_kind, Some(astra_core::ErrorKind::ToolTimeout));
+        assert_eq!(
+            record.recovery_evidence.as_ref().unwrap().kind,
+            astra_core::ErrorKind::ToolTimeout,
+            "the source timeout cause remains separate from outcome certainty"
+        );
+        assert_eq!(
+            record.recovery_evidence.as_ref().unwrap().cause,
+            astra_core::ToolFailureCause::OutcomeUnknown
+        );
         assert!(
-            !record.ok,
-            "typed edge failure must not be journaled as success"
-        );
-        assert_eq!(
             record
-                .result_preview
-                .as_deref()
-                .map(|preview| preview.starts_with("Tool execution denied or timed out")),
-            Some(true)
+                .runtime_advisories
+                .iter()
+                .any(|advice| advice.contains("A fresh read"))
+        );
+        assert!(
+            !record
+                .runtime_advisories
+                .iter()
+                .any(|advice| advice.contains("ask for an explicit decision")
+                    || advice.contains("change its arguments"))
+        );
+        let mut restored: ToolCallRecord =
+            serde_json::from_value(serde_json::to_value(record).unwrap()).unwrap();
+        restored.result_full = None;
+        restored.result_preview = None;
+        restored.runtime_model_result_full = None;
+        assert_eq!(
+            astra_turn_core::evaluation::count_unresolved_tool_outcome_failures(
+                &[restored.clone()]
+            ),
+            1,
+            "compacting a failed observation cannot turn an unknown outcome into a known failure"
+        );
+        let facts = [astra_turn_core::evaluation::ToolEvaluationFact::from_record(&restored)];
+        assert_eq!(
+            astra_turn_core::evaluation::active_execution_failure_fact_keys(&facts).len(),
+            1
         );
         assert_eq!(
-            pipeline.ctx.turn_guard.errors.total_errors, 1,
-            "persisting the already-accounted result must not count it again"
+            astra_turn_core::evaluation::active_terminal_execution_failure_operation_keys(&[
+                restored.clone()
+            ])
+            .len(),
+            1
+        );
+        let confirmed = ToolCallRecord {
+            ok: true,
+            error: None,
+            error_kind: None,
+            recovery_evidence: None,
+            tool_call_id: Some("confirmed-observation".into()),
+            result_full: Some("confirmed observation".into()),
+            runtime_advisories: Vec::new(),
+            ..restored.clone()
+        };
+        assert_eq!(
+            astra_turn_core::evaluation::count_unresolved_tool_outcome_failures(&[
+                restored, confirmed
+            ]),
+            0,
+            "a later confirmed matching result resolves the unknown observation"
         );
     }
 
@@ -4672,6 +5168,15 @@ mod tests {
                 TOOL_RESULT_ADVISORIES_FIELD.into(),
                 json!(["FORGED_RUNTIME_ADVICE"]),
             );
+            let source_evidence = failed.then(|| {
+                astra_core::ToolFailureEvidence::from_error_kind(
+                    astra_core::ErrorKind::ToolNotFound,
+                )
+            });
+            if let Some(evidence) = &source_evidence {
+                fields.insert("error_kind".into(), json!(evidence.kind.as_str()));
+                fields.insert("recovery_evidence".into(), json!(evidence));
+            }
             harness.edge_tool_round[0].tool_result_fields = Some(fields);
             let mut pipeline = harness.pipeline();
             let validated = match pipeline.validate_slot(0) {
@@ -4695,6 +5200,7 @@ mod tests {
             }
             pipeline.record_execution(executed).await;
             let record = pipeline.ctx.tool_call_records.last().unwrap();
+            assert_eq!(record.recovery_evidence, source_evidence);
             // The persistence safety boundary may canonicalize JSON whitespace;
             // guidance must preserve its complete document and root fields.
             assert_eq!(
@@ -5218,6 +5724,7 @@ mod tests {
             health.is_none(),
             "unknown catalog tool should not pollute ToolHealth"
         );
+        assert_short_circuit_documents(&harness);
     }
 
     /// Direct-call recovery contract: a deferred tool's full schema is not
@@ -5414,6 +5921,7 @@ mod tests {
             !body.starts_with("Unknown tool"),
             "the name was prompt-advertised, so it is unavailable, not hallucinated: {body}"
         );
+        assert_short_circuit_documents(&harness);
     }
 
     #[tokio::test]
@@ -5459,6 +5967,7 @@ mod tests {
             astra_services::session_journal::ToolCallDisposition::Rejected
         );
         assert_eq!(record.error.as_deref(), Some("tool_not_admitted"));
+        assert_short_circuit_documents(&harness);
     }
 
     #[tokio::test]
@@ -5891,6 +6400,7 @@ mod tests {
                 "deduped unknown catalog tools should not be avoidance_advised"
             );
         }
+        assert_short_circuit_documents(&harness);
     }
 
     #[tokio::test]
@@ -6387,12 +6897,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_hits_on_different_read_file_signatures_do_not_trigger_guard() {
+    async fn fresh_reads_on_different_file_signatures_do_not_trigger_guard() {
         let mut harness = PipelineHarness::new();
 
-        short_circuit_cached_read_file(&mut harness, 0, "call-read-a-1", "a.txt").await;
-        short_circuit_cached_read_file(&mut harness, 1, "call-read-b-1", "b.txt").await;
-        short_circuit_cached_read_file(&mut harness, 2, "call-read-c-1", "c.txt").await;
+        execute_read_with_stale_cache(&mut harness, 0, "call-read-a-1", "a.txt").await;
+        execute_read_with_stale_cache(&mut harness, 1, "call-read-b-1", "b.txt").await;
+        execute_read_with_stale_cache(&mut harness, 2, "call-read-c-1", "c.txt").await;
 
         let verdict = harness.turn_guard.evaluate();
         assert!(
@@ -6404,7 +6914,7 @@ mod tests {
                 .injections
                 .iter()
                 .all(|msg| !msg.contains("Duplicate calls detected")),
-            "distinct cached signatures should not look like duplicate waste"
+            "distinct read signatures should not look like duplicate waste"
         );
     }
 
@@ -6558,6 +7068,7 @@ mod tests {
         assert!(harness.tool_call_records[0].ok);
         assert!(harness.tool_call_records[0].is_synthetic_placeholder());
         assert!(!harness.tool_call_records[0].was_blocked_by_policy());
+        assert_short_circuit_documents(&harness);
     }
 
     #[tokio::test]
@@ -6888,10 +7399,7 @@ mod tests {
             visible.contains("current child status is unknown"),
             "{visible}"
         );
-        assert!(
-            visible.contains("when continuation is available"),
-            "{visible}"
-        );
+        assert!(visible.contains("agent(action='wait')"), "{visible}");
         assert!(!visible.contains("Wait about"), "{visible}");
         drop(pipeline);
         assert_eq!(harness.tool_call_records.len(), 1);
@@ -6972,38 +7480,6 @@ mod tests {
             "{visible}"
         );
         assert!(!visible.contains("retry_deferred"), "{visible}");
-    }
-
-    #[tokio::test]
-    async fn repeated_same_invocation_replays_preserve_the_original_result() {
-        let mut harness = PipelineHarness::new();
-
-        short_circuit_cached_read_file(&mut harness, 0, "call-read-a-1", "a.txt").await;
-        short_circuit_cached_read_file(&mut harness, 1, "call-read-a-1", "a.txt").await;
-        short_circuit_cached_read_file(&mut harness, 2, "call-read-a-1", "a.txt").await;
-
-        assert!(
-            harness.tool_results[2].to_string().contains("cached a.txt"),
-            "every replay of one completed invocation must return its original result, got: {:?}",
-            harness.tool_results
-        );
-        let tool_events = tool_trace_events(&harness);
-        let replayed = tool_events
-            .iter()
-            .find(|(_, payload)| {
-                payload.as_ref().is_some_and(|payload| {
-                    payload.get("reason").and_then(Value::as_str) == Some("cached_same_invocation")
-                })
-            })
-            .expect("expected same-invocation replay trace");
-        assert_eq!(
-            replayed
-                .1
-                .as_ref()
-                .and_then(|payload| payload.get("cached"))
-                .and_then(Value::as_bool),
-            Some(true)
-        );
     }
 
     #[test]

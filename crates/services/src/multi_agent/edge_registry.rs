@@ -376,6 +376,11 @@ impl std::fmt::Display for HeartbeatError {
 
 #[async_trait]
 pub trait EdgeRegistryService: Send + Sync {
+    /// Whether registry lookups own cross-process routing. An explicitly
+    /// unconfigured single-process registry has no durable route to consult.
+    fn has_durable_routing(&self) -> bool {
+        true
+    }
     #[allow(clippy::too_many_arguments)]
     async fn register_or_update(
         &self,
@@ -1180,7 +1185,7 @@ impl DatabaseEdgeRegistryService {
                 "SELECT {EDGE_AGENT_RECORD_COLUMNS}, registration_state \
                  FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?"
             );
-            let row = sqlx::query(&lookup_sql)
+            let row = sqlx::query(sqlx::AssertSqlSafe(lookup_sql))
                 .bind(user_id)
                 .bind(edge_agent_id)
                 .fetch_optional(&mut *transaction)
@@ -1836,7 +1841,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                AND ((? IS NOT NULL AND workspace_id = ?) OR (? IS NULL AND workspace_id IS NULL)) \
              ORDER BY last_heartbeat_at DESC LIMIT 1"
         );
-        let row = sqlx::query(&lookup_sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(lookup_sql))
             .bind(edge_agent_id)
             .bind(workspace_id)
             .bind(workspace_id)
@@ -1862,7 +1867,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                AND ((? IS NOT NULL AND workspace_id = ?) OR (? IS NULL AND workspace_id IS NULL)) \
              LIMIT 1"
         );
-        let row = sqlx::query(&lookup_sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(lookup_sql))
             .bind(user_id)
             .bind(edge_agent_id)
             .bind(workspace_id)
@@ -1881,7 +1886,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
              WHERE user_id = ? AND registration_state = 1 \
              ORDER BY last_heartbeat_at DESC"
         );
-        let rows = sqlx::query(&list_sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(list_sql))
             .bind(user_id)
             .fetch_all(&self.pool)
             .await
@@ -1906,7 +1911,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                AND CHAR_LENGTH(TRIM(worktree_path)) > 0 \
              ORDER BY edge_agent_id ASC LIMIT ?"
         );
-        let rows = sqlx::query(&list_sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(list_sql))
             .bind(user_id)
             .bind(i64::from(limit.clamp(1, 100)))
             .fetch_all(&self.pool)
@@ -1920,6 +1925,9 @@ pub struct UnconfiguredEdgeRegistryService;
 
 #[async_trait]
 impl EdgeRegistryService for UnconfiguredEdgeRegistryService {
+    fn has_durable_routing(&self) -> bool {
+        false
+    }
     /// When no cross-pod registry is configured (single-pod deployment), edge
     /// registration is a successful no-op: the connection is tracked in the
     /// in-memory pool and there is no cross-pod source of truth to fail. This is

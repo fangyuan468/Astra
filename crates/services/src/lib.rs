@@ -1,20 +1,15 @@
 pub mod admin;
 pub mod admin_config;
 pub mod agent_bindings;
-pub mod agent_lessons;
-pub mod agents;
 pub mod artifact_policy;
 pub mod auth;
 pub mod byok_endpoint;
 mod cancellation_safe_db;
+pub mod chatgpt;
 pub(crate) use cancellation_safe_db::CancellationSafeTransaction;
 pub use cancellation_safe_db::{CancellationSafePoolConnection, TransactionConnection};
-pub mod context;
-pub mod context_manifest;
 pub mod coordination;
-pub mod data_versioning;
 pub mod db_row;
-pub mod decisions;
 pub mod edge_context;
 pub mod event_ingestion;
 pub mod events;
@@ -26,7 +21,6 @@ pub mod introspection;
 pub mod judgment_presentation;
 pub mod llm_trusted_domains;
 pub mod marketplace;
-pub mod marketplace_stats;
 pub mod mcp_registry;
 pub mod model_request_context;
 pub mod model_routing;
@@ -34,8 +28,6 @@ pub mod models;
 pub mod multi_agent;
 pub mod observation_capture;
 pub mod pagination;
-pub mod personal_skills;
-pub mod prompt_delta;
 pub mod reflect;
 pub(crate) mod registry_payload;
 pub use registry_payload::validate_registered_endpoint_url;
@@ -43,7 +35,6 @@ pub mod delegation_model_requirement;
 pub mod resource_governor;
 pub mod runs;
 pub mod runtime_maintenance;
-pub mod sandbox;
 pub mod self_surface;
 pub mod semantic_judgment_observation;
 pub mod semantic_read_observation_store;
@@ -66,12 +57,10 @@ pub mod skill_auto_route_judge;
 pub mod skill_config;
 pub mod skills;
 pub mod snapshot_sql;
-pub mod state_projection;
 pub mod state_sync;
 pub mod storage;
 pub mod sync_outbox;
 pub mod tool_invocation_ledger;
-pub mod tuning;
 pub mod turn_intent_judge;
 pub mod verification;
 pub mod weighted_admission;
@@ -126,15 +115,6 @@ pub use agent_bindings::{
     InMemoryAgentBindingService, UnconfiguredAgentBindingService, validate_agent_binding_create,
     validate_agent_binding_payload,
 };
-pub use agent_lessons::{
-    Lesson, LessonHint, LessonKind, MAX_LESSON_ACTION_CHARS, MIN_LESSON_ACTION_CHARS,
-    MIN_LESSON_ACTION_WORDS, NewLesson, SCRATCHPAD_LOWERCASE_PHRASES, is_action_prompt_worthy,
-    memory_value_to_lesson_hint, sanitize_for_prompt,
-};
-pub use agents::{
-    AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,
-    AgentUpdateRequestData, DatabaseAgentService, UnconfiguredAgentService,
-};
 pub use artifact_policy::{
     PresignedArtifactDownload, artifact_download_signature, build_presigned_artifact_download,
 };
@@ -144,38 +124,21 @@ pub use astra_core::composite_snapshot::{
 pub use auth::{
     AuthLoginRequestData, AuthPrincipal, AuthPrincipalOrigin, AuthProviderAuthorizedRequestContext,
     AuthRefreshRequestData, AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord,
-    DatabaseAdminAuditReader, DatabaseAdminAuthorizer, DatabaseAdminInitializer,
-    DatabaseAdminTokenReader, DatabaseAdminTokenWriter, DatabaseAdminUserRoleManager,
-    DatabaseAuthService, DatabaseSessionService, EdgeTokenBinding, ExternalAuthProviderConfig,
+    BrowserSessionCreated, BrowserSessionRequest, DatabaseAdminAuditReader,
+    DatabaseAdminAuthorizer, DatabaseAdminInitializer, DatabaseAdminTokenReader,
+    DatabaseAdminTokenWriter, DatabaseAdminUserRoleManager, DatabaseAuthService,
+    DatabaseSessionService, EdgeTokenBinding, ExternalAuthProviderConfig,
     ExternalAuthorizeRequestData, ExternalAuthorizedRequest, ExternalCatalogResponse,
     ExternalProviderClient, ExternalRequestDescriptor, ExternalRuntimeContextRequestData,
     ExternalRuntimeContextResponse, FernetTokenEncryptor, HttpExternalProviderClient,
     ProviderRequestDescriptor, ProviderSessionCreationIdentity, ReauthenticationProofRecord,
-    ReauthenticationPurpose, ReauthenticationRequestData, SessionCreateRequestData,
-    SessionCreationResult, SessionListFilter, SessionListRecord, SessionRecord, SessionService,
-    SessionUpdateRequestData,
-};
-pub use context::{
-    ContextService, DatabaseContextService, SnapshotCreateRequestData, SnapshotListFilter,
-    SnapshotListItem, SnapshotListRecord, SnapshotRecord, UnconfiguredContextService,
-};
-pub use context_manifest::{
-    BENCHMARK_TOOL_PREVIEW_BUDGET, BUDGET_V1_8K_PROMPT_CAP, BUDGET_V1_8K_TOTAL_CAP, BudgetV1_8k,
-    CONTEXT_MANIFEST_REASONS, ContextManifestError, ContextManifestItemWrite, ContextManifestWrite,
-    DatabaseContextManifestStore, RECENT_TAIL_BENCHMARK_FLOOR, RetrievalStage,
-    TURN_INTENT_BENCHMARK_COMPARISON, TurnIntentBudgetAllocation, artifact_id_from_raw_ref,
-    budget_for_turn_intent, expired_artifact_placeholder,
+    ReauthenticationPurpose, ReauthenticationRequestData, RequestAuthMechanism, RequestAuthResult,
+    SessionCreateRequestData, SessionCreationResult, SessionListFilter, SessionListRecord,
+    SessionRecord, SessionService, SessionUpdateRequestData,
 };
 pub use coordination::{
     AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, AggregationStrategy,
     CoordinationPattern, DelegationRequest, DelegationResult, aggregate_results,
-};
-pub use data_versioning::{
-    DataVersioningService, DatabaseDataVersioningService, UnconfiguredDataVersioningService,
-};
-pub use decisions::{
-    DatabaseDecisionService, DecisionCreateRequestData, DecisionListFilter, DecisionListRecord,
-    DecisionRecord, DecisionService, DecisionWithContextRecord, UnconfiguredDecisionService,
 };
 pub use edge_context::{EdgeContext, EdgeProfile, EdgeSkillRef};
 pub use events::{
@@ -184,22 +147,20 @@ pub use events::{
 };
 pub use execution_grant::{ExecutionGrantError, ExecutionGrantSigner};
 pub use inference_execution::{
-    AuxiliaryExecutionAttemptFact, InferenceCanonicalTransitionReceipt,
-    InferenceInvocationAdmissionResolution, InferenceInvocationInput, InferenceInvocationPlan,
-    InferenceInvocationTerminal, InferenceOwnerLeaseRenewal, InferenceProviderAttemptPlan,
-    InferenceProviderDeliveryState, InferenceProviderWireIdentity, InferenceRunAdmissionAuthority,
-    InferenceScopeRejection, InferenceSettlementReconcileOutcome, InferenceTerminalStatus,
-    InferenceUsage, InferenceUsageStatus, SessionAuxiliaryUsageCapture, admit_inference_invocation,
+    AuxiliaryExecutionAttemptFact, InferenceInvocationAdmissionResolution,
+    InferenceInvocationInput, InferenceInvocationPlan, InferenceInvocationTerminal,
+    InferenceOwnerLeaseRenewal, InferenceProviderAttemptPlan, InferenceProviderDeliveryState,
+    InferenceProviderWireIdentity, InferenceRunAdmissionAuthority, InferenceScopeRejection,
+    InferenceSettlementReconcileOutcome, InferenceTerminalStatus, InferenceUsage,
+    InferenceUsageStatus, SessionAuxiliaryUsageCapture, admit_inference_invocation,
     admit_inference_invocation_with_first_provider_attempt, begin_inference_provider_attempt,
     declare_inference_attempt_settlement, declare_inference_settlement,
     finish_inference_invocation, finish_inference_provider_attempt,
-    finish_successful_inference_provider_attempt_and_invocation,
-    load_inference_canonical_transitions_for_session, load_session_auxiliary_capture,
+    finish_successful_inference_provider_attempt_and_invocation, load_session_auxiliary_capture,
     next_inference_logical_attempt_pair_base, plan_inference_invocation,
     plan_inference_provider_attempt, plan_inference_provider_attempt_with_context,
     reconcile_inference_settlement, reconcile_inference_settlements,
-    renew_inference_invocation_owner, retire_inference_canonical_transitions_through_turn,
-    settle_uncertain_inference_admission,
+    renew_inference_invocation_owner, settle_uncertain_inference_admission,
 };
 pub use interaction_contract::{
     InteractionContract, InteractionDurableStore, InteractionIdentity, InteractionKind,
@@ -216,16 +177,10 @@ pub use llm_trusted_domains::{
 pub use marketplace::{
     DatabaseMarketplaceService, MarketplaceService, UnconfiguredMarketplaceService,
 };
-pub use marketplace_stats::{
-    DatabaseMarketplaceStatsService, MarketplaceStatsService, NoopMarketplaceStatsService,
-    QualityReportData, SkillMarketplaceStats, SkillSearchQuery, SkillSearchResponse,
-    SkillSearchResult,
-};
 pub use mcp_registry::{
-    DatabaseMcpRegistryService, McpBindingRequestData, McpDiscoveredToolData, McpRegisterRecord,
-    McpRegisterRequestData, McpRegisteredBindingRecord, McpRegisteredToolRecord,
-    McpRegistryService, McpServerRequestData, UnconfiguredMcpRegistryService,
-    mcp_binding_tool_namespace, mcp_schema_hash,
+    DatabaseMcpRegistryService, McpBindingRequestData, McpRegisterRecord, McpRegisterRequestData,
+    McpRegisteredBindingRecord, McpRegisteredToolRecord, McpRegistryService, McpServerRequestData,
+    UnconfiguredMcpRegistryService, mcp_binding_tool_namespace,
 };
 pub use model_request_context::{
     MODEL_REQUEST_CONTEXT_SCHEMA, ModelRequestBudget, ModelRequestCache, ModelRequestCompaction,
@@ -265,19 +220,6 @@ pub use pagination::{
     MAX_ADMIN_AUDIT_LOG_LIMIT, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, clamp_admin_audit_limit,
     clamp_api_list_pagination,
 };
-pub use personal_skills::{
-    ActivateUserSkillVersion, ActivePersonalSkillRecord, CreateUserSkillSource,
-    DatabasePersonalSkillStore, PersonalSkillError, RecordUserSkillEvaluation,
-    SKILL_MD_NORMALIZE_VERSION, SubmitUserSkillVersion, UserSkillEvaluationRecord,
-    UserSkillSourceRecord, UserSkillVersionRecord, normalize_skill_md, skill_md_content_hash,
-};
-pub use prompt_delta::{
-    PromptDeltaCounts, PromptRequestObservability, PromptRequestPersistInput,
-    PromptRequestPersistResult, PromptRequestPlan, PromptRequestPlanInput,
-    count_prompt_requests_for_run, count_prompt_requests_for_session,
-    load_latest_prompt_observability_for_run, load_latest_prompt_observability_for_session,
-    persist_prompt_request, plan_prompt_request,
-};
 pub use reflect::{
     DatabaseReflectService, ReflectReport, ReflectService, UnconfiguredReflectService,
 };
@@ -289,10 +231,6 @@ pub use runs::{
     WorkItemRuntimeBindingRequest, WorkRuntimeBindingRequest, extract_event_type,
     run_list_cursor_db_updated_at, run_list_cursor_run_id, transform_run_event_for_client,
     validate_run_list_limit,
-};
-pub use sandbox::{
-    DatabaseSandboxService, SandboxCreateRequestData, SandboxRecord, SandboxService,
-    UnconfiguredSandboxService,
 };
 pub use self_surface::{
     AcceptanceSurface, BudgetState, BudgetSurface, CapabilitySurface, EnvironmentSurface,
@@ -325,7 +263,8 @@ pub use session_context_coordinator::{
     TransferWriterOutcome, WriterTransferConflictV1, WriterTransferRequestV1,
 };
 pub use session_fork_coordinator::{
-    DatabaseSessionForkCoordinator, PrepareSessionForkV1, SessionForkCoordinatorError,
+    DatabaseSessionForkCoordinator, PrepareSessionForkV1, SessionForkContinuationV1,
+    SessionForkCoordinatorError,
 };
 pub use session_handoff::{
     AttachSessionOutcomeV1, AttachSessionRequestV1, ClaimSessionControllerOutcomeV1,
@@ -346,13 +285,11 @@ pub use skills::{
     DatabaseSkillService, SkillPublishRequestData, SkillRecord, SkillService,
     UnconfiguredSkillService,
 };
-pub use state_projection::{
-    DatabaseStateProjectionStore, StateProjectionError, UserAnchorMemoryItem,
-};
 pub use state_sync::MatrixOneSyncService;
 pub use storage::{
-    CleanupResult, RetentionPolicy, cleanup_expired_data, database_user_from_row,
-    ensure_core_schema, log_session_audit, resolve_active_skill_versions, session_record_from_row,
+    CleanupResult, RefreshCleanupBatch, RefreshCleanupStatus, RetentionPolicy,
+    cleanup_expired_data, cleanup_refresh_session_batch, database_user_from_row,
+    ensure_core_schema, log_session_audit, session_record_from_row,
 };
 pub use sync_outbox::{
     SYNC_OUTBOX_ACK_TOMBSTONE_RETAINED_RECORDS, SYNC_OUTBOX_ACKED_RETAINED_RECORDS,
@@ -374,9 +311,8 @@ pub use verification::{
     VerificationCriterion, VerificationResult, VerificationRunner, VerifierKind,
 };
 pub use weighted_admission::{
-    AdmissionWork, DatabaseWeightedAdmissionController, DistributedAdmissionError,
-    DistributedAdmissionPermit, DistributedAdmissionReservation, WeightedAdmissionController,
-    WeightedAdmissionError, WeightedAdmissionLimits, WeightedAdmissionPermit,
+    AdmissionWork, WeightedAdmissionController, WeightedAdmissionError, WeightedAdmissionLimits,
+    WeightedAdmissionPermit,
 };
 pub use workspace_records::{
     DatabaseWorkspaceRecordStore, InMemoryWorkspaceRecordStore, WorkspaceCleanupDebtEntry,

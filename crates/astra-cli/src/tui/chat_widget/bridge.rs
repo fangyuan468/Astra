@@ -20,6 +20,7 @@ pub(crate) struct TurnContext {
     pub cache_creation_tokens: Option<u64>,
     pub model_name: Option<String>,
     pub auxiliary_summary: Option<String>,
+    pub input_usage_complete: bool,
     pub usage_partial: bool,
     pub tools: u32,
     pub cumulative_tokens: Option<u64>,
@@ -37,6 +38,7 @@ impl TurnContext {
             cache_creation_tokens: self.cache_creation_tokens,
             model_name: self.model_name,
             auxiliary_summary: self.auxiliary_summary,
+            input_usage_complete: self.input_usage_complete,
             usage_partial: self.usage_partial,
             tools: self.tools,
             cumulative_tokens: self.cumulative_tokens,
@@ -169,6 +171,7 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
         TuiAppEvent::RunBound(run_id) => Some(AppEvent::wire(WireEvent::RunBound(run_id))),
         // Bottom-pane-only events — ChatWidget doesn't care.
         TuiAppEvent::ContextWindowPolicy { .. }
+        | TuiAppEvent::RunModelOutcome { .. }
         | TuiAppEvent::SessionBound(_)
         | TuiAppEvent::WorkTaskBoardUpdate(_)
         | TuiAppEvent::ContextWindowEstimated(_)
@@ -186,6 +189,8 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
         | TuiAppEvent::ClientUpdateNotice(_)
         | TuiAppEvent::UserIntentApplied { .. }
         | TuiAppEvent::UserIntentReturned { .. }
+        | TuiAppEvent::ObservedUserIntent { .. }
+        | TuiAppEvent::ScopedAgentLive { .. }
         | TuiAppEvent::PermissionAutoApproved { .. } => None,
     }
 }
@@ -283,6 +288,7 @@ mod tests {
             cache_creation_tokens: None,
             model_name: None,
             auxiliary_summary: None,
+            input_usage_complete: false,
             usage_partial: false,
             tools: 2,
             cumulative_tokens: Some(250),

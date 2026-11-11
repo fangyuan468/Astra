@@ -90,14 +90,13 @@ contract and its tests live in [`scripts/ci/`](scripts/ci/).
 The frozen MOI consumer compatibility test runs independently of this routing
 on every Test Suite run. The required online core aggregate also requires that
 fresh-database journey to pass; see the testing guide for its exact scope.
-The Terminal-Bench fresh-database contract derives admission gate names and
-cardinality from the source-owned partition count and scope formatter. It
-requires the exact ordered gate inventory; missing, duplicate, legacy or
-unknown rows and unsupported source declarations fail closed.
 
-CLI tests build and run their complete inventory once, after building the
-standalone mock MCP server. Five protected check labels require that same
-completed job; they do not repeat setup, builds, archive downloads, or tests.
+CLI tests build and run all library/binary unit tests plus the offline
+`cli_pipe`, `process_supervisor`, `shell_execution_boundaries`, and
+`cli_mcp_setup` integration
+targets once, after building the standalone mock MCP server. Five protected
+check labels require that same completed job; they do not repeat setup, builds,
+archive downloads, or tests.
 Failed, cancelled, or unexpectedly skipped required execution fails closed.
 Caches retain existing trust boundaries, and ordinary fork PR tests run without
 privileged access. The separate optional live-model regression grants provider
@@ -111,10 +110,26 @@ The three ignored production-supervisor smokes use one additional nextest
 invocation, with exact names and separate serial test processes. They use the
 strict profile without retries, preserving the complete inventory's CI JUnit
 file and avoiding three separate Cargo test builds.
-On macOS, the default terminal-reader lane also runs the CLI Bash regression
-using its existing default-feature test executable. Tools lint and serial
-workspace-coordination tests remain parallel; the protected coordination check
-requires both paths to succeed. Feature-specific terminal tests remain separate.
+On macOS, the default terminal-reader lane runs the CLI Bash regression using
+its existing test executable. PR authors in a static contributor ID allowlist
+can attempt one self-hosted ARM bundle for default PTY/Bash, workspace coordination and
+the native Mio readiness regression.
+Main pushes default to hosted; operators may enable a separate isolated main
+runner with `ASTRA_MACOS_MAIN_ENABLED=1`. Develop pushes and release builds
+remain hosted. The PR mini shares a persistent account and toolchain and must
+never serve as the main runner.
+An IDC route gets a 60-minute queue/discovery budget and never switches to
+paid hosted Macs automatically. Queue, setup and control failures fail the
+required checks; fix the cause and **Re-run all jobs** to create a fresh attempt.
+If only Linux work failed, **Re-run failed jobs** reuses the successful Mac
+producer for the same run and tested SHA.
+Other known authors and default-hosted pushes use one Mac bundle that shares
+checkout, toolchain setup and Cargo artifacts across the native checks. Full
+production reflow, dev-tty and portable vendored units stay on Linux. Linux
+execution starts independently. The ordinary workflow retains required checks
+and fork approval; no App or custom check source is needed.
+See [runner operations](docs/guides/repository-automation.md#self-hosted-macos-tests)
+for dispatch bootstrap, budgets, queueing and rollback.
 The lint gate retains restored artifacts; age-based cleanup is not a lint prerequisite.
 
 For fork pull requests, an update may require maintainer approval before the

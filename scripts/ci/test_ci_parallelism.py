@@ -2,7 +2,6 @@
 """Exercise CI gates and the real Makefile's online shard dispatch offline."""
 
 import json
-from itertools import product
 import os
 import re
 import shlex
@@ -14,12 +13,12 @@ import tomllib
 import unittest
 
 from test_release_build_shells import workflow_run_script
+from ci_scope import classify, select_macos_runner
 
 
 ROOT = Path(__file__).resolve().parents[2]
 SHARDS = {
     "core-runtime": "astra-runtime",
-    "core-turn-core": "astra-turn-core",
     "core-services": "astra-services",
 }
 
@@ -68,7 +67,7 @@ sys.exit(17 if sys.argv[1] == os.environ["FAIL_COMMAND"] else 0)
                         "nextest run --locked -p astra-cli --lib --profile strict "
                         "--run-ignored only --test-threads 1 --retries 0 -- --exact"
                     ) + expected_tests)
-                    self.assertEqual(supervisor, str(fixture / "target/debug/astra"))
+                    self.assertEqual(Path(supervisor).resolve(), (fixture / "target/debug/astra").resolve())
         # The smoke profile must not overwrite the full inventory's CI JUnit file.
         config = tomllib.loads((ROOT / ".config/nextest.toml").read_text())
         self.assertNotIn("junit", config["profile"]["default"])
@@ -82,9 +81,6 @@ sys.exit(17 if sys.argv[1] == os.environ["FAIL_COMMAND"] else 0)
             "non-edge", "edge-shell", "edge-fs-tools", "edge-git-gix", "edge-rest",
         })
         self.assertIn('name: "Test: astra-cli (${{ matrix.segment }})"', self.consumer)
-        command = re.search(r"- name: Test complete CLI inventory\n\s+run: ([^\n]+)", self.producer).group(1)
-        self.assertEqual(command,
-                         "cargo nextest run --locked -p astra-cli --lib --bins --profile ci")
 
     def test_required_labels_reject_failed_cancelled_or_missing_test_result(self):
         gate = self.consumer.split("      - name: Require complete CLI test result\n", 1)[1].split("      - ", 1)[0]
@@ -119,22 +115,125 @@ sys.exit(17 if sys.argv[1] == os.environ["FAIL_COMMAND"] else 0)
         self.assertIn("cancel-in-progress: true", self.workflow)
 
 
+class MacRunnerTests(unittest.TestCase):
+    def test_paid_mac_has_one_explicit_producer_and_linux_is_independent(self):
+        workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        for job in ("vendored-terminal", "terminal-pty-shards", "test-online"):
+            header = workflow.split(f"\n  {job}:\n", 1)[1].split("    steps:\n", 1)[0]
+            self.assertIn("needs: scope", header)
+            self.assertIn("runs-on: ubuntu-latest", header)
+            self.assertNotIn("macos-plan", header)
+        hosted = workflow.split("\n  macos-hosted:\n", 1)[1].split("\n  vendored-terminal-macos:", 1)[0]
+        header = hosted.split("    steps:\n")[0]
+        self.assertIn("needs.scope.result == 'success'", header)
+        self.assertIn("needs.scope.outputs.macos_runner == '[\"macos-15\"]'", header)
+        self.assertNotIn("macos-plan", header)
+        self.assertNotIn("matrix:", hosted)
+        self.assertEqual(hosted.count("run-macos-lanes.sh all"), 1)
+        self.assertEqual(workflow.count("runs-on: macos-15"), 1)
+        for job in ("vendored-terminal-macos", "terminal-pty-shards-macos", "macos-workspace-coordination-tests"):
+            section = re.split(r"\n  (?=\S)", workflow.split(f"\n  {job}:\n", 1)[1], maxsplit=1)[0]
+            dependencies = ("scope, macos-plan, macos-hosted, terminal-pty-shards, vendored-terminal"
+                            if job == "macos-workspace-coordination-tests"
+                            else "scope, macos-workspace-coordination-tests")
+            self.assertIn(f"needs: [{dependencies}]", section)
+            self.assertIn("runs-on: ubuntu-latest", section)
+            self.assertNotIn("uses:", section)
+        self.assertNotIn("pull_request_target:", workflow)
+
+    def test_bundle_identity_writes_three_github_output_fields(self):
+        script = workflow_run_script(".github/workflows/test.yml", "Record completed bundle identity")
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            result = subprocess.run(["bash", "-c", script], env={**os.environ,
+                "GITHUB_OUTPUT": str(output), "GITHUB_RUN_ID": "1",
+                "GITHUB_RUN_ATTEMPT": "2", "GITHUB_SHA": "a" * 40}, capture_output=True)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(dict(line.split("=", 1) for line in output.read_text().splitlines()),
+                             {"run_id": "1", "attempt": "2", "sha": "a" * 40})
+
+    def test_unaffected_scope_needs_no_mac_route_or_execution(self):
+        scopes = classify(["docs/README.md"])
+        self.assertFalse(scopes["test_macos"])
+        self.assertEqual(select_macos_runner("pull_request", {}), [])
+        workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        for job in ("macos-plan", "macos-hosted", "vendored-terminal-macos",
+                    "terminal-pty-shards-macos", "macos-workspace-coordination-tests"):
+            header = workflow.split(f"\n  {job}:\n", 1)[1].split("    runs-on:", 1)[0]
+            comparison = "== 'true'" if job in ("macos-plan", "macos-hosted") else "!= 'false'"
+            self.assertIn(f"needs.scope.outputs.test_macos {comparison}", header)
+        script = workflow_run_script(".github/workflows/test.yml", "Require macOS coordination and CLI execution")
+        result = subprocess.run(["bash", "-c", script], env={**os.environ,
+            "SHARDS_REQUIRED": "false", "MACOS_REQUIRED": "false", "COORDINATION_RESULT": "skipped",
+            "TERMINAL_RESULT": "skipped", "MACOS_TERMINAL_RESULT": "skipped", "VENDOR_RESULT": "skipped"}, capture_output=True)
+        self.assertEqual(result.returncode, 0)
+
+    def test_mac_result_reuses_same_frozen_success_and_rejects_invalid_proofs(self):
+        script = workflow_run_script(".github/workflows/test.yml", "Require current macOS bundle")
+        base = {"SCOPE_RESULT": "success", "LINUX_TERMINAL_RESULT": "success", "LINUX_VENDOR_RESULT": "success",
+            "MINI_JOB_RESULT": "success", "MINI_RESULT": "success",
+            "MINI_RUN_ID": "1", "MINI_ATTEMPT": "2", "MINI_SHA": "abc", "HOSTED_JOB_RESULT": "skipped",
+            "HOSTED_RUN_ID": "1", "HOSTED_ATTEMPT": "2", "HOSTED_SHA": "abc",
+            "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_SHA": "abc"}
+        for route in ('["self-hosted","macOS","ARM64","mac-arm64-mini"]',
+                      '["self-hosted","macOS","ARM64","mac-arm64-main"]', '["macos-15"]', '', '[]', '["other"]'):
+            env = {**base, "MACOS_ROUTE": route}
+            valid = route not in ('', '[]', '["other"]')
+            hosted = route == '["macos-15"]'
+            if hosted:
+                env.update(MINI_JOB_RESULT="skipped", HOSTED_JOB_RESULT="success")
+            variants = [({}, valid)]
+            for key in ("SCOPE_RESULT", "LINUX_TERMINAL_RESULT", "LINUX_VENDOR_RESULT", "HOSTED_JOB_RESULT" if hosted else "MINI_JOB_RESULT"):
+                variants.extend(({key: value}, False) for value in ("failure", "cancelled", "skipped", ""))
+            prefix = "HOSTED" if hosted else "MINI"
+            for key in (f"{prefix}_RUN_ID", f"{prefix}_SHA"):
+                variants.extend(({key: value}, False) for value in ("", "wrong"))
+            variants.extend(({f"{prefix}_ATTEMPT": value}, False) for value in ("", "wrong", "0", "-1", "01", "3", "9" * 40))
+            variants.extend([
+                ({f"{prefix}_ATTEMPT": "1", "LINUX_TERMINAL_RESULT": "failure"}, False),
+                ({f"{prefix}_ATTEMPT": "1"}, valid),
+                ({f"{prefix}_ATTEMPT": "1", "GITHUB_SHA": "changed"}, False),
+            ])
+            if not hosted:
+                variants.extend(({"MINI_RESULT": value}, False) for value in ("failure", "unavailable", "obsolete", ""))
+            variants.append(({"MINI_JOB_RESULT" if hosted else "HOSTED_JOB_RESULT": "success"}, False))
+            for changes, expected in variants:
+                with self.subTest(route=route, changes=changes):
+                    result = subprocess.run(["bash", "-c", script], env={**os.environ, **env, **changes}, capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, expected, result.stderr)
+
+    def test_mac_aliases_forward_only_the_canonical_result(self):
+        workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        self.assertEqual(workflow.count('case "$MACOS_ROUTE" in'), 1)
+        for job in ("vendored-terminal-macos", "terminal-pty-shards-macos"):
+            section = re.split(r"\n  (?=\S)", workflow.split(f"\n  {job}:\n", 1)[1], maxsplit=1)[0]
+            script = section.split('        run: ', 1)[1].strip()
+            for status in ("success", "failure", "cancelled", "skipped", ""):
+                with self.subTest(job=job, status=status):
+                    result = subprocess.run(["bash", "-c", script], env={**os.environ, "RESULT": status}, capture_output=True)
+                    self.assertEqual(result.returncode == 0, status == "success")
+
+
 class ParallelGateTests(unittest.TestCase):
     def test_shard_gates_reject_failure_cancellation_and_unexpected_skip(self):
-        for step, variables in (
-            ("Require terminal PTY shards", ("SHARDS_RESULT",)),
-            ("Require macOS coordination and CLI execution", ("COORDINATION_RESULT", "TERMINAL_RESULT")),
+        for step, variables, mac_variables in (
+            ("Require terminal PTY shards", ("SHARDS_RESULT", "MACOS_RESULT"), {"MACOS_RESULT"}),
+            ("Require macOS coordination and CLI execution", ("COORDINATION_RESULT", "TERMINAL_RESULT", "MACOS_TERMINAL_RESULT", "VENDOR_RESULT"),
+             {"COORDINATION_RESULT", "MACOS_TERMINAL_RESULT"}),
         ):
             script = workflow_run_script(".github/workflows/test.yml", step)
-            for required in (True, False):
-                for statuses in product(("success", "failure", "cancelled", "skipped", ""), repeat=len(variables)):
-                    with self.subTest(step=step, required=required, statuses=statuses):
-                        result = subprocess.run(["bash", "-c", script], env={
-                            **os.environ, "SHARDS_REQUIRED": str(required).lower(),
-                            **dict(zip(variables, statuses)),
-                        }, capture_output=True, text=True)
-                        expected = all(status == "success" or (not required and status == "skipped") for status in statuses)
-                        self.assertEqual(result.returncode == 0, expected)
+            for linux_required, mac_required in ((True, True), (True, False), (False, False)):
+                baseline = {key: "success" if (mac_required if key in mac_variables else linux_required) else "skipped" for key in variables}
+                for key in variables:
+                    for status in ("success", "failure", "cancelled", "skipped", ""):
+                        statuses = {**baseline, key: status}
+                        with self.subTest(step=step, linux=linux_required, mac=mac_required, statuses=statuses):
+                            result = subprocess.run(["bash", "-c", script], env={
+                                **os.environ, "SHARDS_REQUIRED": str(linux_required).lower(),
+                                "MACOS_REQUIRED": str(mac_required).lower(), **statuses,
+                            }, capture_output=True, text=True)
+                            required = mac_required if key in mac_variables else linux_required
+                            self.assertEqual(result.returncode == 0, status == "success" or (not required and status == "skipped"))
 
     def test_online_gate_requires_all_matrix_jobs_to_succeed(self):
         script = workflow_run_script(".github/workflows/test.yml", "Require online shards")
@@ -154,7 +253,7 @@ class ParallelGateTests(unittest.TestCase):
             self.assertIn("!cancelled()", header)
             self.assertIn("fail-fast: false", header)
         terminal = workflow.split("\n  terminal-pty:\n", 1)[1].split("\n  terminal-pty-shards:", 1)[0]
-        self.assertIn("needs: [scope, terminal-pty-shards]", terminal)
+        self.assertIn("needs: [scope, terminal-pty-shards, terminal-pty-shards-macos]", terminal)
         self.assertIn("needs.scope.result != 'success'", terminal)
         self.assertIn("needs.scope.outputs.test_cli == 'true'", terminal)
         self.assertIn("needs.scope.outputs.test_core == 'true'", terminal)
@@ -162,14 +261,15 @@ class ParallelGateTests(unittest.TestCase):
         self.assertIn("if: ${{ !cancelled() }}", terminal)
         coordination = workflow.split("\n  macos-workspace-coordination:\n", 1)[1].split("\n  macos-workspace-coordination-tests:", 1)[0]
         self.assertIn('name: "Test: macOS workspace coordination"', coordination)
-        self.assertIn("needs: [scope, macos-workspace-coordination-tests, terminal-pty-shards]", coordination)
+        self.assertIn("needs: [scope, macos-workspace-coordination-tests, terminal-pty-shards, terminal-pty-shards-macos, vendored-terminal]", coordination)
         self.assertIn("needs.scope.result != 'success'", coordination)
         self.assertIn("if: ${{ !cancelled() }}", coordination)
         contracts = workflow.split("\n  macos-workspace-coordination-tests:\n", 1)[1].split("    steps:\n", 1)[0]
-        self.assertIn("needs: scope", contracts)
-        self.assertNotIn("terminal-pty-shards", contracts, "Tools contracts must not wait for the CLI build")
+        self.assertIn("needs: [scope, macos-plan, macos-hosted, terminal-pty-shards, vendored-terminal]", contracts)
+        hosted = workflow.split("\n  macos-hosted:\n", 1)[1].split("    steps:\n", 1)[0]
+        self.assertNotIn("terminal-pty-shards", hosted, "Actual Mac work starts independently; only adapters wait for portable coverage")
         online = workflow.split("\n  test-online:\n", 1)[1]
-        self.assertIn("lane: [core-runtime, core-turn-core, core-services, integration]", online)
+        self.assertIn("lane: [core-runtime, core-services, integration]", online)
         self.assertIn("matrix.lane != 'integration' && needs.scope.outputs.online_core == 'true'", online)
         self.assertIn("matrix.lane == 'integration' && needs.scope.outputs.online_integration == 'true'", online)
         self.assertIn('ASTRA_ONLINE_LANE: ${{ matrix.lane }}', online)
@@ -246,7 +346,7 @@ sys.exit(1 if kind == "cargo" and os.environ["ASTRA_CI_FAIL_PACKAGE"] in args el
 
     def test_shards_cover_combined_core_with_identical_test_selections(self):
         combined = self.cargo_calls("core")
-        self.assertEqual(len(combined), 3)
+        self.assertEqual(len(combined), len(SHARDS))
         split = []
         for lane, package in SHARDS.items():
             with self.subTest(lane=lane):
@@ -260,9 +360,10 @@ sys.exit(1 if kind == "cargo" and os.environ["ASTRA_CI_FAIL_PACKAGE"] in args el
                 self.assertEqual(call["args"][call["args"].index("--profile") + 1], "strict-online-ci")
                 if package == "astra-services":
                     self.assertEqual(call["test_database"], call["database"])
+                    self.assertEqual(call["args"][call["args"].index("--features") + 1], "e2e-hooks")
                 split.append(call)
         self.assertEqual([row["args"] for row in split], [row["args"] for row in combined])
-        self.assertEqual(len({row["database"] for row in split}), 3)
+        self.assertEqual(len({row["database"] for row in split}), len(SHARDS))
 
     def test_default_all_still_includes_core_and_integration(self):
         expected = self.cargo_calls("core") + self.cargo_calls("integration")
@@ -281,7 +382,7 @@ sys.exit(1 if kind == "cargo" and os.environ["ASTRA_CI_FAIL_PACKAGE"] in args el
     def test_combined_core_keeps_running_remaining_suites_after_failure(self):
         result, records = self.run_lane("core", fail_package="astra-runtime")
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(len([row for row in records if row["kind"] == "cargo"]), 3)
+        self.assertEqual(len([row for row in records if row["kind"] == "cargo"]), len(SHARDS))
 
     def test_each_shard_resets_only_its_own_database(self):
         for lane in (*SHARDS, "integration"):
@@ -300,6 +401,44 @@ sys.exit(1 if kind == "cargo" and os.environ["ASTRA_CI_FAIL_PACKAGE"] in args el
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid ASTRA_ONLINE_LANE", result.stdout)
         self.assertEqual(records, [])
+
+
+class NextIntegrationPrerequisitesTests(unittest.TestCase):
+    def test_selected_integration_lane_builds_web_and_stops_on_failure(self):
+        workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        online = workflow.split("\n  test-online:\n", 1)[1]
+        setup = online.split("      - uses: actions/setup-node@", 1)[1].split("      - name: Run online tests", 1)[0]
+        condition = "if: env.RUN_TESTS == 'true' && matrix.lane == 'integration'"
+        self.assertEqual(setup.count(condition), 3)
+        self.assertIn("node-version-file: .nvmrc", setup)
+        self.assertIn("working-directory: web\n        run: npm exec -- playwright install --with-deps chromium --only-shell", setup)
+        script = workflow_run_script(".github/workflows/test.yml", "Build Web for real Next integration")
+        expected = [
+            ["--prefix", "packages/sdk", "ci", "--ignore-scripts"],
+            ["--prefix", "packages/sdk", "run", "build"],
+            ["--prefix", "web", "ci"],
+            ["--prefix", "web", "run", "build"],
+        ]
+        for fail_at in range(5):
+            with self.subTest(fail_at=fail_at), tempfile.TemporaryDirectory() as directory:
+                fixture = Path(directory)
+                calls = fixture / "calls.jsonl"
+                npm = fixture / "npm"
+                npm.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, sys
+log = pathlib.Path(os.environ["CALLS"])
+with log.open("a") as out:
+    out.write(json.dumps(sys.argv[1:]) + "\\n")
+sys.exit(23 if len(log.read_text().splitlines()) == int(os.environ["FAIL_AT"]) else 0)
+''')
+                npm.chmod(0o755)
+                result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=fixture,
+                                        env={**os.environ, "PATH": f"{fixture}{os.pathsep}{os.environ['PATH']}",
+                                             "CALLS": str(calls), "FAIL_AT": str(fail_at)},
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 23 if fail_at else 0, result.stderr)
+                recorded = [json.loads(line) for line in calls.read_text().splitlines()]
+                self.assertEqual(recorded, expected[:fail_at or 4])
 
 
 if __name__ == "__main__":

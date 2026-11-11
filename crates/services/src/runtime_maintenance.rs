@@ -3,7 +3,8 @@
 //!
 //! This worker is deliberately limited to explicit user delete intents,
 //! expired diagnostics, and runtime objects whose owner was already removed.
-//! It does not transition or end agent_sessions, and it does not expire
+//! It also cancels expired, unused provider fork preparations through their
+//! existing abort and Session deletion owners. It does not expire
 //! session traces.
 //! Durable conversation history remains available until the user deletes the
 //! session through the normal API.
@@ -44,20 +45,14 @@ pub struct RuntimeMaintenanceSweepResult {
     pub model_request_context_more: bool,
     /// Expired aggregate observation-identity collision diagnostics.
     pub observation_collision_receipts_expired: u64,
-    /// Expired prompt-assembly request diagnostics removed after retention.
-    pub prompt_request_records_expired: u64,
-    /// Child prompt delta diagnostics removed before their parent requests.
-    pub prompt_deltas_expired: u64,
     /// Expired fork-retention pins released after their grace period.
     pub expired_fork_pins_released: u64,
+    /// Unactivated provider forks cancelled after their retry window.
+    pub expired_provider_prepares_aborted: u64,
     /// Fork records whose child session no longer exists.
     pub orphaned_forks_collected: u64,
     /// Unpinned manifest nodes whose owner session no longer exists.
     pub orphaned_manifests_collected: u64,
-    /// Segment references whose manifest node no longer exists.
-    pub orphaned_manifest_references_collected: u64,
-    /// Owner-deduplicated segment payloads with no remaining reference.
-    pub unreferenced_segments_collected: u64,
     /// Terminal branch-control operation receipts removed after retention.
     pub work_branch_control_operations_expired: u64,
     /// Terminal or abandoned branch-creation operation receipts removed after
@@ -123,19 +118,6 @@ pub async fn maintain_runtime_storage(
         "expire_observation_collision_receipts",
         expire_observation_collision_receipts(pool, policy.batch_limit).await,
     );
-    match crate::prompt_delta::expire_prompt_diagnostics(pool, policy.batch_limit).await {
-        Ok(expiry) => {
-            result.prompt_request_records_expired = expiry.prompt_request_records;
-            result.prompt_deltas_expired = expiry.prompt_deltas;
-        }
-        Err(error) => {
-            record_runtime_storage_maintenance(
-                &mut result.cleanup_errors,
-                "expire_prompt_diagnostics",
-                Err(error),
-            );
-        }
-    }
     result.work_branch_control_operations_expired = record_runtime_storage_maintenance(
         &mut result.cleanup_errors,
         "expire_work_branch_control_operations",
@@ -152,6 +134,13 @@ pub async fn maintain_runtime_storage(
         expire_session_attachments(pool, policy.batch_limit).await,
     );
     if let Some(coordinator) = fork_coordinator {
+        result.expired_provider_prepares_aborted = record_runtime_storage_maintenance(
+            &mut result.cleanup_errors,
+            "abort_expired_provider_prepares",
+            coordinator
+                .abort_expired_provider_prepares(policy.batch_limit)
+                .await,
+        );
         result.expired_fork_pins_released = record_runtime_storage_maintenance(
             &mut result.cleanup_errors,
             "release_expired_fork_pins",
@@ -173,20 +162,6 @@ pub async fn maintain_runtime_storage(
                 .collect_unpinned_orphan_manifests(policy.batch_limit)
                 .await,
         );
-        result.orphaned_manifest_references_collected = record_runtime_storage_maintenance(
-            &mut result.cleanup_errors,
-            "collect_orphaned_manifest_segment_references",
-            coordinator
-                .collect_orphaned_manifest_segment_references(policy.batch_limit)
-                .await,
-        );
-        result.unreferenced_segments_collected = record_runtime_storage_maintenance(
-            &mut result.cleanup_errors,
-            "collect_unreferenced_conversation_segments",
-            coordinator
-                .collect_unreferenced_conversation_segments(policy.batch_limit)
-                .await,
-        );
     }
     result
 }
@@ -197,13 +172,10 @@ impl RuntimeMaintenanceSweepResult {
         self.explicit_delete_intents_reconciled
             .saturating_add(self.model_request_context_events_expired)
             .saturating_add(self.observation_collision_receipts_expired)
-            .saturating_add(self.prompt_request_records_expired)
-            .saturating_add(self.prompt_deltas_expired)
             .saturating_add(self.expired_fork_pins_released)
+            .saturating_add(self.expired_provider_prepares_aborted)
             .saturating_add(self.orphaned_forks_collected)
             .saturating_add(self.orphaned_manifests_collected)
-            .saturating_add(self.orphaned_manifest_references_collected)
-            .saturating_add(self.unreferenced_segments_collected)
             .saturating_add(self.work_branch_control_operations_expired)
             .saturating_add(self.work_branch_creation_operations_expired)
             .saturating_add(self.expired_session_attachments_deleted)
@@ -343,14 +315,17 @@ mod tests {
         settings.database = format!("astra_test_collision_ttl_{}", uuid::Uuid::new_v4().simple());
         settings.db_pool_max_connections = 1;
         settings.db_pool_min_connections = 1;
-        sqlx::query(&format!("CREATE DATABASE `{}`", settings.database))
-            .execute(&mut admin)
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE `{}`",
+            settings.database
+        )))
+        .execute(&mut admin)
+        .await
+        .unwrap();
         // Clone only the production table: unrelated expired fixtures cannot
         // consume LIMIT 1, and no unrelated maintenance work enters this test.
         let result: Result<_, sqlx::Error> = async {
-            sqlx::query(&format!("CREATE TABLE `{}`.observation_identity_collisions LIKE `{source}`.observation_identity_collisions", settings.database))
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TABLE `{}`.observation_identity_collisions LIKE `{source}`.observation_identity_collisions", settings.database)))
                 .execute(&mut admin).await?;
             let pool = astra_core::SharedPool::new(&settings).await?;
             sqlx::query("INSERT INTO observation_identity_collisions (user_id, identity_kind, identity_id, stored_payload_hash, attempted_payload_hash, source, expires_at) VALUES ('expired-older','agent_event','one','a','b','ttl-test',DATE_SUB(NOW(6),INTERVAL 2 SECOND)), ('expired','agent_event','one','a','b','ttl-test',DATE_SUB(NOW(6),INTERVAL 1 SECOND)), ('retained','agent_event','one','a','b','ttl-test',DATE_ADD(NOW(6),INTERVAL 7 DAY))")
@@ -366,10 +341,13 @@ mod tests {
             Ok((deleted, after_first, repeated, exhausted, owners))
         }.await;
         // The destructive target is exactly the randomly named database above.
-        sqlx::query(&format!("DROP DATABASE `{}`", settings.database))
-            .execute(&mut admin)
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE `{}`",
+            settings.database
+        )))
+        .execute(&mut admin)
+        .await
+        .unwrap();
         let (deleted, after_first, repeated, exhausted, owners) = result.unwrap();
         assert_eq!(deleted, 1);
         assert_eq!(after_first, ["expired", "retained"]);

@@ -1,124 +1,12 @@
-//! Session restore: reconstruct session state from MatrixOne + local files.
-//!
-//! # Architecture
-//!
-//! ```text
-//! restore_session(user_id, session_id)
-//!   ├─ 1. Prove the MatrixOne session belongs to user_id
-//!   ├─ 2. Pull owner-scoped local journal/checkpoints when present
-//!   ├─ 3. Pull owner-bound cloud artifacts/events/checkpoints
-//!   └─ 4. Return RestoredSession for the REPL to continue
-//! ```
-//!
-//! Local-only restore is a separate API path and intentionally never reads MatrixOne.
-//! Cloud restore is always owner-bound.
+//! Session restore: canonical Server summaries and explicit CLI-local recovery.
+//! Server execution state is materialized by the Session Context coordinator.
 
-use async_trait::async_trait;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use astra_core::canonical_names::{append_unique_names, normalize_name_list};
 
-use crate::{SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionArtifact};
-
-const MAX_CLOUD_RESTORE_CHECKPOINTS: u32 = 200;
 pub const COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND: &str = "composite_snapshot_index";
-pub const COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID: &str = "projection:composite-snapshot-index";
-const CLOUD_CHECKPOINTS_SELECT_SQL: &str = "\
-    SELECT number, turn, title, summary, total_tokens \
-    FROM ( \
-        SELECT number, turn, title, summary, total_tokens \
-        FROM session_checkpoints \
-        WHERE user_id = ? AND session_id = ? AND state_json IS NULL \
-        ORDER BY number DESC \
-        LIMIT ? \
-    ) AS recent_checkpoints \
-    ORDER BY number";
-const CLOUD_CHECKPOINT_COUNT_SQL: &str = "\
-    SELECT COUNT(*) AS checkpoint_count \
-    FROM session_checkpoints \
-    WHERE user_id = ? AND session_id = ? AND state_json IS NULL";
-pub const MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS: i64 = 80;
-pub const PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL: &str = "\
-    SELECT role, content, run_id, run_status \
-    FROM ( \
-        SELECT sti.item_seq, sti.role, sti.content, sti.run_id, r.status AS run_status \
-        FROM session_transcript_items sti \
-        LEFT JOIN agent_runs r \
-          ON r.user_id = sti.user_id \
-         AND r.session_id = sti.session_id \
-         AND r.run_id = sti.run_id \
-        WHERE sti.session_id = ? \
-          AND sti.user_id = ? \
-          AND sti.role IN ('user', 'assistant', 'system') \
-          AND TRIM(sti.content) <> '' \
-          AND ( \
-              sti.run_id IS NULL \
-              OR (r.run_id IS NOT NULL AND r.parent_run_id IS NULL) \
-          ) \
-        ORDER BY sti.item_seq DESC \
-        LIMIT ? \
-    ) recent_prompt_history \
-    ORDER BY item_seq";
-
-/// Prompt-facing closure for a durable root run whose transcript contains a
-/// user request but no assistant response. Without this typed boundary, a new
-/// turn can interpret a cancelled/failed request as a second still-active
-/// objective and resume it after completing the latest request.
-pub fn prompt_history_terminal_boundary(status: &str) -> Option<String> {
-    let status = match status {
-        "cancelled" => "cancelled before completion",
-        "failed" => "failed before completion",
-        "paused" | "waiting" => "paused before completion",
-        "delegated" => "handed off to delegated execution",
-        "completed" => "completed without a prompt-facing assistant response",
-        _ => return None,
-    };
-    Some(format!(
-        "[Runtime turn boundary: the preceding request {status}. It is not an active objective; continue it only when the latest user request explicitly asks to do so.]"
-    ))
-}
-
-pub fn prompt_history_role_is_provider_safe(role: &str, has_prompt_content: bool) -> bool {
-    has_prompt_content && matches!(role, "user" | "assistant" | "system")
-}
-
-pub fn prompt_history_boundary_after_message(
-    role: &str,
-    has_prompt_content: bool,
-    run_id: Option<&str>,
-    next_run_id: Option<&str>,
-    run_status: Option<&str>,
-) -> Option<String> {
-    // A cancelled turn can contain non-provider-safe tool evidence after its
-    // user request. The bounded fallback excludes that evidence, so close at
-    // the last prompt-facing row when the next safe row belongs elsewhere. A
-    // terminal assistant response already closes the objective naturally and
-    // must not gain a synthetic suffix.
-    let can_end_unfinished_turn = role != "assistant" || !has_prompt_content;
-    if !can_end_unfinished_turn || run_id.is_none() || run_id == next_run_id {
-        return None;
-    }
-    prompt_history_terminal_boundary(run_status?)
-}
-pub const PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL: &str = "\
-    SELECT 1 AS present \
-    FROM session_transcript_items sti \
-    LEFT JOIN agent_runs r \
-      ON r.user_id = sti.user_id \
-     AND r.session_id = sti.session_id \
-     AND r.run_id = sti.run_id \
-    WHERE sti.session_id = ? \
-      AND sti.user_id = ? \
-          AND sti.role IN ('user', 'assistant', 'system') \
-          AND TRIM(sti.content) <> '' \
-      AND ( \
-          sti.run_id IS NULL \
-          OR (r.run_id IS NOT NULL AND r.parent_run_id IS NULL) \
-      ) \
-    LIMIT 1";
-
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
@@ -127,7 +15,6 @@ trait SessionRestoreRow {
     fn string_column(&self, column: &str) -> Result<String, sqlx::Error>;
     fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error>;
     fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error>;
-    fn i32_column(&self, column: &str) -> Result<i32, sqlx::Error>;
 }
 
 impl SessionRestoreRow for sqlx::mysql::MySqlRow {
@@ -144,11 +31,6 @@ impl SessionRestoreRow for sqlx::mysql::MySqlRow {
     fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
         use sqlx::Row;
         self.try_get::<i64, _>(column)
-    }
-
-    fn i32_column(&self, column: &str) -> Result<i32, sqlx::Error> {
-        use sqlx::Row;
-        self.try_get::<i32, _>(column)
     }
 }
 
@@ -175,36 +57,6 @@ fn mysql_i64(row: &impl SessionRestoreRow, context: &str, column: &str) -> Resul
         .map_err(|e| format!("{context}: decode column `{column}`: {e}"))
 }
 
-fn mysql_i32(row: &impl SessionRestoreRow, context: &str, column: &str) -> Result<i32, String> {
-    row.i32_column(column)
-        .map_err(|e| format!("{context}: decode column `{column}`: {e}"))
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct CloudRestoreTimings {
-    session_query_ms: u64,
-    heavy_checkpoint_ms: u64,
-    total_ms: u64,
-}
-
-impl CloudRestoreTimings {
-    fn emit(self, session_id: &str, restored: bool) {
-        tracing::info!(
-            target: "astra_services::session_restore",
-            %session_id,
-            restored,
-            session_query_ms = self.session_query_ms,
-            heavy_checkpoint_ms = self.heavy_checkpoint_ms,
-            total_ms = self.total_ms,
-            "cloud session restore timings"
-        );
-    }
-}
-
-fn elapsed_ms(started_at: std::time::Instant) -> u64 {
-    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
 fn metadata_json_state(metadata_str: Option<&str>) -> Result<SessionMetadataState, String> {
     match metadata_str.map(str::trim).filter(|m| !m.is_empty()) {
         Some(metadata) => extract_session_state_from_metadata(metadata),
@@ -218,11 +70,6 @@ fn non_negative_i64_to_u64(value: i64, context: &str, column: &str) -> Result<u6
 }
 
 fn non_negative_i64_to_u32(value: i64, context: &str, column: &str) -> Result<u32, String> {
-    u32::try_from(value)
-        .map_err(|_| format!("{context}: column `{column}` expected u32 range, got {value}"))
-}
-
-fn non_negative_i32_to_u32(value: i32, context: &str, column: &str) -> Result<u32, String> {
     u32::try_from(value)
         .map_err(|_| format!("{context}: column `{column}` expected u32 range, got {value}"))
 }
@@ -294,7 +141,8 @@ fn apply_restore_cache_token_usage(
 
 // ─── Restored Session State ─────────────────────────────────────────────────
 
-/// The reconstructed state needed to resume a session.
+/// Reconstructed Session state. The resumable directory returns only its summary
+/// fields; execution requires the separate selected-Session restore and admission.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RestoredSession {
     /// Session ID being restored.
@@ -388,20 +236,6 @@ pub struct SessionMetadataState {
     pub permission_mode: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct CloudHeavyCheckpointState {
-    pub conversation_cursor: Option<astra_turn_types::SessionCursorV1>,
-    pub config_version_id: Option<String>,
-    pub messages: Vec<serde_json::Value>,
-    pub blocked_tools: Vec<String>,
-    pub recent_tools: Vec<String>,
-    pub deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
-    pub approval_overrides: Option<serde_json::Value>,
-    pub interruption: Option<serde_json::Value>,
-    pub compaction_state: Option<serde_json::Value>,
-    pub pipeline_state: Option<serde_json::Value>,
-}
-
 /// A restored checkpoint entry (lightweight, for listing).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoredCheckpoint {
@@ -412,35 +246,16 @@ pub struct RestoredCheckpoint {
     pub total_tokens: u64,
 }
 
-// ─── Session Restore Trait ──────────────────────────────────────────────────
-
-/// Abstraction for restoring session state from various backends.
-#[async_trait]
-pub trait SessionRestoreService: Send + Sync {
-    /// Restore a session owned by a user. Returns None if the session is missing or not owned.
-    async fn restore_session(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> Result<Option<RestoredSession>, String>;
-
-    /// List available checkpoints for a session.
-    async fn list_checkpoints(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> Result<Vec<RestoredCheckpoint>, String>;
-
-    /// List resumable sessions for a user (active or paused).
-    async fn list_resumable_sessions(&self, user_id: &str) -> Result<Vec<RestoredSession>, String>;
-}
-
 async fn restore_cloud_cache_token_totals(
     pool: &sqlx::Pool<sqlx::MySql>,
     user_id: &str,
     session_id: &str,
 ) -> Result<(i64, i64), String> {
-    let rows = sqlx::query(
+    use futures_util::TryStreamExt;
+    let mut connection = crate::CancellationSafePoolConnection::acquire(pool)
+        .await
+        .map_err(|e| format!("restore_cloud_session.cache_tokens: {e}"))?;
+    let mut rows = sqlx::query(
         "SELECT event_id, IFNULL(CAST(token_usage AS CHAR), '{}') AS token_usage \
          FROM agent_events \
          WHERE session_id = ? AND user_id = ? \
@@ -448,13 +263,15 @@ async fn restore_cloud_cache_token_totals(
     )
     .bind(session_id)
     .bind(user_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| format!("restore_cloud_session.cache_tokens: {e}"))?;
+    .fetch(connection.connection_mut());
 
     let mut cache_read_total = 0i64;
     let mut cache_creation_total = 0i64;
-    for row in rows {
+    while let Some(row) = rows
+        .try_next()
+        .await
+        .map_err(|e| format!("restore_cloud_session.cache_tokens: {e}"))?
+    {
         let event_id = mysql_string(&row, "restore_cloud_session.cache_tokens", "event_id")
             .unwrap_or_else(|error| {
                 tracing::warn!(
@@ -472,23 +289,25 @@ async fn restore_cloud_cache_token_totals(
             &mut cache_creation_total,
         );
     }
+    drop(rows);
+    connection.release();
     Ok((cache_read_total, cache_creation_total))
 }
 
-// ─── Local-First Implementation ─────────────────────────────────────────────
+// ─── Restore Implementation ─────────────────────────────────────────────
 
-/// Restores from local files first, falls back to MatrixOne.
-pub struct HybridRestoreService {
+/// Explicit local recovery and owner-scoped cloud diagnostic summaries.
+pub struct SessionRestoreService {
     pool: Option<sqlx::Pool<sqlx::MySql>>,
 }
 
-impl HybridRestoreService {
-    /// Create with MatrixOne pool for cloud fallback.
+impl SessionRestoreService {
+    /// Create with a MatrixOne pool for cloud summaries.
     pub fn new(pool: sqlx::Pool<sqlx::MySql>) -> Self {
         Self { pool: Some(pool) }
     }
 
-    /// Create for local-only mode (no cloud fallback).
+    /// Create for local filesystem recovery.
     pub fn local_only() -> Self {
         Self { pool: None }
     }
@@ -498,7 +317,52 @@ impl HybridRestoreService {
         &self,
         session_id: &str,
     ) -> Result<Option<RestoredSession>, String> {
-        self.restore_session_inner(None, session_id).await
+        let journal = summarize_local_journal(session_id)?;
+        let workspace = match super::session_workspace::read_workspace(session_id) {
+            Ok(workspace) => Some(workspace),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) if journal.is_none() => {
+                return Err(format!("read local workspace for {session_id}: {error}"));
+            }
+            Err(_) => None,
+        };
+        let Some(workspace) = workspace else {
+            return journal
+                .map(|summary| {
+                    Ok(RestoredSession {
+                        session_id: session_id.into(),
+                        turn_count: summary.turn_count,
+                        total_tokens_in: summary.total_tokens_in,
+                        total_tokens_out: summary.total_tokens_out,
+                        total_cache_read_tokens: summary.total_cache_read_tokens,
+                        total_cache_creation_tokens: summary.total_cache_creation_tokens,
+                        recent_tools: normalize_name_list(summary.recent_tools),
+                        checkpoint_count: local_checkpoint_count(
+                            session_id,
+                            "restore_local_session",
+                        )?,
+                        last_status: summary.last_status,
+                        model: summary.model,
+                        permission_mode: summary.permission_mode,
+                        ..Default::default()
+                    })
+                })
+                .transpose();
+        };
+        let mut recent_tools =
+            recent_tools_from_context_trace(workspace.last_context_trace.as_ref());
+        if recent_tools.is_empty()
+            && let Some(summary) = journal.as_ref()
+        {
+            recent_tools = normalize_name_list(summary.recent_tools.iter().map(String::as_str));
+        }
+        Ok(Some(restored_session_from_workspace(
+            workspace,
+            journal.as_ref(),
+            recent_tools,
+            local_checkpoint_count(session_id, "restore_local_session")?,
+            false,
+        )))
     }
 
     /// List only local filesystem checkpoints. This intentionally never reads MatrixOne.
@@ -506,199 +370,9 @@ impl HybridRestoreService {
         &self,
         session_id: &str,
     ) -> Result<Vec<RestoredCheckpoint>, String> {
-        self.list_checkpoints_inner(None, session_id).await
-    }
-
-    async fn require_owned_cloud_session(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> Result<bool, String> {
-        let pool = self.pool.as_ref().ok_or_else(|| {
-            "owner-bound session restore requires a MatrixOne pool; use local-only restore for local files"
-                .to_string()
-        })?;
-        crate::storage::agent_session_exists_for_user(pool, session_id, user_id)
-            .await
-            .map_err(|error| format!("session owner check: {error}"))
-    }
-
-    async fn restore_session_inner(
-        &self,
-        user_id: Option<&str>,
-        session_id: &str,
-    ) -> Result<Option<RestoredSession>, String> {
-        if let Some(user_id) = user_id
-            && !self
-                .require_owned_cloud_session(user_id, session_id)
-                .await?
-        {
-            return Ok(None);
-        }
-
-        let local_journal = summarize_local_journal(user_id, session_id)?;
-        let mut local_workspace_error = None;
-        let local_workspace = match self.restore_local_workspace(user_id, session_id) {
-            Ok(workspace) => workspace,
-            Err(error) => {
-                local_workspace_error = Some(error);
-                None
-            }
-        };
-
-        let mut projection = if let Some(ws) = local_workspace {
-            let mut recent_tools = if let Some(user_id) = user_id {
-                self.restore_recent_tools(user_id, session_id).await?
-            } else {
-                Vec::new()
-            };
-            if recent_tools.is_empty() {
-                recent_tools = recent_tools_from_context_trace(ws.last_context_trace.as_ref());
-            }
-            if recent_tools.is_empty()
-                && let Some(summary) = local_journal.as_ref()
-            {
-                recent_tools = normalize_name_list(summary.recent_tools.iter().map(String::as_str));
-            }
-
-            let ckpt_count = local_checkpoint_count(user_id, session_id, "restore_session_inner")?;
-
-            Some(restored_session_from_workspace(
-                ws,
-                local_journal.as_ref(),
-                recent_tools,
-                ckpt_count,
-                false,
-            ))
-        } else if let Some(user_id) = user_id
-            && let Some(ws) = self.restore_cloud_workspace(user_id, session_id).await?
-        {
-            let mut recent_tools = self.restore_recent_tools(user_id, session_id).await?;
-            if recent_tools.is_empty() {
-                recent_tools =
-                    recent_tools_from_context_trace(ws.metadata.last_context_trace.as_ref());
-            }
-            if recent_tools.is_empty()
-                && let Some(summary) = local_journal.as_ref()
-            {
-                recent_tools = normalize_name_list(summary.recent_tools.iter().map(String::as_str));
-            }
-
-            let local_ckpt_count =
-                local_checkpoint_count(Some(user_id), session_id, "restore_session_inner")?;
-            let cloud_ckpt_count = self
-                .cloud_checkpoint_count(user_id, session_id)
-                .await
-                .map_err(|e| format!("restore_session_inner cloud checkpoint count: {e}"))?;
-
-            Some(restored_session_from_workspace(
-                ws.metadata,
-                local_journal.as_ref(),
-                recent_tools,
-                cloud_ckpt_count.max(local_ckpt_count),
-                true,
-            ))
-        } else if let Some(summary) = local_journal {
-            let ckpt_count = local_checkpoint_count(user_id, session_id, "restore_session_inner")?;
-
-            Some(RestoredSession {
-                session_id: session_id.to_string(),
-                turn_count: summary.turn_count,
-                total_tokens_in: summary.total_tokens_in,
-                total_tokens_out: summary.total_tokens_out,
-                total_cache_read_tokens: summary.total_cache_read_tokens,
-                total_cache_creation_tokens: summary.total_cache_creation_tokens,
-                recent_tools: normalize_name_list(summary.recent_tools),
-                checkpoint_count: ckpt_count,
-                last_status: summary.last_status,
-                model: summary.model,
-                permission_mode: summary.permission_mode,
-                restored_from_cloud: false,
-                ..Default::default()
-            })
-        } else {
-            None
-        };
-
-        if let Some(user_id) = user_id {
-            // Authenticated restore can observe two independently persisted
-            // projections: local journal/workspace state and MatrixOne event
-            // state. Neither projection is allowed to shadow a later causal
-            // turn from the other. Reconcile them before returning so callers
-            // never pair an old turn clock with a newer Server session.
-            if let Some(cloud) = self.restore_cloud_session(user_id, session_id).await? {
-                projection = Some(match projection {
-                    Some(local) => reconcile_restored_session_candidates(user_id, local, cloud)?,
-                    None => cloud,
-                });
-            }
-        }
-
-        if projection.is_some() {
-            return Ok(projection);
-        }
-
-        if let Some(error) = local_workspace_error {
-            return Err(error);
-        }
-
-        Ok(None)
-    }
-
-    async fn list_checkpoints_inner(
-        &self,
-        user_id: Option<&str>,
-        session_id: &str,
-    ) -> Result<Vec<RestoredCheckpoint>, String> {
-        if let Some(user_id) = user_id
-            && !self
-                .require_owned_cloud_session(user_id, session_id)
-                .await?
-        {
-            return Ok(Vec::new());
-        }
-
-        let local_entries = if user_id.is_some() {
-            Vec::new()
-        } else {
-            super::session_checkpoint::read_checkpoint_index(session_id).map_err(|error| {
-                format!(
-                    "list_checkpoints_inner: failed to read local checkpoint index for {session_id}: {error}"
-                )
-            })?
-        };
-        let local = parse_local_checkpoint_entries(&local_entries);
-        let cloud = if let Some(user_id) = user_id {
-            self.cloud_checkpoints(user_id, session_id)
-                .await
-                .map_err(|error| {
-                    format!(
-                        "list_checkpoints_inner: failed to read cloud checkpoints for {session_id}: {error}"
-                    )
-                })?
-        } else {
-            Vec::new()
-        };
-        Ok(merge_checkpoints(local, cloud))
-    }
-
-    /// Try restoring workspace metadata from local YAML file.
-    fn restore_local_workspace(
-        &self,
-        user_id: Option<&str>,
-        session_id: &str,
-    ) -> Result<Option<super::session_workspace::WorkspaceMetadata>, String> {
-        // The legacy YAML workspace has no physical owner in its path. It is
-        // valid only for local/CLI restore and must never be consulted by an
-        // authenticated cloud restore.
-        if user_id.is_some() {
-            return Ok(None);
-        }
-        match super::session_workspace::read_workspace(session_id) {
-            Ok(ws) => Ok(Some(ws)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(format!("read local workspace for {session_id}: {e}")),
-        }
+        let entries = super::session_checkpoint::read_checkpoint_index(session_id)
+            .map_err(|error| format!("list_local_checkpoints: failed to read local checkpoint index for {session_id}: {error}"))?;
+        Ok(parse_local_checkpoint_entries(&entries))
     }
 
     /// Try restoring workspace metadata from remote session artifacts.
@@ -706,7 +380,7 @@ impl HybridRestoreService {
         &self,
         user_id: &str,
         session_id: &str,
-    ) -> Result<Option<CloudWorkspaceArtifact>, String> {
+    ) -> Result<Option<super::session_workspace::WorkspaceMetadata>, String> {
         let pool = match self.pool.as_ref() {
             Some(pool) => pool,
             None => return Ok(None),
@@ -728,30 +402,25 @@ impl HybridRestoreService {
             serde_json::from_value::<super::session_workspace::WorkspaceMetadata>(artifact.content)
                 .map_err(|e| format!("restore_cloud_workspace: {e}"))?;
 
-        Ok(Some(CloudWorkspaceArtifact { metadata }))
+        Ok(Some(metadata))
     }
 
-    /// Restore from MatrixOne agent_sessions table.
-    async fn restore_cloud_session(
+    /// Load owner-scoped diagnostic summaries. This does not authorize continuation.
+    pub async fn load_cloud_summary(
         &self,
         user_id: &str,
         session_id: &str,
     ) -> Result<Option<RestoredSession>, String> {
-        let started_at = std::time::Instant::now();
         let pool = match &self.pool {
             Some(p) => p,
             None => return Ok(None),
         };
 
-        let session_query_started_at = std::time::Instant::now();
         let row = sqlx::query(
-            "SELECT s.session_id, s.user_id, s.title, s.status, s.event_count, CAST(s.metadata AS CHAR) AS metadata_json, \
+            "SELECT s.title, s.status, CAST(s.metadata AS CHAR) AS metadata_json, \
              COALESCE(event_summary.turn_count, 0) AS turn_count, \
              COALESCE(event_summary.total_tokens_in, 0) AS total_tokens_in, \
-             COALESCE(event_summary.total_tokens_out, 0) AS total_tokens_out, \
-             COALESCE(checkpoint_summary.checkpoint_count, 0) AS checkpoint_count, \
-             latest_model.llm_model_used AS latest_model, \
-             s.created_at, s.updated_at \
+             COALESCE(event_summary.total_tokens_out, 0) AS total_tokens_out \
               FROM agent_sessions s \
               LEFT JOIN ( \
                 SELECT user_id, session_id, \
@@ -761,36 +430,19 @@ impl HybridRestoreService {
                        CAST(COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
                          THEN COALESCE(token_output, 0) ELSE 0 END), 0) AS SIGNED) AS total_tokens_out \
                 FROM agent_events \
+                WHERE user_id = ? AND session_id = ? \
                 GROUP BY user_id, session_id \
               ) event_summary \
                 ON event_summary.user_id = s.user_id AND event_summary.session_id = s.session_id \
-              LEFT JOIN ( \
-                SELECT user_id, session_id, COUNT(*) AS checkpoint_count \
-                FROM session_checkpoints \
-                WHERE state_json IS NULL \
-                GROUP BY user_id, session_id \
-              ) checkpoint_summary \
-                ON checkpoint_summary.user_id = s.user_id AND checkpoint_summary.session_id = s.session_id \
-              LEFT JOIN ( \
-                SELECT user_id, session_id, llm_model_used \
-                FROM ( \
-                  SELECT user_id, session_id, llm_model_used, \
-                         ROW_NUMBER() OVER (PARTITION BY user_id, session_id ORDER BY created_at DESC, event_id DESC) AS rn \
-                  FROM agent_events \
-                  WHERE parent_run_id IS NULL \
-                    AND llm_model_used IS NOT NULL AND llm_model_used != '' \
-                ) ranked_models \
-                WHERE rn = 1 \
-              ) latest_model \
-                ON latest_model.user_id = s.user_id AND latest_model.session_id = s.session_id \
               WHERE s.session_id = ? AND s.user_id = ?",
         )
+        .bind(user_id)
+        .bind(session_id)
         .bind(session_id)
         .bind(user_id)
         .fetch_optional(pool)
         .await
         .map_err(|e| format!("restore_cloud_session: {e}"))?;
-        let session_query_ms = elapsed_ms(session_query_started_at);
 
         match row {
             Some(row) => {
@@ -800,8 +452,6 @@ impl HybridRestoreService {
                 let total_tokens_in = mysql_i64(&row, "restore_cloud_session", "total_tokens_in")?;
                 let total_tokens_out =
                     mysql_i64(&row, "restore_cloud_session", "total_tokens_out")?;
-                let checkpoint_count =
-                    mysql_i64(&row, "restore_cloud_session", "checkpoint_count")?;
                 let (total_cache_read_tokens, total_cache_creation_tokens) =
                     restore_cloud_cache_token_totals(pool, user_id, session_id).await?;
 
@@ -810,42 +460,8 @@ impl HybridRestoreService {
                     mysql_optional_string(&row, "restore_cloud_session", "metadata_json")?;
                 let metadata_state = metadata_json_state(metadata_str.as_deref())?;
 
-                let heavy_started_at = std::time::Instant::now();
-                let mut heavy_state = self
-                    .restore_latest_heavy_checkpoint_state(user_id, session_id)
-                    .await?;
-                let heavy_checkpoint_ms = elapsed_ms(heavy_started_at);
-
-                CloudRestoreTimings {
-                    session_query_ms,
-                    heavy_checkpoint_ms,
-                    total_ms: elapsed_ms(started_at),
-                }
-                .emit(session_id, true);
-
                 let completed_turn =
                     non_negative_i64_to_u32(turn_count, "restore_cloud_session", "turn_count")?;
-                let conversation_from_checkpoint = heavy_state
-                    .as_ref()
-                    .is_some_and(|heavy| !heavy.messages.is_empty());
-                let conversation_messages = heavy_state
-                    .as_mut()
-                    .map(|heavy| {
-                        astra_core::history_work::record_serialized_value(
-                            astra_core::history_work::HistoryWorkSite::SessionRestoreHydration,
-                            &heavy.messages,
-                        );
-                        std::mem::take(&mut heavy.messages)
-                    })
-                    .filter(|messages| !messages.is_empty())
-                    .unwrap_or_default();
-                let resume_bundle = build_resume_bundle(
-                    user_id,
-                    session_id,
-                    conversation_messages,
-                    conversation_from_checkpoint,
-                    heavy_state.as_ref(),
-                )?;
                 let mut restored = RestoredSession {
                     session_id: session_id.to_string(),
                     turn_count: completed_turn,
@@ -872,287 +488,31 @@ impl HybridRestoreService {
                     last_status: status,
                     title,
                     restored_from_cloud: true,
-                    checkpoint_count: non_negative_i64_to_u32(
-                        checkpoint_count,
-                        "restore_cloud_session",
-                        "checkpoint_count",
-                    )?,
                     git_branch: metadata_state.git_branch.clone(),
                     // Versioned restore owns the potentially large history in
                     // exactly one response field.
                     conversation_messages: Vec::new(),
-                    resume_bundle,
                     ..Default::default()
                 };
-                apply_selected_resume_bundle(&mut restored);
+                if let Some(workspace) = self.restore_cloud_workspace(user_id, session_id).await? {
+                    // These are observed diagnostic subtotals. Only canonical
+                    // Context may supply the executable conversation and cursor.
+                    restored.total_tokens_in =
+                        restored.total_tokens_in.max(workspace.total_tokens_in);
+                    restored.total_tokens_out =
+                        restored.total_tokens_out.max(workspace.total_tokens_out);
+                    restored.total_cache_read_tokens = restored
+                        .total_cache_read_tokens
+                        .max(workspace.total_cache_read_tokens);
+                    restored.total_cache_creation_tokens = restored
+                        .total_cache_creation_tokens
+                        .max(workspace.total_cache_creation_tokens);
+                    restored.git_branch = restored.git_branch.or(workspace.git_branch);
+                }
                 Ok(Some(restored))
             }
-            None => {
-                CloudRestoreTimings {
-                    session_query_ms,
-                    total_ms: elapsed_ms(started_at),
-                    ..Default::default()
-                }
-                .emit(session_id, false);
-                Ok(None)
-            }
+            None => Ok(None),
         }
-    }
-
-    /// Restore recent tools from recent cloud checkpoints.
-    async fn restore_recent_tools(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> Result<Vec<String>, String> {
-        let pool = match &self.pool {
-            Some(p) => p,
-            None => return Ok(Vec::new()),
-        };
-
-        let checkpoint_rows = sqlx::query(
-            "SELECT CAST(tools_json AS CHAR) AS tools_json FROM session_checkpoints \
-             WHERE user_id = ? AND session_id = ? AND state_json IS NULL \
-             ORDER BY number DESC LIMIT 5",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| format!("restore_recent_tools: {e}"))?;
-
-        let mut tools = Vec::new();
-        for row in &checkpoint_rows {
-            let Some(tools_json) =
-                mysql_optional_string(row, "restore_recent_tools", "tools_json")?
-            else {
-                continue;
-            };
-            if tools_json.trim().is_empty() {
-                continue;
-            }
-            let used = serde_json::from_str::<Vec<String>>(&tools_json)
-                .map_err(|e| format!("restore_recent_tools: parse tools_json: {e}"))?;
-            append_unique_names(&mut tools, used.iter().map(String::as_str));
-        }
-
-        Ok(tools)
-    }
-
-    async fn restore_latest_heavy_checkpoint_state(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> Result<Option<CloudHeavyCheckpointState>, String> {
-        let pool = match &self.pool {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-
-        let Some(state_json) = pull_step_checkpoint_from_cloud(pool, user_id, session_id).await?
-        else {
-            return Ok(None);
-        };
-        parse_cloud_heavy_checkpoint_state(&state_json)
-    }
-
-    /// List checkpoints from MatrixOne.
-    async fn cloud_checkpoints(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> Result<Vec<RestoredCheckpoint>, String> {
-        let pool = match &self.pool {
-            Some(p) => p,
-            None => return Ok(Vec::new()),
-        };
-
-        let rows = sqlx::query(CLOUD_CHECKPOINTS_SELECT_SQL)
-            .bind(user_id)
-            .bind(session_id)
-            .bind(MAX_CLOUD_RESTORE_CHECKPOINTS)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| format!("cloud_checkpoints: {e}"))?;
-
-        let ckpts = rows
-            .iter()
-            .map(|row| {
-                Ok(RestoredCheckpoint {
-                    number: non_negative_i32_to_u32(
-                        mysql_i32(row, "cloud_checkpoints", "number")?,
-                        "cloud_checkpoints",
-                        "number",
-                    )?,
-                    turn: non_negative_i32_to_u32(
-                        mysql_i32(row, "cloud_checkpoints", "turn")?,
-                        "cloud_checkpoints",
-                        "turn",
-                    )?,
-                    title: mysql_string(row, "cloud_checkpoints", "title")?,
-                    summary: mysql_optional_string(row, "cloud_checkpoints", "summary")?
-                        .unwrap_or_default(),
-                    total_tokens: non_negative_i64_to_u64(
-                        mysql_i64(row, "cloud_checkpoints", "total_tokens")?,
-                        "cloud_checkpoints",
-                        "total_tokens",
-                    )?,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        Ok(ckpts)
-    }
-
-    async fn cloud_checkpoint_count(&self, user_id: &str, session_id: &str) -> Result<u32, String> {
-        let pool = match &self.pool {
-            Some(p) => p,
-            None => return Ok(0),
-        };
-        let row = sqlx::query(CLOUD_CHECKPOINT_COUNT_SQL)
-            .bind(user_id)
-            .bind(session_id)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| format!("cloud_checkpoint_count: {e}"))?;
-        let count = mysql_i64(&row, "cloud_checkpoint_count", "checkpoint_count")?;
-        non_negative_i64_to_u32(count, "cloud_checkpoint_count", "checkpoint_count")
-    }
-}
-
-fn validate_resume_cursor_identity(
-    owner_id: &str,
-    session_id: &str,
-    cursor: &astra_turn_types::SessionCursorV1,
-) -> Result<(), String> {
-    if cursor.owner_id != owner_id {
-        return Err(format!(
-            "resume cursor belongs to owner `{}`, expected `{owner_id}`",
-            cursor.owner_id
-        ));
-    }
-    if cursor.session_id != session_id {
-        return Err(format!(
-            "resume cursor belongs to session `{}`, expected `{session_id}`",
-            cursor.session_id
-        ));
-    }
-    if cursor.branch_id != astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID {
-        return Err(format!(
-            "resume cursor branch `{}` is unsupported",
-            cursor.branch_id
-        ));
-    }
-    Ok(())
-}
-
-fn build_resume_bundle(
-    owner_id: &str,
-    session_id: &str,
-    messages: Vec<serde_json::Value>,
-    conversation_from_checkpoint: bool,
-    heavy: Option<&CloudHeavyCheckpointState>,
-) -> Result<Option<astra_turn_types::ResumeBundleV1>, String> {
-    if messages.is_empty() {
-        return Ok(None);
-    }
-    if !conversation_from_checkpoint {
-        return Ok(None);
-    }
-    let Some(cursor) = heavy.and_then(|state| state.conversation_cursor.clone()) else {
-        return Ok(None);
-    };
-    let source = astra_turn_types::ResumeSourceV1::Checkpoint;
-    validate_resume_cursor_identity(owner_id, session_id, &cursor)?;
-    let degraded_reasons = vec![astra_turn_types::ResumeDegradedReasonV1::CheckpointFallback];
-    let checkpoint = heavy.and_then(|state| {
-        let source_cursor = state.conversation_cursor.as_ref()?;
-        let projection = astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
-            source_cursor.clone(),
-            astra_turn_types::ResumeCheckpointProjectionV1 {
-                blocked_tools: state.blocked_tools.clone(),
-                recent_tools: state.recent_tools.clone(),
-                approval_overrides: state.approval_overrides.clone(),
-                interruption: state.interruption.clone(),
-                compaction_state: state.compaction_state.clone(),
-                pipeline_state: state.pipeline_state.clone(),
-            },
-        );
-        projection.is_admissible_at(&cursor).then_some(projection)
-    });
-    let activation = heavy.and_then(|state| {
-        let source_cursor = state.conversation_cursor.as_ref()?;
-        let projection = astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
-            source_cursor.clone(),
-            astra_turn_types::ResumeActivationProjectionV1 {
-                deferred_tool_activations: state.deferred_tool_activations.clone(),
-            },
-        );
-        projection.is_admissible_at(&cursor).then_some(projection)
-    });
-    let candidate = astra_turn_types::ResumeCandidateV1 {
-        source,
-        cursor,
-        conversation_messages: messages,
-        materialized_conversation_root_hash: None,
-        degraded_reasons,
-        repair_actions: vec![
-            astra_turn_types::ResumeRepairActionV1::InspectCanonicalJournal,
-            astra_turn_types::ResumeRepairActionV1::RebuildProjectionFromJournal,
-        ],
-        projections: astra_turn_types::ResumeProjectionSetV1 {
-            checkpoint,
-            provider: None,
-            activation,
-        },
-    };
-    astra_turn_types::select_resume_bundle(None, [candidate])
-        .map(Some)
-        .map_err(|error| format!("cloud resume projection failed causal selection: {error}"))
-}
-
-fn merge_exact_resume_projections(
-    current: &mut astra_turn_types::ResumeBundleV1,
-    other: &astra_turn_types::ResumeBundleV1,
-) {
-    if current.cursor != other.cursor {
-        return;
-    }
-    let cursor = current.cursor.clone();
-    if current.projections.checkpoint_at(&cursor).is_none()
-        && let Some(payload) = other.projections.checkpoint_at(&cursor)
-    {
-        current.projections.checkpoint =
-            Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
-                cursor.clone(),
-                payload.clone(),
-            ));
-    }
-    if current.projections.provider_at(&cursor).is_none()
-        && let Some(payload) = other.projections.provider_at(&cursor)
-    {
-        current.projections.provider =
-            Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
-                cursor.clone(),
-                payload.clone(),
-            ));
-    }
-
-    let mut activations = current.deferred_tool_activations().to_vec();
-    if let Some(other_activation) = other.projections.activation_at(&cursor) {
-        for activation in &other_activation.deferred_tool_activations {
-            if !activations.contains(activation) {
-                activations.push(activation.clone());
-            }
-        }
-    }
-    if !activations.is_empty() {
-        current.projections.activation =
-            Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
-                cursor,
-                astra_turn_types::ResumeActivationProjectionV1 {
-                    deferred_tool_activations: activations,
-                },
-            ));
     }
 }
 
@@ -1214,7 +574,8 @@ pub fn install_canonical_resume_bundle(
     session: &mut RestoredSession,
     bundle: astra_turn_types::ResumeBundleV1,
 ) -> Result<(), String> {
-    if bundle.source != astra_turn_types::ResumeSourceV1::CanonicalJournal
+    if bundle.cursor.session_id != session.session_id
+        || bundle.source != astra_turn_types::ResumeSourceV1::CanonicalJournal
         || !bundle.validates_root()
     {
         return Err("canonical resume bundle does not validate its materialized content".into());
@@ -1226,171 +587,18 @@ pub fn install_canonical_resume_bundle(
     Ok(())
 }
 
-/// Reconcile two restore projections without combining history from different
-/// causal turns.
-///
-/// The projection with the greatest completed-turn clock owns all
-/// turn-sensitive state. Projections at the same turn may safely complement
-/// one another because they describe the same causal boundary.
-fn reconcile_restored_session_candidates(
-    owner_id: &str,
-    first: RestoredSession,
-    second: RestoredSession,
-) -> Result<RestoredSession, String> {
-    if first.session_id != second.session_id {
-        return Err(format!(
-            "cannot reconcile restore candidates for different sessions: `{}` and `{}`",
-            first.session_id, second.session_id
-        ));
-    }
-    for bundle in [first.resume_bundle.as_ref(), second.resume_bundle.as_ref()]
-        .into_iter()
-        .flatten()
-    {
-        validate_resume_cursor_identity(owner_id, &first.session_id, &bundle.cursor)?;
-    }
-    let authoritative_turn = match (first.restored_from_cloud, second.restored_from_cloud) {
-        (true, true) | (false, false) => first.turn_count.max(second.turn_count),
-        (true, false) => first.turn_count,
-        (false, true) => second.turn_count,
-    };
-    let observed_cloud = first.restored_from_cloud || second.restored_from_cloud;
-
-    let first_bundle = first.resume_bundle.as_ref();
-    let second_bundle = second.resume_bundle.as_ref();
-    let selected_side = match (first_bundle, second_bundle) {
-        (None, None) => None,
-        _ => {
-            let candidates = [first_bundle, second_bundle]
-                .into_iter()
-                .enumerate()
-                .filter_map(|(side, bundle)| {
-                    bundle.map(|bundle| (side, bundle.descriptor(), bundle.validates_root()))
-                })
-                .collect::<Vec<_>>();
-            if candidates.iter().any(|(_, _, valid)| !valid) {
-                return Err(format!(
-                    "causal resume selection failed for owner {owner_id}: projection root mismatch"
-                ));
-            }
-            let descriptors = candidates
-                .iter()
-                .map(|(_, descriptor, _)| descriptor.clone())
-                .collect::<Vec<_>>();
-            let selected = astra_turn_types::select_resume_candidate_index(None, &descriptors)
-                .map_err(|error| format!("causal resume selection failed: {error}"))?;
-            Some(candidates[selected].0)
-        }
-    };
-    let same_generation = match (first_bundle, second_bundle) {
-        (Some(first), Some(second)) => first.cursor == second.cursor,
-        (None, None) => first.turn_count == second.turn_count,
-        _ => false,
-    };
-    let (mut current, other) = if selected_side == Some(1)
-        || (selected_side.is_none() && second.turn_count > first.turn_count)
-    {
-        (second, first)
-    } else {
-        (first, second)
-    };
-    if same_generation
-        && let (Some(current_bundle), Some(other_bundle)) =
-            (current.resume_bundle.as_mut(), other.resume_bundle.as_ref())
-    {
-        merge_exact_resume_projections(current_bundle, other_bundle);
-    }
-    apply_selected_resume_bundle(&mut current);
-    current.turn_count = authoritative_turn;
-    current.restored_from_cloud = observed_cloud;
-
-    current.total_tokens_in = current.total_tokens_in.max(other.total_tokens_in);
-    current.total_tokens_out = current.total_tokens_out.max(other.total_tokens_out);
-    current.total_cache_read_tokens = current
-        .total_cache_read_tokens
-        .max(other.total_cache_read_tokens);
-    current.total_cache_creation_tokens = current
-        .total_cache_creation_tokens
-        .max(other.total_cache_creation_tokens);
-    current.checkpoint_count = current.checkpoint_count.max(other.checkpoint_count);
-
-    if current.git_branch.is_none() {
-        current.git_branch = other.git_branch.clone();
-    }
-    if current.title.is_none() {
-        current.title = other.title.clone();
-    }
-
-    if same_generation
-        && current.resume_bundle.is_none()
-        && current.conversation_messages.is_empty()
-    {
-        current.conversation_messages = other.conversation_messages;
-    }
-
-    Ok(current)
-}
-
-fn local_checkpoint_count(
-    user_id: Option<&str>,
-    session_id: &str,
-    context: &str,
-) -> Result<u32, String> {
-    let count = match user_id {
-        // Authenticated counts come from cloud checkpoint rows. The runtime
-        // local step format is owned by `astra-pipeline`; the services crate
-        // must not duplicate that codec or reverse-depend on runtime layers.
-        Some(_) => 0,
-        None => super::session_checkpoint::read_checkpoint_index(session_id)
-            .map_err(|error| {
-                format!(
-                    "{context}: failed to read local checkpoint index for {session_id}: {error}"
-                )
-            })?
-            .len(),
-    };
+fn local_checkpoint_count(session_id: &str, context: &str) -> Result<u32, String> {
+    let count = super::session_checkpoint::read_checkpoint_index(session_id)
+        .map_err(|error| {
+            format!("{context}: failed to read local checkpoint index for {session_id}: {error}")
+        })?
+        .len();
     u32::try_from(count).map_err(|_| {
         format!(
             "{context}: local checkpoint index for {session_id} has too many entries: {}",
             count
         )
     })
-}
-
-fn composite_snapshot_index_to_remote_artifact_record(
-    session_id: &str,
-    user_id: &str,
-    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
-) -> Result<SessionArtifactJsonRecord, serde_json::Error> {
-    Ok(SessionArtifactJsonRecord {
-        artifact_id: COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID.to_string(),
-        session_id: session_id.to_string(),
-        user_id: user_id.to_string(),
-        artifact_kind: COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND.to_string(),
-        source: Some("composite_snapshot_index".to_string()),
-        turn: index.snapshots.last().map(|snapshot| snapshot.turn),
-        round: None,
-        content: serde_json::to_value(index)?,
-        metadata: Some(json!({
-            "snapshot_count": index.snapshots.len(),
-            "latest_version": index.current_version(),
-        })),
-        references: Vec::new(),
-    })
-}
-
-pub async fn persist_remote_composite_snapshot_index(
-    session_id: &str,
-    user_id: &str,
-    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
-    store: &impl SessionArtifactJsonStore,
-) -> Result<StoredSessionArtifact, String> {
-    let record = composite_snapshot_index_to_remote_artifact_record(session_id, user_id, index)
-        .map_err(|error| error.to_string())?;
-    store
-        .merge_composite_snapshot_index_projection(record)
-        .await
-        .map_err(|error| error.to_string())
 }
 
 fn recent_tools_from_context_trace(
@@ -1430,20 +638,6 @@ fn parse_local_checkpoint_entries(local_entries: &[String]) -> Vec<RestoredCheck
         .collect()
 }
 
-fn merge_checkpoints(
-    local: Vec<RestoredCheckpoint>,
-    cloud: Vec<RestoredCheckpoint>,
-) -> Vec<RestoredCheckpoint> {
-    let mut merged = BTreeMap::new();
-    for checkpoint in local {
-        merged.insert(checkpoint.number, checkpoint);
-    }
-    for checkpoint in cloud {
-        merged.insert(checkpoint.number, checkpoint);
-    }
-    merged.into_values().collect()
-}
-
 #[derive(Debug, Clone, Default)]
 struct LocalJournalSummary {
     turn_count: u32,
@@ -1457,21 +651,8 @@ struct LocalJournalSummary {
     last_status: String,
 }
 
-#[derive(Debug, Clone)]
-struct CloudWorkspaceArtifact {
-    metadata: super::session_workspace::WorkspaceMetadata,
-}
-
-fn summarize_local_journal(
-    user_id: Option<&str>,
-    session_id: &str,
-) -> Result<Option<LocalJournalSummary>, String> {
-    let digest = match user_id {
-        Some(user_id) => {
-            crate::session_journal::read_journal_for_digest_for_user(user_id, session_id)
-        }
-        None => crate::session_journal::read_journal_for_digest(session_id),
-    };
+fn summarize_local_journal(session_id: &str) -> Result<Option<LocalJournalSummary>, String> {
+    let digest = crate::session_journal::read_journal_for_digest(session_id);
     let (events, _, _) = match digest {
         Ok(digest) => digest,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1619,248 +800,55 @@ fn restored_session_from_workspace(
     }
 }
 
-fn cloud_heavy_payload(
-    root: &serde_json::Value,
-) -> Result<Option<&serde_json::Map<String, serde_json::Value>>, String> {
-    let Some(heavy) = root.get("Heavy") else {
-        return Ok(None);
-    };
-    heavy.as_object().map(Some).ok_or_else(|| {
-        "invalid cloud heavy checkpoint JSON field: field=Heavy, expected=object".to_string()
-    })
-}
-
-fn required_cloud_heavy_field<T>(
-    heavy: &serde_json::Map<String, serde_json::Value>,
-    field: &'static str,
-) -> Result<T, String>
-where
-    T: DeserializeOwned,
-{
-    let value = heavy
-        .get(field)
-        .ok_or_else(|| format!("missing cloud heavy checkpoint JSON field: field={field}"))?;
-    if value.is_null() {
-        return Err(format!(
-            "invalid cloud heavy checkpoint JSON field: field={field}, expected=non-null"
-        ));
-    }
-    serde_json::from_value(value.clone()).map_err(|source| {
-        format!("invalid cloud heavy checkpoint JSON field: field={field}, source={source}")
-    })
-}
-
-/// Parse cloud step-checkpoint JSON into the heavy-state fields needed for restore.
-/// Accepts only the current externally tagged `{"Heavy": ...}` shape.
-pub fn parse_cloud_heavy_checkpoint_state(
-    state_json: &str,
-) -> Result<Option<CloudHeavyCheckpointState>, String> {
-    let root = serde_json::from_str::<serde_json::Value>(state_json)
-        .map_err(|source| format!("invalid cloud heavy checkpoint JSON: source={source}"))?;
-    let Some(heavy) = cloud_heavy_payload(&root)? else {
-        return Ok(None);
-    };
-    let recent_tools: Vec<String> = required_cloud_heavy_field(heavy, "recent_tools")?;
-    let deferred_tool_activations = heavy
-        .get("deferred_tool_activations")
-        .cloned()
-        .map(serde_json::from_value::<Vec<astra_turn_types::DeferredToolActivation>>)
-        .transpose()
-        .map_err(|source| {
-            format!(
-                "invalid cloud heavy checkpoint JSON field: field=deferred_tool_activations, source={source}"
-            )
-        })?
-        .unwrap_or_default();
-    Ok(Some(CloudHeavyCheckpointState {
-        conversation_cursor: heavy
-            .get("conversation_cursor")
-            .cloned()
-            .filter(|value| !value.is_null())
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|source| {
-                format!(
-                    "invalid cloud heavy checkpoint JSON field: field=conversation_cursor, source={source}"
-                )
-            })?,
-        config_version_id: heavy
-            .get("config_version_id")
-            .cloned()
-            .filter(|value| !value.is_null())
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|source| {
-                format!(
-                    "invalid cloud heavy checkpoint JSON field: field=config_version_id, source={source}"
-                )
-            })?,
-        messages: required_cloud_heavy_field(heavy, "messages")?,
-        blocked_tools: required_cloud_heavy_field(heavy, "blocked_tools")?,
-        recent_tools: normalize_name_list(recent_tools),
-        deferred_tool_activations,
-        approval_overrides: heavy
-            .get("approval_overrides")
-            .cloned()
-            .filter(|v| !v.is_null()),
-        interruption: heavy.get("interruption").cloned().filter(|v| !v.is_null()),
-        compaction_state: heavy
-            .get("compaction_state")
-            .cloned()
-            .filter(|v| !v.is_null()),
-        pipeline_state: heavy
-            .get("pipeline_state")
-            .cloned()
-            .filter(|v| !v.is_null()),
-    }))
-}
-
-#[async_trait]
-impl SessionRestoreService for HybridRestoreService {
-    async fn restore_session(
+impl SessionRestoreService {
+    pub async fn list_resumable_sessions(
         &self,
         user_id: &str,
-        session_id: &str,
-    ) -> Result<Option<RestoredSession>, String> {
-        self.restore_session_inner(Some(user_id), session_id).await
-    }
-
-    async fn list_checkpoints(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> Result<Vec<RestoredCheckpoint>, String> {
-        self.list_checkpoints_inner(Some(user_id), session_id).await
-    }
-
-    async fn list_resumable_sessions(&self, user_id: &str) -> Result<Vec<RestoredSession>, String> {
+    ) -> Result<Vec<RestoredSession>, String> {
         let pool = match &self.pool {
             Some(p) => p,
             None => return Ok(Vec::new()),
         };
 
-        let rows = sqlx::query(
+        // A directory item selects a Session; it is not a hydrated resume bundle.
+        // Detail recovery and its evidence checks run only after that selection.
+        let mut select = sqlx::QueryBuilder::<sqlx::MySql>::new(
             "SELECT s.session_id, s.title, s.status, CAST(s.metadata AS CHAR) AS metadata_json, \
-         COALESCE(event_summary.turn_count, 0) AS turn_count, \
-         latest_model.llm_model_used AS latest_model \
-         FROM agent_sessions s \
-         LEFT JOIN ( \
-           SELECT user_id, session_id, COALESCE(MAX(CASE WHEN parent_run_id IS NULL THEN turn_seq END), 0) AS turn_count \
-           FROM agent_events \
-           GROUP BY user_id, session_id \
-         ) event_summary \
-           ON event_summary.user_id = s.user_id AND event_summary.session_id = s.session_id \
-         LEFT JOIN ( \
-           SELECT user_id, session_id, llm_model_used \
-           FROM ( \
-             SELECT user_id, session_id, llm_model_used, \
-                    ROW_NUMBER() OVER (PARTITION BY user_id, session_id ORDER BY created_at DESC, event_id DESC) AS rn \
-             FROM agent_events \
-             WHERE parent_run_id IS NULL \
-               AND llm_model_used IS NOT NULL AND llm_model_used != '' \
-           ) ranked_models \
-           WHERE rn = 1 \
-         ) latest_model \
-           ON latest_model.user_id = s.user_id AND latest_model.session_id = s.session_id \
-         WHERE s.user_id = ? AND s.status IN ('active', 'paused') \
-         ORDER BY s.updated_at DESC LIMIT 20",
-        )
-        .bind(user_id)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| format!("list_resumable: {e}"))?;
+             s.context_completed_turn AS turn_count FROM ",
+        );
+        crate::auth::session::push_session_activity_source(&mut select, user_id);
+        select.push(
+            " WHERE s.status IN ('active', 'paused') \
+              ORDER BY s.activity_at DESC, s.session_id DESC LIMIT 20",
+        );
+        let rows = select
+            .build()
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("list_resumable: {e}"))?;
 
-        let mut sessions = Vec::new();
+        let mut sessions = Vec::with_capacity(rows.len());
         for row in &rows {
-            let session_id = mysql_string(row, "list_resumable_sessions", "session_id")?;
-            let title = mysql_optional_string(row, "list_resumable_sessions", "title")?;
-            let status = mysql_string(row, "list_resumable_sessions", "status")?;
-            let turn_count = mysql_i64(row, "list_resumable_sessions", "turn_count")?;
             let metadata_json =
                 mysql_optional_string(row, "list_resumable_sessions", "metadata_json")?;
-            let metadata_state = metadata_json_state(metadata_json.as_deref())?;
-            let latest_model = astra_core::model_override::normalize_model_override_owned(
-                mysql_optional_string(row, "list_resumable_sessions", "latest_model")?,
-            );
-            let model = metadata_state.model.clone().or(latest_model);
-            let mut restored = if let Some(workspace) =
-                self.restore_cloud_workspace(user_id, &session_id).await?
-            {
-                let mut recent_tools = self.restore_recent_tools(user_id, &session_id).await?;
-                if recent_tools.is_empty() {
-                    recent_tools = recent_tools_from_context_trace(
-                        workspace.metadata.last_context_trace.as_ref(),
-                    );
-                }
-                let checkpoint_count = self
-                    .cloud_checkpoint_count(user_id, &session_id)
-                    .await
-                    .map_err(|e| format!("list_resumable_sessions checkpoint count: {e}"))?;
-                restored_session_from_workspace(
-                    workspace.metadata,
-                    None,
-                    recent_tools,
-                    checkpoint_count,
-                    true,
-                )
-            } else {
-                RestoredSession {
-                    session_id: session_id.clone(),
-                    restored_from_cloud: true,
-                    ..Default::default()
-                }
-            };
-            restored.turn_count = restored.turn_count.max(non_negative_i64_to_u32(
-                turn_count,
-                "list_resumable_sessions",
-                "turn_count",
-            )?);
-            restored.last_status = status;
-            restored.title = restored.title.or(title);
-            if restored.git_branch.is_none() {
-                restored.git_branch = metadata_state.git_branch.clone();
-            }
-            if restored.model.is_none() {
-                restored.model = model;
-            }
-            if restored.permission_mode.is_none() {
-                restored.permission_mode = metadata_state.permission_mode.clone();
-            }
-            restored.restored_from_cloud = true;
-            sessions.push(restored);
+            let metadata = metadata_json_state(metadata_json.as_deref())?;
+            sessions.push(RestoredSession {
+                session_id: mysql_string(row, "list_resumable_sessions", "session_id")?,
+                title: mysql_optional_string(row, "list_resumable_sessions", "title")?,
+                last_status: mysql_string(row, "list_resumable_sessions", "status")?,
+                turn_count: non_negative_i64_to_u32(
+                    mysql_i64(row, "list_resumable_sessions", "turn_count")?,
+                    "list_resumable_sessions",
+                    "turn_count",
+                )?,
+                git_branch: metadata.git_branch,
+                model: metadata.model,
+                permission_mode: metadata.permission_mode,
+                restored_from_cloud: true,
+                ..Default::default()
+            });
         }
         Ok(sessions)
-    }
-}
-
-/// Pull the latest Heavy step checkpoint JSON from MatrixOne for session recovery.
-/// Returns the raw state_json string — caller deserializes to StepCheckpoint.
-pub async fn pull_step_checkpoint_from_cloud(
-    pool: &sqlx::Pool<sqlx::MySql>,
-    user_id: &str,
-    session_id: &str,
-) -> Result<Option<String>, String> {
-    use sqlx::Row;
-
-    let row = sqlx::query(
-        "SELECT CAST(state_json AS CHAR) AS state_json_json FROM session_checkpoints \
-         WHERE user_id = ? AND session_id = ? AND summary = 'heavy' AND state_json IS NOT NULL \
-         ORDER BY number DESC LIMIT 1",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| format!("pull_step_checkpoint: {e}"))?;
-
-    match row {
-        Some(row) => {
-            let json: String = row
-                .try_get("state_json_json")
-                .map_err(|e| format!("read state_json: {e}"))?;
-            Ok(Some(json))
-        }
-        None => Ok(None),
     }
 }
 
@@ -1916,23 +904,10 @@ mod tests {
     use super::*;
     use crate::session_journal::JournalDirGuard;
     use crate::session_workspace;
+    use serde_json::json;
 
     const REAL_SESSION_0AC769_FIXTURE: &str =
         include_str!("../fixtures/real_session_0ac769_min.jsonl");
-
-    fn typed_resume_bundle(
-        owner_id: &str,
-        session_id: &str,
-        sequence: u64,
-        text: &str,
-    ) -> astra_turn_types::ResumeBundleV1 {
-        typed_resume_bundle_from_messages(
-            owner_id,
-            session_id,
-            sequence,
-            vec![serde_json::json!({"role": "user", "content": text})],
-        )
-    }
 
     fn typed_resume_bundle_from_messages(
         owner_id: &str,
@@ -2010,7 +985,6 @@ mod tests {
             self.fail_if_needed(column)?;
             Ok(match column {
                 "title" => Some("Resume work".to_string()),
-                "latest_model" => None,
                 _ => unreachable!("unexpected optional string column: {column}"),
             })
         }
@@ -2023,87 +997,78 @@ mod tests {
                 _ => unreachable!("unexpected i64 column: {column}"),
             })
         }
+    }
 
-        fn i32_column(&self, column: &str) -> Result<i32, sqlx::Error> {
-            self.fail_if_needed(column)?;
-            Ok(match column {
-                "number" => 7,
-                _ => unreachable!("unexpected i32 column: {column}"),
-            })
+    #[test]
+    fn cloud_summary_decoding_preserves_values_and_rejects_corrupt_columns() {
+        let row = FakeSessionRestoreRow::complete();
+        assert_eq!(mysql_string(&row, "summary", "status").unwrap(), "active");
+        assert_eq!(
+            mysql_optional_string(&row, "summary", "title")
+                .unwrap()
+                .as_deref(),
+            Some("Resume work")
+        );
+        assert_eq!(mysql_i64(&row, "summary", "turn_count").unwrap(), 42);
+        for column in ["status", "title", "turn_count"] {
+            let row = FakeSessionRestoreRow::fail_on(column);
+            let error = match column {
+                "status" => mysql_string(&row, "summary", column).unwrap_err(),
+                "title" => mysql_optional_string(&row, "summary", column).unwrap_err(),
+                _ => mysql_i64(&row, "summary", column).unwrap_err(),
+            };
+            assert!(
+                error.contains("summary") && error.contains(column),
+                "{error}"
+            );
         }
     }
 
     #[test]
-    fn session_restore_row_decode_helpers_preserve_database_values() {
-        let row = FakeSessionRestoreRow::complete();
-
+    fn canonical_install_rejects_foreign_or_corrupt_bundles_without_mutation() {
+        let messages = vec![json!({"role":"assistant", "content":"retained"})];
+        let mut bundle = typed_resume_bundle_from_messages("owner", "session", 2, messages.clone());
+        bundle.source = astra_turn_types::ResumeSourceV1::CanonicalJournal;
+        bundle.materialized_conversation_root_hash =
+            Some(astra_turn_types::canonical_conversation_root(&messages));
+        let mut restored = RestoredSession {
+            session_id: "session".into(),
+            ..Default::default()
+        };
+        restored.total_tokens_in = 17;
+        restored.total_cache_read_tokens = 3;
+        restored.model = Some("stale-model".into());
+        restored.permission_mode = Some("allow".into());
+        restored.recent_tools = vec!["stale-tool".into()];
+        restored.blocked_tools = vec!["stale-block".into()];
+        restored.approval_overrides = Some(json!({"write": "allow"}));
+        restored.interruption = Some(json!({"reason": "old"}));
+        restored.compaction_state = Some(json!({"old": true}));
+        restored.pipeline_state = Some(json!({"old": true}));
+        restored.workspace = Some(crate::session_workspace::WorkspaceMetadata::new(
+            "session", "/tmp/old",
+        ));
+        install_canonical_resume_bundle(&mut restored, bundle.clone()).unwrap();
+        assert!(restored.model.is_none() && restored.permission_mode.is_none());
+        assert!(restored.recent_tools.is_empty() && restored.blocked_tools.is_empty());
+        assert!(restored.approval_overrides.is_none() && restored.interruption.is_none());
+        assert!(restored.compaction_state.is_none() && restored.pipeline_state.is_none());
+        assert!(restored.workspace.is_none() && restored.last_context_trace.is_none());
+        assert_eq!(restored.resume_messages(), messages);
         assert_eq!(
-            mysql_string(&row, "restore_cloud_session", "status").unwrap(),
-            "active"
+            (restored.total_tokens_in, restored.total_cache_read_tokens),
+            (17, 3)
         );
-        assert_eq!(
-            mysql_optional_string(&row, "restore_cloud_session", "title").unwrap(),
-            Some("Resume work".to_string())
-        );
-        assert_eq!(
-            mysql_optional_string(&row, "restore_cloud_session", "latest_model").unwrap(),
-            None
-        );
-        assert_eq!(
-            mysql_i64(&row, "restore_cloud_session", "turn_count").unwrap(),
-            42
-        );
-        assert_eq!(mysql_i32(&row, "cloud_checkpoints", "number").unwrap(), 7);
-    }
-
-    #[test]
-    fn session_restore_row_decode_helpers_fail_loudly_with_context_and_column() {
-        for (column, decode) in [
-            (
-                "status",
-                mysql_string(
-                    &FakeSessionRestoreRow::fail_on("status"),
-                    "restore_cloud_session",
-                    "status",
-                ),
-            ),
-            (
-                "title",
-                mysql_optional_string(
-                    &FakeSessionRestoreRow::fail_on("title"),
-                    "restore_cloud_session",
-                    "title",
-                )
-                .map(|_| String::new()),
-            ),
-            (
-                "turn_count",
-                mysql_i64(
-                    &FakeSessionRestoreRow::fail_on("turn_count"),
-                    "restore_cloud_session",
-                    "turn_count",
-                )
-                .map(|_| String::new()),
-            ),
-            (
-                "number",
-                mysql_i32(
-                    &FakeSessionRestoreRow::fail_on("number"),
-                    "cloud_checkpoints",
-                    "number",
-                )
-                .map(|_| String::new()),
-            ),
-        ] {
-            let err = decode.unwrap_err();
-            assert!(
-                err.contains(&format!("decode column `{column}`")),
-                "error should identify failed column: {err}"
-            );
-            assert!(
-                err.contains("restore_cloud_session") || err.contains("cloud_checkpoints"),
-                "error should identify decode context: {err}"
-            );
+        let original = serde_json::to_value(&restored).unwrap();
+        let mut corrupt = bundle.clone();
+        corrupt.conversation_messages.clear();
+        let mut foreign = bundle.clone();
+        foreign.cursor.session_id = "foreign".into();
+        let mut checkpoint = bundle;
+        checkpoint.source = astra_turn_types::ResumeSourceV1::Checkpoint;
+        for rejected in [corrupt, foreign, checkpoint] {
+            assert!(install_canonical_resume_bundle(&mut restored, rejected).is_err());
+            assert_eq!(serde_json::to_value(&restored).unwrap(), original);
         }
     }
 
@@ -2262,15 +1227,10 @@ mod tests {
             non_negative_i64_to_u32(42, "restore_cloud_session", "turn_count").unwrap(),
             42
         );
-        assert_eq!(
-            non_negative_i32_to_u32(42, "cloud_checkpoints", "turn").unwrap(),
-            42
-        );
 
         for err in [
             non_negative_i64_to_u64(-1, "restore_cloud_session", "total_tokens_in").unwrap_err(),
             non_negative_i64_to_u32(-1, "restore_cloud_session", "turn_count").unwrap_err(),
-            non_negative_i32_to_u32(-1, "cloud_checkpoints", "turn").unwrap_err(),
             non_negative_i64_to_u32(i64::MAX, "restore_cloud_session", "turn_count").unwrap_err(),
         ] {
             assert!(
@@ -2332,11 +1292,11 @@ mod tests {
         assert_eq!(loaded.total_tokens, 50000);
     }
 
-    // ── HybridRestoreService (local-only mode) ──
+    // ── SessionRestoreService (local-only mode) ──
 
     #[tokio::test]
     async fn local_only_restore_nonexistent_returns_none() {
-        let svc = HybridRestoreService::local_only();
+        let svc = SessionRestoreService::local_only();
         let result = svc
             .restore_local_session("nonexistent-session")
             .await
@@ -2346,7 +1306,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_only_list_checkpoints_empty() {
-        let svc = HybridRestoreService::local_only();
+        let svc = SessionRestoreService::local_only();
         let ckpts = svc
             .list_local_checkpoints("nonexistent-session")
             .await
@@ -2364,7 +1324,7 @@ mod tests {
             .join("index.md");
         std::fs::create_dir_all(&checkpoint_index).unwrap();
 
-        let svc = HybridRestoreService::local_only();
+        let svc = SessionRestoreService::local_only();
         let error = svc
             .list_local_checkpoints(&sid)
             .await
@@ -2375,14 +1335,14 @@ mod tests {
             "checkpoint listing error should identify local index failure: {error}"
         );
         assert!(
-            error.contains("list_checkpoints_inner"),
+            error.contains("list_local_checkpoints"),
             "checkpoint listing error should include context: {error}"
         );
     }
 
     #[tokio::test]
     async fn local_only_list_resumable_empty() {
-        let svc = HybridRestoreService::local_only();
+        let svc = SessionRestoreService::local_only();
         let sessions = svc.list_resumable_sessions("user1").await.unwrap();
         assert!(sessions.is_empty());
     }
@@ -2393,7 +1353,7 @@ mod tests {
     async fn restore_from_local_workspace() {
         // This test depends on whether workspace files exist
         // Just verify the function doesn't panic and returns a valid type
-        let svc = HybridRestoreService::local_only();
+        let svc = SessionRestoreService::local_only();
 
         // Use a UUID that doesn't exist → should return None
         let result = svc
@@ -2412,7 +1372,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, REAL_SESSION_0AC769_FIXTURE).unwrap();
 
-        let svc = HybridRestoreService::local_only();
+        let svc = SessionRestoreService::local_only();
         let restored = svc
             .restore_local_session(sid)
             .await
@@ -2441,7 +1401,7 @@ mod tests {
         let ws = session_workspace::WorkspaceMetadata::with_context(sid, "glm-5.1", "/repo", None);
         session_workspace::write_workspace(&ws).unwrap();
 
-        let svc = HybridRestoreService::local_only();
+        let svc = SessionRestoreService::local_only();
         let restored = svc
             .restore_local_session(sid)
             .await
@@ -2485,7 +1445,7 @@ mod tests {
         std::fs::create_dir_all(&workspace_dir).unwrap();
         std::fs::write(workspace_dir.join("workspace.yaml"), ":\nnot-valid-yaml").unwrap();
 
-        let svc = HybridRestoreService::local_only();
+        let svc = SessionRestoreService::local_only();
         let restored = svc
             .restore_local_session(&sid)
             .await
@@ -2511,7 +1471,7 @@ mod tests {
             .join("index.md");
         std::fs::create_dir_all(&checkpoint_index).unwrap();
 
-        let svc = HybridRestoreService::local_only();
+        let svc = SessionRestoreService::local_only();
         let error = svc
             .restore_local_session(&sid)
             .await
@@ -2522,7 +1482,7 @@ mod tests {
             "restore error should identify checkpoint index failure: {error}"
         );
         assert!(
-            error.contains("restore_session_inner"),
+            error.contains("restore_local_session"),
             "restore error should include context: {error}"
         );
     }
@@ -2569,7 +1529,7 @@ mod tests {
             ))
             .unwrap();
 
-        let svc = HybridRestoreService::local_only();
+        let svc = SessionRestoreService::local_only();
         let restored = svc
             .restore_local_session(&sid)
             .await
@@ -2609,7 +1569,7 @@ mod tests {
         ws.turn_count = 1;
         session_workspace::write_workspace(&ws).unwrap();
 
-        let svc = HybridRestoreService::local_only();
+        let svc = SessionRestoreService::local_only();
         let restored = svc
             .restore_local_session(&sid)
             .await
@@ -2628,7 +1588,7 @@ mod tests {
         let path = crate::session_journal::journal_file_path(&sid);
         std::fs::create_dir_all(&path).unwrap();
 
-        let svc = HybridRestoreService::local_only();
+        let svc = SessionRestoreService::local_only();
         let error = svc
             .restore_local_session(&sid)
             .await
@@ -2651,201 +1611,6 @@ mod tests {
         };
         assert!(!local.restored_from_cloud);
         assert!(cloud.restored_from_cloud);
-    }
-
-    #[test]
-    fn legacy_restore_reconciliation_keeps_messages_but_discards_unversioned_authority() {
-        let local_projection = RestoredSession {
-            session_id: "session-1".into(),
-            turn_count: 1,
-            total_tokens_in: 100,
-            model: Some("local-model".into()),
-            conversation_messages: vec![
-                serde_json::json!({"role": "user", "content": "stale local question"}),
-                serde_json::json!({"role": "assistant", "content": "stale local answer"}),
-            ],
-            restored_from_cloud: false,
-            ..Default::default()
-        };
-        let cloud_projection = RestoredSession {
-            session_id: "session-1".into(),
-            turn_count: 4,
-            total_tokens_in: 500,
-            total_cache_read_tokens: 400,
-            model: Some("cloud-model".into()),
-            conversation_messages: vec![
-                serde_json::json!({"role": "user", "content": "current cloud question"}),
-                serde_json::json!({"role": "assistant", "content": "current cloud answer"}),
-            ],
-            restored_from_cloud: true,
-            ..Default::default()
-        };
-
-        let restored =
-            reconcile_restored_session_candidates("owner-1", local_projection, cloud_projection)
-                .unwrap();
-
-        assert_eq!(restored.turn_count, 4);
-        assert_eq!(restored.model, None);
-        assert_eq!(restored.total_tokens_in, 500);
-        assert_eq!(restored.total_cache_read_tokens, 400);
-        assert!(restored.restored_from_cloud);
-        assert_eq!(
-            restored.conversation_messages[1]["content"], "current cloud answer",
-            "a newer causal clock must carry its matching conversation projection"
-        );
-        assert!(
-            restored
-                .conversation_messages
-                .iter()
-                .all(|message| message["content"] != "stale local answer"),
-            "history from an older turn must not be combined with a newer turn count"
-        );
-    }
-
-    #[test]
-    fn typed_restore_reconciliation_never_splices_richer_stale_runtime_state() {
-        let local = RestoredSession {
-            session_id: "session-typed".into(),
-            turn_count: 9,
-            resume_bundle: Some(typed_resume_bundle(
-                "owner-1",
-                "session-typed",
-                9,
-                "stale local",
-            )),
-            blocked_tools: vec!["stale-block".into()],
-            total_tokens_in: 900,
-            ..Default::default()
-        };
-        let cloud = RestoredSession {
-            session_id: "session-typed".into(),
-            turn_count: 10,
-            resume_bundle: Some(typed_resume_bundle(
-                "owner-1",
-                "session-typed",
-                10,
-                "current cloud",
-            )),
-            total_tokens_in: 1_000,
-            restored_from_cloud: true,
-            ..Default::default()
-        };
-
-        let restored = reconcile_restored_session_candidates("owner-1", local, cloud).unwrap();
-        assert_eq!(restored.turn_count, 10);
-        assert_eq!(restored.resume_messages()[0]["content"], "current cloud");
-        assert!(restored.blocked_tools.is_empty());
-    }
-
-    #[test]
-    fn typed_restore_reconciliation_keeps_a_newer_local_generation_over_stale_cloud() {
-        let mut local_bundle =
-            typed_resume_bundle("owner-1", "session-local-newer", 11, "current local");
-        local_bundle.projections.checkpoint =
-            Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
-                local_bundle.cursor.clone(),
-                astra_turn_types::ResumeCheckpointProjectionV1 {
-                    blocked_tools: vec!["current-block".into()],
-                    ..Default::default()
-                },
-            ));
-        let local = RestoredSession {
-            session_id: "session-local-newer".into(),
-            turn_count: 11,
-            resume_bundle: Some(local_bundle),
-            blocked_tools: vec!["current-block".into()],
-            total_tokens_in: 500,
-            ..Default::default()
-        };
-        let cloud = RestoredSession {
-            session_id: "session-local-newer".into(),
-            // The Server head can be ahead of its latest warm checkpoint.
-            turn_count: 12,
-            resume_bundle: Some(typed_resume_bundle(
-                "owner-1",
-                "session-local-newer",
-                10,
-                "stale cloud",
-            )),
-            blocked_tools: vec!["stale-block".into()],
-            total_tokens_in: 1_000,
-            restored_from_cloud: true,
-            ..Default::default()
-        };
-
-        let restored = reconcile_restored_session_candidates("owner-1", local, cloud).unwrap();
-        assert_eq!(restored.turn_count, 12);
-        assert_eq!(
-            restored
-                .resume_bundle
-                .as_ref()
-                .unwrap()
-                .cursor
-                .completed_turn,
-            11
-        );
-        assert_eq!(restored.resume_messages()[0]["content"], "current local");
-        assert_eq!(restored.blocked_tools, ["current-block"]);
-        assert_eq!(
-            restored.total_tokens_in, 1_000,
-            "monotonic usage accounting may advance independently"
-        );
-        assert!(restored.restored_from_cloud);
-    }
-
-    #[test]
-    fn typed_restore_reconciliation_rejects_cross_owner_candidates() {
-        let local = RestoredSession {
-            session_id: "same-visible-id".into(),
-            resume_bundle: Some(typed_resume_bundle(
-                "owner-a",
-                "same-visible-id",
-                1,
-                "owner a",
-            )),
-            ..Default::default()
-        };
-        let cloud = RestoredSession {
-            session_id: "same-visible-id".into(),
-            resume_bundle: Some(typed_resume_bundle(
-                "owner-b",
-                "same-visible-id",
-                99,
-                "owner b",
-            )),
-            ..Default::default()
-        };
-
-        let error = reconcile_restored_session_candidates("owner-a", local, cloud).unwrap_err();
-        assert!(error.contains("expected `owner-a`"), "{error}");
-    }
-
-    #[test]
-    fn typed_restore_reconciliation_rejects_candidates_for_another_owner() {
-        let first = RestoredSession {
-            session_id: "same-visible-id".into(),
-            resume_bundle: Some(typed_resume_bundle(
-                "owner-b",
-                "same-visible-id",
-                1,
-                "first",
-            )),
-            ..Default::default()
-        };
-        let second = RestoredSession {
-            session_id: "same-visible-id".into(),
-            resume_bundle: Some(typed_resume_bundle(
-                "owner-b",
-                "same-visible-id",
-                2,
-                "second",
-            )),
-            ..Default::default()
-        };
-
-        let error = reconcile_restored_session_candidates("owner-a", first, second).unwrap_err();
-        assert!(error.contains("expected `owner-a`"), "{error}");
     }
 
     #[test]
@@ -2876,161 +1641,6 @@ mod tests {
                 .len(),
             2_048
         );
-    }
-
-    #[test]
-    fn corrupt_checkpoint_root_is_rejected_instead_of_degraded_into_current_state() {
-        let messages = vec![serde_json::json!({"role": "user", "content": "actual"})];
-        let mut cursor = typed_resume_bundle("owner-1", "corrupt-session", 3, "different").cursor;
-        cursor.canonical_root_hash = "not-the-actual-root".into();
-        let heavy = CloudHeavyCheckpointState {
-            conversation_cursor: Some(cursor),
-            messages: messages.clone(),
-            ..Default::default()
-        };
-
-        let error = build_resume_bundle("owner-1", "corrupt-session", messages, true, Some(&heavy))
-            .unwrap_err();
-        assert!(error.contains("no valid resume candidate"), "{error}");
-    }
-
-    #[test]
-    fn cursorless_cloud_history_cannot_restore_session_authority() {
-        let messages = vec![serde_json::json!({"role": "user", "content": "resume"})];
-        let heavy = CloudHeavyCheckpointState {
-            conversation_cursor: None,
-            messages: messages.clone(),
-            blocked_tools: vec!["write".into()],
-            approval_overrides: Some(serde_json::json!({"bash": "allow"})),
-            ..Default::default()
-        };
-        let bundle = build_resume_bundle(
-            "owner-1",
-            "cursorless-cloud-session",
-            messages.clone(),
-            true,
-            Some(&heavy),
-        )
-        .unwrap();
-        assert!(bundle.is_none());
-
-        let mut restored = RestoredSession {
-            session_id: "cursorless-cloud-session".into(),
-            conversation_messages: messages.clone(),
-            model: Some("model-a".into()),
-            permission_mode: Some("plan".into()),
-            blocked_tools: heavy.blocked_tools.clone(),
-            approval_overrides: heavy.approval_overrides.clone(),
-            ..Default::default()
-        };
-        apply_selected_resume_bundle(&mut restored);
-
-        assert_eq!(restored.conversation_messages, messages);
-        assert!(restored.resume_messages().is_empty());
-        assert_eq!(restored.model, None);
-        assert_eq!(restored.permission_mode, None);
-        assert!(restored.blocked_tools.is_empty());
-        assert_eq!(restored.approval_overrides, None);
-    }
-
-    #[test]
-    fn canonical_resume_never_restamps_side_state_from_an_older_materialization() {
-        let messages = vec![serde_json::json!({"role": "user", "content": "resume"})];
-        let source_cursor =
-            typed_resume_bundle_from_messages("owner-1", "canonical-session", 3, messages.clone())
-                .cursor;
-        let heavy = CloudHeavyCheckpointState {
-            conversation_cursor: Some(source_cursor),
-            messages: messages.clone(),
-            blocked_tools: vec!["write".into()],
-            ..Default::default()
-        };
-        let checkpoint_bundle = build_resume_bundle(
-            "owner-1",
-            "canonical-session",
-            messages.clone(),
-            true,
-            Some(&heavy),
-        )
-        .unwrap()
-        .unwrap();
-        let checkpoint_cursor = checkpoint_bundle.cursor.clone();
-        let canonical_bundle = |materialized_messages: Vec<serde_json::Value>| {
-            let mut cursor = checkpoint_cursor.clone();
-            cursor.schema_version = astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION;
-            cursor.projection_schema =
-                astra_turn_types::SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION;
-            cursor.canonical_root_hash = "a".repeat(64);
-            let materialized_root =
-                astra_turn_types::canonical_conversation_root(&materialized_messages);
-            astra_turn_types::select_resume_bundle(
-                Some(&cursor),
-                [astra_turn_types::ResumeCandidateV1 {
-                    source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
-                    cursor: cursor.clone(),
-                    conversation_messages: materialized_messages,
-                    materialized_conversation_root_hash: Some(materialized_root),
-                    degraded_reasons: Vec::new(),
-                    repair_actions: Vec::new(),
-                    projections: Default::default(),
-                }],
-            )
-            .unwrap()
-        };
-
-        let mut equivalent = RestoredSession {
-            session_id: "canonical-session".into(),
-            resume_bundle: Some(checkpoint_bundle.clone()),
-            ..Default::default()
-        };
-        install_canonical_resume_bundle(&mut equivalent, canonical_bundle(messages)).unwrap();
-        assert_eq!(equivalent.model, None);
-        assert_eq!(equivalent.permission_mode, None);
-        assert!(equivalent.blocked_tools.is_empty());
-
-        let mut divergent = RestoredSession {
-            session_id: "canonical-session".into(),
-            resume_bundle: Some(checkpoint_bundle),
-            model: Some("must-be-cleared".into()),
-            ..Default::default()
-        };
-        install_canonical_resume_bundle(
-            &mut divergent,
-            canonical_bundle(vec![serde_json::json!({
-                "role": "user",
-                "content": "different"
-            })]),
-        )
-        .unwrap();
-        assert_eq!(divergent.model, None);
-        assert!(divergent.blocked_tools.is_empty());
-    }
-
-    #[test]
-    fn transcript_fallback_does_not_borrow_an_empty_checkpoint_cursor() {
-        let empty_checkpoint =
-            typed_resume_bundle("owner-1", "transcript-session", 4, "checkpoint");
-        let heavy = CloudHeavyCheckpointState {
-            conversation_cursor: Some(empty_checkpoint.cursor),
-            messages: Vec::new(),
-            blocked_tools: vec!["checkpoint-only".into()],
-            ..Default::default()
-        };
-        let transcript = vec![
-            serde_json::json!({"role": "user", "content": "transcript"}),
-            serde_json::json!({"role": "assistant", "content": "fallback"}),
-        ];
-
-        let bundle = build_resume_bundle(
-            "owner-1",
-            "transcript-session",
-            transcript,
-            false,
-            Some(&heavy),
-        )
-        .unwrap();
-
-        assert!(bundle.is_none());
     }
 
     #[test]
@@ -3065,30 +1675,6 @@ mod tests {
         assert_eq!(parsed[0].number, 1);
         assert_eq!(parsed[0].turn, 5);
         assert_eq!(parsed[0].title, "First checkpoint");
-    }
-
-    #[test]
-    fn merge_checkpoints_prefers_cloud_metadata_for_same_number() {
-        let local = vec![RestoredCheckpoint {
-            number: 3,
-            turn: 10,
-            title: "Local title".into(),
-            summary: String::new(),
-            total_tokens: 0,
-        }];
-        let cloud = vec![RestoredCheckpoint {
-            number: 3,
-            turn: 10,
-            title: "Cloud title".into(),
-            summary: "Rich summary".into(),
-            total_tokens: 1234,
-        }];
-
-        let merged = merge_checkpoints(local, cloud);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].title, "Cloud title");
-        assert_eq!(merged[0].summary, "Rich summary");
-        assert_eq!(merged[0].total_tokens, 1234);
     }
 
     // ── Restore field completeness ──
@@ -3144,319 +1730,6 @@ mod tests {
         assert_eq!(s.checkpoint_count, 0);
     }
 
-    // ── HybridRestoreService local_only behavior ──
-
-    #[tokio::test]
-    async fn local_only_recent_tools_returns_empty() {
-        let svc = HybridRestoreService::local_only();
-        let tools = svc
-            .restore_recent_tools("user1", "nonexistent")
-            .await
-            .unwrap();
-        assert!(tools.is_empty());
-    }
-
-    #[tokio::test]
-    async fn local_only_cloud_checkpoints_returns_empty() {
-        let svc = HybridRestoreService::local_only();
-        let ckpts = svc.cloud_checkpoints("user1", "nonexistent").await.unwrap();
-        assert!(ckpts.is_empty());
-    }
-
-    #[tokio::test]
-    async fn local_only_cloud_checkpoint_count_returns_zero() {
-        let svc = HybridRestoreService::local_only();
-        let count = svc
-            .cloud_checkpoint_count("user1", "nonexistent")
-            .await
-            .unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn cloud_checkpoint_queries_are_bounded_and_projection_aware() {
-        assert_eq!(MAX_CLOUD_RESTORE_CHECKPOINTS, 200);
-        assert!(
-            CLOUD_CHECKPOINTS_SELECT_SQL
-                .to_ascii_uppercase()
-                .contains("LIMIT ?"),
-            "cloud checkpoint restore must bound LONGTEXT reads"
-        );
-        assert!(
-            CLOUD_CHECKPOINTS_SELECT_SQL.contains("ORDER BY number DESC"),
-            "inner query must choose the latest checkpoints before applying LIMIT"
-        );
-        assert!(
-            CLOUD_CHECKPOINTS_SELECT_SQL.ends_with("ORDER BY number"),
-            "outer query must restore ascending checkpoint order for callers"
-        );
-        assert!(
-            !CLOUD_CHECKPOINT_COUNT_SQL.contains("summary"),
-            "checkpoint count must not read LONGTEXT checkpoint bodies"
-        );
-        assert!(
-            CLOUD_CHECKPOINT_COUNT_SQL
-                .to_ascii_uppercase()
-                .contains("COUNT(*)"),
-            "checkpoint count must stay a lightweight aggregate"
-        );
-    }
-
-    #[test]
-    fn prompt_history_transcript_query_restores_only_root_conversation_rows() {
-        for sql in [
-            PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL,
-            PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL,
-        ] {
-            let upper = sql.to_ascii_uppercase();
-
-            assert!(
-                upper.contains("LEFT JOIN AGENT_RUNS"),
-                "prompt-history transcript restore must classify transcript rows by durable run lineage: {sql}"
-            );
-            assert!(
-                upper.contains("R.SESSION_ID = STI.SESSION_ID"),
-                "run lineage lookup must stay scoped to the same session: {sql}"
-            );
-            assert!(
-                upper.contains("STI.RUN_ID IS NULL"),
-                "system/session transcript rows without a run owner remain restorable: {sql}"
-            );
-            assert!(
-                upper.contains("R.RUN_ID IS NOT NULL") && upper.contains("R.PARENT_RUN_ID IS NULL"),
-                "child/subrun transcript rows must not be restored as main prompt history: {sql}"
-            );
-        }
-        assert!(
-            PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL
-                .to_ascii_uppercase()
-                .contains("ORDER BY STI.ITEM_SEQ DESC"),
-            "inner prompt-history transcript query must choose the newest bounded rows first: {PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL}"
-        );
-        assert!(
-            PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL
-                .to_ascii_uppercase()
-                .contains("LIMIT ?"),
-            "prompt-history transcript restore must be bounded: {PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL}"
-        );
-        assert!(
-            PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL
-                .to_ascii_uppercase()
-                .ends_with("ORDER BY ITEM_SEQ"),
-            "prompt-history transcript restore must preserve transcript order: {PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL}"
-        );
-        assert_eq!(
-            MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS, 80,
-            "transcript fallback is not the canonical log; keep it bounded"
-        );
-    }
-
-    #[test]
-    fn dangling_terminal_user_request_gets_a_typed_prompt_boundary() {
-        assert!(
-            !PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL.contains("'tool'")
-                && PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL.contains("TRIM(sti.content) <> ''"),
-            "bare tool/empty assistant evidence must not consume the provider-safe history quota"
-        );
-        assert!(
-            prompt_history_boundary_after_message(
-                "user",
-                true,
-                Some("run-old"),
-                Some("run-old"),
-                Some("cancelled"),
-            )
-            .is_none(),
-            "an assistant or later intent in the same run still owns closure"
-        );
-        let boundary = prompt_history_boundary_after_message(
-            "user",
-            true,
-            Some("run-old"),
-            Some("run-new"),
-            Some("cancelled"),
-        )
-        .expect("cancelled dangling request must be closed");
-        assert!(boundary.contains("cancelled before completion"));
-        assert!(boundary.contains("not an active objective"));
-        assert!(
-            prompt_history_boundary_after_message(
-                "tool",
-                true,
-                Some("run-old"),
-                Some("run-new"),
-                Some("cancelled"),
-            )
-            .is_some(),
-            "partial side effects remain evidence but must not keep the old objective active"
-        );
-        assert!(
-            prompt_history_boundary_after_message(
-                "assistant",
-                true,
-                Some("run-old"),
-                Some("run-new"),
-                Some("cancelled"),
-            )
-            .is_none()
-        );
-        assert!(
-            prompt_history_boundary_after_message(
-                "assistant",
-                false,
-                Some("run-old"),
-                Some("run-new"),
-                Some("cancelled"),
-            )
-            .is_some(),
-            "an empty assistant tool-call tail does not naturally close a cancelled request"
-        );
-        assert!(prompt_history_role_is_provider_safe("assistant", true));
-        assert!(
-            !prompt_history_role_is_provider_safe("tool", true),
-            "a bare tool row without tool_call_id/pairing must never enter provider history"
-        );
-        assert!(
-            prompt_history_boundary_after_message(
-                "user",
-                true,
-                Some("run-old"),
-                Some("run-new"),
-                Some("running"),
-            )
-            .is_none(),
-            "a live run must not be sealed by a restore projection"
-        );
-    }
-
-    #[test]
-    fn tool_heavy_terminal_tail_cannot_evict_provider_safe_history_quota() {
-        let mut newest_first = (0..MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS)
-            .map(|index| ("tool", format!("tool-result-{index}")))
-            .collect::<Vec<_>>();
-        newest_first.extend(
-            (0..MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS)
-                .map(|index| ("user", format!("prompt-{index}"))),
-        );
-
-        let selected = newest_first
-            .into_iter()
-            .filter(|(role, content)| {
-                prompt_history_role_is_provider_safe(role, !content.trim().is_empty())
-            })
-            .take(MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS as usize)
-            .collect::<Vec<_>>();
-
-        assert_eq!(selected.len(), MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS as usize);
-        assert!(selected.iter().all(|(role, _)| *role == "user"));
-    }
-
-    static SESSION_RESTORE_DB: tokio::sync::OnceCell<astra_core::MatrixOneSettings> =
-        tokio::sync::OnceCell::const_new();
-
-    async fn setup_session_restore_db_it() -> astra_core::SharedPool {
-        assert_eq!(
-            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
-            Ok("1"),
-            "set ASTRA_TEST_DB_IT=1 for ignored MatrixOne restore tests"
-        );
-        let settings = SESSION_RESTORE_DB
-            .get_or_init(|| async {
-                let settings = astra_core::MatrixOneSettings::from_env();
-                let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
-                    .unwrap_or_else(|_| "mysql".to_string());
-                crate::storage::ensure_core_schema(&settings, &catalog)
-                    .await
-                    .expect("ensure_core_schema");
-                settings
-            })
-            .await
-            .clone();
-        astra_core::SharedPool::new(&settings)
-            .await
-            .expect("SharedPool::new")
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-    async fn authenticated_restore_does_not_let_an_incomplete_local_mirror_shadow_matrixone() {
-        let journal_dir = tempfile::tempdir().unwrap();
-        let _journal_guard = JournalDirGuard::new(journal_dir.path());
-        let pool = setup_session_restore_db_it().await;
-        let user_id = format!("user-{}", uuid::Uuid::new_v4());
-        let session_id = format!("sess-{}", uuid::Uuid::new_v4());
-        let event_id = format!("event-{}", uuid::Uuid::new_v4());
-
-        sqlx::query(
-            "INSERT INTO agent_sessions
-             (session_id, user_id, status, created_at, updated_at, last_active_at)
-             VALUES (?, ?, 'active', NOW(6), NOW(6), NOW(6))",
-        )
-        .bind(&session_id)
-        .bind(&user_id)
-        .execute(pool.get())
-        .await
-        .expect("insert restore session");
-        sqlx::query(
-            "INSERT INTO agent_events
-             (event_id, session_id, user_id, event_type, content, turn_seq, payload_hash, ingestion_write_id, created_at)
-             VALUES (?, ?, ?, 'user_query', 'turn four', 4, ?, ?, NOW(6))",
-        )
-        .bind(&event_id)
-        .bind(&session_id)
-        .bind(&user_id)
-        .bind(crate::observation_capture::canonical_observation_payload_hash(
-            crate::observation_capture::ObservationPayloadDomain::AgentEvent,
-            &serde_json::json!({"event_id": event_id, "session_id": session_id, "user_id": user_id, "event_type": "user_query", "content": "turn four", "turn_seq": 4}),
-        ))
-        .bind(uuid::Uuid::new_v4().to_string())
-        .execute(pool.get())
-        .await
-        .expect("insert authoritative turn event");
-
-        // The API process writes an owner-scoped observability mirror before
-        // the CLI writes its completed-turn journal. It is evidence that the
-        // session exists, but it contains no completed Turn event and must not
-        // hide the authoritative MatrixOne clock.
-        let local_writer =
-            crate::session_journal::JournalWriter::for_user(&user_id, &session_id).unwrap();
-        local_writer
-            .append(&crate::session_journal::JournalEvent::session_start(
-                Some(&session_id),
-                Some("mirror-model"),
-            ))
-            .unwrap();
-
-        let service = HybridRestoreService::new(pool.get().clone());
-        let restored = service
-            .restore_session(&user_id, &session_id)
-            .await
-            .expect("restore should reconcile available projections")
-            .expect("session should be resumable");
-
-        sqlx::query("DELETE FROM agent_events WHERE user_id = ? AND session_id = ?")
-            .bind(&user_id)
-            .bind(&session_id)
-            .execute(pool.get())
-            .await
-            .expect("delete restore events");
-        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
-            .bind(&user_id)
-            .bind(&session_id)
-            .execute(pool.get())
-            .await
-            .expect("delete restore session");
-
-        assert_eq!(restored.turn_count, 4);
-        assert!(
-            restored.restored_from_cloud,
-            "the projection that owns the furthest completed turn must own the restored state"
-        );
-    }
-
-    // ── Checkpoint convergence ──
-
     #[test]
     fn restored_checkpoint_covers_listing_fields() {
         let ckpt = RestoredCheckpoint {
@@ -3466,7 +1739,7 @@ mod tests {
             summary: "All tests passing after auth refactor".into(),
             total_tokens: 120_000,
         };
-        // Keep the fields returned by cloud checkpoint listing.
+        // Keep the local checkpoint listing wire fields.
         assert_eq!(ckpt.number, 7);
         assert_eq!(ckpt.turn, 35);
         assert!(!ckpt.title.is_empty());
@@ -3614,7 +1887,6 @@ mod tests {
             history: None,
             budget: None,
             timing: None,
-            explanations: Vec::new(),
         };
 
         assert_eq!(
@@ -3645,7 +1917,6 @@ mod tests {
             history: None,
             budget: None,
             timing: None,
-            explanations: Vec::new(),
         };
 
         assert_eq!(
@@ -3653,193 +1924,5 @@ mod tests {
             vec!["rg".to_string(), "bash".to_string()],
             "resume recent_tools must contain canonical non-empty tool names only"
         );
-    }
-
-    #[test]
-    fn composite_snapshot_index_uses_one_stable_remote_projection_id() {
-        let index = astra_core::composite_snapshot::CompositeSnapshotIndex::default();
-        let first =
-            composite_snapshot_index_to_remote_artifact_record("session-a", "user-a", &index)
-                .expect("serialize first index");
-        let second =
-            composite_snapshot_index_to_remote_artifact_record("session-a", "user-a", &index)
-                .expect("serialize replayed index");
-
-        assert_eq!(first.artifact_id, COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID);
-        assert_eq!(second.artifact_id, first.artifact_id);
-    }
-
-    #[test]
-    fn authenticated_local_summary_reads_only_the_requested_owner() {
-        let temp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(temp.path());
-        let session_id = uuid::Uuid::new_v4().to_string();
-        let owner_writer = crate::session_journal::JournalWriter::for_user("user-a", &session_id)
-            .expect("owner journal");
-        owner_writer
-            .append(&crate::session_journal::JournalEvent::session_start(
-                Some(&session_id),
-                Some("owner-model"),
-            ))
-            .unwrap();
-
-        assert!(
-            summarize_local_journal(Some("user-b"), &session_id)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            summarize_local_journal(Some("user-a"), &session_id)
-                .unwrap()
-                .and_then(|summary| summary.model),
-            Some("owner-model".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_cloud_heavy_checkpoint_state_accepts_only_tagged_shape() {
-        let messages = vec![serde_json::json!({"role":"user","content":"hi"})];
-        let conversation_cursor = astra_turn_types::SessionCursorV1 {
-            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
-            owner_id: "owner-1".into(),
-            session_id: "session-1".into(),
-            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.into(),
-            completed_turn: 1,
-            journal_event_seq: 1,
-            conversation_seq: 1,
-            canonical_root_hash: astra_turn_types::canonical_conversation_root(&messages),
-            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
-            compaction_generation: 0,
-            config_version_id: Some("cfg-1".into()),
-        };
-        let approval_overrides = serde_json::json!({"rules": []});
-        let interruption = serde_json::json!({"kind":"rate_limited"});
-        let compaction_state = serde_json::json!({"attempt_count": 2});
-        let expected = CloudHeavyCheckpointState {
-            conversation_cursor: Some(conversation_cursor.clone()),
-            config_version_id: Some("cfg-1".into()),
-            messages: messages.clone(),
-            blocked_tools: vec!["bash".into()],
-            recent_tools: vec!["rg".into()],
-            deferred_tool_activations: Vec::new(),
-            approval_overrides: Some(approval_overrides.clone()),
-            interruption: Some(interruption.clone()),
-            compaction_state: Some(compaction_state.clone()),
-            pipeline_state: None,
-        };
-        let tagged = serde_json::json!({
-            "Heavy": {
-                "light": {},
-                "conversation_cursor": conversation_cursor,
-                "config_version_id": "cfg-1",
-                "messages": messages,
-                "blocked_tools": ["bash"],
-                "recent_tools": ["rg"],
-                "approval_overrides": approval_overrides,
-                "interruption": interruption,
-                "compaction_state": compaction_state
-            }
-        })
-        .to_string();
-        let untagged = serde_json::json!({
-            "messages": expected.messages.clone(),
-            "blocked_tools": expected.blocked_tools.clone(),
-            "recent_tools": expected.recent_tools.clone(),
-            "approval_overrides": expected.approval_overrides.clone(),
-            "interruption": expected.interruption.clone(),
-            "compaction_state": expected.compaction_state.clone()
-        })
-        .to_string();
-
-        assert_eq!(
-            parse_cloud_heavy_checkpoint_state(&tagged),
-            Ok(Some(expected.clone()))
-        );
-        assert_eq!(
-            parse_cloud_heavy_checkpoint_state(&untagged),
-            Ok(None),
-            "unversioned/unwrapped cloud heavy payloads must not be restored"
-        );
-    }
-
-    #[test]
-    fn parse_cloud_heavy_checkpoint_state_normalizes_recent_tools() {
-        let checkpoint = serde_json::json!({
-            "Heavy": {
-                "messages": [],
-                "blocked_tools": [],
-                "recent_tools": ["", "  ", " rg ", "rg", " bash"]
-            }
-        })
-        .to_string();
-
-        let state = parse_cloud_heavy_checkpoint_state(&checkpoint)
-            .unwrap()
-            .expect("tagged heavy checkpoint should restore");
-
-        assert_eq!(
-            state.recent_tools,
-            vec!["rg".to_string(), "bash".to_string()]
-        );
-        assert!(
-            state.deferred_tool_activations.is_empty(),
-            "cloud checkpoints written before typed activation evidence must remain readable"
-        );
-    }
-
-    #[test]
-    fn parse_cloud_heavy_checkpoint_state_rejects_corrupt_json() {
-        let error = parse_cloud_heavy_checkpoint_state("{not-json").unwrap_err();
-        assert!(error.contains("invalid cloud heavy checkpoint JSON"));
-    }
-
-    #[test]
-    fn parse_cloud_heavy_checkpoint_state_rejects_missing_required_heavy_fields() {
-        for field in ["messages", "blocked_tools", "recent_tools"] {
-            let mut heavy = serde_json::Map::new();
-            heavy.insert("messages".into(), serde_json::json!([]));
-            heavy.insert("blocked_tools".into(), serde_json::json!([]));
-            heavy.insert("recent_tools".into(), serde_json::json!([]));
-            heavy.remove(field);
-            let checkpoint = serde_json::json!({ "Heavy": heavy }).to_string();
-
-            let error = parse_cloud_heavy_checkpoint_state(&checkpoint).unwrap_err();
-            assert!(
-                error.contains(&format!("field={field}")),
-                "error should identify missing field {field}: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn parse_cloud_heavy_checkpoint_state_rejects_null_or_corrupt_required_fields() {
-        for (field, value) in [
-            ("messages", serde_json::Value::Null),
-            ("blocked_tools", serde_json::Value::Null),
-            ("recent_tools", serde_json::Value::Null),
-            ("messages", serde_json::json!("not-array")),
-            ("blocked_tools", serde_json::json!([1])),
-            ("recent_tools", serde_json::json!({"tool": "rg"})),
-        ] {
-            let mut heavy = serde_json::Map::new();
-            heavy.insert("messages".into(), serde_json::json!([]));
-            heavy.insert("blocked_tools".into(), serde_json::json!([]));
-            heavy.insert("recent_tools".into(), serde_json::json!([]));
-            heavy.insert(field.into(), value);
-            let checkpoint = serde_json::json!({ "Heavy": heavy }).to_string();
-
-            let error = parse_cloud_heavy_checkpoint_state(&checkpoint).unwrap_err();
-            assert!(
-                error.contains(&format!("field={field}")),
-                "error should identify corrupt field {field}: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn parse_cloud_heavy_checkpoint_state_rejects_non_object_heavy_payload() {
-        let checkpoint = serde_json::json!({ "Heavy": "not-object" }).to_string();
-        let error = parse_cloud_heavy_checkpoint_state(&checkpoint).unwrap_err();
-        assert!(error.contains("field=Heavy"));
     }
 }

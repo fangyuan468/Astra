@@ -85,3 +85,15 @@ CLI stream observation uses its existing snapshot sink directly through
 CLI `harness_trace` copy and `RecordingKernel` wrapper are retired. Shared
 recorded traces, privacy projection and whole-session contract validation remain
 available to the execution harness.
+
+### Local failures before execution
+
+An existing empty machine-event file is valid only alongside a strict failed CLI
+terminal envelope that agrees with the nonzero process status and explicitly
+reports `server_admission_not_dispatched=true`, with no Run, output, model usage,
+or tool execution. A selected Session is diagnostic context and grants no
+inspection or cancellation authority. The harness retains the stable failure
+code and category; it performs no session capture, cleanup, or semantic judging
+for that invocation. The case remains failed. Missing files, malformed streams,
+contradictory execution facts, and empty evidence for admitted runs remain
+protocol failures.

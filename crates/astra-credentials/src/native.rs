@@ -3,6 +3,8 @@
 //! part of this protocol, not optional legacy profile attributes.
 use fs2::FileExt;
 mod diagnostics;
+#[cfg(all(test, unix))]
+mod publication_tests;
 use diagnostics::{RotationDiagnostic, response_request_id, transport_cause};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -127,6 +129,76 @@ pub struct NativeStore {
     root: PathBuf,
 }
 
+/// Cancellation wins only before the atomic rename is admitted. Callers must
+/// join publication after requesting cancellation; never detach a writer.
+#[derive(Clone)]
+pub struct PublicationControl {
+    phase: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    deadline: std::time::Instant,
+}
+
+impl PublicationControl {
+    pub fn new(wait: std::time::Duration) -> Self {
+        Self {
+            phase: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            deadline: std::time::Instant::now() + wait,
+        }
+    }
+
+    pub fn cancel(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                0,
+                1,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if self.phase.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+            return Err(
+                "Operation stopped before credential publication; saved credentials are unchanged."
+                    .into(),
+            );
+        }
+        if std::time::Instant::now() >= self.deadline {
+            return Err("Timed out waiting to publish credentials; the saved sign-in is unchanged. Close other sign-in operations and try again.".into());
+        }
+        Ok(())
+    }
+
+    fn begin_commit(&self) -> Result<(), String> {
+        self.check()?;
+        self.phase
+            .compare_exchange(
+                0,
+                2,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .map_err(|_| {
+                "Operation stopped before credential publication; saved credentials are unchanged."
+                    .to_string()
+            })?;
+        self.check()
+    }
+}
+
+/// Rename made the new session visible even when directory fsync failed.
+pub struct PublishedLogin {
+    pub session: NativeSession,
+    pub previous: Option<NativeSession>,
+    pub directory_synced: bool,
+}
+
+#[derive(Debug)]
+pub struct Committed<T> {
+    pub value: T,
+    pub directory_synced: bool,
+}
+
 /// Read-only local status; observing it never sends a refresh request.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -204,8 +276,29 @@ impl NativeStore {
 
     pub fn publish(
         &self,
-        mut session: NativeSession,
+        session: NativeSession,
     ) -> Result<(NativeSession, Option<NativeSession>), String> {
+        let result = self.publish_controlled(
+            session,
+            &PublicationControl::new(std::time::Duration::from_secs(10)),
+        )?;
+        Ok((result.session, result.previous))
+    }
+
+    pub fn publish_controlled(
+        &self,
+        session: NativeSession,
+        control: &PublicationControl,
+    ) -> Result<PublishedLogin, String> {
+        self.publish_with_sync(session, control, sync_auth_directory)
+    }
+
+    fn publish_with_sync(
+        &self,
+        mut session: NativeSession,
+        control: &PublicationControl,
+        sync_directory: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> Result<PublishedLogin, String> {
         session.environment.validate()?;
         if [
             &session.subject,
@@ -225,7 +318,7 @@ impl NativeStore {
         session.refresh_pending = false;
         session.workspace_id = None;
         session.role_id = None;
-        self.transaction(|state| {
+        let committed = self.transaction_with_sync(Some(control), sync_directory, |state| {
             let previous = state
                 .active
                 .as_ref()
@@ -241,10 +334,15 @@ impl NativeStore {
                 .insert(key.clone(), session.environment.clone());
             state.sessions.insert(key, Some(session.clone()));
             Ok((session, previous))
+        })?;
+        Ok(PublishedLogin {
+            session: committed.value.0,
+            previous: committed.value.1,
+            directory_synced: committed.directory_synced,
         })
     }
 
-    pub fn logout(&self) -> Result<Option<NativeSession>, String> {
+    pub fn logout(&self) -> Result<Committed<Option<NativeSession>>, String> {
         self.transaction(|state| {
             let key = state
                 .active
@@ -260,25 +358,54 @@ impl NativeStore {
         &self,
         expected: &NativeSession,
         workspace: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<Committed<()>, String> {
+        self.select_workspace_with_control(expected, workspace, None)
+    }
+
+    pub fn select_workspace_controlled(
+        &self,
+        expected: &NativeSession,
+        workspace: Option<&str>,
+        control: &PublicationControl,
+    ) -> Result<Committed<()>, String> {
+        self.select_workspace_with_control(expected, workspace, Some(control))
+    }
+
+    fn select_workspace_with_control(
+        &self,
+        expected: &NativeSession,
+        workspace: Option<&str>,
+        control: Option<&PublicationControl>,
+    ) -> Result<Committed<()>, String> {
         if workspace
             .is_some_and(|v| v.is_empty() || v.len() > 128 || v.chars().any(char::is_whitespace))
         {
             return Err("invalid workspace identity".into());
         }
-        self.update(expected, |session| {
+        self.update_with_control(expected, control, |session| {
             session.workspace_id = workspace.map(str::to_owned);
             session.role_id = None;
             Ok(())
         })
     }
 
-    fn update(
+    fn update_with_control(
         &self,
         expected: &NativeSession,
+        control: Option<&PublicationControl>,
         f: impl FnOnce(&mut NativeSession) -> Result<(), String>,
-    ) -> Result<(), String> {
-        self.transaction(|state| {
+    ) -> Result<Committed<()>, String> {
+        self.update_with_sync(expected, control, sync_auth_directory, f)
+    }
+
+    fn update_with_sync(
+        &self,
+        expected: &NativeSession,
+        control: Option<&PublicationControl>,
+        sync_directory: impl FnOnce(&Path) -> std::io::Result<()>,
+        f: impl FnOnce(&mut NativeSession) -> Result<(), String>,
+    ) -> Result<Committed<()>, String> {
+        self.transaction_with_sync(control, sync_directory, |state| {
             let key = expected.environment.key();
             if state.active.as_ref() != Some(&key) {
                 return Err("MOI environment changed during operation".into());
@@ -369,32 +496,71 @@ impl NativeStore {
         Ok(state)
     }
 
-    fn transaction<R>(&self, f: impl FnOnce(&mut State) -> Result<R, String>) -> Result<R, String> {
+    fn transaction<R>(
+        &self,
+        f: impl FnOnce(&mut State) -> Result<R, String>,
+    ) -> Result<Committed<R>, String> {
+        self.transaction_with_sync(None, sync_auth_directory, f)
+    }
+
+    fn transaction_with_sync<R>(
+        &self,
+        control: Option<&PublicationControl>,
+        sync_directory: impl FnOnce(&Path) -> std::io::Result<()>,
+        f: impl FnOnce(&mut State) -> Result<R, String>,
+    ) -> Result<Committed<R>, String> {
         self.prepare_dir()?;
         let lock = private_open(&self.root.join("auth.lock"), true)?;
-        FileExt::lock_exclusive(&lock).map_err(|_| "cannot lock MOI credentials")?;
+        if let Some(control) = control {
+            loop {
+                control.check()?;
+                match FileExt::try_lock_exclusive(&lock) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    Err(_) => return Err("cannot lock MOI credentials".into()),
+                }
+            }
+        } else {
+            FileExt::lock_exclusive(&lock).map_err(|_| "cannot lock MOI credentials")?;
+        }
         let mut state = self.read_locked()?;
         let result = f(&mut state)?;
         let body = serde_json::to_vec(&state).map_err(|_| "cannot encode MOI credentials")?;
         let tmp_path = self.root.join(format!("auth-{}.tmp", uuid::Uuid::new_v4()));
-        let write = || -> Result<(), String> {
+        let write = || -> Result<bool, String> {
             let mut tmp = private_create(&tmp_path)?;
             tmp.write_all(&body)
                 .map_err(|_| "cannot write MOI credentials")?;
             tmp.sync_all().map_err(|_| "cannot sync MOI credentials")?;
+            if let Some(control) = control {
+                control.begin_commit()?;
+            }
             fs::rename(&tmp_path, self.root.join("auth.json"))
                 .map_err(|_| "cannot publish MOI credentials")?;
-            File::open(&self.root)
-                .and_then(|f| f.sync_all())
-                .map_err(|_| "cannot sync MOI auth directory")?;
-            Ok(())
+            // The commit is visible. Never return a pre-commit error here or
+            // revoke the newly published session as if publication had failed.
+            let directory_synced = sync_directory(&self.root).is_ok();
+            if !directory_synced {
+                tracing::warn!(
+                    "MOI credentials are visible but directory durability is unconfirmed"
+                );
+            }
+            Ok(directory_synced)
         };
-        if let Err(error) = write() {
+        let directory_synced = write().inspect_err(|_| {
             let _ = fs::remove_file(&tmp_path);
-            return Err(error);
-        }
-        Ok(result)
+        })?;
+        Ok(Committed {
+            value: result,
+            directory_synced,
+        })
     }
+}
+
+fn sync_auth_directory(root: &Path) -> std::io::Result<()> {
+    File::open(root).and_then(|file| file.sync_all())
 }
 
 fn private_create(path: &Path) -> Result<File, String> {
@@ -816,7 +982,16 @@ impl NativeStore {
             // not abandon an in-flight rotation or clear a token that may
             // already have been consumed.
             let settlement = tokio::spawn(async move {
-                settle_token_rotation(store, expected, client, request, rotation, diagnostic).await
+                settle_token_rotation(
+                    store,
+                    expected,
+                    client,
+                    request,
+                    rotation,
+                    diagnostic,
+                    sync_auth_directory,
+                )
+                .await
             });
             current = settlement.await.map_err(|_| {
                 tracing::warn!("native token rotation task panicked before settlement");
@@ -845,35 +1020,50 @@ impl NativeStore {
     }
 }
 
-async fn settle_token_rotation(
+async fn settle_token_rotation<S>(
     store: NativeStore,
     expected: NativeSession,
     client: reqwest::Client,
     request: reqwest::Request,
     rotation: std::sync::Arc<std::fs::File>,
     diagnostic: RotationDiagnostic,
-) -> Result<NativeSession, CredentialFailure> {
+    sync_directory: S,
+) -> Result<NativeSession, CredentialFailure>
+where
+    S: Fn(&Path) -> std::io::Result<()> + Clone + Send + 'static,
+{
     diagnostic
         .record("pending_write", "started", None, None, None)
         .await;
     let write_guard = rotation.clone();
     let pending_expected = expected.clone();
+    let pending_sync = sync_directory.clone();
     let pending = store
         .blocking(move |store| {
             // spawn_blocking outlives cancellation of its awaiting task.
             // Retain rotation ownership until the durable write finishes.
             let _write_guard = write_guard;
-            store.update(&pending_expected, |session| {
+            store.update_with_sync(&pending_expected, None, pending_sync, |session| {
                 session.refresh_pending = true;
                 Ok(())
             })
         })
         .await;
-    if let Err(error) = pending {
-        diagnostic
-            .record("pending_write", "storage_failed", None, None, Some(&error))
-            .await;
-        return Err(CredentialFailure::Unavailable(error));
+    match pending {
+        Err(error) => {
+            diagnostic
+                .record("pending_write", "storage_failed", None, None, Some(&error))
+                .await;
+            return Err(CredentialFailure::Unavailable(error));
+        }
+        Ok(committed) if !committed.directory_synced => {
+            let error = "refresh intent is visible but its durability is unconfirmed";
+            diagnostic
+                .record("pending_write", "storage_failed", None, None, Some(error))
+                .await;
+            return Err(CredentialFailure::RotationInterrupted);
+        }
+        Ok(_) => {}
     }
     diagnostic
         .record("http", "request_started", None, None, None)
@@ -895,10 +1085,11 @@ async fn settle_token_rotation(
                 .await;
             let expected = expected.clone();
             let write_guard = rotation.clone();
+            let clear_sync = sync_directory.clone();
             let cleared = store
                 .blocking(move |store| {
                     let _write_guard = write_guard;
-                    store.update(&expected, |session| {
+                    store.update_with_sync(&expected, None, clear_sync, |session| {
                         session.refresh_pending = false;
                         Ok(())
                     })
@@ -1025,36 +1216,52 @@ async fn settle_token_rotation(
     diagnostic
         .record("save", "started", Some(status), request_id.as_deref(), None)
         .await;
-    if let Err(error) = store
-        .blocking(move |store| {
-            let _write_guard = write_guard;
-            store.update(&saved, |session| {
-                session.access_token = access_token;
-                session.refresh_token = refresh_token;
-                session.expires_at = unix_now()? + expires_in;
-                session.refresh_pending = false;
-                Ok(())
-            })
+    let writer_store = store.clone();
+    let write_result = tokio::task::spawn_blocking(move || {
+        let _write_guard = write_guard;
+        writer_store.update_with_sync(&saved, None, sync_directory, |session| {
+            session.access_token = access_token;
+            session.refresh_token = refresh_token;
+            session.expires_at = unix_now()? + expires_in;
+            session.refresh_pending = false;
+            Ok(())
         })
-        .await
-    {
-        diagnostic
-            .record(
-                "save",
-                "storage_failed",
-                Some(status),
-                request_id.as_deref(),
-                Some(&error),
-            )
-            .await;
-        let _ = revoke(&expected.environment, &token.refresh_token).await;
-        tracing::warn!(cause = %error, "rotated token could not be saved");
-        return Err(log_rotation_failure(classify_post_rotation_save(error)));
-    }
+    })
+    .await;
+    let durable = match write_result {
+        Ok(Err(error)) => {
+            diagnostic
+                .record(
+                    "save",
+                    "storage_failed",
+                    Some(status),
+                    request_id.as_deref(),
+                    Some(&error),
+                )
+                .await;
+            let _ = revoke(&expected.environment, &token.refresh_token).await;
+            tracing::warn!(cause = %error, "rotated token could not be saved");
+            return Err(log_rotation_failure(classify_post_rotation_save(error)));
+        }
+        Err(_) => {
+            // A worker panic does not establish whether rename committed.
+            // Revoking the replacement could invalidate visible credentials.
+            return Err(log_rotation_failure(CredentialFailure::RotationUnconfirmed));
+        }
+        Ok(Ok(committed)) if !committed.directory_synced => {
+            tracing::warn!("rotated credentials are visible but crash durability is unconfirmed");
+            false
+        }
+        Ok(Ok(_)) => true,
+    };
     diagnostic
         .record(
             "settled",
-            "success",
+            if durable {
+                "success"
+            } else {
+                "visible_durability_unconfirmed"
+            },
             Some(status),
             request_id.as_deref(),
             None,
@@ -1332,7 +1539,7 @@ mod tests {
             .rotation_lock(&published.environment.key(), std::time::Duration::ZERO)
             .unwrap();
         store
-            .update(&published, |current| {
+            .update_with_control(&published, None, |current| {
                 current.refresh_pending = true;
                 Ok(())
             })
@@ -1403,7 +1610,7 @@ mod tests {
                 .rotation_lock(&session.environment.key(), std::time::Duration::ZERO)
                 .unwrap();
             store
-                .update(&session, |current| {
+                .update_with_control(&session, None, |current| {
                     current.refresh_pending = true;
                     Ok(())
                 })
@@ -1516,7 +1723,7 @@ mod tests {
         assert_eq!(store.current().unwrap().subject, "A");
     }
 
-    fn session(subject: &str) -> NativeSession {
+    pub(super) fn session(subject: &str) -> NativeSession {
         let issuer = "https://uc.example.test/realms/moi";
         NativeSession {
             environment: Environment {
@@ -1543,7 +1750,7 @@ mod tests {
         }
     }
 
-    fn store() -> (tempfile::TempDir, NativeStore) {
+    pub(super) fn store() -> (tempfile::TempDir, NativeStore) {
         let directory = tempfile::tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let store = NativeStore::with_directory(directory.path().to_path_buf());
@@ -1608,20 +1815,20 @@ mod tests {
         assert_ne!(store.current().unwrap().generation, first.generation);
         assert!(
             store
-                .update(&first, |s| {
+                .update_with_control(&first, None, |s| {
                     s.access_token = "stale".into();
                     Ok(())
                 })
                 .is_err()
         );
-        assert_eq!(store.logout().unwrap().unwrap().subject, "B");
+        assert_eq!(store.logout().unwrap().value.unwrap().subject, "B");
         assert!(store.configured().unwrap());
         assert!(store.current().is_err());
         assert_eq!(
             store.selected_environment().unwrap(),
             Some(first.environment)
         );
-        assert!(store.logout().unwrap().is_none());
+        assert!(store.logout().unwrap().value.is_none());
         let disk = fs::read_to_string(directory.path().join("auth.json")).unwrap();
         assert!(!disk.contains("synthetic-access") && !disk.contains("synthetic-refresh"));
     }
@@ -1709,7 +1916,7 @@ mod tests {
         );
         let current = store.current().unwrap();
         store
-            .update(&current, |s| {
+            .update_with_control(&current, None, |s| {
                 s.refresh_pending = true;
                 Ok(())
             })
@@ -1773,7 +1980,7 @@ mod tests {
         let (_directory, store) = store();
         let (published, _) = store.publish(session("A")).unwrap();
         store
-            .update(&published, |session| {
+            .update_with_control(&published, None, |session| {
                 session.refresh_pending = true;
                 Ok(())
             })
@@ -1799,6 +2006,111 @@ mod tests {
         );
         assert!(store.current().unwrap().refresh_pending);
         drop(lock);
+    }
+
+    async fn rotate_with_sync<S>(
+        store: NativeStore,
+        expected: NativeSession,
+        sync: S,
+    ) -> Result<NativeSession, CredentialFailure>
+    where
+        S: Fn(&Path) -> std::io::Result<()> + Clone + Send + 'static,
+    {
+        let rotation = store
+            .rotation_lock(&expected.environment.key(), std::time::Duration::ZERO)
+            .unwrap();
+        let client = http_client().unwrap();
+        let request = client
+            .post(&expected.environment.token_endpoint)
+            .form(&[
+                ("client_id", "astra-cli"),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", expected.refresh_token.as_str()),
+            ])
+            .build()
+            .unwrap();
+        let diagnostic = RotationDiagnostic::new(&store, &expected);
+        settle_token_rotation(store, expected, client, request, rotation, diagnostic, sync).await
+    }
+
+    async fn prepared_rotation() -> (
+        RotationFixture,
+        tempfile::TempDir,
+        NativeStore,
+        NativeSession,
+    ) {
+        let fixture = rotation_fixture("A").await;
+        let (directory, store) = store();
+        let mut expired = session("A");
+        expired.environment = fixture.environment.clone();
+        expired.expires_at = unix_now().unwrap();
+        let (expected, _) = store.publish(expired).unwrap();
+        (fixture, directory, store, expected)
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_pending_intent_never_sends_refresh() {
+        use std::sync::atomic::Ordering;
+        let (fixture, _directory, store, expected) = prepared_rotation().await;
+        let result = rotate_with_sync(store.clone(), expected, |_| {
+            Err(std::io::Error::other("injected sync failure"))
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(CredentialFailure::RotationInterrupted)
+        ));
+        assert_eq!(fixture.rotations.load(Ordering::SeqCst), 0);
+        assert!(store.current().unwrap().refresh_pending);
+    }
+
+    #[tokio::test]
+    async fn visible_rotated_token_is_not_revoked_when_directory_sync_fails() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let (fixture, _directory, store, expected) = prepared_rotation().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        fixture.release.notify_one();
+        let result = rotate_with_sync(store.clone(), expected, move |root| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                sync_auth_directory(root)
+            } else {
+                Err(std::io::Error::other("injected sync failure"))
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.refresh_token, "synthetic-rotated");
+        assert_eq!(store.current().unwrap().refresh_token, "synthetic-rotated");
+        assert_eq!(fixture.rotations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.revocations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_worker_outcome_does_not_revoke_visible_rotated_token() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let (fixture, _directory, store, expected) = prepared_rotation().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        fixture.release.notify_one();
+        let result = rotate_with_sync(store.clone(), expected, move |root| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                sync_auth_directory(root)
+            } else {
+                panic!("injected failure after rename")
+            }
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(CredentialFailure::RotationUnconfirmed)
+        ));
+        assert_eq!(store.current().unwrap().refresh_token, "synthetic-rotated");
+        assert_eq!(fixture.revocations.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

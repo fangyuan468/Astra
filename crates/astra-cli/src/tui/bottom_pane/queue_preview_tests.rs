@@ -1,7 +1,8 @@
 #![cfg(test)]
 
 use super::{
-    BottomPane, PendingUserIntentCustody, PendingUserIntentTarget, UserIntentRejectReason,
+    AgentDeliveryBarrier, BottomPane, PendingUserIntentCustody, PendingUserIntentTarget,
+    UserIntentRejectReason,
 };
 use crate::tui::task_status::TaskStatus;
 use ratatui::{buffer::Buffer, layout::Rect};
@@ -50,6 +51,237 @@ fn known_guidance_identity_has_a_neutral_local_error() {
     );
 }
 
+#[test]
+fn pending_guidance_is_bounded_without_evicting_earlier_messages() {
+    let mut pane = BottomPane::new();
+    for index in 0..64 {
+        pane.accept_turn_user_intent("turn", index.to_string(), format!("message {index}"))
+            .unwrap();
+    }
+    assert_eq!(
+        pane.accept_turn_user_intent("turn", "overflow".into(), "new message".into()),
+        Err(UserIntentRejectReason::QueueFull)
+    );
+    assert_eq!(pane.next_unsent_guidance("turn").unwrap().text, "message 0");
+    assert_eq!(pane.finish_turn_user_intents("turn").len(), 64);
+
+    assert_eq!(
+        pane.accept_turn_user_intent("turn", "large".into(), "x".repeat(1024 * 1024 + 1)),
+        Err(UserIntentRejectReason::QueueFull)
+    );
+    assert_eq!(pane.pending_user_intent_count(), 0);
+
+    // Old uncertain deliveries remain visible but cannot permanently exhaust
+    // the new turn's local sending queue.
+    for index in 0..64 {
+        let id = format!("unknown-{index}");
+        pane.accept_turn_user_intent("old", id.clone(), "previous".into())
+            .unwrap();
+        assert!(pane.mark_user_intent_unconfirmed(&id));
+    }
+    pane.accept_turn_user_intent("new", "new".into(), "continue".into())
+        .unwrap();
+    assert_eq!(pane.next_unsent_guidance("new").unwrap().text, "continue");
+}
+
+#[test]
+#[serial_test::serial]
+fn root_guidance_follows_its_first_session_binding_and_owner() {
+    let _credentials = crate::tests::isolate_credentials();
+    let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+        "default",
+        Some("owner"),
+    )
+    .unwrap();
+    let binding = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let scope = super::RootIntentScope::new(
+        crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+        3,
+        binding.clone(),
+    );
+    let mut pane = BottomPane::new();
+    pane.set_session_attachment(None, 3);
+    pane.set_root_intent_scope(std::sync::Arc::new(scope));
+    pane.accept_turn_user_intent("turn", "private".into(), "private instruction".into())
+        .unwrap();
+    pane.accept_turn_user_intent("turn", "unsent".into(), "unfinished instruction".into())
+        .unwrap();
+    assert!(pane.mark_user_intent_unconfirmed("private"));
+    assert!(render_text(&pane, Rect::new(0, 0, 100, 8)).contains("private instruction"));
+    *binding.lock().unwrap() = Some("original".into());
+    pane.set_session_attachment(Some("original"), 3);
+    assert!(render_text(&pane, Rect::new(0, 0, 100, 8)).contains("private instruction"));
+    pane.set_session_attachment(Some("other"), 4);
+    assert!(!render_text(&pane, Rect::new(0, 0, 100, 8)).contains("private instruction"));
+    pane.set_session_attachment(Some("original"), 5);
+    assert!(render_text(&pane, Rect::new(0, 0, 100, 8)).contains("private instruction"));
+    let _replacement = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+        "default",
+        Some("different-owner"),
+    )
+    .unwrap();
+    assert!(!render_text(&pane, Rect::new(0, 0, 100, 8)).contains("private instruction"));
+    assert!(pane.settle_detached_root_intent("private", true));
+    pane.retain_unsent_detached_turn("turn");
+    assert!(pane.finish_turn_user_intents("turn").is_empty());
+    assert!(pane.composer.text().is_empty());
+    assert!(!pane.recover_returned_root_guidance());
+    drop(_replacement);
+    assert!(pane.recover_returned_root_guidance());
+    assert_eq!(pane.composer.text(), "private instruction");
+    pane.composer.set_text("");
+    assert!(pane.recover_returned_root_guidance());
+    assert!(pane.composer.text().contains("unfinished instruction"));
+}
+
+#[test]
+#[serial_test::serial]
+fn first_session_binding_advances_write_authority_exactly_once() {
+    let binding = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let mut pane = BottomPane::new();
+    pane.set_session_attachment(None, 5);
+    pane.set_root_intent_scope(std::sync::Arc::new(super::RootIntentScope::new(
+        crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+        5,
+        binding.clone(),
+    )));
+    pane.accept_turn_user_intent("turn", "intent".into(), "message".into())
+        .unwrap();
+    assert!(pane.root_intent_is_visible("intent"));
+    *binding.lock().unwrap() = Some("session".into());
+    pane.set_session_attachment(Some("session"), 5);
+    assert!(!pane.root_intent_is_visible("intent"));
+    pane.set_session_attachment(Some("session"), 6);
+    assert!(pane.root_intent_is_visible("intent"));
+    pane.set_session_attachment(Some("session"), 7);
+    assert!(!pane.root_intent_is_visible("intent"));
+}
+
+#[test]
+#[serial_test::serial]
+fn unbound_unsent_guidance_can_be_recovered_after_switching_sessions() {
+    let _credentials = crate::tests::isolate_credentials();
+    let _owner = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+        "default",
+        Some("owner"),
+    )
+    .unwrap();
+    let binding = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let mut pane = BottomPane::new();
+    pane.set_session_attachment(None, 3);
+    pane.set_root_intent_scope(std::sync::Arc::new(super::RootIntentScope::new(
+        crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+        3,
+        binding,
+    )));
+    for n in 0..64 {
+        pane.accept_turn_user_intent("unbound", format!("old-{n}"), format!("draft {n}"))
+            .unwrap();
+    }
+    pane.set_session_attachment(Some("new-session"), 4);
+    assert!(pane.finish_turn_user_intents("unbound").is_empty());
+    assert!(pane.composer.text().is_empty());
+    pane.set_root_intent_scope(std::sync::Arc::new(super::RootIntentScope::new(
+        crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+        4,
+        std::sync::Arc::new(std::sync::Mutex::new(Some("new-session".into()))),
+    )));
+    pane.accept_turn_user_intent("new", "new".into(), "continue".into())
+        .unwrap();
+    pane.set_session_attachment(None, 5);
+    assert!(pane.recover_returned_root_guidance());
+    assert_eq!(pane.composer.text(), "draft 0");
+}
+
+#[test]
+#[serial_test::serial]
+fn restoring_scoped_guidance_preserves_the_existing_command_draft() {
+    let _credentials = crate::tests::isolate_credentials();
+    let _owner = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+        "default",
+        Some("owner"),
+    )
+    .unwrap();
+    let mut pane = BottomPane::new();
+    pane.set_session_attachment(Some("session-a"), 1);
+    pane.set_root_intent_scope(std::sync::Arc::new(super::RootIntentScope::new(
+        crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+        1,
+        std::sync::Arc::new(std::sync::Mutex::new(Some("session-a".into()))),
+    )));
+    pane.accept_turn_user_intent("turn", "private".into(), "private instruction".into())
+        .unwrap();
+    pane.composer.set_text("/session");
+    assert!(pane.promote_user_intent_accepted("private"));
+    assert!(pane.return_user_intent(
+        "private",
+        astra_turn_types::UserIntentStatus::Returned,
+        "private instruction"
+    ));
+    pane.set_session_attachment(Some("session-b"), 2);
+    let screen = render_text(&pane, Rect::new(0, 0, 100, 8));
+    assert!(!screen.contains("private instruction"), "{screen}");
+    assert!(!pane.recover_returned_root_guidance());
+    pane.set_session_attachment(Some("session-a"), 3);
+    assert!(pane.recover_returned_root_guidance());
+    assert_eq!(pane.composer.text(), "private instruction");
+    pane.composer.set_text("");
+    assert!(pane.restore_next_draft());
+    assert_eq!(pane.composer.text(), "/session");
+}
+
+#[test]
+fn unknown_root_guidance_requires_explicit_scoped_discard() {
+    let mut pane = BottomPane::new();
+    pane.accept_turn_user_intent("turn", "unknown".into(), "important".into())
+        .unwrap();
+    assert!(pane.mark_user_intent_unconfirmed("unknown"));
+    assert_eq!(
+        pane.unconfirmed_root_guidance(None).unwrap().text,
+        "important"
+    );
+    assert!(pane.take_client_recoverable_user_intents().is_empty());
+    assert!(pane.dismiss_unconfirmed_root_guidance("unknown"));
+    assert!(pane.unconfirmed_root_guidance(None).is_none());
+}
+
+#[test]
+#[serial_test::serial]
+fn uncertain_root_guidance_is_bounded_across_turns_and_can_be_cleared() {
+    let _credentials = crate::tests::isolate_credentials();
+    let _owner = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+        "default",
+        Some("owner"),
+    )
+    .unwrap();
+    for session in [None, Some("session")] {
+        let mut pane = BottomPane::new();
+        pane.set_session_attachment(session, 1);
+        let scope = || {
+            std::sync::Arc::new(super::RootIntentScope::new(
+                crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+                1,
+                std::sync::Arc::new(std::sync::Mutex::new(session.map(str::to_owned))),
+            ))
+        };
+        pane.set_root_intent_scope(scope());
+        for n in 0..64 {
+            let id = format!("unknown-{n}");
+            pane.accept_turn_user_intent("turn", id.clone(), "message".into())
+                .unwrap();
+            pane.mark_user_intent_unconfirmed(&id);
+        }
+        pane.set_root_intent_scope(scope());
+        assert_eq!(
+            pane.accept_turn_user_intent("next", "overflow".into(), "message".into()),
+            Err(UserIntentRejectReason::QueueFull)
+        );
+        assert!(pane.dismiss_unconfirmed_root_guidance("unknown-0"));
+        pane.accept_turn_user_intent("next", "next".into(), "message".into())
+            .unwrap();
+    }
+}
+
 fn apply_guidance(pane: &mut BottomPane, intent_id: &str, text: &str) -> Option<String> {
     pane.apply_user_intent(
         intent_id,
@@ -89,7 +321,7 @@ fn ambiguous_guidance_ownership_is_visible_and_never_auto_replayed() {
     assert!(pane.has_pending_user_intents());
     let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
     assert!(
-        rendered.contains("Guidance delivery uncertain · stable identity retained"),
+        rendered.contains("Message delivery is unknown"),
         "the unresolved protocol state must remain visible: {rendered:?}"
     );
 }
@@ -108,7 +340,7 @@ fn accepted_guidance_with_unresolved_disposition_becomes_unconfirmed_not_replaya
     assert!(pane.has_pending_user_intents());
     let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
     assert!(
-        rendered.contains("Guidance delivery uncertain · stable identity retained"),
+        rendered.contains("Message received · whether it was used is unknown"),
         "{rendered:?}"
     );
 }
@@ -365,15 +597,11 @@ fn locally_accepted_intent_does_not_claim_remote_delivery() {
 
     let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
     assert!(
-        rendered.contains("Sending guidance"),
-        "local acknowledgement should expose the in-flight delivery state; got {rendered:?}"
-    );
-    assert!(
-        rendered.contains("awaiting server acceptance"),
+        rendered.contains("Waiting for the current task"),
         "local acknowledgement must not promise an application boundary; got {rendered:?}"
     );
     assert!(
-        rendered.contains("sending"),
+        rendered.contains("waiting"),
         "intent panel should show the typed local delivery status; got {rendered:?}"
     );
     assert!(
@@ -383,9 +611,11 @@ fn locally_accepted_intent_does_not_claim_remote_delivery() {
 }
 
 #[test]
+#[serial_test::serial]
 fn agent_guidance_uses_its_named_target_and_never_drains_into_root_chat() {
     for accepted in [false, true] {
         let mut pane = BottomPane::new();
+        pane.set_session_attachment(None, 7);
         let guide = crate::tui::event_loop::AgentGuideTarget::capture(
             "Reviewer".into(),
             "internal-run-id".into(),
@@ -395,6 +625,7 @@ fn agent_guidance_uses_its_named_target_and_never_drains_into_root_chat() {
             astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             None,
             7,
+            None,
         );
         assert!(pane.accept_agent_guide(
             "intent-agent-1".into(),
@@ -403,7 +634,7 @@ fn agent_guidance_uses_its_named_target_and_never_drains_into_root_chat() {
         ));
 
         let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
-        assert!(rendered.contains("Sending guidance to Reviewer"));
+        assert!(rendered.contains("Sending message to Reviewer"));
         assert!(!rendered.contains("internal-run-id"));
         assert!(pane.take_client_recoverable_user_intents().is_empty());
         if accepted {
@@ -465,6 +696,146 @@ fn agent_guidance_uses_its_named_target_and_never_drains_into_root_chat() {
 }
 
 #[test]
+#[serial_test::serial]
+fn child_guidance_waits_for_same_target_delivery_and_keeps_other_targets_independent() {
+    let capture = |run: &str, session: &str| {
+        crate::tui::event_loop::AgentGuideTarget::capture(
+            "Reviewer".into(),
+            run.into(),
+            crate::tui::agent_run_projection::AgentControlTarget::DurableRun { run_id: run.into() },
+            astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            Some(session.into()),
+            3,
+            None,
+        )
+    };
+    let first = capture("run", "session");
+    let same = capture("run", "session");
+    let reattached = crate::tui::event_loop::AgentGuideTarget::capture(
+        "Reviewer".into(),
+        "run".into(),
+        crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+            run_id: "run".into(),
+        },
+        astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+        Some("session".into()),
+        4,
+        None,
+    );
+    let other_run = capture("other", "session");
+    let other_session = capture("run", "other-session");
+    let mut pane = BottomPane::new();
+    assert!(pane.accept_agent_guide("first".into(), first, "do A".into()));
+    assert_eq!(
+        pane.agent_delivery_barrier(&same, &[]),
+        Some(AgentDeliveryBarrier::Sending)
+    );
+    assert_eq!(pane.agent_delivery_barrier(&other_run, &[]), None);
+    assert_eq!(pane.agent_delivery_barrier(&other_session, &[]), None);
+    assert!(pane.mark_user_intent_unconfirmed("first"));
+    assert_eq!(
+        pane.agent_delivery_barrier(&reattached, &[]),
+        Some(AgentDeliveryBarrier::Unconfirmed(vec!["first".into()]))
+    );
+    assert_eq!(
+        pane.agent_delivery_barrier(&same, &[]),
+        Some(AgentDeliveryBarrier::Unconfirmed(vec!["first".into()]))
+    );
+    assert_eq!(pane.agent_delivery_barrier(&same, &["first".into()]), None);
+    assert!(pane.accept_agent_guide("second".into(), same.clone(), "do B".into()));
+    assert!(pane.mark_user_intent_unconfirmed("second"));
+    assert_eq!(
+        pane.agent_delivery_barrier(&same, &["first".into()]),
+        Some(AgentDeliveryBarrier::Unconfirmed(vec![
+            "first".into(),
+            "second".into()
+        ]))
+    );
+    assert_eq!(
+        pane.agent_delivery_barrier(&same, &["first".into(), "second".into()]),
+        None
+    );
+    assert!(pane.promote_agent_guide_accepted("second"));
+    assert!(pane.promote_agent_guide_accepted("first"));
+    assert_eq!(pane.agent_delivery_barrier(&same, &[]), None);
+}
+
+#[test]
+#[serial_test::serial]
+fn detached_child_messages_are_bounded_per_session_without_blocking_main_input() {
+    let target = |session: &str| {
+        crate::tui::event_loop::AgentGuideTarget::capture(
+            "Reviewer".into(),
+            "run".into(),
+            crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                run_id: "run".into(),
+            },
+            astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            Some(session.into()),
+            1,
+            None,
+        )
+    };
+    let first = target("first");
+    let mut pane = BottomPane::new();
+    for n in 0..64 {
+        let id = format!("child-{n}");
+        assert!(pane.accept_agent_guide(id.clone(), first.clone(), "input".into()));
+        assert!(pane.mark_user_intent_unconfirmed(&id));
+    }
+    assert!(!pane.accept_agent_guide("overflow".into(), first, "input".into()));
+    assert!(pane.accept_agent_guide("other".into(), target("other"), "input".into()));
+    assert!(pane.accept_user_intent(
+        "main",
+        astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+        astra_turn_types::UserIntentStatus::AcceptedLocal,
+        "main input"
+    ));
+}
+
+#[test]
+#[serial_test::serial]
+fn accepted_child_messages_become_actionable_after_observer_detaches() {
+    let target = |epoch| {
+        crate::tui::event_loop::AgentGuideTarget::capture(
+            "Reviewer".into(),
+            "run".into(),
+            crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                run_id: "run".into(),
+            },
+            astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            Some("session".into()),
+            epoch,
+            None,
+        )
+    };
+    let original = target(1);
+    let mut pane = BottomPane::new();
+    pane.set_session_attachment(Some("session"), 1);
+    for n in 0..64 {
+        let id = format!("child-{n}");
+        assert!(pane.accept_agent_guide(id.clone(), original.clone(), "message".into()));
+        assert!(pane.promote_agent_guide_accepted(&id));
+    }
+    pane.retire_detached_agent_observations(Some("other"), 2);
+    pane.set_session_attachment(Some("session"), 3);
+    let uncertain = pane
+        .returned_agent_guide(Some("session"), 3, Some("child-0"))
+        .unwrap();
+    assert!(uncertain.delivery_is_unconfirmed());
+    assert_eq!(
+        uncertain.status,
+        astra_turn_types::UserIntentStatus::AcceptedRemote
+    );
+    assert!(
+        pane.take_returned_agent_guide("child-0", &original, Some("session"), 3)
+            .is_some()
+    );
+    assert!(pane.accept_agent_guide("new".into(), target(3), "continue".into()));
+    assert!(pane.remove_detached_agent_guide("child-1", &original));
+}
+
+#[test]
 fn guidance_during_tool_execution_explains_the_real_application_boundary() {
     let mut pane = BottomPane::new();
     pane.set_task_status(TaskStatus::ToolExecuting {
@@ -479,13 +850,10 @@ fn guidance_during_tool_execution_explains_the_real_application_boundary() {
     ));
 
     let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
-    assert!(rendered.contains("Guidance accepted"), "{rendered:?}");
-    assert!(
-        rendered.contains("before next unstarted action"),
-        "{rendered:?}"
-    );
-    assert!(rendered.contains("Ctrl+C requests stop"), "{rendered:?}");
-    assert!(!rendered.contains("Guidance applied"), "{rendered:?}");
+    assert!(rendered.contains("Message received"), "{rendered:?}");
+    assert!(rendered.contains("waiting to take effect"), "{rendered:?}");
+    assert!(rendered.contains("Ctrl+C to stop"), "{rendered:?}");
+    assert!(!rendered.contains("Message added"), "{rendered:?}");
     assert!(!rendered.contains("accepted locally"), "{rendered:?}");
 }
 
@@ -525,7 +893,10 @@ fn remotely_accepted_guidance_is_not_replayed_when_local_settlement_fails() {
     );
     pane.set_task_status(TaskStatus::Idle);
     let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
-    assert!(rendered.contains("being reconciled"), "{rendered:?}");
+    assert!(
+        rendered.contains("Checking whether your message was used"),
+        "{rendered:?}"
+    );
 }
 
 #[test]
@@ -602,4 +973,387 @@ fn snapshot_active_bottom_surface_narrow_42() {
         "bottom_surface_active_42",
         snapshot_text(&pane, Rect::new(0, 0, 42, 5))
     );
+}
+
+#[test]
+fn restored_drafts_survive_menu_edits_and_explicit_clearing() {
+    use super::{BottomPaneAction, chat_composer::ChatComposer};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for edit in [KeyCode::Tab, KeyCode::Char('1'), KeyCode::Esc] {
+        let mut pane = BottomPane::new();
+        pane.composer = ChatComposer::new_ephemeral();
+        pane.set_slash_items(vec![crate::tui::slash_menu::SlashItem::simple(
+            "/help", "help",
+        )]);
+        pane.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        pane.restore_into_composer("//returned");
+        assert!(
+            pane.notice_lines(100)
+                .iter()
+                .any(|line| line.to_string().contains("Unsent drafts (1)"))
+        );
+        pane.handle_key(KeyEvent::new(edit, KeyModifiers::NONE));
+        assert_eq!(pane.restored_drafts.len(), 1);
+        assert!(
+            pane.slash_menu.is_none(),
+            "dismissed menus must stay dismissed"
+        );
+        pane.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(pane.composer.text(), "//returned");
+        assert!(pane.restored_drafts.is_empty());
+        let BottomPaneAction::SubmitInput(raw) =
+            pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("restored input must still need Enter");
+        };
+        assert_eq!(raw, "//returned");
+    }
+}
+
+#[test]
+fn restoring_multiline_conversation_closes_skill_completion() {
+    use super::{BottomPaneAction, chat_composer::ChatComposer, skill_popup::SkillItem};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut pane = BottomPane::new();
+    pane.composer = ChatComposer::new_ephemeral();
+    pane.set_skill_items(vec![SkillItem {
+        name: "inspect".into(),
+        description: "inspect".into(),
+        source: "test".into(),
+    }]);
+    for ch in "$inspect".chars() {
+        pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    assert!(pane.skill_popup.is_some());
+    pane.restore_into_composer("//returned");
+    assert!(pane.skill_popup.is_none());
+    let BottomPaneAction::SubmitInput(raw) =
+        pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    else {
+        panic!("completion must not swallow multiline input");
+    };
+    assert_eq!(raw, "$inspect\n\n/returned");
+}
+
+#[test]
+fn restoration_waits_for_buffered_paste_without_losing_its_bytes() {
+    use super::{BottomPaneAction, chat_composer::ChatComposer};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut pane = BottomPane::new();
+    pane.composer = ChatComposer::new_ephemeral();
+    pane.composer.force_pending_paste_burst_for_test(
+        "draft being pasted",
+        Instant::now() - std::time::Duration::from_secs(1),
+    );
+    pane.restore_into_composer("//returned");
+    assert!(
+        !pane.composer.is_empty(),
+        "buffered paste prevents replay and empty-input quit"
+    );
+    assert!(
+        pane.composer.text().is_empty(),
+        "restoration must not reset a pending burst"
+    );
+    pane.pre_draw_tick(Instant::now());
+    assert!(
+        matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            BottomPaneAction::Consumed
+        ),
+        "a late pasted newline must not submit recovery"
+    );
+    assert!(pane.composer.text().ends_with('\n'));
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let BottomPaneAction::SubmitInput(raw) =
+        pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    else {
+        panic!("a later deliberate Enter must submit");
+    };
+    assert_eq!(raw.trim_end(), "draft being pasted\n\n/returned");
+}
+
+#[test]
+fn starting_another_draft_preserves_paste_payloads_and_pending_bytes() {
+    use super::{BottomPaneAction, chat_composer::ChatComposer};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for placeholder in [false, true] {
+        let mut pane = BottomPane::new();
+        pane.composer = ChatComposer::new_ephemeral();
+        let original = if placeholder {
+            "large pasted line\n".repeat(100)
+        } else {
+            "pending paste".into()
+        };
+        if placeholder {
+            pane.handle_paste(&original);
+            assert!(
+                !pane.composer.text().contains(&original),
+                "fixture uses a compact placeholder"
+            );
+        } else {
+            pane.composer
+                .force_pending_paste_burst_for_test(&original, Instant::now());
+        }
+        pane.start_composer_draft("/help");
+        assert_eq!(pane.composer.text(), "/help");
+        pane.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(pane.composer.text(), original);
+        if !placeholder {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        let BottomPaneAction::SubmitInput(raw) =
+            pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("cleared command must reveal an editable draft");
+        };
+        assert_eq!(raw, original);
+    }
+}
+
+#[test]
+fn clearing_a_paste_keeps_a_trailing_newline_from_submitting_recovery() {
+    use super::{BottomPaneAction, chat_composer::ChatComposer};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for returned in ["//returned", "/help"] {
+        for clear in [
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        ] {
+            let mut pane = BottomPane::new();
+            pane.composer = ChatComposer::new_ephemeral();
+            pane.set_slash_items(vec![crate::tui::slash_menu::SlashItem::simple(
+                "/help", "help",
+            )]);
+            pane.composer
+                .force_pending_paste_burst_for_test("unfinished paste", Instant::now());
+            pane.restore_into_composer(returned);
+            pane.handle_key(clear);
+            assert_eq!(pane.composer.text(), returned);
+            assert_eq!(pane.slash_menu_is_open(), returned == "/help");
+            assert!(
+                matches!(
+                    pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                    BottomPaneAction::Consumed
+                ),
+                "cancelled paste still needs protection against its trailing newline"
+            );
+            assert_eq!(pane.composer.text(), format!("{returned}\n"));
+            assert!(!pane.slash_menu_is_open());
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let BottomPaneAction::SubmitInput(raw) =
+                pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            else {
+                panic!("a later fresh gesture must submit recovery");
+            };
+            assert_eq!(raw.trim_end(), returned);
+        }
+    }
+}
+
+#[test]
+fn picker_navigation_transfers_suspended_history_drafts_and_pastes() {
+    use super::{BottomPaneAction, chat_composer::ChatComposer, info_view::InfoView};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for (original, recalled_edit) in [
+        ("original draft".to_owned(), None),
+        (
+            "original draft".to_owned(),
+            Some("edited history".to_owned()),
+        ),
+        ("same".to_owned(), Some("same".to_owned())),
+        (String::new(), None),
+        (
+            "original paste\n".repeat(100),
+            Some("edited paste\n".repeat(100)),
+        ),
+    ] {
+        let mut pane = BottomPane::new();
+        pane.composer = ChatComposer::new_ephemeral();
+        pane.handle_paste("previous message");
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            BottomPaneAction::SubmitInput(_)
+        ));
+        pane.handle_paste(&original);
+        pane.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        if let Some(edit) = &recalled_edit {
+            pane.composer.set_text("");
+            pane.handle_paste(edit);
+        }
+        pane.push_view(Box::new(InfoView::from_plain(
+            "Memory Stats",
+            vec!["ready".into()],
+        )));
+        pane.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(!pane.has_active_view());
+        assert_eq!(pane.composer.text(), "/");
+        let mut expected = Vec::new();
+        if let Some(edit) = recalled_edit {
+            expected.push(edit);
+        }
+        if !original.is_empty() && !expected.contains(&original) {
+            expected.push(original);
+        }
+        assert_eq!(
+            pane.restored_drafts.iter().cloned().collect::<Vec<_>>(),
+            expected
+        );
+        pane.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        if expected.is_empty() {
+            assert!(pane.composer.is_empty());
+        } else {
+            let BottomPaneAction::SubmitInput(raw) =
+                pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            else {
+                panic!("fresh gesture submits retained editing");
+            };
+            assert_eq!(raw, expected.join("\n\n"));
+        }
+    }
+}
+
+#[test]
+fn history_suspension_transfers_pending_paste_bytes_before_up() {
+    use super::chat_composer::ChatComposer;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut pane = BottomPane::new();
+    pane.composer = ChatComposer::new_ephemeral();
+    pane.composer.set_text("previous");
+    pane.composer.clear_and_submit();
+    pane.composer.set_text("original ");
+    pane.composer
+        .force_pending_paste_burst_for_test("pending bytes", Instant::now());
+    pane.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    pane.start_composer_draft("/help");
+    assert_eq!(
+        pane.restored_drafts.iter().cloned().collect::<Vec<_>>(),
+        vec!["original pending bytes"]
+    );
+}
+
+#[test]
+fn pasted_drafts_keep_dispatch_boundaries_and_exact_payloads_on_restoration() {
+    use super::{BottomPaneAction, chat_composer::ChatComposer};
+    use crate::tui::slash_dispatch::parse_submission;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for (prefix, payload, separate) in [
+        ("", "!printf 'one'\nprintf 'two'\nprintf 'three'\r\n ", true),
+        (" \t", "!!printf 'one'\nprintf 'two'\nprintf 'three'", true),
+        ("", "/unknown\nargument\nlast\t", true),
+        ("", "/plan inspect\nargument\nlast\r\n", true),
+        ("", "!\n\n", true),
+        ("", "//stop\nconversation\nlast\r\n ", false),
+        ("", "///tmp/path\nconversation\nlast\t", false),
+        ("/", "/stop\nconversation\nlast\r\n", false),
+        (
+            "explain ",
+            "!printf 'one'\nprintf 'two'\nprintf 'three'",
+            false,
+        ),
+    ] {
+        for followup in [false, true] {
+            let mut pane = BottomPane::new();
+            pane.composer = ChatComposer::new_ephemeral();
+            pane.composer.set_text(prefix);
+            pane.handle_paste(payload);
+            let display = pane.composer.text();
+            assert!(display.contains("[Pasted #"));
+            let original = format!("{prefix}{payload}");
+            assert_eq!(pane.composer.expanded_raw_text(), original);
+            let blobs = pane.composer.pasted_blob_count();
+            pane.restore_into_composer("//returned");
+            assert_eq!(pane.composer.pasted_blob_count(), blobs);
+            if separate {
+                assert_eq!(pane.composer.text(), display);
+                assert_eq!(pane.restored_drafts.len(), 1);
+            }
+            let key = if followup {
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)
+            } else {
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            };
+            let action = pane.handle_key(key);
+            let raw = match (action, followup) {
+                (BottomPaneAction::SubmitInput(raw), false)
+                | (BottomPaneAction::QueueFollowUp(raw), true) => raw,
+                other => panic!("expected deliberate submission: {other:?}"),
+            };
+            if separate {
+                assert_eq!(raw, original);
+                assert_eq!(pane.composer.text(), "//returned");
+                let second = pane.handle_key(key);
+                assert!(matches!(second,
+                    BottomPaneAction::SubmitInput(ref raw) | BottomPaneAction::QueueFollowUp(ref raw)
+                    if parse_submission(raw).text() == "/returned"
+                ));
+            } else {
+                assert_eq!(raw, format!("{original}\n\n/returned"));
+                assert_eq!(
+                    parse_submission(&raw).text(),
+                    format!("{}\n\n/returned", parse_submission(&original).text())
+                );
+            }
+            assert!(pane.composer.is_empty());
+            assert!(pane.restored_drafts.is_empty());
+        }
+    }
+}
+
+#[test]
+fn restoration_preserves_multiple_paste_blobs_and_suspended_history() {
+    use super::{BottomPaneAction, chat_composer::ChatComposer};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut pane = BottomPane::new();
+    pane.composer = ChatComposer::new_ephemeral();
+    pane.handle_paste("previous message");
+    pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let suspended = "suspended paste\n".repeat(100);
+    pane.handle_paste(&suspended);
+    pane.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    pane.composer.set_text("");
+    let first = "//first\r\nsecond\r\nlast \t";
+    let second = "another\nlarge\npaste\r\n";
+    pane.handle_paste(first);
+    pane.handle_paste(second);
+    let expected = format!("{first}{second}");
+    let display = pane.composer.text();
+    let cursor = pane.composer.cursor_byte();
+    for _ in 0..2 {
+        assert_eq!(pane.composer.expanded_raw_text(), expected);
+    }
+    assert_eq!(pane.composer.text(), display);
+    assert_eq!(pane.composer.cursor_byte(), cursor);
+    assert!(pane.composer.is_browsing_history());
+    assert_eq!(pane.composer.pasted_blob_count(), 3);
+    pane.restore_into_composer("//returned");
+    assert_eq!(pane.composer.pasted_blob_count(), 3);
+    pane.start_composer_draft("/help");
+    assert_eq!(
+        pane.restored_drafts.iter().cloned().collect::<Vec<_>>(),
+        vec![format!("{expected}\n\n/returned"), suspended.clone()]
+    );
+    pane.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    let BottomPaneAction::SubmitInput(raw) =
+        pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    else {
+        panic!("retained input still needs a new gesture");
+    };
+    assert_eq!(raw, format!("{expected}\n\n/returned\n\n{suspended}"));
+}
+
+#[test]
+fn recovery_waits_behind_intentional_whitespace_drafts() {
+    use super::chat_composer::ChatComposer;
+    for draft in [" ", "\n", "\r\n \t"] {
+        let mut pane = BottomPane::new();
+        pane.composer = ChatComposer::new_ephemeral();
+        pane.composer.set_text(draft);
+        pane.restore_into_composer("//returned");
+        assert_eq!(pane.composer.text(), draft);
+        assert_eq!(
+            pane.restored_drafts.front().map(String::as_str),
+            Some("//returned")
+        );
+        assert!(!pane.composer.is_empty());
+    }
 }

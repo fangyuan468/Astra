@@ -449,6 +449,36 @@ impl MemoriaCredentialResolver {
         })
     }
 }
+/// The binding verified outside a transaction. Compare under the account lock
+/// before issuing a successor, including disconnect/reconnect with the same key.
+pub(super) struct MemoriaRefreshBinding {
+    token_id: String,
+    ciphertext: String,
+    metadata: String,
+}
+
+impl MemoriaRefreshBinding {
+    pub(super) async fn check(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        user: &str,
+    ) -> Result<bool, AuthHttpError> {
+        let current: Option<(String, String)> = sqlx::query_as(
+            "SELECT encrypted_value, CAST(metadata AS CHAR) FROM auth_tokens
+             WHERE token_id = ? AND scope_user_id = ? AND type = 'memoria_connection'
+               AND provider = 'memoria' AND is_active = 1 FOR UPDATE",
+        )
+        .bind(&self.token_id)
+        .bind(user)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(internal_error)?;
+        Ok(current.as_ref().is_some_and(|(ciphertext, metadata)| {
+            ciphertext == &self.ciphertext && metadata == &self.metadata
+        }))
+    }
+}
+
 impl DatabaseAuthService {
     pub(super) async fn reauthentication_binding(
         &self,
@@ -559,6 +589,7 @@ impl DatabaseAuthService {
         {
             return Err("UC built-in memory requires MEMORIA_BASE_URL and MEMORIA_MASTER_KEY, without MEMORIA_WEB_URL".into());
         }
+        self.authentication_cache = std::sync::Arc::default();
         self.memoria_provider = Some(MemoriaProvider::new(settings)?);
         Ok(self)
     }
@@ -583,7 +614,7 @@ impl DatabaseAuthService {
     }
     pub(super) async fn memoria_owner(
         &self,
-        pool: &sqlx::MySqlPool,
+        executor: impl sqlx::Executor<'_, Database = sqlx::MySql>,
         user: &str,
     ) -> Result<Option<String>, AuthHttpError> {
         let current_provider_id = self
@@ -593,7 +624,7 @@ impl DatabaseAuthService {
             .unwrap_or("");
         let identity: Option<(String, String)> = sqlx::query_as(
             "SELECT provider_id, external_subject
-             FROM auth_external_identities
+             FROM auth_external_identities FORCE INDEX (idx_external_identity_user)
              WHERE astra_user_id = ? AND provider_id LIKE 'memoria:%'
              ORDER BY CASE WHEN provider_id = ? THEN 0 ELSE 1 END,
                       updated_at DESC, provider_id ASC
@@ -601,9 +632,16 @@ impl DatabaseAuthService {
         )
         .bind(user)
         .bind(current_provider_id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
         .map_err(internal_error)?;
+        self.validate_memoria_identity(identity)
+    }
+
+    pub(super) fn validate_memoria_identity(
+        &self,
+        identity: Option<(String, String)>,
+    ) -> Result<Option<String>, AuthHttpError> {
         if let Some((provider, subject)) = identity {
             if self
                 .memoria_provider
@@ -621,18 +659,53 @@ impl DatabaseAuthService {
         _pool: &sqlx::MySqlPool,
         user: &str,
         owner: &str,
-    ) -> Result<(), AuthHttpError> {
+    ) -> Result<MemoriaRefreshBinding, AuthHttpError> {
         let resolver = self.credential_resolver().ok_or_else(unavailable)?;
-        let credential = resolver
-            .resolve(user)
-            .await
-            .map_err(|_| unavailable())?
-            .ok_or_else(reconnect)?;
-        let identity = resolver.provider.verify(&credential.key).await?;
-        if identity.memoria_user_id != owner || identity.key_id != credential.generation {
-            return Err(reconnect());
+        for _ in 0..3 {
+            let snapshot = resolver
+                .load_authority_snapshot(user)
+                .await
+                .map_err(|_| unavailable())?
+                .ok_or_else(reconnect)?;
+            let credential = resolver
+                .scoped_credential(&snapshot)
+                .map_err(|_| unavailable())?
+                .ok_or_else(reconnect)?;
+            let verified = resolver
+                .provider
+                .verify(&credential.key)
+                .await
+                .and_then(|identity| {
+                    if identity.memoria_user_id == owner && identity.key_id == credential.generation
+                    {
+                        Ok(())
+                    } else {
+                        Err(reconnect())
+                    }
+                });
+            if let Err(error) = verified {
+                if error.0 == StatusCode::UNAUTHORIZED {
+                    let current = resolver
+                        .load_authority_snapshot(user)
+                        .await
+                        .map_err(|_| unavailable())?;
+                    if current.is_some_and(|current| {
+                        current.current_token != snapshot.current_token
+                            || current.ciphertext != snapshot.ciphertext
+                            || current.metadata != snapshot.metadata
+                    }) {
+                        continue;
+                    }
+                }
+                return Err(error);
+            }
+            return Ok(MemoriaRefreshBinding {
+                token_id: resolver.token_id(user),
+                ciphertext: snapshot.ciphertext.ok_or_else(reconnect)?,
+                metadata: snapshot.metadata.ok_or_else(reconnect)?,
+            });
         }
-        Ok(())
+        Err(unavailable())
     }
     pub(super) async fn memoria_login(&self, key: &str) -> Result<MemoriaLogin, AuthHttpError> {
         let resolver = self.credential_resolver().ok_or_else(unavailable)?;
@@ -672,6 +745,9 @@ impl DatabaseAuthService {
         ciphertext: &str,
         key: &str,
     ) -> Result<AuthTokenRecord, AuthHttpError> {
+        // Initial upstream verification already succeeded. Clear observations
+        // around the transaction, including uncertain commit/cancellation.
+        let _invalidation = self.authentication_cache.mutation();
         let mut tx = pool.begin().await.map_err(internal_error)?;
         let user = self
             .resolve_verified_provider_identity(
@@ -720,8 +796,8 @@ impl DatabaseAuthService {
         let refresh_token = self
             .create_refresh_token(&user.user_id, &session, &origin)
             .map_err(internal_error)?;
-        sqlx::query("INSERT INTO auth_refresh_tokens (token_id,user_id,session_id,token_hash,expires_at,is_revoked) VALUES (?, ?, ?, ?, ?, 0)")
-            .bind(uuid::Uuid::new_v4().to_string()).bind(&user.user_id).bind(&session).bind(sha256_hex(&refresh_token))
+        sqlx::query("INSERT INTO auth_refresh_tokens (session_id,user_id,token_hash,expires_at,is_revoked) VALUES (?, ?, ?, ?, 0)")
+            .bind(&session).bind(&user.user_id).bind(sha256_hex(&refresh_token))
             .bind(self.refresh_token_expires_at_string(chrono::Utc::now())).execute(&mut *tx).await.map_err(internal_error)?;
         tx.commit().await.map_err(internal_error)?;
         Ok(AuthTokenRecord {
@@ -744,7 +820,7 @@ impl DatabaseAuthService {
             .map_err(internal_error)?;
         sqlx::query("DELETE FROM auth_tokens WHERE type = 'memoria_connection' AND provider = 'memoria' AND scope_user_id = ?")
             .bind(user).execute(&mut *tx).await.map_err(internal_error)?;
-        sqlx::query("UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE user_id = ?")
+        sqlx::query("UPDATE auth_refresh_tokens SET is_revoked = 1, expires_at = LEAST(expires_at, UTC_TIMESTAMP(6)), browser_handle_hash = NULL, browser_ciphertext = NULL WHERE user_id = ?")
             .bind(user)
             .execute(&mut *tx)
             .await

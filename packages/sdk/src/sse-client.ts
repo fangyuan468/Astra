@@ -187,7 +187,7 @@ export class SSEClient {
         headers = headersInitToRecord(headers, { 'Content-Type': 'application/json' });
       }
 
-      const response = await fetch(this.options.url, {
+      const response = await (this.options.transport ?? fetch)(this.options.url, {
         method: this.options.method ?? 'GET',
         headers,
         body: this.options.body,

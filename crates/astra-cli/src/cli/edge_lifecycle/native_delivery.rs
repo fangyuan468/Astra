@@ -31,6 +31,20 @@ use std::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// External native runtimes are a selected capacity, not an implicit cost of
+/// every ordinary Server-model turn. Read before probing PATH or publishing Edge.
+pub(crate) fn native_collaborators_requested() -> Result<bool, String> {
+    match std::env::var("ASTRA_NATIVE_COLLABORATORS") {
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" => Ok(true),
+            "0" | "false" | "" => Ok(false),
+            _ => Err("ASTRA_NATIVE_COLLABORATORS must be true/false or 1/0".into()),
+        },
+        Err(_) => Err("ASTRA_NATIVE_COLLABORATORS must be UTF-8".into()),
+    }
+}
+
 const NATIVE_DELIVERY_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const NATIVE_DELIVERY_STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
 
@@ -347,6 +361,17 @@ async fn wait_for_native_delivery_ready(handle: &NativeDeliveryHandle, ticket: u
     })
     .await
     .unwrap_or(false)
+}
+
+async fn require_native_capacity_ready(
+    handle: &NativeDeliveryHandle,
+    ticket: u64,
+) -> Result<(), String> {
+    if wait_for_native_delivery_ready(handle, ticket).await && handle.provider_available() {
+        Ok(())
+    } else {
+        Err("selected native collaborator capacity did not become ready before chat".into())
+    }
 }
 
 /// All identities come from the selected authenticated CLI boundary. The
@@ -1038,26 +1063,29 @@ pub(crate) async fn start_headless_native_delivery(
     executor: Arc<ToolExecutor>,
     permission_policy: PermissionPolicySubscription,
     terminal_deadline: Option<tokio::time::Instant>,
-) -> Option<NativeDeliveryHandle> {
+) -> Result<Option<NativeDeliveryHandle>, String> {
+    if !native_collaborators_requested()? {
+        return Ok(None);
+    }
     let root = match executor.effective_project_root().canonicalize() {
         Ok(root) => root,
         Err(error) => {
             tracing::debug!(%error, "headless native collaborator workspace unavailable");
-            return None;
+            return Err("selected native collaborator capacity is unavailable".into());
         }
     };
     let materialization_id = match astra_runtime_env::load_or_create_materialization_id(&root) {
         Ok(id) => id,
         Err(error) => {
             tracing::debug!(%error, "headless native collaborator materialization unavailable");
-            return None;
+            return Err("selected native collaborator capacity is unavailable".into());
         }
     };
     let edge_agent_id = match crate::cli::chat_stream::try_edge_executor_instance_id() {
         Ok(id) => id.to_owned(),
         Err(error) => {
             tracing::debug!(%error, "headless native collaborator Edge identity unavailable");
-            return None;
+            return Err("selected native collaborator capacity is unavailable".into());
         }
     };
     let config = match build_native_delivery_config(
@@ -1075,7 +1103,7 @@ pub(crate) async fn start_headless_native_delivery(
         Ok(config) => config,
         Err(error) => {
             tracing::debug!(%error, "headless native collaborator delivery unavailable");
-            return None;
+            return Err("selected native collaborator capacity is unavailable".into());
         }
     };
     let cancellation = CancellationToken::new();
@@ -1103,12 +1131,11 @@ pub(crate) async fn start_headless_native_delivery(
         session_id.to_owned(),
         Some(deadline),
     );
-    // The supervisor reports optional capacity as ready even when the
-    // provider is unavailable, so a headless turn never waits on this
-    // capability. It still retains the owner and reconnect path for work
-    // admitted after the first attachment.
-    wait_for_native_delivery_ready(&handle, 1).await;
-    Some(handle)
+    if let Err(error) = require_native_capacity_ready(&handle, 1).await {
+        handle.shutdown().await;
+        return Err(error);
+    }
+    Ok(Some(handle))
 }
 
 // The capability-only installation path is shared by production and real transport
@@ -1195,7 +1222,14 @@ async fn connect_native_delivery(
             .parse()
             .map_err(|_| NativeDeliveryError::other("invalid Edge authentication header"))?,
     );
-    let connect = tokio_tungstenite::connect_async(request);
+    let connect = tokio_tungstenite::connect_async_tls_with_config(
+        request,
+        None,
+        false,
+        Some(tokio_tungstenite::Connector::Rustls(
+            astra_core::net::public_root_tls_config(),
+        )),
+    );
     let (socket, _) = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Err(NativeDeliveryError::other("native delivery cancelled")),
@@ -1653,7 +1687,10 @@ pub(crate) async fn ensure_session_native_delivery(
     api: &astra_thin_client::ThinClient,
     token: &str,
     session_id: &str,
-) {
+) -> Result<(), String> {
+    if !native_collaborators_requested()? {
+        return Ok(());
+    }
     let attachment_epoch = state.session_attachment_epoch;
     let account_id = state
         .ingestion_user_id
@@ -1679,10 +1716,7 @@ pub(crate) async fn ensure_session_native_delivery(
             // coalesces concurrent requests.
             handle.request_refresh();
         }
-        wait_for_native_delivery_ready(handle, handle.refresh_tx.requested()).await;
-        // Capacity is optional. A slow or unavailable provider must not block
-        // the ordinary turn; the next turn reuses the same readiness watch.
-        return;
+        return require_native_capacity_ready(handle, handle.refresh_tx.requested()).await;
     }
 
     if let Some(handle) = state.native_delivery.take() {
@@ -1695,17 +1729,15 @@ pub(crate) async fn ensure_session_native_delivery(
     state.native_delivery_attachment_epoch = None;
 
     let Some(shutdown) = state.native_delivery_shutdown.clone() else {
-        // Headless/line callers have no interactive delivery owner. They
-        // continue through the ordinary canonical turn path unchanged.
-        return;
+        return Err("selected native collaborators require an interactive delivery owner".into());
     };
     if shutdown.is_cancelled() {
-        return;
+        return Err("native collaborator preparation was cancelled".into());
     }
 
     let Some(account_id) = account_id.filter(|value| !value.trim().is_empty()) else {
         tracing::debug!("native collaborator delivery skipped: account identity unavailable");
-        return;
+        return Err("selected native collaborator capacity is unavailable".into());
     };
     let root = match std::env::current_dir()
         .ok()
@@ -1714,35 +1746,34 @@ pub(crate) async fn ensure_session_native_delivery(
         Some(root) => root,
         None => {
             tracing::warn!("native collaborator delivery skipped: workspace is unavailable");
-            return;
+            return Err("selected native collaborator capacity is unavailable".into());
         }
     };
     let materialization_id = match astra_runtime_env::load_or_create_materialization_id(&root) {
         Ok(id) => id,
         Err(error) => {
             tracing::warn!(%error, "native collaborator delivery skipped: materialization is unavailable");
-            return;
+            return Err("selected native collaborator capacity is unavailable".into());
         }
     };
     let edge_agent_id = match crate::cli::chat_stream::try_edge_executor_instance_id() {
         Ok(id) => id.to_owned(),
         Err(error) => {
             tracing::warn!(%error, "native collaborator delivery skipped: Edge identity unavailable");
-            return;
+            return Err("selected native collaborator capacity is unavailable".into());
         }
     };
 
     let mut executor = ToolExecutor::new(root.clone())
+        .with_shared_git_worktree_journal(state.git_worktree_journal.clone())
         .with_active_session_id(session_id.to_owned())
         .with_cloud(api.api_origin(), token.to_owned())
         .with_shared_file_journal(state.file_journal.clone())
         .with_shared_file_state(state.file_state.clone())
         .with_shared_database_snapshot_journal(state.database_snapshot_journal.clone())
-        .with_shared_git_worktree_journal(state.git_worktree_journal.clone())
         .with_shared_session_state_journal(state.session_state_journal.clone())
-        .with_bg_task_commands(state.bg_task_commands.clone())
-        .with_bg_task_list_cache(state.bg_task_list_cache.clone())
-        .with_bash_detach_slot(state.bash_detach_slot.clone());
+        .with_background_tasks(state.background_tasks.clone())
+        .with_foreground_wait_control(state.foreground_wait_control.clone());
     if let Some(observability) = state.observability_session.clone() {
         executor = executor.with_observability_session(observability);
     }
@@ -1762,7 +1793,7 @@ pub(crate) async fn ensure_session_native_delivery(
         Ok(config) => config,
         Err(error) => {
             tracing::warn!(%error, "native collaborator delivery skipped: invalid WebSocket endpoint");
-            return;
+            return Err("selected native collaborator capacity is unavailable".into());
         }
     };
 
@@ -1787,13 +1818,14 @@ pub(crate) async fn ensure_session_native_delivery(
     state.native_delivery_session_id = Some(session_id.to_owned());
     state.native_delivery_attachment_epoch = Some(attachment_epoch);
     if let Some(handle) = state.native_delivery.as_ref() {
-        wait_for_native_delivery_ready(handle, 1).await;
+        require_native_capacity_ready(handle, 1).await?;
     }
     tracing::info!(
         session_id,
         attachment_epoch,
-        "native collaborator delivery startup scheduled"
+        "native collaborator delivery ready"
     );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1964,6 +1996,69 @@ for line in sys.stdin:
         );
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordinary_turns_skip_unselected_native_capacity_before_local_or_network_setup() {
+        let _selection = crate::test_utils::ProcessEnvGuard::remove("ASTRA_NATIVE_COLLABORATORS");
+        let workspace = tempfile::tempdir().unwrap();
+        let absent = workspace.path().join("not-materialized");
+        let executor = Arc::new(ToolExecutor::new(&absent));
+        let mut state = SessionState::default();
+        let http = wiremock::MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&http.uri(), None).unwrap();
+        assert!(!native_collaborators_requested().unwrap());
+        for value in [None, Some("false"), Some("0"), Some("")] {
+            unsafe {
+                match value {
+                    None => std::env::remove_var("ASTRA_NATIVE_COLLABORATORS"),
+                    Some(value) => std::env::set_var("ASTRA_NATIVE_COLLABORATORS", value),
+                }
+            }
+            let handle = start_headless_native_delivery(
+                &api,
+                "token",
+                "account".into(),
+                "session",
+                executor.clone(),
+                state.perm_manager.subscribe_permission_policy(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(handle.is_none());
+            ensure_session_native_delivery(&mut state, &api, "token", "session")
+                .await
+                .unwrap();
+            assert!(state.native_delivery.is_none());
+        }
+        assert!(
+            !absent.exists(),
+            "unselected capacity must not materialize a workspace"
+        );
+        unsafe {
+            std::env::set_var("ASTRA_NATIVE_COLLABORATORS", "true");
+        }
+        let failed = start_headless_native_delivery(
+            &api,
+            "token",
+            "account".into(),
+            "session",
+            executor,
+            state.perm_manager.subscribe_permission_policy(),
+            None,
+        )
+        .await;
+        assert!(
+            failed.is_err(),
+            "explicitly selected invalid capacity cannot fall through"
+        );
+        unsafe {
+            std::env::set_var("ASTRA_NATIVE_COLLABORATORS", "typo");
+        }
+        assert!(native_collaborators_requested().is_err());
+        assert!(http.received_requests().await.unwrap().is_empty());
+    }
+
     #[test]
     fn authentication_failure_is_typed_for_recovery() {
         assert!(NativeDeliveryError::Authentication("rejected".into()).is_authentication());
@@ -2044,6 +2139,12 @@ for line in sys.stdin:
         );
         published.send_replace(later);
         assert!(wait.await);
+        assert!(
+            require_native_capacity_ready(&handle, later).await.is_err(),
+            "a completed unavailable probe is not selected capacity readiness"
+        );
+        handle.provider_available.store(true, Ordering::Release);
+        require_native_capacity_ready(&handle, later).await.unwrap();
         let pending = handle.request_refresh();
         drop(published);
         assert!(
@@ -2051,6 +2152,7 @@ for line in sys.stdin:
             "owner closure is not publication"
         );
         cancellation.cancel();
+        assert!(require_native_capacity_ready(&handle, later).await.is_err());
         assert!(
             !wait_for_native_delivery_ready(&handle, later).await,
             "cancelled ownership cannot report readiness from an old completion"
@@ -2062,6 +2164,10 @@ for line in sys.stdin:
     #[tokio::test]
     #[ignore = "requires authenticated installed Codex and a fresh invocation supervisor; no model calls"]
     async fn live_supervisor_refresh_waits_for_current_publication_through_turn_preparation() {
+        let _selection = crate::test_utils::ProcessEnvGuard::remove("ASTRA_NATIVE_COLLABORATORS");
+        unsafe {
+            std::env::set_var("ASTRA_NATIVE_COLLABORATORS", "true");
+        }
         use astra_server_types::edge_ws_protocol::EdgeServerMessage;
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
@@ -2224,7 +2330,7 @@ for line in sys.stdin:
         );
         ui_refresh.request();
         let latest = refresh.requested();
-        preparing.await;
+        preparing.await.unwrap();
         third_started.notified().await;
         let handle = state.native_delivery.take().unwrap();
         assert!(
@@ -2385,6 +2491,8 @@ for line in sys.stdin:
                     network_allowed: false,
                 },
             )),
+            traceparent: None,
+            tracestate: None,
         }
     }
 
@@ -3014,6 +3122,9 @@ for line in sys.stdin:
                 execution_deadline_unix_ms: Some(unix + 5000),
                 execution_timeout_ms: Some(5000),
                 command_timeout_cap_ms: Some(120_000),
+
+                traceparent: None,
+                tracestate: None,
             };
             ws.send(Message::Text(
                 serde_json::to_string(&request).unwrap().into(),
@@ -3342,6 +3453,9 @@ for line in sys.stdin:
                 ),
                 execution_timeout_ms: Some(15_000),
                 command_timeout_cap_ms: Some(120_000),
+
+                traceparent: None,
+                tracestate: None,
             };
             if scenario == "released" {
                 let mut refused = request.clone();

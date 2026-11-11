@@ -26,6 +26,11 @@ pub(crate) fn physical_workspace_id() -> String {
 
 pub(crate) fn record(user_id: &str, session_id: &str, parent: Option<&str>) -> DurableRunRecord {
     DurableRunRecord {
+        opening: Default::default(),
+        opening_hash: None,
+        context_admission_hash: None,
+        terminal_receipt_json: None,
+        terminal_at: None,
         run_id: Uuid::new_v4().to_string(),
         user_id: user_id.into(),
         session_id: session_id.into(),
@@ -43,8 +48,8 @@ pub(crate) fn record(user_id: &str, session_id: &str, parent: Option<&str>) -> D
         owner_lease_expires_at: None,
         run_generation: 1,
         last_event_idx: -1,
-        checkpoint_version: None,
-        checkpoint_json: None,
+        last_guidance_event_idx: -1,
+        current_checkpoint: None,
         error_code: None,
         error_message: None,
         total_prompt_tokens: 0,
@@ -145,7 +150,17 @@ pub(crate) async fn seed_live_edge_invocation(
     use astra_services::multi_agent::{
         DatabaseEdgeDispatchService, EdgeDispatchIdentity, EdgeDispatchService,
     };
-    let binding = seed_execution_binding(pool, &user_id, &session_id).await;
+    let key = SessionKeyV1::owner_session(
+        "server",
+        &user_id,
+        &session_id,
+        DEFAULT_CONVERSATION_BRANCH_ID,
+    );
+    let binding = astra_services::DatabaseSessionContextCoordinator::new(pool.clone())
+        .load_execution_binding(&key)
+        .await
+        .unwrap()
+        .expect("prepare the canonical binding before creating the parent Run");
     child.events = vec![json!({"event_type":"run_started", "data":{
         "execution_binding_generation": binding.generation,
         "workspace": {"kind":"edge_workspace", "cwd":"/selected-runner", "authority":"read_write"},
@@ -207,6 +222,6 @@ pub(crate) async fn seed_live_edge_invocation(
     );
     assert!(matches!(dispatch.admit_and_claim_direct_dispatch(&dispatch_identity, "selected-runner", &json!({
             "identity":identity, "request_id":identity.storage_key(), "tool":"native_codex", "args":{"task":"native interaction"}
-        }).to_string()).await.unwrap(), astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed));
+        })).await.unwrap(), astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed));
     (ledger, identity)
 }

@@ -297,6 +297,36 @@ mod markdown_tests {
     }
 
     #[test]
+    fn code_block_rows_are_marked_verbatim() {
+        use crate::tui::markdown_render::render_markdown_rows_with_width;
+        let rows =
+            render_markdown_rows_with_width("Intro\n\n```\nEOF\n\n  x\n```\n\nOutro", Some(80));
+        let flagged: Vec<(String, bool)> = rows
+            .iter()
+            .map(|row| {
+                let text = row.line.spans.iter().map(|s| s.content.as_ref()).collect();
+                (text, row.verbatim)
+            })
+            .collect();
+        let verbatim: Vec<&str> = flagged
+            .iter()
+            .filter(|(_, verbatim)| *verbatim)
+            .map(|(text, _)| text.as_str())
+            .collect();
+        assert_eq!(verbatim, ["EOF", "", "  x"], "{flagged:?}");
+        assert!(
+            flagged
+                .iter()
+                .any(|(text, verbatim)| text == "Intro" && !verbatim)
+        );
+        assert!(
+            flagged
+                .iter()
+                .any(|(text, verbatim)| text == "Outro" && !verbatim)
+        );
+    }
+
+    #[test]
     #[ignore = "compiles Oniguruma patterns on first use; run manually with -- --ignored"]
     fn renders_highlighted_code_block() {
         let text = render_markdown_text_with_width("```rust\nfn main() {}\n```", None);

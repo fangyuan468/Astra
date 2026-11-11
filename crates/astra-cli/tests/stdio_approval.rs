@@ -88,7 +88,6 @@ async fn prompt_approval_over_piped_stdio_can_approve_deny_and_interrupt() {
                 "stdio-e2e",
                 "--model",
                 "mock-model",
-                "--bare",
                 "--no-instructions",
                 "serve",
                 "stdio",
@@ -218,7 +217,7 @@ async fn prompt_approval_over_piped_stdio_can_approve_deny_and_interrupt() {
             if action == "deny" {
                 assert_eq!(mock.tool_results().len(), 1, "denial must reach Server");
             } else {
-                assert_eq!(mock.cancelled_runs(), ["mock-run-tool"]);
+                assert_eq!(mock.cancellation_requests(), ["mock-run-tool"]);
             }
         }
         // Settled or interrupted requests cannot authorize a later tool call.
@@ -271,7 +270,6 @@ async fn piped_prompt_without_approval_transport_fails_before_server_admission()
                 "stdio-e2e",
                 "--model",
                 "mock-model",
-                "--bare",
                 "--no-instructions",
                 "chat",
                 "--permission-mode",

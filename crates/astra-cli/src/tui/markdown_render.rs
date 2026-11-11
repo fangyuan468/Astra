@@ -47,6 +47,35 @@ pub(crate) fn render_markdown_text_with_width_and_cwd(
     width: Option<usize>,
     cwd: Option<&Path>,
 ) -> Text<'static> {
+    write_markdown(input, width, cwd).into_text()
+}
+
+/// One rendered Markdown row. `verbatim` prevents presentation wrapping
+/// from inserting hard breaks into code. It grants no terminal-control trust.
+#[derive(Debug, Clone)]
+pub(crate) struct MarkdownRow {
+    pub line: Line<'static>,
+    pub verbatim: bool,
+}
+
+impl From<Line<'static>> for MarkdownRow {
+    fn from(line: Line<'static>) -> Self {
+        Self {
+            line,
+            verbatim: false,
+        }
+    }
+}
+
+pub(crate) fn render_markdown_rows_with_width(
+    input: &str,
+    width: Option<usize>,
+) -> Vec<MarkdownRow> {
+    let cwd = std::env::current_dir().ok();
+    write_markdown(input, width, cwd.as_deref()).into_rows()
+}
+
+fn write_markdown(input: &str, width: Option<usize>, cwd: Option<&Path>) -> Writer {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
@@ -54,7 +83,7 @@ pub(crate) fn render_markdown_text_with_width_and_cwd(
     let mut writer = Writer::new(width, cwd.map(Path::to_path_buf));
     writer.styles = MarkdownStyles::from_theme();
     writer.run(parser);
-    writer.into_text()
+    writer
 }
 
 struct Writer {
@@ -64,6 +93,8 @@ struct Writer {
     style_stack: Vec<Style>,
     in_code_block: Option<String>,
     code_block_content: String,
+    /// Row ranges in `lines` that hold code-block source verbatim.
+    code_rows: Vec<std::ops::Range<usize>>,
     list_stack: Vec<Option<u64>>,
     in_heading: Option<HeadingLevel>,
     in_blockquote: bool,
@@ -114,6 +145,7 @@ impl Writer {
             style_stack: vec![Style::default()],
             in_code_block: None,
             code_block_content: String::new(),
+            code_rows: Vec::new(),
             list_stack: Vec::new(),
             in_heading: None,
             in_blockquote: false,
@@ -326,9 +358,11 @@ impl Writer {
         };
 
         self.lines.push(Line::default());
+        let code_start = self.lines.len();
         for line in highlighted {
             self.lines.push(line_to_static(&line));
         }
+        self.code_rows.push(code_start..self.lines.len());
         self.lines.push(Line::default());
     }
 
@@ -577,6 +611,22 @@ impl Writer {
                 .collect();
         }
         Text::from(self.lines)
+    }
+
+    fn into_rows(mut self) -> Vec<MarkdownRow> {
+        let code_rows = std::mem::take(&mut self.code_rows);
+        let lines = self.into_text().lines;
+        let mut verbatim = vec![false; lines.len()];
+        for row in code_rows.into_iter().flatten() {
+            if let Some(flag) = verbatim.get_mut(row) {
+                *flag = true;
+            }
+        }
+        lines
+            .into_iter()
+            .zip(verbatim)
+            .map(|(line, verbatim)| MarkdownRow { line, verbatim })
+            .collect()
     }
 }
 

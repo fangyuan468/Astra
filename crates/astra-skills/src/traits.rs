@@ -129,6 +129,14 @@ pub struct ResolvedSkill {
     pub trust_tier: super::manifest::TrustTier,
 }
 
+/// Package-relative text, returned through the same admitted Skill owner.
+/// Resources do not register tools, hooks, agents, or execution authority.
+#[derive(Clone, Debug)]
+pub struct SkillResource {
+    pub path: String,
+    pub content: String,
+}
+
 /// Resolves skill names to instructions.
 #[async_trait]
 pub trait SkillResolver: Send + Sync {
@@ -143,6 +151,12 @@ pub trait SkillResolver: Send + Sync {
         self.resolve(name)
     }
 
+    async fn read_resource(&self, _name: &str, _path: &str) -> Result<SkillResource, SkillError> {
+        Err(SkillError::LoadFailed(
+            "skill_resource_not_supported".into(),
+        ))
+    }
+
     /// List available skills for schema generation.
     fn available_skills(&self) -> Vec<SkillToolInfo>;
 
@@ -154,6 +168,13 @@ pub trait SkillResolver: Send + Sync {
     /// support opaque dynamic names may keep the default and enforce their own
     /// public admission contract.
     fn catalog_is_authoritative(&self) -> bool {
+        false
+    }
+
+    /// Whether this resolver can execute custody-backed opaque selections
+    /// without enumerating its remote catalog in the prompt. Such resolvers
+    /// must validate each selection at resolution, not infer it from a name.
+    fn has_dynamic_catalog(&self) -> bool {
         false
     }
 

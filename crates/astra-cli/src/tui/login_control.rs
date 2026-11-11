@@ -27,6 +27,13 @@ impl LoginControl {
     pub(super) fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::SeqCst) == 2
     }
+
+    pub(super) async fn shutdown<T: Send + 'static>(&self, tasks: &mut tokio::task::JoinSet<T>) {
+        if self.cancel() {
+            tasks.abort_all();
+        }
+        while tasks.join_next().await.is_some() {}
+    }
 }
 
 #[cfg(test)]
@@ -50,6 +57,29 @@ mod tests {
         assert!(control.begin_exchange().is_ok());
         assert!(!control.cancel());
         assert!(!control.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_an_exchange_instead_of_aborting_it() {
+        let control = std::sync::Arc::new(LoginControl::default());
+        control.begin_exchange().unwrap();
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut tasks = tokio::task::JoinSet::new();
+        let task_release = release.clone();
+        let task_completed = completed.clone();
+        tasks.spawn(async move {
+            task_release.notified().await;
+            task_completed.store(true, Ordering::SeqCst);
+        });
+        let shutdown = tokio::spawn(async move {
+            control.shutdown(&mut tasks).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        release.notify_one();
+        shutdown.await.unwrap();
+        assert!(completed.load(Ordering::SeqCst));
     }
 
     #[test]

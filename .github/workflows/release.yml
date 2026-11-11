@@ -547,6 +547,7 @@ jobs:
           fi
           generate_notes="$(
             python3 scripts/prepare_github_release_body.py prepare \
+              --repository "${GITHUB_REPOSITORY}" \
               --owner-run-id "${owner_run_id}" \
               --source-sha "${SOURCE_SHA}" \
               --source-tag "${SOURCE_TAG}" \
@@ -619,6 +620,7 @@ jobs:
           staged_json="${RUNNER_TEMP}/staged-release.json"
           gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "${staged_json}"
           python3 scripts/prepare_github_release_body.py verify \
+            --repository "${GITHUB_REPOSITORY}" \
             --owner-run-id "${OWNER_RUN_ID}" \
             --source-sha "${SOURCE_SHA}" \
             --source-tag "${SOURCE_TAG}" \

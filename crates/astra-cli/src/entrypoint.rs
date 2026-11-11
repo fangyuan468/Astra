@@ -55,26 +55,42 @@ use cli::project_instructions::{
 
 // ════════════════════════════════════════════════════════════════ main ════
 
-fn validate_native_directory_source(
+/// Variables that relocate trusted user state (credentials, user-level
+/// configuration, permissions and workspace trust). A workspace `.env` must
+/// not supply them; only the launching shell may. `HOME` is the fallback root
+/// for all of these when the others are unset, so a sanitized environment
+/// without it must not let the workspace choose it.
+const SHELL_ONLY_ENV: [&str; 3] = [
+    "MOI_AUTH_DIR",
+    astra_core::local_state::ASTRA_LOCAL_STATE_ROOT_ENV,
+    "HOME",
+];
+
+fn validate_shell_only_source(
+    name: &str,
     before: Option<std::ffi::OsString>,
     after: Option<std::ffi::OsString>,
-) -> Result<(), &'static str> {
+) -> Result<(), String> {
     if before != after {
-        return Err(
-            "MOI_AUTH_DIR cannot be supplied by a workspace .env; set it explicitly in your shell",
-        );
+        return Err(format!(
+            "{name} cannot be supplied by a workspace .env; set it explicitly in your shell"
+        ));
     }
     Ok(())
 }
 
 #[test]
-fn workspace_dotenv_cannot_select_native_auth_directory() {
-    assert!(validate_native_directory_source(None, Some("/untrusted".into())).is_err());
-    assert!(validate_native_directory_source(None, Some("".into())).is_err());
-    assert!(validate_native_directory_source(None, None).is_ok());
-    assert!(
-        validate_native_directory_source(Some("/trusted".into()), Some("/trusted".into())).is_ok()
-    );
+fn workspace_dotenv_cannot_select_trusted_state_roots() {
+    for name in SHELL_ONLY_ENV {
+        let rejected = validate_shell_only_source(name, None, Some("/untrusted".into()));
+        assert!(rejected.unwrap_err().contains(name));
+        assert!(validate_shell_only_source(name, None, Some("".into())).is_err());
+        assert!(validate_shell_only_source(name, None, None).is_ok());
+        assert!(
+            validate_shell_only_source(name, Some("/trusted".into()), Some("/trusted".into()))
+                .is_ok()
+        );
+    }
 }
 
 pub fn run() -> i32 {
@@ -155,13 +171,13 @@ async fn run_async() -> i32 {
     // Chat/login can launch credential-consuming children too. Inspect the
     // actual loaded environment, not a second parse of a mutable .env file.
     if !explicit_env_config {
-        let native_directory = std::env::var_os("MOI_AUTH_DIR");
+        let shell_values = SHELL_ONLY_ENV.map(std::env::var_os);
         dotenvy::dotenv().ok();
-        if let Err(error) =
-            validate_native_directory_source(native_directory, std::env::var_os("MOI_AUTH_DIR"))
-        {
-            eprintln!("Error: {error}");
-            return 2;
+        for (name, before) in SHELL_ONLY_ENV.into_iter().zip(shell_values) {
+            if let Err(error) = validate_shell_only_source(name, before, std::env::var_os(name)) {
+                eprintln!("Error: {error}");
+                return 2;
+            }
         }
     }
     cli::diagnostic_log::init_cli_observability(&cli);
@@ -267,10 +283,8 @@ async fn run_async() -> i32 {
         settings: _settings_already_applied,
         session_id: cli_session_id,
         session_name,
-        bare,
         no_instructions,
         no_journal_content,
-        startup_trace,
         diagnostic_log: _,
         log_file: _,
         trace_profile: _trace_profile_already_applied,
@@ -293,7 +307,6 @@ async fn run_async() -> i32 {
         return 1;
     }
 
-    let _ = (startup_trace, bare);
     let mut cli_context = match cli::cli_config::cli_context::CliContext::from_launch_options(
         no_journal_content,
         &allowed_tools,
@@ -741,7 +754,7 @@ mod tests {
         std::fs::write(ws_dir.join("workspace.yaml"), "invalid: yaml: content: [").unwrap();
 
         // Malformed workspace now falls back to journal-only local restore.
-        let svc = astra_services::session_restore::HybridRestoreService::local_only();
+        let svc = astra_services::session_restore::SessionRestoreService::local_only();
         let result = svc
             .restore_local_session(&sid)
             .await
@@ -770,7 +783,7 @@ mod tests {
             .unwrap();
         drop(writer);
 
-        let svc = astra_services::session_restore::HybridRestoreService::local_only();
+        let svc = astra_services::session_restore::SessionRestoreService::local_only();
         let result = svc
             .restore_local_session(&sid)
             .await

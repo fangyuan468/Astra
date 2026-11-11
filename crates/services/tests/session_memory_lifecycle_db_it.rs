@@ -46,6 +46,185 @@ async fn persisted_work(pool: &SharedPool, user: &str, session: &str) -> serde_j
     value
 }
 
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn deleting_session_respects_actual_plan_holder_and_owner() {
+    let (pool, settings, user, session) = setup().await;
+    let other_session = format!("other-{}", uuid::Uuid::new_v4().simple());
+    let foreign_user = format!("foreign-{}", uuid::Uuid::new_v4().simple());
+    sqlx::query("INSERT INTO agent_sessions (user_id, session_id, status, active_plan_id) VALUES (?, ?, 'active', 'held-elsewhere')")
+        .bind(&user).bind(&other_session).execute(pool.get()).await.unwrap();
+    sqlx::query("UPDATE agent_sessions SET active_plan_id = 'owned-active' WHERE user_id = ? AND session_id = ?")
+        .bind(&user).bind(&session).execute(pool.get()).await.unwrap();
+    for (owner, id, hint) in [
+        (&user, "held-elsewhere", Some(session.as_str())),
+        (&user, "owned-active", None),
+        (&user, "unbound-hint", Some(session.as_str())),
+        (&foreign_user, "unbound-hint", Some(session.as_str())),
+    ] {
+        sqlx::query("INSERT INTO plans (user_id, plan_id, session_id, goal, phase, plan_json) VALUES (?, ?, ?, 'goal', 'planning', '{}')")
+            .bind(owner).bind(id).bind(hint).execute(pool.get()).await.unwrap();
+    }
+    DatabaseSessionService::new(settings)
+        .with_pool(pool.clone())
+        .delete_session(session.clone(), user.clone())
+        .await
+        .unwrap();
+
+    let remaining: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT plan_id, session_id FROM plans WHERE user_id = ? ORDER BY plan_id")
+            .bind(&user)
+            .fetch_all(pool.get())
+            .await
+            .unwrap();
+    assert_eq!(
+        remaining,
+        vec![("held-elsewhere".into(), Some(other_session.clone()))]
+    );
+    let binding: Option<String> = sqlx::query_scalar(
+        "SELECT active_plan_id FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user)
+    .bind(&other_session)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(binding.as_deref(), Some("held-elsewhere"));
+    let foreign: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM plans WHERE user_id = ? AND plan_id = 'unbound-hint'",
+    )
+    .bind(&foreign_user)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(foreign, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn deleting_session_rolls_back_when_plan_has_multiple_holders() {
+    let (pool, settings, user, session) = setup().await;
+    let other_session = format!("other-{}", uuid::Uuid::new_v4().simple());
+    sqlx::query("INSERT INTO agent_sessions (user_id, session_id, status, active_plan_id) VALUES (?, ?, 'active', 'shared')")
+        .bind(&user).bind(&other_session).execute(pool.get()).await.unwrap();
+    sqlx::query(
+        "UPDATE agent_sessions SET active_plan_id = 'shared' WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user)
+    .bind(&session)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO plans (user_id, plan_id, session_id, goal, phase, plan_json) VALUES (?, 'shared', ?, 'goal', 'planning', '{}')")
+        .bind(&user).bind(&session).execute(pool.get()).await.unwrap();
+    assert!(
+        DatabaseSessionService::new(settings)
+            .with_pool(pool.clone())
+            .delete_session(session.clone(), user.clone())
+            .await
+            .is_err()
+    );
+    let plans: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM plans WHERE user_id = ? AND plan_id = 'shared'")
+            .bind(&user)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+    let sessions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND active_plan_id = 'shared'",
+    )
+    .bind(&user)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!((plans, sessions), (1, 2));
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn continuation_activation_avoids_active_writes_and_respects_lifecycle() {
+    let (pool, settings, user, session) = setup().await;
+    let sessions = DatabaseSessionService::new(settings).with_pool(pool.clone());
+    let audit_count = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM auth_audit_logs WHERE user_id = ? AND resource_type = 'session' AND resource_id = ? AND action = 'session_update'",
+        )
+        .bind(&user)
+        .bind(&session)
+        .fetch_one(pool.get())
+        .await
+        .unwrap()
+    };
+    sqlx::query("UPDATE agent_sessions SET updated_at = '2000-01-01 00:00:00' WHERE user_id = ? AND session_id = ?")
+        .bind(&user).bind(&session).execute(pool.get()).await.unwrap();
+    let before = audit_count().await;
+    sessions
+        .ensure_session_active(session.clone(), user.clone())
+        .await
+        .unwrap();
+    let unchanged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND session_id = ? AND updated_at = '2000-01-01 00:00:00' AND status = 'active'")
+        .bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
+    assert_eq!(unchanged, 1);
+    assert_eq!(audit_count().await, before);
+
+    assert!(
+        sessions
+            .ensure_session_active(session.clone(), "foreign-user".into())
+            .await
+            .is_err()
+    );
+    let foreign_fence: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_lifecycle_fences WHERE user_id = 'foreign-user' AND session_id = ?")
+        .bind(&session).fetch_one(pool.get()).await.unwrap();
+    assert_eq!(foreign_fence, 0);
+
+    let mut tx = pool.get().begin().await.unwrap();
+    astra_services::storage::lock_agent_session_write_fence(&mut tx, &session, &user)
+        .await
+        .unwrap();
+    let contender = sessions.clone();
+    let contender_user = user.clone();
+    let contender_session = session.clone();
+    let mut refresh = tokio::spawn(async move {
+        contender
+            .ensure_session_active(contender_session, contender_user)
+            .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut refresh)
+            .await
+            .is_err()
+    );
+    sqlx::query("UPDATE agent_sessions SET status = 'paused' WHERE user_id = ? AND session_id = ?")
+        .bind(&user)
+        .bind(&session)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    refresh.await.unwrap().unwrap();
+    assert_eq!(
+        sessions
+            .get_session(session.clone(), user.clone())
+            .await
+            .unwrap()
+            .status,
+        "active"
+    );
+    assert_eq!(audit_count().await, before + 1);
+
+    sqlx::query("UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6) WHERE user_id = ? AND session_id = ?")
+        .bind(&user).bind(&session).execute(pool.get()).await.unwrap();
+    assert_eq!(
+        sessions
+            .ensure_session_active(session.clone(), user.clone())
+            .await
+            .unwrap_err()
+            .0,
+        axum::http::StatusCode::NOT_FOUND
+    );
+    assert_eq!(audit_count().await, before + 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn independent_pools_preserve_one_active_and_newest_pending_input() {
@@ -646,23 +825,14 @@ async fn large_json_journal_survives_close_status_claim_and_recovery_reads() {
 
 #[tokio::test]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
-async fn close_during_resumed_turn_recovers_after_prior_exit_finalization() {
+async fn close_during_controller_turn_recovers_after_prior_exit_finalization() {
     for missed_handoff in [false, true] {
-        assert_resumed_turn_close_recovers(missed_handoff, false).await;
+        assert_controller_turn_close_recovers(missed_handoff).await;
     }
 }
 
-#[tokio::test]
-#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
-async fn close_after_terminal_slot_release_waits_for_canonical_commit() {
-    assert_resumed_turn_close_recovers(true, true).await;
-}
-
-async fn assert_resumed_turn_close_recovers(missed_handoff: bool, release_before_close: bool) {
-    use astra_services::{
-        AcquireWriterAndReserveTurnOutcome, SessionContextCoordinator,
-        runs::{DatabaseRunStateStore, RunStateStore},
-    };
+async fn assert_controller_turn_close_recovers(missed_handoff: bool) {
+    use astra_services::{AcquireWriterAndReserveTurnOutcome, SessionContextCoordinator};
     use astra_turn_types::{
         ActorContextV1, ActorKindV1, AuthorityEpochsV1, SessionKeyV1, SessionSurfaceV1,
     };
@@ -690,12 +860,6 @@ async fn assert_resumed_turn_close_recovers(missed_handoff: bool, release_before
         false
     );
 
-    // Admit through the actual Run store: a resumable Session remains
-    // active after CLI-exit maintenance and acquires its execution slot.
-    let runs = DatabaseRunStateStore::new(pool.clone());
-    let run = common::collaborator_fixture::record(&user, &session, None);
-    let run_id = run.run_id.clone();
-    runs.insert_run(run).await.unwrap();
     let key = SessionKeyV1::owner_session("server", &user, &session, "main");
     let actor = ActorContextV1::owner_user(
         &user,
@@ -721,47 +885,6 @@ async fn assert_resumed_turn_close_recovers(missed_handoff: bool, release_before
     let AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation } = ready else {
         panic!("follow-up admission must succeed: {ready:?}")
     };
-    let release_slot = || async {
-        assert!(
-            runs.update_run_status_with_events_if_current(
-                &user,
-                &session,
-                &run_id,
-                &["running"],
-                None,
-                "completed",
-                None,
-                None,
-                &[]
-            )
-            .await
-            .unwrap()
-        );
-    };
-    if release_before_close {
-        // Production ordering: terminal status commits and removes the slot
-        // while the canonical turn is still reserved and the handoff was lost.
-        release_slot().await;
-        let slots: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&user)
-        .bind(&session)
-        .fetch_one(pool.get())
-        .await
-        .unwrap();
-        assert_eq!(slots, 0);
-        assert_eq!(
-            coordinator
-                .load_head(&key)
-                .await
-                .unwrap()
-                .unwrap()
-                .cursor
-                .completed_turn,
-            1
-        );
-    }
     let sessions = DatabaseSessionService::new(settings).with_pool(pool.clone());
     close_owned_session(&sessions, &user, &session).await;
     let status = store.status(&user, &session).await.unwrap();
@@ -795,9 +918,6 @@ async fn assert_resumed_turn_close_recovers(missed_handoff: bool, release_before
             .await
             .unwrap();
         store.request_extraction(&user, &session).await.unwrap();
-    }
-    if !release_before_close {
-        release_slot().await;
     }
     coordinator
         .commit_turn(&reservation, canonical_delta(2), "follow-up-commit")
@@ -950,5 +1070,103 @@ fn canonical_delta(turn: u32) -> astra_turn_types::CanonicalTurnDeltaV1 {
             json!({"role":"user","content":format!("canonical-turn-{turn}")}),
             json!({"role":"assistant","content":"durable reply"}),
         ]],
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn activation_rechecks_pending_and_completed_delete_after_owner_read() {
+    for continuation in [false, true] {
+        for completed in [false, true] {
+            let (pool, mut settings, user, session) = setup().await;
+            settings.db_pool_max_connections = 1;
+            settings.db_pool_min_connections = 1;
+            let worker = SharedPool::new(&settings).await.unwrap();
+            let connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+                .fetch_one(worker.get())
+                .await
+                .unwrap();
+            let service = DatabaseSessionService::new(settings).with_pool(worker.clone());
+            sqlx::query(
+                "UPDATE agent_sessions SET status='paused' WHERE user_id=? AND session_id=?",
+            )
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+            let mut holder = pool.get().begin().await.unwrap();
+            astra_services::storage::lock_agent_session_write_fence(&mut holder, &session, &user)
+                .await
+                .unwrap();
+            let queued_user = user.clone();
+            let queued_session = session.clone();
+            let activation = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                if continuation {
+                    service
+                        .ensure_session_active(queued_session, queued_user)
+                        .await
+                } else {
+                    service
+                        .update_session(
+                            queued_session,
+                            queued_user,
+                            SessionUpdateRequestData {
+                                status: Some("active".into()),
+                                title: None,
+                                metadata: None,
+                                metadata_patch: None,
+                            },
+                        )
+                        .await
+                        .map(|_| ())
+                }
+            }));
+            // Observe this connection at the fence, proving the owner read
+            // finished. No timing sleep is used to establish the race ordering.
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let queries: Vec<String> = sqlx::query_scalar("SELECT info FROM information_schema.processlist WHERE db=? AND conn_id=? AND info IS NOT NULL")
+                        .bind(&pool.settings().database).bind(connection_id).fetch_all(pool.get()).await.unwrap();
+                    if queries.iter().any(|query| query.contains("agent_session_lifecycle_fences")) { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }).await.expect("activation reached the owned Session fence");
+            let delete_sql = if completed {
+                "UPDATE agent_session_lifecycle_fences SET delete_requested_at=NOW(6), database_deleted_at=NOW(6) WHERE user_id=? AND session_id=?"
+            } else {
+                "UPDATE agent_session_lifecycle_fences SET delete_requested_at=NOW(6) WHERE user_id=? AND session_id=?"
+            };
+            sqlx::query(delete_sql)
+                .bind(&user)
+                .bind(&session)
+                .execute(&mut *holder)
+                .await
+                .unwrap();
+            holder.commit().await.unwrap();
+            let error = activation.await.unwrap().unwrap_err();
+            assert_eq!(
+                error.0,
+                axum::http::StatusCode::NOT_FOUND,
+                "continuation={continuation}, completed={completed}"
+            );
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM agent_sessions WHERE user_id=? AND session_id=?",
+            )
+            .bind(&user)
+            .bind(&session)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+            assert_eq!(status, "paused");
+            let audits: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_audit_logs WHERE user_id=? AND resource_id=? AND action='session_update'")
+                .bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
+            assert_eq!(
+                audits, 0,
+                "rejected activation cannot publish a success audit"
+            );
+            worker.close().await;
+            pool.close().await;
+        }
     }
 }

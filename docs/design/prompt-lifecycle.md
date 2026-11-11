@@ -108,10 +108,15 @@ from a model name. Missing legacy delivery metadata retains the pre-axis `all`
 behavior, while newly serialized metadata is versioned and writes every
 behavioral field explicitly.
 
-`append_only_user_tail` is a distinct provider wire shape, not a compatibility
-fallback. It is valid only with `required_only` delivery. A required runtime
-control is appended as a typed, runtime-owned `role=user` frame so the next
-request strictly extends the prior provider history. Provider role is not
+`append_only_user_tail` is a distinct provider wire shape for prefix and
+strict-history caches, including Responses. A selected runtime control is
+appended as a typed, runtime-owned `role=user` frame so the next request
+strictly extends the complete prior request. With `all` delivery, optional
+context is retained in an advisory snapshot using the same
+canonical history, lifetime, retry and compaction owners. Replacing even a
+trailing context message can invalidate the whole conversation cache on a
+strict-history deployment; an unchanged system header alone is insufficient.
+`required_only` suppresses new optional snapshots. Provider role is not
 semantic authorship: intent, memory, observer, display, turn-boundary, and
 ordinary summary projections must use typed provenance and must never count
 that frame as human speech. Unknown runtime provenance fails closed and cannot
@@ -126,10 +131,24 @@ compaction may retain the exact frame bytes only under the same stable semantic
 policy used by main inference; all other summary/learning projections exclude
 runtime-owned frames.
 
+Advisory snapshots remain current within their human turn until superseded.
+Unchanged snapshots are deduplicated across tool rounds; a changed or empty
+snapshot supersedes the previous facts, and a new human turn expires them.
+Their historical bytes remain cacheable evidence, with no instruction or execution authority.
+This preserves the full selected context without a separate cache history or
+additional database admission query. When context pressure requires a rewrite,
+compaction may remove expired frames and older complete tool rounds while
+retaining the active snapshot, required controls and their dependencies. This
+can invalidate the provider cache; cache hit rate never overrides the budget
+or permits omitting active context.
+
 When an active session changes to a non-append wire shape, expired frames are
-removed from the provider projection. Active authority is unframed and re-homed
-to the required system lane; kinds rebuilt by a current authoritative source
-replace their historical frame instead of being duplicated. Canonical history
+removed from the provider projection. Active required authority is unframed and
+re-homed to the required system lane; kinds rebuilt by a current authoritative
+source replace their historical frame instead of being duplicated. Advisory
+snapshots are replaced by the destination provider's current context selection
+and delivery policy, including when returning to an append-only `RequiredOnly`
+placement. Canonical history
 retains the typed record needed for deterministic resume, while the chosen
 provider projection contains each effective authority kind once. Correctness is
 never weakened to preserve cache reuse.
@@ -166,60 +185,23 @@ connection. Content hashes remain independent of execution identity: delta
 ancestry may reuse exact content across runs within the same owner/session/source.
 Diagnostic rows remain opt-in and are not a count of physical provider calls.
 
-Append-only canonical state uses the provider-attempt ledger as a write-ahead
-boundary. Before HTTP is authorized, the same transaction that admits the
-exact provider body stores every newly provider-owned canonical append as a
-versioned transition with predecessor/result message counts and append-friendly
-history identities. The first transition is self-contained from the canonical
-coordinator's admitted durable base. Each successor stores only the lossless
-gap since its parent plus the attempt-owned append; this keeps admission work
-and storage proportional to new data instead of repeatedly hashing and writing
-the complete growing turn. A request with no new runtime frame still stores a
-recovery-only transition: provider delivery, rather than the presence of a
-particular authority shape, creates the durability obligation. Initial
-authority frames are authority-only appends; an internal continuation is one
-atomic assistant-plus-authority append.
+Provider admission stores the exact request hash and byte count under the
+existing invocation and attempt owners. Run generation, owner lease and
+unsettled-delivery checks fence dispatch. An uncertain admission commit can
+authorize delivery only after the original call verifies its exact admission
+token and immutable request identity; ordinary re-entry grants no delivery.
 
-Linked transition construction consumes the parent identity and its new message
-delta. The unused full-history linked constructor and standalone predecessor
-reconstruction APIs are retired; canonical recovery uses the validated chain
-application path.
+Settled continuation restores from the existing Run checkpoint and its admitted
+canonical base. Its bounded continuation payload preserves exact message
+identity and crosses the checkpoint credential-redaction boundary. Recovery of
+an in-flight parent transition is unsupported and requires a new turn; the
+provider-attempt ledger alone cannot reconstruct uncheckpointed conversation
+content or authorize resending an uncertain request. There is no separate
+database canonical-head/WAL recovery protocol.
 
-A resumed host uses the admitted durable message count as an ownership
-boundary. It detaches the fresh request suffix, loads the database-authoritative
-per-turn head, restores its bounded transition chain on the durable base, and
-finally reattaches the fresh suffix. Every transition names its immutable parent
-transition id and parent result identity. Provider-attempt admission validates
-parent-to-current-head and advances the head in the same transaction as the
-exact provider body; a same-transition physical retry is idempotent. It never
-compares message values to infer lineage or guess whether repeated input such as
-`continue` belongs before or after the crash. A missing parent, fork, stale
-head, payload/hash conflict, or ambiguous commit without the exact head attempt
-fails before HTTP or canonical mutation.
-This covers a crash after HTTP authorization but before any step or canonical
-checkpoint. Provider body roles, model names, prompt text, transport errors,
-timestamps, run-local counters, and attempt ids are not recovery evidence.
-
-WAL payloads cross the same durable credential-redaction boundary as runtime
-checkpoints. They preserve the already-durable canonical base byte-for-byte and
-redact only newly retained message data. The head tracks both chain length and
-serialized bytes. Before either hard limit is reached, runtime emits a lossless
-checkpoint that proves the prior head is an exact prefix, stores one
-self-contained recovery anchor, and atomically retires the earlier chain. This
-capacity checkpoint is not context compaction and needs no rewrite authority.
-Once a canonical commit absorbs a turn, its head and payloads are retired
-atomically; the next session boundary retries retirement for an earlier commit
-that crashed before cleanup. Hard session deletion removes both owner-scoped
-heads and attempt rows.
-
-Prefix mismatch is not replacement authority. An append transition must prove
-that the admitted durable base remains an exact prefix. A replacement
-transition can be created only from the canonical rewrite proof after its
-pre-mutation permit has been validated and bound to the exact resulting
-predecessor identity and compaction generation. That authority is consumed when
-the replacement anchor is admitted, so later provider rounds return to
-incremental append until another real rewrite occurs. Otherwise provider
-admission fails before HTTP.
+Prefix mismatch is not replacement authority. Local history replacement and
+terminal Context publication require the existing typed rewrite proof bound
+to the admitted base and resulting compaction generation.
 
 At a text-only completion boundary, a provider may receive one request with a
 stable schema declaration plus its native no-tool choice. If it nevertheless

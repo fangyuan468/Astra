@@ -95,7 +95,7 @@ Requirements:
 - redaction boundary;
 - exclusion from default learning pipeline.
 
-CLI context dumps use `astra.context_dump/v2`. They retain the recorded prompt
+CLI context dumps use `astra.context_dump/v3`. They retain the recorded prompt
 trace, conversation, usage and compaction facts; the empty local built-in skill
 selection field is retired. Actual skill injection remains in the trace.
 
@@ -108,6 +108,23 @@ existing safety/redaction boundary and before lossy model presentation. Storage
 does not pretty-print or otherwise rewrite those bytes: descriptor hashes,
 byte ranges and recovery windows must all address the same source. Formatting
 belongs to bounded display projections.
+
+The model-facing tool-result reference is `artifact://session/tool-result/result_<sha256>`
+(or `guidance_<sha256>` for the separately identified runtime-guidance document).
+The digest addresses a small immutable descriptor manifest in the same
+owner/session-local tool-result store. It covers the producer run, call,
+document kind, byte length and content digest. The reader verifies the manifest
+and then verifies the original payload through the existing bounded reader.
+Serialized manifests have a 64 KiB metadata bound, enforced before publication
+and by a bounded read before hashing or decoding; payload paging limits remain
+independent. Immutable replay requires a regular file for both payloads and
+manifests, and rejects symlinks even when their target has the expected bytes.
+Missing, non-regular, oversized or changed manifests fail explicitly; references never
+select a nearby result or cross owner/session boundaries. Manifest publication
+is required before a successful recoverable projection is returned. Exact
+replay may finish publication after an interrupted write. Existing inline
+descriptor references in durable histories remain readable and preserve their
+own reference while paging; reading does not create a replacement manifest.
 
 Artifact possession does not grant read authority. Stored result previews and
 compact projections retain the artifact identity without promising a callable
@@ -167,3 +184,13 @@ Each class has independent redaction and retention policy.
 - Expired bundle is inaccessible except allowed audit metadata.
 - Export does not include classes that were not enabled.
 - Deletion propagates to artifact references and learning exclusions.
+
+The v3 context dump uses the same typed `ContextAssemblyTrace` payload in live
+and journal `trace` fields. An absent capture produces `trace: null`; the latest malformed
+or unsupported journal trace fails the dump explicitly. It does not fall back
+to an older trace or convert retired compression-detail shapes. Visible chat
+history is separate display evidence, not an exact provider-request replay.
+
+The v3 trace also retires the generic explanation array: it had no production
+producer. Canonical memory/tool exclusions, provider decisions and durable
+execution evidence remain available through their existing owners.

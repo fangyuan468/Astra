@@ -1259,6 +1259,8 @@ mod tests {
 
     fn mk_outcome() -> RunOutcome {
         RunOutcome {
+            error_code: None,
+            server_admission_not_dispatched: false,
             model: "m".into(),
             exit_code: 0,
             text: "hello".into(),

@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 
+use super::markdown_render::MarkdownRow;
 use crossterm::{
     cursor::MoveTo,
     queue,
@@ -10,97 +11,95 @@ use ratatui::backend::Backend;
 use ratatui::layout::Size;
 use ratatui::style::{Color as RColor, Modifier, Style};
 use ratatui::text::Line;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::custom_terminal;
 
 /// Insert history lines above the viewport into terminal scrollback.
 /// Matches Codex insert_history.rs Standard/Zellij paths.
+/// Returns whether the viewport must be fully repainted after insertion.
 pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
     terminal: &mut custom_terminal::Terminal<B>,
-    lines: &[Line<'_>],
+    rows: &[MarkdownRow],
     trusted_links: bool,
     is_zellij: bool,
-) -> io::Result<()> {
-    if lines.is_empty() {
-        return Ok(());
+) -> io::Result<bool> {
+    if rows.is_empty() {
+        return Ok(false);
     }
 
     let screen_size = terminal.backend().size().unwrap_or(Size::new(0, 0));
     let area = terminal.viewport_area;
     let last_cursor_pos = terminal.last_known_cursor_pos;
-    let wrap_width = area.width.max(1) as usize;
-    let mut should_update_area = false;
+    let wrap_width = screen_size.width.max(1) as usize;
 
-    // Pre-wrap lines using adaptive wrapping (URL-aware, span-preserving)
+    // Sanitization is independent of copy semantics. Code and pure URLs use
+    // terminal soft wrapping so only logical source rows emit CRLFs.
     let mut wrapped: Vec<Line<'static>> = Vec::new();
     let mut wrapped_rows: u16 = 0;
-    for line in lines {
-        let line_w: usize = line.spans.iter().map(|s| s.content.width()).sum();
-        if line_w == 0 {
-            wrapped.push(if trusted_links {
-                super::render::line_utils::sanitize_line_for_terminal_with_links(line)
-            } else {
-                super::render::line_utils::line_to_static(line)
-            });
-            wrapped_rows += 1;
-        } else if super::wrapping::line_contains_url_like(line)
-            && !super::wrapping::line_has_mixed_url_and_non_url_tokens(line)
-        {
-            // Pure URL line — don't wrap, let terminal handle it (keeps URL clickable)
-            let physical = line_w.max(1).div_ceil(wrap_width) as u16;
-            wrapped_rows += physical;
-            wrapped.push(if trusted_links {
-                super::render::line_utils::sanitize_line_for_terminal_with_links(line)
-            } else {
-                super::render::line_utils::line_to_static(line)
-            });
+    for row in rows {
+        let line = if trusted_links {
+            super::render::line_utils::sanitize_line_for_terminal_with_links(&row.line)
         } else {
-            let line_wrapped = super::wrapping::adaptive_wrap_line(
-                line,
-                super::wrapping::RtOptions::new(wrap_width),
-            );
-            for wl in &line_wrapped {
-                wrapped_rows += wl.width().max(1).div_ceil(wrap_width) as u16;
-            }
-            wrapped.extend(line_wrapped.into_iter().map(|l| {
-                if trusted_links {
-                    crate::tui::render::line_utils::sanitize_line_for_terminal_with_links(&l)
-                } else {
-                    crate::tui::render::line_utils::line_to_static(&l)
-                }
-            }));
+            super::render::line_utils::line_to_static(&row.line)
+        };
+        let soft_wrap = row.verbatim
+            || (super::wrapping::line_contains_url_like(&line)
+                && !super::wrapping::line_has_mixed_url_and_non_url_tokens(&line));
+        if soft_wrap {
+            let physical = soft_wrapped_rows(&line, wrap_width);
+            wrapped_rows = wrapped_rows.saturating_add(u16::try_from(physical).unwrap_or(u16::MAX));
+            wrapped.push(line);
+            continue;
+        }
+        for line in
+            super::wrapping::adaptive_wrap_line(&line, super::wrapping::RtOptions::new(wrap_width))
+        {
+            let physical = soft_wrapped_rows(&line, wrap_width);
+            wrapped_rows = wrapped_rows.saturating_add(u16::try_from(physical).unwrap_or(u16::MAX));
+            wrapped.push(if trusted_links {
+                super::render::line_utils::sanitize_line_for_terminal_with_links(&line)
+            } else {
+                super::render::line_utils::line_to_static(&line)
+            });
         }
     }
 
     if wrapped_rows == 0 {
-        return Ok(());
+        return Ok(false);
     }
 
     let writer = terminal.backend_mut();
+    let mut new_area = area;
 
-    if is_zellij {
-        // Zellij mode: emit newlines at bottom, write at absolute positions
-        let space_below = screen_size.height.saturating_sub(area.bottom());
-        let shift_down = wrapped_rows.min(space_below);
-        let scroll_up = wrapped_rows.saturating_sub(shift_down);
+    // A full-height viewport has no protected history region. Both it and
+    // Zellij need a repaint after content flows through the transient frame.
+    let needs_full_repaint = is_zellij || area.height == screen_size.height;
+    if needs_full_repaint {
+        let end = u32::from(area.top()) + u32::from(wrapped_rows);
+        new_area.y = end.min(u32::from(screen_size.height.saturating_sub(area.height))) as u16;
+        let reserve = end
+            .min(u32::from(screen_size.height))
+            .saturating_sub(u32::from(new_area.top())) as u16;
 
-        if scroll_up > 0 {
-            queue!(writer, MoveTo(0, screen_size.height.saturating_sub(1)))?;
-            for _ in 0..scroll_up {
-                queue!(writer, Print("\n"))?;
-            }
+        queue!(writer, SetAttribute(Attribute::Reset))?;
+        if area.top() < screen_size.height {
+            queue!(writer, MoveTo(0, area.top()))?;
+        } else {
+            // An empty viewport can sit just past the last screen row.
+            // Append rather than overwriting the final history row.
+            queue!(
+                writer,
+                MoveTo(0, screen_size.height.saturating_sub(1)),
+                Print("\r\n")
+            )?;
         }
+        queue!(writer, Clear(ClearType::FromCursorDown))?;
 
-        let mut new_area = area;
-        if shift_down > 0 {
-            new_area.y += shift_down;
-            should_update_area = true;
-        }
-
-        let cursor_top = area.top().saturating_sub(scroll_up + shift_down);
-        queue!(writer, MoveTo(0, cursor_top))?;
-
+        // Write first: terminal autowrap naturally scrolls even a single
+        // multi-page code row. Pre-scrolling would clamp its origin to zero
+        // and leave its tail inside the composer.
         for (i, line) in wrapped.iter().enumerate() {
             if i > 0 {
                 queue!(writer, Print("\r\n"))?;
@@ -108,16 +107,13 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
             write_history_line(writer, line, trusted_links)?;
         }
 
-        // Restore cursor position
-        queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
-        Write::flush(writer)?;
-
-        let _ = writer;
-        if should_update_area {
-            terminal.set_viewport_area(new_area);
-        }
-        if wrapped_rows > 0 {
-            terminal.note_history_rows_inserted(wrapped_rows);
+        // Reserve the transient frame only after content has flowed. This
+        // adds at most one viewport height, independent of the batch size.
+        if reserve > 0 {
+            queue!(writer, MoveTo(0, screen_size.height.saturating_sub(1)))?;
+            for _ in 0..reserve {
+                queue!(writer, Print("\n"))?;
+            }
         }
     } else {
         // Standard mode — matches Codex insert_history.rs Standard path:
@@ -128,7 +124,6 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
         // 3. Write history lines within that protected region.
         // 4. Reset scroll region and restore cursor.
 
-        let mut new_area = area;
         let cursor_top = if area.bottom() < screen_size.height {
             let scroll_amount = wrapped_rows.min(screen_size.height - area.bottom());
 
@@ -145,7 +140,6 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
 
             let ct = area.top().saturating_sub(1);
             new_area.y += scroll_amount;
-            should_update_area = true;
             ct
         } else {
             area.top().saturating_sub(1)
@@ -163,21 +157,47 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
 
             queue!(writer, Print("\x1b[r"))?;
         }
-
-        // Restore cursor position
-        queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
-        Write::flush(writer)?;
-
-        let _ = writer;
-        if should_update_area {
-            terminal.set_viewport_area(new_area);
-        }
-        if wrapped_rows > 0 {
-            terminal.note_history_rows_inserted(wrapped_rows);
-        }
     }
 
-    Ok(())
+    queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
+    Write::flush(writer)?;
+
+    let _ = writer;
+    if new_area != area {
+        terminal.set_viewport_area(new_area);
+    }
+    terminal.note_history_rows_inserted(wrapped_rows);
+
+    Ok(needs_full_repaint)
+}
+
+/// Count terminal rows without materializing physical fragments. Carry the
+/// column across styled spans and account for a wide glyph wrapping early.
+fn soft_wrapped_rows(line: &Line<'_>, width: usize) -> usize {
+    let width = width.max(1);
+    let mut rows = 1usize;
+    let mut column = 0usize;
+    for span in &line.spans {
+        let visible = crate::cli::terminal_hyperlinks::strip_link_markers(&span.content);
+        for grapheme in visible.graphemes(true) {
+            if grapheme == "\t" {
+                // Default terminal tab stops advance without wrapping and
+                // clamp to the last column. No application changes tab stops.
+                column = ((column / 8 + 1) * 8).min(width - 1);
+                continue;
+            }
+            let cells = grapheme.width().min(width);
+            if cells == 0 {
+                continue;
+            }
+            if column > 0 && column + cells > width {
+                rows = rows.saturating_add(1);
+                column = 0;
+            }
+            column += cells;
+        }
+    }
+    rows
 }
 
 fn write_history_line(

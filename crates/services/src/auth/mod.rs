@@ -40,11 +40,14 @@ use tracing::warn;
 use uuid::Uuid;
 
 mod admin;
+mod browser;
+mod cache;
 mod encryption;
 pub mod external;
 mod jwt;
 pub mod memoria;
 pub mod provider_request;
+mod refresh;
 pub mod session;
 pub mod uc;
 mod validation;
@@ -58,6 +61,7 @@ pub use admin::{
     UnconfiguredAdminAuditReader, UnconfiguredAdminAuthorizer, UnconfiguredAdminInitializer,
     UnconfiguredAdminTokenReader, UnconfiguredAdminTokenWriter, UnconfiguredAdminUserRoleManager,
 };
+pub use browser::{BrowserSessionCreated, BrowserSessionRequest};
 pub use encryption::FernetTokenEncryptor;
 use encryption::sha256_hex;
 use external::validate_provider_runtime_context;
@@ -433,6 +437,25 @@ pub enum EdgeTokenBinding {
     MissingBinding,
 }
 
+/// Authentication mechanism established by the verifier for this request.
+/// Provider identity alone cannot distinguish existing user tokens from the
+/// request-bound HMAC mechanism.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestAuthMechanism {
+    /// Successfully verified through the existing current-user credential path.
+    KnownLegacy,
+    /// Successfully verified against this request's method, path, body and nonce.
+    RequestBoundHmac,
+    /// An existing custom verifier supplied no explicit mechanism evidence.
+    Unspecified,
+}
+
+#[derive(Clone, Debug)]
+pub struct RequestAuthResult {
+    pub principal: AuthPrincipal,
+    pub mechanism: RequestAuthMechanism,
+}
+
 #[async_trait]
 pub trait AuthService: Send + Sync {
     async fn reauthentication_options(
@@ -477,6 +500,16 @@ pub trait AuthService: Send + Sync {
         Err(error_response(
             StatusCode::NOT_IMPLEMENTED,
             "Memoria connection is not configured",
+        ))
+    }
+
+    async fn create_browser_session(
+        &self,
+        _request: BrowserSessionRequest,
+    ) -> Result<BrowserSessionCreated, AuthHttpError> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Browser sessions are not configured",
         ))
     }
 
@@ -535,11 +568,27 @@ pub trait AuthService: Send + Sync {
         self.current_principal(headers).await
     }
 
-    /// Reauthorize only an atomically adopted handoff. A serialized run id,
-    /// user id, or provider scope is not sufficient to reconstruct a principal.
+    /// Existing custom request verifiers remain authoritative. Their successful
+    /// result is deliberately unspecified: consumers must not infer legacy
+    /// admission from a provider principal or retry another verifier.
+    async fn current_principal_for_request_with_provenance(
+        &self,
+        headers: &HeaderMap,
+        request: ProviderRequestDescriptor,
+    ) -> Result<RequestAuthResult, (StatusCode, Json<ErrorResponse>)> {
+        self.current_principal_for_request(headers, request)
+            .await
+            .map(|principal| RequestAuthResult {
+                principal,
+                mechanism: RequestAuthMechanism::Unspecified,
+            })
+    }
+
+    /// Fresh authorization from a store-created canonical admission before
+    /// claiming execution. Serialized provenance alone cannot grant a principal.
     async fn reauthorize_execution_handoff(
         &self,
-        _handoff: &crate::session_context_coordinator::ResumedExecutionTurn,
+        _admission: &crate::runs::StoredRunAdmission,
     ) -> Result<AuthPrincipal, AuthHttpError> {
         Err(execution_continuation_unavailable())
     }
@@ -656,8 +705,8 @@ pub struct AuthPrincipal {
 }
 
 /// Original authenticated identity references, never retained credentials or
-/// permission to resume execution. Only AuthService may reauthorize an adopted
-/// run; a fresh login by the same user is not the original session.
+/// permission to resume execution. Only AuthService may reauthorize a stored
+/// Run admission; a fresh login by the same user is not the original session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutionAuthenticationProvenance {
@@ -791,6 +840,7 @@ pub struct DatabaseAuthService {
     /// and logout for every user.
     control_pool: Option<SharedPool>,
     jwt: JwtSettings,
+    authentication_cache: Arc<cache::AuthenticationCache>,
     encryptor: Option<FernetTokenEncryptor>,
     memoria_provider: Option<memoria::MemoriaProvider>,
     uc_provider: Option<uc::UcNativeProvider>,
@@ -836,36 +886,12 @@ impl fmt::Debug for DatabaseAuthService {
     }
 }
 
-trait RefreshTokenRow {
-    fn string_column(&self, column: &'static str) -> Result<String, sqlx::Error>;
-    fn optional_string_column(&self, column: &'static str) -> Result<Option<String>, sqlx::Error>;
-}
-
-impl RefreshTokenRow for sqlx::mysql::MySqlRow {
-    fn string_column(&self, column: &'static str) -> Result<String, sqlx::Error> {
-        self.try_get(column)
-    }
-
-    fn optional_string_column(&self, column: &'static str) -> Result<Option<String>, sqlx::Error> {
-        self.try_get(column)
-    }
-}
-
-fn decode_refresh_token_row(
-    row: &impl RefreshTokenRow,
-) -> Result<(String, String, Option<String>), sqlx::Error> {
-    Ok((
-        row.string_column("user_id")?,
-        row.string_column("expires_at")?,
-        row.optional_string_column("session_id")?,
-    ))
-}
-
 impl DatabaseAuthService {
     pub fn new(matrixone: MatrixOneSettings, jwt: JwtSettings) -> Self {
         Self {
             matrixone,
             jwt,
+            authentication_cache: Arc::default(),
             pool: None,
             control_pool: None,
             encryptor: None,
@@ -964,21 +990,6 @@ impl DatabaseAuthService {
         }
     }
 
-    async fn fetch_refresh_token(
-        &self,
-        executor: impl sqlx::Executor<'_, Database = MySql>,
-        token_hash: &str,
-    ) -> Result<Option<(String, String, Option<String>)>, sqlx::Error> {
-        query(
-            "SELECT user_id, DATE_FORMAT(expires_at, '%Y-%m-%dT%H:%i:%s') AS expires_at, session_id \
-             FROM auth_refresh_tokens WHERE token_hash = ? AND is_revoked = 0 LIMIT 1",
-        )
-        .bind(token_hash)
-        .fetch_optional(executor)
-        .await
-        .and_then(|row| row.map(|row| decode_refresh_token_row(&row)).transpose())
-    }
-
     fn create_access_token(
         &self,
         user_id: &str,
@@ -1042,6 +1053,7 @@ impl DatabaseAuthService {
     }
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
+        self.authentication_cache = Arc::default();
         self.pool = Some(pool);
         self
     }
@@ -1050,11 +1062,13 @@ impl DatabaseAuthService {
     /// The regular pool remains the fallback for tests and deployments that
     /// do not configure a separate reservation.
     pub fn with_control_pool(mut self, pool: SharedPool) -> Self {
+        self.authentication_cache = Arc::default();
         self.control_pool = Some(pool);
         self
     }
 
     pub fn with_encryptor(mut self, encryptor: FernetTokenEncryptor) -> Self {
+        self.authentication_cache = Arc::default();
         self.encryptor = Some(encryptor);
         self
     }
@@ -1286,6 +1300,76 @@ impl DatabaseAuthService {
         Ok(())
     }
 
+    async fn verify_request_principal(
+        &self,
+        headers: &HeaderMap,
+        request: ProviderRequestDescriptor,
+    ) -> Result<RequestAuthResult, (StatusCode, Json<ErrorResponse>)> {
+        let Some((provider_id, _action, token)) = Self::external_request_auth_headers(headers)?
+        else {
+            let token = bearer_token(headers)?;
+            let principal = if token.starts_with(MOI_USER_TOKEN_PREFIX) {
+                self.principal_from_edge_token(token, request).await?
+            } else {
+                self.current_principal(headers).await?
+            };
+            return Ok(RequestAuthResult {
+                principal,
+                mechanism: RequestAuthMechanism::KnownLegacy,
+            });
+        };
+        let provider = self.provider_config(&provider_id)?.clone();
+        if provider.auth_type != "hmac" {
+            return Err(provider_request_auth_error(
+                "Provider request auth configuration is unsupported",
+            ));
+        }
+        let authorized = verify_provider_request_hmac_token(
+            &provider.provider,
+            &provider.key,
+            &token,
+            &request,
+        )?;
+        let request_id = request.request_id.as_deref().unwrap_or_default();
+        self.record_provider_request_authorization(&authorized, request_id)
+            .await?;
+        let user_id = format!(
+            "provider_authorized:{}:{}",
+            authorized.provider_id, authorized.external_subject
+        );
+        let username_len = authorized.external_subject.chars().count();
+        if username_len > USERNAME_MAX_LEN {
+            return Err(provider_request_auth_error(
+                "Provider request external subject exceeds the Astra username limit",
+            ));
+        }
+        if user_id.chars().count() > USER_ID_MAX_LEN {
+            return Err(provider_request_auth_error(
+                "Provider-authorized user principal exceeds the Astra user_id limit",
+            ));
+        }
+        let principal = AuthPrincipal::from_provider_request(
+            AuthUserRecord {
+                user_id,
+                username: authorized.external_subject.clone(),
+                email: String::new(),
+                display_name: None,
+            },
+            AuthProviderAuthorizedRequestContext {
+                provider_id: authorized.provider_id,
+                external_subject: authorized.external_subject,
+                provider_scope_id: authorized.provider_scope_id,
+                request_authorization_id: authorized.request_authorization_id,
+                // Provider-request (HMAC server-to-server) calls carry no edge binding.
+                edge_agent_id: None,
+            },
+        );
+        Ok(RequestAuthResult {
+            principal,
+            mechanism: RequestAuthMechanism::RequestBoundHmac,
+        })
+    }
+
     fn external_request_auth_headers(
         headers: &HeaderMap,
     ) -> Result<ExternalRequestAuthHeaders, AuthHttpError> {
@@ -1321,10 +1405,10 @@ impl DatabaseAuthService {
         let row = query(
             "SELECT CAST(UNIX_TIMESTAMP(MAX(expires_at)) AS SIGNED) AS max_expires_at_unix \
              FROM auth_refresh_tokens \
-             WHERE user_id = ? AND session_id = ? AND is_revoked = 0 AND expires_at > NOW()",
+             WHERE session_id = ? AND user_id = ? AND is_revoked = 0 AND expires_at > NOW()",
         )
-        .bind(user_id)
         .bind(session_id)
+        .bind(user_id)
         .fetch_one(pool)
         .await?;
         row.try_get::<Option<i64>, _>("max_expires_at_unix")
@@ -1665,12 +1749,11 @@ impl AuthService for DatabaseAuthService {
             .await
             .map_err(|e| map_auth_sqlx(e, "login.update_last_login_at", Some(&pool)))?;
         query(
-            "INSERT INTO auth_refresh_tokens (token_id, user_id, session_id, token_hash, expires_at, is_revoked) \
-             VALUES (?, ?, ?, ?, ?, 0)",
+            "INSERT INTO auth_refresh_tokens (session_id, user_id, token_hash, expires_at, is_revoked) \
+             VALUES (?, ?, ?, ?, 0)",
         )
-        .bind(Uuid::new_v4().to_string())
-        .bind(&user.user_id)
         .bind(&session_id)
+        .bind(&user.user_id)
         .bind(&refresh_token_hash)
         .bind(expires_at)
         .execute(&mut *tx)
@@ -1704,143 +1787,64 @@ impl AuthService for DatabaseAuthService {
     }
 
     async fn disconnect_memoria(&self, user_id: &str) -> Result<(), AuthHttpError> {
+        let _invalidation = self.authentication_cache.mutation();
         self.memoria_disconnect(user_id).await
+    }
+
+    async fn create_browser_session(
+        &self,
+        request: BrowserSessionRequest,
+    ) -> Result<BrowserSessionCreated, AuthHttpError> {
+        self.adopt_browser_session(request).await
     }
 
     async fn refresh(
         &self,
         request: AuthRefreshRequestData,
-    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
-        let claims =
-            decode_jwt_claims_with_detail(&request.refresh_token, &self.jwt, "Invalid token")?;
-        if claims.token_type.as_deref() != Some("refresh") {
-            return Err(error_response(
-                StatusCode::UNAUTHORIZED,
-                "Invalid token type",
-            ));
+    ) -> Result<AuthTokenRecord, AuthHttpError> {
+        if request.refresh_token.starts_with(browser::HANDLE_PREFIX) {
+            return self.resolve_browser_session(&request.refresh_token).await;
         }
-        let user_id = claims
-            .sub
-            .clone()
-            .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Invalid token"))?;
-        let (session_id, origin, _) = self.parse_token_session(&claims)?;
-
         let pool = self
             .get_pool()
             .await
-            .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
-        let refresh_token_hash = sha256_hex(&request.refresh_token);
-        let stored = self
-            .fetch_refresh_token(&pool, &refresh_token_hash)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "refresh.fetch_refresh_token", Some(&pool)))?
-            .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Token expired or revoked"))?;
-
-        if stored.0 != user_id || stored.2.as_deref() != Some(session_id.as_str()) {
-            return Err(error_response(
-                StatusCode::UNAUTHORIZED,
-                "Token session mismatch",
-            ));
-        }
-        if stored.1 < Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string() {
-            return Err(error_response(
-                StatusCode::UNAUTHORIZED,
-                "Token expired or revoked",
-            ));
-        }
-        let user = self
-            .fetch_user_by_id_or_username(&pool, &user_id, None)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "refresh.fetch_user_by_id", Some(&pool)))?
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "User not found"))?;
-
-        if !user.is_active {
-            return Err(error_response(StatusCode::UNAUTHORIZED, "User is inactive"));
-        }
-        let memoria_owner = self.memoria_owner(&pool, &user_id).await?;
-        let origin = if let Some(owner) = memoria_owner.as_deref() {
-            self.revalidate_memoria_connection(&pool, &user_id, owner)
+            .map_err(|error| map_auth_sqlx(error, "auth.get_pool", None))?;
+        for _ in 0..3 {
+            let rotation = self.prepare_refresh(&pool, &request.refresh_token).await?;
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|error| map_auth_sqlx(error, "refresh.begin", Some(&pool)))?;
+            self.lock_refresh_account(&mut tx, &rotation.user_id)
                 .await?;
-            format!(
-                "verified:{}",
-                self.memoria_provider
-                    .as_ref()
-                    .ok_or_else(|| internal_error("Memoria provider unavailable"))?
-                    .provider_id
-            )
-        } else if origin == "memoria" || origin.starts_with("verified:memoria:") {
-            return Err(error_response(
-                StatusCode::UNAUTHORIZED,
-                "Memoria identity binding is missing",
-            ));
-        } else {
-            origin
-        };
-
-        let access_token = self
-            .create_access_token(&user.user_id, &user.username, &session_id, &origin)
-            .map_err(internal_error)?;
-        let new_refresh_token = self
-            .create_refresh_token(&user.user_id, &session_id, &origin)
-            .map_err(internal_error)?;
-        let new_refresh_token_hash = sha256_hex(&new_refresh_token);
-        let expires_at = self.refresh_token_expires_at_string(Utc::now());
-
-        let mut tx = pool.begin().await.map_err(internal_error)?;
-        query("SELECT user_id FROM auth_users WHERE user_id = ? FOR UPDATE")
-            .bind(&user_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(internal_error)?;
-        // A concurrent disconnect revokes this row under the same user lock;
-        // the compare-and-revoke prevents refresh from resurrecting it.
-        let revoked = query(
-            "UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE token_hash = ? AND is_revoked = 0",
-        )
-        .bind(&refresh_token_hash)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| map_auth_sqlx(e, "refresh.revoke_old_token", Some(&pool)))?;
-        if revoked.rows_affected() != 1 {
-            return Err(error_response(
-                StatusCode::UNAUTHORIZED,
-                "Token expired or revoked",
-            ));
+            match self.commit_refresh(&mut tx, &rotation, None).await {
+                Ok(()) => {}
+                Err(refresh::CommitRefreshError::BindingChanged) => {
+                    tx.rollback()
+                        .await
+                        .map_err(|error| map_auth_sqlx(error, "refresh.rollback", Some(&pool)))?;
+                    continue;
+                }
+                Err(refresh::CommitRefreshError::Auth(error)) => return Err(error),
+            }
+            tx.commit()
+                .await
+                .map_err(|error| map_auth_sqlx(error, "refresh.commit", Some(&pool)))?;
+            return Ok(rotation.tokens);
         }
-        query(
-            "INSERT INTO auth_refresh_tokens (token_id, user_id, session_id, token_hash, expires_at, is_revoked) \
-             VALUES (?, ?, ?, ?, ?, 0)",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(&user.user_id)
-        .bind(&session_id)
-        .bind(&new_refresh_token_hash)
-        .bind(expires_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| map_auth_sqlx(e, "refresh.insert_new_refresh_token", Some(&pool)))?;
-        tx.commit()
-            .await
-            .map_err(|e| map_auth_sqlx(e, "refresh.commit_tx", Some(&pool)))?;
-
-        Ok(AuthTokenRecord {
-            user_id: user.user_id,
-            access_token,
-            refresh_token: new_refresh_token,
-            token_type: "bearer".to_string(),
-            expires_in: if origin == "memoria" || origin.starts_with("verified:memoria:") {
-                self.access_token_expires_in_seconds()
-                    .min(memoria::ACCESS_TTL_SECONDS)
-            } else {
-                self.access_token_expires_in_seconds()
-            },
-        })
+        Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Session binding changed; retry",
+        ))
     }
 
     async fn logout(
         &self,
         request: AuthRefreshRequestData,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        if request.refresh_token.starts_with(browser::HANDLE_PREFIX) {
+            return self.logout_browser_session(&request.refresh_token).await;
+        }
         let claims =
             decode_jwt_claims_with_detail(&request.refresh_token, &self.jwt, "Invalid token")?;
         if claims.token_type.as_deref() != Some("refresh") {
@@ -1854,41 +1858,50 @@ impl AuthService for DatabaseAuthService {
             .clone()
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Invalid token"))?;
         let (session_id, _, _) = self.parse_token_session(&claims)?;
-
-        let pool = self
-            .get_pool()
-            .await
-            .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
-        let refresh_token_hash = sha256_hex(&request.refresh_token);
-        let stored = self
-            .fetch_refresh_token(&pool, &refresh_token_hash)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "logout.fetch_refresh_token", Some(&pool)))?
-            .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Token expired or revoked"))?;
-
-        if stored.0 != user_id || stored.2.as_deref() != Some(session_id.as_str()) {
-            return Err(error_response(
-                StatusCode::UNAUTHORIZED,
-                "Token session mismatch",
-            ));
-        }
-        if stored.1 < Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string() {
+        // JWT validation allows clock-skew leeway; logout proofs do not.
+        if claims.exp <= Utc::now().timestamp() {
             return Err(error_response(
                 StatusCode::UNAUTHORIZED,
                 "Token expired or revoked",
             ));
         }
 
+        let pool = self
+            .get_pool()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
+        let _invalidation = self
+            .authentication_cache
+            .session_mutation(&user_id, &session_id);
         let mut tx = pool
             .begin()
             .await
             .map_err(|e| map_auth_sqlx(e, "logout.begin_tx", Some(&pool)))?;
-        query("UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE token_hash = ? AND user_id = ?")
-            .bind(&refresh_token_hash)
+        let account = query("SELECT user_id FROM auth_users WHERE user_id = ? FOR UPDATE")
+            .bind(&user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| map_auth_sqlx(e, "logout.lock_user", Some(&pool)))?;
+        if account.is_none() {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Token expired or revoked",
+            ));
+        }
+        // Recheck after waiting for the lock. The signed session claim is the
+        // proof even when a consumed token's old hash has been replaced.
+        if claims.exp <= Utc::now().timestamp() {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Token expired or revoked",
+            ));
+        }
+        query("UPDATE auth_refresh_tokens SET is_revoked = 1, expires_at = LEAST(expires_at, UTC_TIMESTAMP(6)), browser_handle_hash = NULL, browser_ciphertext = NULL WHERE session_id = ? AND user_id = ? AND is_revoked = 0")
+            .bind(&session_id)
             .bind(&user_id)
             .execute(&mut *tx)
             .await
-            .map_err(|e| map_auth_sqlx(e, "logout.revoke_submitted_token", Some(&pool)))?;
+            .map_err(|e| map_auth_sqlx(e, "logout.revoke_session", Some(&pool)))?;
 
         tx.commit()
             .await
@@ -2021,17 +2034,9 @@ impl AuthService for DatabaseAuthService {
 
     async fn reauthorize_execution_handoff(
         &self,
-        handoff: &crate::session_context_coordinator::ResumedExecutionTurn,
+        admission: &crate::runs::StoredRunAdmission,
     ) -> Result<AuthPrincipal, AuthHttpError> {
-        let run = handoff.run();
-        let receipt = handoff.receipt();
-        if receipt.run_id != run.run_id
-            || receipt.run_generation != run.run_generation
-            || receipt.source.key.owner_user_id != run.user_id
-            || receipt.source.key.session_id != run.session_id
-        {
-            return Err(execution_continuation_denied());
-        }
+        let run = admission.run();
 
         let provenance = run
             .execution_authentication()
@@ -2200,29 +2205,70 @@ impl AuthService for DatabaseAuthService {
             .clone()
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Invalid token"))?;
         let (session_id, token_origin, _) = self.parse_token_session(&claims)?;
+        if claims.exp <= Utc::now().timestamp() {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Access token expired",
+            ));
+        }
+        let key = cache::AuthenticationCache::key(token);
+        let (cached, generation) = self.authentication_cache.lookup(&key);
+        if let Some(principal) = cached {
+            return Ok(principal);
+        }
+        let checked_at = std::time::Instant::now();
         let pool = self
             .get_pool()
             .await
             .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
-        // All three reads use the already-verified JWT subject/session and
-        // have no side effects. Keep them owned by this request, then consume
-        // their results in the original validation/error-precedence order.
-        // No read result is cached across authentication attempts.
-        let (session_expiry, memoria_binding, database_user) = tokio::join!(
-            self.refresh_session_is_active(&pool, &user_id, &session_id),
-            self.memoria_owner(&pool, &user_id),
-            self.fetch_user_by_id_or_username(&pool, &user_id, None),
-        );
-        let session_expires_at_unix = session_expiry
-            .map_err(|e| map_auth_sqlx(e, "current_principal.refresh_session", Some(&pool)))?
+        // A single statement observes account, session, and issuer binding.
+        // The aggregate anchors one row even if the account/session is missing,
+        // retaining session-denial precedence without fetching password hashes.
+        let row = query(
+            "SELECT u.user_id, u.username, u.email, u.display_name, u.is_active,
+                    CAST(UNIX_TIMESTAMP(s.session_expires_at) AS SIGNED) AS session_expires_at_unix,
+                    m.provider_id AS memoria_provider_id, m.external_subject AS memoria_subject
+             FROM (SELECT MAX(expires_at) AS session_expires_at
+                   FROM auth_refresh_tokens WHERE session_id = ? AND user_id = ?
+                     AND is_revoked = 0 AND expires_at > NOW()) s
+             LEFT JOIN auth_users u ON u.user_id = ?
+             LEFT JOIN (SELECT astra_user_id, provider_id, external_subject
+                        FROM auth_external_identities
+                        WHERE astra_user_id = ? AND provider_id LIKE 'memoria:%'
+                        ORDER BY CASE WHEN provider_id = ? THEN 0 ELSE 1 END,
+                                 updated_at DESC, provider_id ASC LIMIT 1) m
+               ON m.astra_user_id = u.user_id",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .bind(&user_id)
+        .bind(&user_id)
+        .bind(
+            self.memoria_provider
+                .as_ref()
+                .map_or("", |p| p.provider_id.as_str()),
+        )
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| map_auth_sqlx(e, "current_principal.snapshot", Some(&pool)))?;
+        let session_expires_at_unix = row
+            .try_get::<Option<i64>, _>("session_expires_at_unix")
+            .map_err(internal_error)?
             .filter(|expires_at| *expires_at > Utc::now().timestamp())
             .ok_or_else(|| {
                 error_response(StatusCode::UNAUTHORIZED, "Session expired or revoked")
             })?;
-
+        let provider_id: Option<String> =
+            row.try_get("memoria_provider_id").map_err(internal_error)?;
+        let memoria_owner = match provider_id {
+            Some(provider) => {
+                let subject = row.try_get("memoria_subject").map_err(internal_error)?;
+                self.validate_memoria_identity(Some((provider, subject)))?
+            }
+            None => None,
+        };
         // Bound legacy Memoria tokens too: earlier builds issued them with
         // `internal` origin and the self-hosted deployment's longer TTL.
-        let memoria_owner = memoria_binding?;
         if (token_origin == "memoria" || token_origin.starts_with("verified:memoria:"))
             && memoria_owner.is_none()
         {
@@ -2242,21 +2288,28 @@ impl AuthService for DatabaseAuthService {
             ));
         }
 
-        let user = database_user
-            .map_err(|e| map_auth_sqlx(e, "current_user.fetch_user", Some(&pool)))?
+        let resolved_user_id: Option<String> = row.try_get("user_id").map_err(internal_error)?;
+        let resolved_user_id = resolved_user_id
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "User not found"))?;
-
-        if !user.is_active {
+        if row.try_get::<i16, _>("is_active").map_err(internal_error)? == 0 {
             return Err(error_response(StatusCode::UNAUTHORIZED, "User is inactive"));
         }
-
         let user = AuthUserRecord {
-            user_id: user.user_id,
-            username: user.username,
-            email: user.email,
-            display_name: user.display_name,
+            user_id: resolved_user_id,
+            username: row.try_get("username").map_err(internal_error)?,
+            email: row.try_get("email").map_err(internal_error)?,
+            display_name: row.try_get("display_name").map_err(internal_error)?,
         };
-        if let Some(subject) = memoria_owner {
+        let mut expires_at_unix = claims.exp.min(session_expires_at_unix);
+        if memoria_owner.is_some() {
+            expires_at_unix = expires_at_unix.min(
+                claims
+                    .iat
+                    .unwrap_or_default()
+                    .saturating_add(i64::from(memoria::ACCESS_TTL_SECONDS)),
+            );
+        }
+        let principal = if let Some(subject) = memoria_owner {
             let resolver = self
                 .credential_resolver()
                 .ok_or_else(|| internal_error("Memoria provider unavailable"))?;
@@ -2271,7 +2324,7 @@ impl AuthService for DatabaseAuthService {
                     "Memoria connection disconnected",
                 ));
             }
-            return Ok(AuthPrincipal::from_verified_provider_session(
+            AuthPrincipal::from_verified_provider_session(
                 user,
                 session_id.clone(),
                 resolver.provider.provider_id.clone(),
@@ -2281,18 +2334,27 @@ impl AuthService for DatabaseAuthService {
                     session_id.clone(),
                     session_expires_at_unix,
                 )),
+            )
+        } else {
+            let execution_continuation = ExecutionContinuationGrant::from_active_session(
+                user.user_id.clone(),
+                session_id.clone(),
+                session_expires_at_unix,
+            );
+            AuthPrincipal::from_local_jwt(user, session_id, execution_continuation)
+        };
+        // The successful database snapshot authenticates this overlapping
+        // request. An unrelated cache invalidation only prevents retaining it.
+        // All awaited checks are complete; absolute expiry still applies now.
+        if Utc::now().timestamp() >= expires_at_unix {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Authentication expired",
             ));
         }
-        let execution_continuation = ExecutionContinuationGrant::from_active_session(
-            user.user_id.clone(),
-            session_id.clone(),
-            session_expires_at_unix,
-        );
-        Ok(AuthPrincipal::from_local_jwt(
-            user,
-            session_id,
-            execution_continuation,
-        ))
+        self.authentication_cache
+            .publish(key, generation, checked_at, expires_at_unix, &principal);
+        Ok(principal)
     }
 
     async fn current_principal_for_request(
@@ -2300,60 +2362,17 @@ impl AuthService for DatabaseAuthService {
         headers: &HeaderMap,
         request: ProviderRequestDescriptor,
     ) -> Result<AuthPrincipal, (StatusCode, Json<ErrorResponse>)> {
-        let Some((provider_id, _action, token)) = Self::external_request_auth_headers(headers)?
-        else {
-            let token = bearer_token(headers)?;
-            if token.starts_with(MOI_USER_TOKEN_PREFIX) {
-                return self.principal_from_edge_token(token, request).await;
-            }
-            return self.current_principal(headers).await;
-        };
-        let provider = self.provider_config(&provider_id)?.clone();
-        if provider.auth_type != "hmac" {
-            return Err(provider_request_auth_error(
-                "Provider request auth configuration is unsupported",
-            ));
-        }
-        let authorized = verify_provider_request_hmac_token(
-            &provider.provider,
-            &provider.key,
-            &token,
-            &request,
-        )?;
-        let request_id = request.request_id.as_deref().unwrap_or_default();
-        self.record_provider_request_authorization(&authorized, request_id)
-            .await?;
-        let user_id = format!(
-            "provider_authorized:{}:{}",
-            authorized.provider_id, authorized.external_subject
-        );
-        let username_len = authorized.external_subject.chars().count();
-        if username_len > USERNAME_MAX_LEN {
-            return Err(provider_request_auth_error(
-                "Provider request external subject exceeds the Astra username limit",
-            ));
-        }
-        if user_id.chars().count() > USER_ID_MAX_LEN {
-            return Err(provider_request_auth_error(
-                "Provider-authorized user principal exceeds the Astra user_id limit",
-            ));
-        }
-        Ok(AuthPrincipal::from_provider_request(
-            AuthUserRecord {
-                user_id,
-                username: authorized.external_subject.clone(),
-                email: String::new(),
-                display_name: None,
-            },
-            AuthProviderAuthorizedRequestContext {
-                provider_id: authorized.provider_id,
-                external_subject: authorized.external_subject,
-                provider_scope_id: authorized.provider_scope_id,
-                request_authorization_id: authorized.request_authorization_id,
-                // Provider-request (HMAC server-to-server) calls carry no edge binding.
-                edge_agent_id: None,
-            },
-        ))
+        self.verify_request_principal(headers, request)
+            .await
+            .map(|result| result.principal)
+    }
+
+    async fn current_principal_for_request_with_provenance(
+        &self,
+        headers: &HeaderMap,
+        request: ProviderRequestDescriptor,
+    ) -> Result<RequestAuthResult, (StatusCode, Json<ErrorResponse>)> {
+        self.verify_request_principal(headers, request).await
     }
 
     async fn edge_registration_binding(
@@ -3415,74 +3434,6 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body.0.error_code.as_deref(), Some("database_error"));
         assert!(body.0.detail.contains("database connection closed"));
-    }
-
-    struct FakeRefreshTokenRow {
-        failed_column: Option<&'static str>,
-    }
-
-    impl FakeRefreshTokenRow {
-        fn complete() -> Self {
-            Self {
-                failed_column: None,
-            }
-        }
-
-        fn fail_on(column: &'static str) -> Self {
-            Self {
-                failed_column: Some(column),
-            }
-        }
-    }
-
-    impl RefreshTokenRow for FakeRefreshTokenRow {
-        fn string_column(&self, column: &'static str) -> Result<String, sqlx::Error> {
-            if self.failed_column == Some(column) {
-                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
-            }
-
-            Ok(match column {
-                "user_id" => "user-1",
-                "expires_at" => "2026-06-26T10:00:00",
-                _ => unreachable!("unexpected refresh token column: {column}"),
-            }
-            .to_string())
-        }
-
-        fn optional_string_column(
-            &self,
-            column: &'static str,
-        ) -> Result<Option<String>, sqlx::Error> {
-            if self.failed_column == Some(column) {
-                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
-            }
-
-            Ok(match column {
-                "session_id" => Some("session-1".to_string()),
-                _ => unreachable!("unexpected optional refresh token column: {column}"),
-            })
-        }
-    }
-
-    #[test]
-    fn refresh_token_row_decode_preserves_database_values() {
-        let (user_id, expires_at, session_id) =
-            decode_refresh_token_row(&FakeRefreshTokenRow::complete())
-                .expect("complete refresh token row should decode");
-
-        assert_eq!(user_id, "user-1");
-        assert_eq!(expires_at, "2026-06-26T10:00:00");
-        assert_eq!(session_id.as_deref(), Some("session-1"));
-    }
-
-    #[test]
-    fn refresh_token_row_decode_fails_loudly_on_any_missing_column() {
-        for column in ["user_id", "expires_at", "session_id"] {
-            match decode_refresh_token_row(&FakeRefreshTokenRow::fail_on(column)).unwrap_err() {
-                sqlx::Error::ColumnNotFound(name) => assert_eq!(name, column),
-                err => panic!("expected ColumnNotFound({column}), got {err:?}"),
-            }
-        }
     }
 
     #[test]

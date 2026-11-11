@@ -11,7 +11,6 @@
 //! // During context assembly:
 //! collector.record_tool_surface(&visible_tools, &per_tool_costs, tools_available, latency_ms);
 //! collector.record_memory_retrieval(&query, candidates, &ranked_results, latency_ms);
-//! collector.record_compression(&pipeline_outcome, initial_msgs, final_msgs, ...);
 //!
 //! // At turn end:
 //! let trace = collector.finalize();
@@ -24,9 +23,8 @@ use std::time::Instant;
 use astra_core::sync_poison::{recover_rwlock_read, recover_rwlock_write};
 
 use crate::context_assembly_trace::{
-    CompressionMethod, ContextAssemblyTrace, ContextAssemblyTraceBuilder, DecisionExplanation,
-    HistorySelectionTrace, MemoryRetrievalTrace, ModelRequestTraceIdentity, SystemPromptBreakdown,
-    TokenBudgetTrace, ToolSurfaceTrace, build_history_trace_from_compression,
+    ContextAssemblyTrace, ContextAssemblyTraceBuilder, HistorySelectionTrace, MemoryRetrievalTrace,
+    ModelRequestTraceIdentity, SystemPromptBreakdown, TokenBudgetTrace, ToolSurfaceTrace,
     build_memory_trace_from_entries, build_memory_trace_from_retrieval, build_tool_surface_trace,
     build_tool_surface_trace_with_deferred,
 };
@@ -51,7 +49,6 @@ struct CollectorState {
     memory: Option<MemoryRetrievalTrace>,
     tools: Option<ToolSurfaceTrace>,
     token_budget: Option<TokenBudgetTrace>,
-    explanations: Vec<DecisionExplanation>,
 }
 
 pub struct ToolSurfaceDeferredInput<'a> {
@@ -78,7 +75,6 @@ impl TurnTraceCollector {
                 memory: None,
                 tools: None,
                 token_budget: None,
-                explanations: Vec::new(),
             })),
         }
     }
@@ -149,27 +145,20 @@ impl TurnTraceCollector {
         state.tools = Some(trace);
     }
 
-    /// Record memory retrieval results.
-    /// Set per-turn history retention data.
+    /// Replace the observed CLI admission input. Local group ordinals are
+    /// not canonical session-turn identities; no compaction is inferred.
     pub fn set_history_retained(&self, turns: &[crate::context_assembly_trace::TurnRetention]) {
         astra_core::history_work::record_serialized_value(
             astra_core::history_work::HistoryWorkSite::TurnTraceHistoryClone,
             turns,
         );
-        let mut state = recover_rwlock_write(&self.inner);
-        let had_history = state.history.is_some();
-        let hist = state
-            .history
-            .get_or_insert_with(HistorySelectionTrace::default);
-        hist.turns_retained = turns.to_vec();
-        hist.total_turns_available = turns.len() as u32;
-        let total: u32 = turns.iter().map(|t| t.tokens).sum();
-        hist.tokens_after = total;
-        // If record_compression was never called (no prior history trace),
-        // default tokens_before to tokens_after (no compression occurred).
-        if !had_history {
-            hist.tokens_before = total;
-        }
+        let history = HistorySelectionTrace {
+            turns_retained: turns.to_vec(),
+            total_tokens: turns
+                .iter()
+                .fold(0u32, |total, turn| total.saturating_add(turn.tokens)),
+        };
+        recover_rwlock_write(&self.inner).history = Some(history);
     }
 
     pub fn record_memory_retrieval(
@@ -196,26 +185,6 @@ impl TurnTraceCollector {
         let trace = build_memory_trace_from_entries(query, outcome, entries, latency_ms);
         let mut state = recover_rwlock_write(&self.inner);
         state.memory = Some(trace);
-    }
-
-    /// Record compression pipeline results.
-    pub fn record_compression(
-        &self,
-        layer_results: &[(String, CompressionMethod, u32)],
-        initial_messages: usize,
-        final_messages: usize,
-        initial_tokens: u32,
-        final_tokens: u32,
-    ) {
-        let trace = build_history_trace_from_compression(
-            initial_messages,
-            final_messages,
-            initial_tokens,
-            final_tokens,
-            layer_results,
-        );
-        let mut state = recover_rwlock_write(&self.inner);
-        state.history = Some(trace);
     }
 
     /// Record token budget allocation.
@@ -313,12 +282,6 @@ impl TurnTraceCollector {
         }
     }
 
-    /// Add a decision explanation.
-    pub fn add_explanation(&self, explanation: DecisionExplanation) {
-        let mut state = recover_rwlock_write(&self.inner);
-        state.explanations.push(explanation);
-    }
-
     // ─── Finalization ────────────────────────────────────────────────────────
 
     /// Finalize and return the complete trace.
@@ -348,9 +311,6 @@ impl TurnTraceCollector {
         }
         if let Some(ref tb) = state.token_budget {
             builder = builder.with_token_budget(tb.clone());
-        }
-        for exp in &state.explanations {
-            builder = builder.add_explanation(exp.clone());
         }
 
         builder.build()
@@ -395,6 +355,72 @@ fn budget_component_total(budget: &TokenBudgetTrace) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cloned_history_snapshots_are_coherent_and_session_local() {
+        use crate::context_assembly_trace::TurnRetention;
+        let first = super::TurnTraceCollector::new("turn-1", "session-a");
+        let second = super::TurnTraceCollector::new("turn-1", "session-b");
+        assert!(first.finalize().history.is_none());
+        let turns = [
+            TurnRetention {
+                turn_index: 0,
+                role: "user".into(),
+                tokens: u32::MAX,
+                has_tool_calls: false,
+                content_preview: "session-a".into(),
+            },
+            TurnRetention {
+                turn_index: 1,
+                role: "assistant".into(),
+                tokens: 1,
+                has_tool_calls: false,
+                content_preview: "answer-a".into(),
+            },
+        ];
+        first.set_history_retained(&turns);
+        let history = first.finalize().history.unwrap();
+        assert_eq!(history.turns_retained.len(), 2);
+        assert_eq!(history.total_tokens, u32::MAX);
+        let writer = first.clone_arc();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                for _ in 0..32 {
+                    writer.set_history_retained(&turns);
+                    writer.set_history_retained(&[]);
+                }
+            });
+            for _ in 0..32 {
+                let snapshot = first.finalize();
+                assert_eq!(snapshot.session_id, "session-a");
+                if let Some(history) = snapshot.history {
+                    let tokens = history
+                        .turns_retained
+                        .iter()
+                        .fold(0u32, |total, item| total.saturating_add(item.tokens));
+                    assert_eq!(history.total_tokens, tokens);
+                }
+                assert!(second.finalize().history.is_none());
+            }
+        });
+        assert!(first.finalize().history.unwrap().turns_retained.is_empty());
+        second.set_history_retained(&[]);
+        assert_eq!(second.finalize().session_id, "session-b");
+        assert_eq!(second.finalize().history.unwrap().total_tokens, 0);
+    }
+
+    #[test]
+    fn compression_trigger_does_not_fabricate_history_observation() {
+        let collector = super::TurnTraceCollector::new("turn-1", "session-1");
+        collector.record_token_budget(crate::context_assembly_trace::TokenBudgetTrace {
+            compression_triggered: true,
+            ..Default::default()
+        });
+        let trace = collector.finalize().to_json_value();
+        assert_eq!(trace["history"], serde_json::Value::Null);
+        assert!(trace.get("explanations").is_none());
+        assert_eq!(trace["token_budget"]["compression_triggered"], true);
+    }
+
     use super::*;
     use crate::context_assembly_trace::{MemoryInjection, SkillInjection};
 
@@ -623,14 +649,16 @@ mod tests {
         ];
         collector.set_history_retained(&turns);
         let trace = collector.finalize();
-        assert_eq!(trace.history.turns_retained.len(), 2);
-        assert_eq!(trace.history.turns_retained[0].tokens, 50);
-        assert_eq!(trace.history.turns_retained[1].tokens, 800);
-        assert!(trace.history.turns_retained[1].has_tool_calls);
-        assert_eq!(trace.history.total_turns_available, 2);
-        assert_eq!(trace.history.tokens_after, 850);
-        // When record_compression was not called, tokens_before defaults to tokens_after.
-        assert_eq!(trace.history.tokens_before, 850);
+        let history = trace.history.unwrap();
+        assert_eq!(history.turns_retained.len(), 2);
+        assert_eq!(history.turns_retained[0].tokens, 50);
+        assert_eq!(history.turns_retained[1].tokens, 800);
+        assert!(history.turns_retained[1].has_tool_calls);
+        assert_eq!(history.total_tokens, 850);
+        collector.set_history_retained(&[]);
+        let empty = collector.finalize().history.unwrap();
+        assert!(empty.turns_retained.is_empty());
+        assert_eq!(empty.total_tokens, 0);
     }
 
     #[test]

@@ -117,14 +117,14 @@ fn assert_health_contract_json(
         .expect("health contract should be a JSON object")
         .insert(
             "build_git_sha".to_string(),
-            serde_json::Value::String(astra_core::history_work_baseline::BUILD_GIT_SHA.to_string()),
+            serde_json::Value::String(astra_build_info::BUILD_GIT_SHA.to_string()),
         );
     resolved_expected
         .as_object_mut()
         .expect("health contract should be a JSON object")
         .insert(
             "build_git_dirty".to_string(),
-            serde_json::Value::Bool(astra_core::history_work_baseline::BUILD_GIT_DIRTY == "true"),
+            serde_json::Value::Bool(astra_build_info::BUILD_GIT_DIRTY == "true"),
         );
     test_support::assert_contract_json(actual, &resolved_expected, label);
 }
@@ -198,6 +198,21 @@ async fn unhealthy_state_matches_shared_contract() {
 }
 
 #[tokio::test]
+async fn retired_promotion_reports_have_no_http_route() {
+    let app = build_test_app(true);
+    for path in ["/audit/promotions", "/sessions/fixture/audit/promotions"] {
+        for headers in [vec![], vec![("authorization", "Bearer fixture-user")]] {
+            let response = app
+                .clone()
+                .oneshot(build_request("GET", path, &headers, body::Body::empty()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "GET {path}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn removed_learning_routes_are_not_public_contracts() {
     let app = build_test_app(true);
 
@@ -222,12 +237,78 @@ async fn retired_database_mutation_routes_cannot_execute_through_http() {
     let app = build_test_app(true);
     let payload = serde_json::json!({"name":"fixture_branch","source":"fixture_source","target":"fixture_target","operation":"merge","model":"fixture_model","session_count":2,"checkpoint_name":"fixture_checkpoint"});
     for (method, path) in [
+        ("POST", "/marketplace/credentials"),
+        (
+            "DELETE",
+            "/marketplace/credentials?skill_name=fixture&credential_name=fixture",
+        ),
+        ("GET", "/context"),
+        ("POST", "/context"),
+        ("GET", "/context/snapshot"),
+        ("GET", "/decisions"),
+        ("POST", "/decisions"),
+        ("GET", "/decisions/decision"),
+        ("GET", "/decisions/decision/audit"),
+        ("GET", "/introspection/context/trend?session_id=fixture"),
+        ("GET", "/introspection/context/snapshot?session_id=fixture"),
+        (
+            "GET",
+            "/introspection/context/retrieval_quality?session_id=fixture",
+        ),
+        ("GET", "/introspection/decision-trace?session_id=fixture"),
+        ("GET", "/sessions/fixture/harness/snapshot"),
+        ("GET", "/sessions/fixture/harness/history"),
+        ("GET", "/sessions/fixture/harness/diff"),
+        ("GET", "/sessions/fixture/harness/stream"),
+        ("GET", "/admin/harness/sessions"),
+        ("POST", "/skills/user/review_changes/evaluations"),
         ("POST", "/branches"),
         ("DELETE", "/branches"),
         ("POST", "/branches/diff"),
         ("POST", "/branches/merge"),
         ("POST", "/branches/cost-estimate"),
         ("POST", "/data-versioning/sandbox/fixture/restore"),
+        ("POST", "/data-versioning/checkpoints"),
+        ("GET", "/data-versioning/checkpoints"),
+        ("GET", "/data-versioning/checkpoints/fixture/events"),
+        ("GET", "/data-versioning/lineage/fixture/chain"),
+        ("GET", "/data-versioning/lineage/fixture/upstream"),
+        ("GET", "/v1/works/work/branches/branch/patch-artifacts"),
+        ("POST", "/v1/works/work/branches/branch/patch-artifacts"),
+        (
+            "GET",
+            "/v1/works/work/branches/branch/patch-artifacts/artifact",
+        ),
+        (
+            "GET",
+            "/v1/works/work/branches/branch/patch-artifacts/artifact/content",
+        ),
+        (
+            "GET",
+            "/v1/works/work/branches/branch/patch-materializations",
+        ),
+        (
+            "POST",
+            "/v1/works/work/branches/branch/patch-materializations",
+        ),
+        (
+            "GET",
+            "/v1/works/work/branches/branch/patch-materializations/operation",
+        ),
+        (
+            "DELETE",
+            "/v1/works/work/branches/branch/patch-materializations/operation",
+        ),
+        ("GET", "/v1/works/work/branches/branch/patch-commits"),
+        ("POST", "/v1/works/work/branches/branch/patch-commits"),
+        (
+            "GET",
+            "/v1/works/work/branches/branch/patch-commits/operation",
+        ),
+        (
+            "DELETE",
+            "/v1/works/work/branches/branch/patch-commits/operation",
+        ),
     ] {
         for authenticated in [false, true] {
             let headers = if authenticated {

@@ -65,6 +65,13 @@ Revision verification requires the built-in CLI executor and is unavailable in
 dashboard mode. Embedded identity is a build declaration: use the trusted build
 workflow to refresh source metadata, particularly after uncommitted edits;
 this check does not fingerprint runtime configuration or all dependencies.
+Ordinary Cargo builds without a source declaration or valid attestation nonce
+report an unverified (`git_dirty=true`) identity and cannot enter this mode.
+Use the manual harness workflow, or build all compared binaries with a valid
+64-hex `ASTRA_BUILD_ATTESTATION_NONCE`; source-watched builds then detect
+unstaged changes even when that nonce is reused. A trusted source orchestrator
+may instead refresh both `ASTRA_BUILD_SOURCE_GIT_SHA` and
+`ASTRA_BUILD_SOURCE_GIT_DIRTY` for every build, as the manual workflow does.
 Preflight resolves the legacy execution profile before checking health and
 passes that same explicit profile to health, model probes and case execution;
 it does not validate a native MOI endpoint and then execute on a legacy one.
@@ -121,7 +128,13 @@ overlapping archives, nonadjacent repeated turns, and multiple physical scopes
 inside one capture are unavailable rather than assigned a guessed order. There
 is no journal or terminal-counter fallback for this ratio.
 The injected `required_cache_scope` hard gate uses qualified cache-read facts;
-it does not require unrelated creation or fresh-input lanes.
+it does not require unrelated creation or fresh-input lanes. All captures must
+retain trusted identity, complete execution boundaries, and unambiguous order,
+but missing cache counters remain unknown and do not erase a known reuse witness.
+The post-cold read count is the sum of known request-group reads, a lower bound
+when other counters are unknown. Unknown or zero reads alone cannot prove reuse.
+Exact totals, ratios, and explicit per-warm-turn read requirements retain their
+complete-measurement checks.
 Conversation reuse requires reads after the first user turn; intra-turn reuse
 requires reads after the first ModelRound request in one user turn and run.
 Physical retries alone cannot establish another request boundary. Consecutive
@@ -235,6 +248,17 @@ check results, not a claimed root-cause analysis. Raw prompts, tool/provider bod
 and free-form judge diagnostics remain private; public artifacts do not include
 them. Checks without a safe numeric projection explicitly say that their detailed
 payload is withheld. Full private diagnostics remain in the local suite report.
+Journal tool-outcome count failures publish only the expected bounds and actual
+count, using the same deduplicated records as the verdict. Tool arguments,
+results, and file contents remain private; an unavailable capture reports no
+count instead of inventing zero.
+
+Prompt-cache scope checks retain their grading-time observation count, post-cold
+cache-read sum, and bounded per-execution capture status, identity-match flags,
+scope count, and cache-read counters. This distinguishes a missing/pending explain
+capture from an observed absence of warm reuse without publishing session/run
+identities, prompt content, provider bodies, or raw capture diagnostics. These
+fields explain the existing verdict; they do not change cache-scope acceptance.
 
 Once execution identity is verified, child-adoption checks publish a closed `child_adoption` diagnostic with status
 `proven`, `contradicted`, or `unavailable`, and a fixed failure reason such as
@@ -280,7 +304,7 @@ Allowlist changes take effect only after they reach the trusted base branch.
 
 The authoritative selection is [ci-regression.txt](ci-regression.txt). The
 selector stages those original files unchanged into one suite; it does not copy
-prompts into the workflow or implement another grader. The 18 roots cover
+prompts into the workflow or implement another grader. The 19 roots cover
 distinct delivery, tool, observability, context and delegation boundaries; child
 communication and inherited-model checks bind to the selected model rather than
 requiring an obsolete hard-coded provider version.
@@ -297,6 +321,7 @@ requiring an obsolete hard-coded provider version.
 | `same_model_fanout_handoff_flash` | Medium: two Flash children, exact slot identities, real child results and parent adoption |
 | `file_edit_prepared_bytes` | File creation, localized edit, read-back and exact on-disk bytes |
 | `read_only_shell_diagnostics` | Read-only shell authorization and truthful output delivery |
+| `interactive_shell_next_output` | Real two-stage shell input, waiting for new output, and terminal completion |
 | `introspection_reflection_source_boundary` | Distinct live-process and durable-session evidence |
 | `multi_turn_local_followup_focus` | Topic change, local follow-up and explicit historical recall |
 | `flash_rejected_delegation_preserves_parent_tools` | Parent remains usable after a rejected child request |
@@ -313,6 +338,10 @@ GLM-5.3 is temporarily excluded from this regression because its service is unst
 The full suite retains `multi_model_fanout_handoff`; explicitly configure its GLM
 dependency in `HARNESS_ADDITIONAL_MODELS_JSON` to run it. The regression does not
 claim heterogeneous-model coverage.
+The same CI harness job also runs the standalone Edge WS shell contract against
+a synthetic provider and an actual `astra-edge` process. It verifies the exact
+model-facing shell schema and executes a normal command; it is reported
+separately from the live-model case counts.
 An explicit `deepseek-v4.1-flash` entry in `HARNESS_ADDITIONAL_MODELS_JSON`
 replaces its default configuration unchanged; other additional models remain
 self-contained. Missing/unavailable models fail preflight;
@@ -321,7 +350,7 @@ they are never silently substituted or omitted. No Jev configuration is required
 Run once, serially, with an aggregate **15-minute execution budget** plus at most
 two minutes for cancellation/settlement. This is a budget, not a measured
 performance claim: build, service startup, registration and artifact publication
-are separate and may make the entire workflow longer. Eighteen roots include
+are separate and may make the entire workflow longer. Nineteen roots include
 follow-up turns; these are not counted as additional roots. Per-case timings, results, error classes, usage
 coverage and partial-timeout summaries use the same safe live progress as the
 manual workflow. There is no retry-until-green policy. This sample does not
@@ -385,13 +414,21 @@ loss or file-write failure cancels via the existing runner and fails closed.
 Selected custom source revisions must support this option and the repository
 helper; unsupported sources fail explicitly, without an old-log fallback.
 
-Progress uses `astra.harness_progress.v3`. Argument failures include bounded
+Progress uses `astra.harness_progress.v8`. Unavailable judges report the canonical
+error kind and a fixed failure stage; unknown causes remain `unknown`. Required
+quorum failures retain the first typed cause and still fail closed. Raw errors
+and individual vote diagnostics remain private. Argument failures include bounded
 validator-authored rule codes and canonical built-in field paths; array indices
 become `*`, and unknown/provider fields are opaque. Private error text, arguments,
 provider responses and judge rationale are not public artifacts. Issue/outcome
 omissions are counted. If a receipt lacks rule details, analysis explicitly says
 the exact invalid field is unknown; an argument rejection does not prove model
-admission was reached. The unavailable-model negative control intentionally
+admission was reached. Failed execution predicates also report one bounded first
+structural difference per predicate: declared paths, JSON types, fixed reasons
+and counts, never actual values or unexpected member names. Missing keys, nulls,
+extra members and value differences remain distinct; truncated diagnostics are
+explicit and never change matching or the verdict.
+The unavailable-model negative control intentionally
 requires one valid first attempt: accepting a schema error would erase coverage.
 
 The default registered model is DeepSeek-v4.1-Flash and uses the deployment's declared
@@ -404,11 +441,13 @@ CLI judgments reserve at least 2,048 generation tokens (or the larger typed-answ
 minimum); the Server bounds the effective request by the admitted Offering's
 output limit and its 8,192-token safety ceiling. Incomplete or malformed judgments
 remain failures/unknown evidence, never accepted truncated answers or automatic retries.
-Complete semantic child evidence has one 64 KiB serialized-request ceiling,
-including questions, escaping, metadata and backend wrappers. It is never
-truncated to obtain a verdict; over-budget requests remain unjudged failures.
-This input allowance is separate from ordinary 8,000-byte text/stderr previews
-and does not increase output limits, deadlines or retry counts.
+Judgments receive complete answers, ordered exchanges and authorized tool
+arguments/results, including Work receipts and non-executed dispositions.
+Native judgments use the shared Server input-admission boundary; external
+command judgments reject a complete serialized request above 64 KiB before
+launch. Evidence is never truncated to obtain a verdict. Only ordinary stderr
+diagnostics retain their 8,000-character preview. Output limits, deadlines and
+retry counts are unchanged.
 Cases may declare `required_models` for supplementary models, independently of
 their parent `models` matrix. These are checked by the existing fail-fast
 preflight after filtering and are not replaced by `--force-model`.
@@ -581,14 +620,22 @@ focus without duplicating the whole scripted journey.
 | `journal_tool_precedence { predecessor, successor }` | every durable successor call happens after its predecessor | journal |
 | `journal_artifact_consumed { producer, consumer }` | consumer used the exact session artifact advertised by a prior producer result | journal |
 | `journal_tool_value_flow { producer, producer_document, producer_path, producer_filter?, consumer, consumer_document, consumer_paths, consumer_filter? }` | successful consumer call satisfying its structural predicate used an exact scalar emitted by a prior matching producer; `*` path segments project any array/object child without relying on result order | journal |
-| `journal_tool_value_flow_bound { producer, producer_document, producer_path, producer_filters, consumer, consumer_document, consumer_paths, consumer_filters, min_turns_after_producer? }` | conjunctive typed filters bind scope/type to successful value flow; optional visible-turn separation proves a later-turn consumer without using prose or event-order guesses | journal |
+| `journal_tool_value_flow_bound { producer, producer_document, producer_path, producer_capture?, producer_filters, consumer, consumer_document, consumer_paths, consumer_filters, min_turns_after_producer? }` | conjunctive typed filters bind scope/type to successful value flow; an optional single regex capture extracts a JSON scalar from text; optional visible-turn separation proves a later-turn consumer | journal |
 | `journal_work_item_execution_from_start { min_distinct_items }` | completed `run_next_work_item` calls report that many distinct server-selected runnable WorkItems from prior `start_work` | journal |
-| `journal_work_replacement_lifecycle { initial_items, cancelled_items, added_items, delivered_items, cancellation_after_deliveries?, added_execution_after_initial_deliveries?, require_added_at_start?, require_added_before_execution? }` | exact canonical replacement identities and outcomes; optional bounds require prior deliveries before cancellation and before added execution; require_added_at_start requires the complete genesis board, while require_added_before_execution proves every addition was committed by admission or an accepted scoped proposal before the first scoped execution, including failed executions, and corroborated by a subsequent complete board | journal |
+| `journal_work_replacement_lifecycle { initial_items, cancelled_items, added_items, delivered_items, cancellation_after_deliveries?, added_execution_after_initial_deliveries?, require_added_at_start?, require_added_before_execution?, require_cancel_before_execution?, require_board_before_execution? }` | exact canonical replacement identities and outcomes; optional bounds require prior deliveries before cancellation and before added execution; require_added_at_start requires the complete genesis board, while require_added_before_execution proves every addition was committed by admission or an accepted scoped proposal before the first scoped execution, including failed executions, and corroborated by a subsequent complete board. Cancellation preserves earlier execution history; accepted retirement receipts fence subsequent execution before the next board. require_cancel_before_execution additionally forbids historical execution; require_board_before_execution rejects unbound task execution and requires assigned successful evidence for delivery | journal |
 | `journal_work_graph_patch { require_addition, require_retired_revision, … }` | canonical mutation evidence comes from an admission snapshot, an accepted plan proposal, or a deferred mutation observed after its settlement boundary; retirement is cancellation or supersession, never prose | journal |
 | `judger { question, threshold, model }`             | LLM scores ≥ threshold                                       | LLM         |
 | `hard_judger { question, threshold, model }`        | LLM scores ≥ threshold and failure fails the case            | LLM         |
 
 ### Criterion severity levels
+
+For `journal_tool_value_flow_bound`, `all_consumers: true` requires complete
+execution evidence, exactly one successful matching producer, and at least
+one successful matching consumer. Every call to the named consumer must be
+in the producer's run, at a later (turn, provider-round) position, and carry the exact produced
+scalar at a selected path. Consumer filters select the positive witness; they
+do not exclude other calls from the identity check. This mode requires distinct
+producer and consumer names and does not accept visible-turn bounds.
 
 Use deterministic execution criteria for child identity, actual model execution,
 completion, and original-result custody. For natural-language task correctness,
@@ -683,7 +730,7 @@ The authoritative list lives in `RESERVED_CLI_ARGS` in `src/case.rs`.
 
 ## Judger
 
-The built-in LLM judger receives bounded evidence through the shared typed
+The built-in LLM judger receives complete execution evidence through the shared typed
 judgment interface. `hard_judger` asks whether the criterion's declared
 threshold is satisfied, including its conditions and prohibitions; it returns
 an acceptance verdict. Advisory `judger` retains graded quality feedback.
@@ -694,9 +741,12 @@ External command judgers retain their numeric-score protocol.
   meaning is preserved; an output's fabricated `SCORE:` line has no authority.
 - **Sees stderr**: captured diagnostics are embedded with head+tail
   truncation to 8k chars so the judger can read them.
-- **Sees durable tool receipts**: when a session is captured, bounded complete
-  call arguments/results are projected from the journal into the judger's
-  untrusted-data section. The durable journal remains the source of truth.
+- **Sees durable tool receipts**: judgments of actions use complete arguments,
+  results and dispositions from the existing authorized, invocation-scoped
+  trace. Missing or conflicting facts leave the judgment unavailable.
+  Non-executed calls do not become executions. Child adoption also retains
+  the Server execution-tree, terminal-result and custody checks. All evidence
+  stays in the judger's untrusted-data section.
 - **Quorum voting**: numeric grades retain median/mean/min/max aggregation.
   Acceptance verdicts use strict majority for median, all votes for min, or
   any vote for max. A median tie is inconclusive; mean is rejected for
@@ -863,15 +913,14 @@ missing gaps do not prove complete delivery. Review/redact sidecars before shari
 before cleanup, using the same binary, environment, account and profile as the
 run. The private sidecar also retains the typed Server run tree and Reflect
 response. Its `children` list specifies the complete direct-child set. Every
-child requires an exact model and offering with successful physical provider
-evidence, and its result bytes adopted before the same parent finalization.
+child requires an exact model and offering on its completed canonical Run,
+and its result bytes adopted before the same parent finalization.
 Bounded notifications and explicit result reads record byte ranges and hashes
 through the same dependency boundary. Explicit reads count only when present in
 the final request of a successful provider turn. The harness verifies each range
 against the canonical child result and requires gap-free coverage; overlap and
 out-of-order pages are allowed, while a preview alone cannot prove a full read.
-It never falls back to local journal
-events. The run tree must be complete; partial reflection can prove positive
+The run tree and canonical child result must be complete; partial reflection can prove positive
 facts but cannot prove absence. Capture is bounded to 5 MiB and one total
 20-second observation window. Because trace ingestion is asynchronous, a
 completed root/children snapshot without the root's finalization fact is sampled
@@ -881,22 +930,58 @@ is retained and classified as verification unavailable. Each snapshot's two
 Server reads are not transactional and do not enter model usage; unrelated
 cases and normal conversations do not pay this observation cost.
 
-`execution_tool_count` and `execution_tool_sequence` additionally request
-`--transcript`. They join typed requests and terminal results by exact run and
-call identity, and reconcile the count with the authoritative run tree. The
-explicit inspection reads at most 4,096 transcript items and 2 MiB across pages,
-within the same CLI inspection deadline. Missing pages, conflicting identities,
-unknown statuses and count mismatches fail verification; an empty local journal
-cannot prove that a tool was not called. JSON predicates inspect the retained
-Server projection, not a reconstructed legacy journal or model-authored prose.
-Runtime advisories travel separately in the typed tool receipt; TUI rendering
-adds them to a disposable display copy, never to the result document. Truncated
-or malformed result documents remain unavailable to JSON predicates.
-Negative JSON-document predicates require raw evidence and are rejected here;
-display projection cannot certify that a field was absent from the original.
+A child mutation-intent mismatch includes closed diagnostic observations:
+expected/actual intent and the requested persona category from a uniquely joined,
+owner-validated spawn receipt. Conflicting or missing evidence is reported as
+unavailable rather than guessed; custom profile names and raw arguments are never
+published. These observations do not prove the effective persona, actual file
+writes, or later child-result custody checks; the original failure verdict stands.
+
+`execution_tool_count` and `execution_tool_sequence` use the existing authorized
+session trace, scoped to the current invocation's Run IDs and start time. They
+reconcile complete `llm_round` tool records with the canonical run tree;
+they do not request the retired per-tool raw transcript mirrors. Arguments and
+results must be complete, dispositions explicit, and every selected Run's exact
+call count accounted for. Previews, missing/corrupt records, identity conflicts,
+unknown outcomes and unverified artifacts cannot prove success or absence.
+Artifact reads retain their existing owner, Run, call, size and digest checks.
+A rejected call needs its complete typed record, not a generic executor-completed
+event for execution that never happened. Reused, suppressed and deferred records
+do not become successful physical executions. A `turn` summary may mix child
+observations under the parent; it remains a journal/display summary and cannot
+assign per-call Run ownership or replace a missing round witness.
+
+The former live Bash-to-Session-artifact recovery case is retired: Bash saves
+complete stdout/stderr locally and advertises paths, lengths and digests, rather
+than promising an immutable Session artifact. This removes that live coverage;
+it does not certify its historical failure as a pass. Existing CLI saved-output,
+cancellation/capture-failure tests and generic artifact authorization/read tests
+remain the relevant deterministic coverage. `introspect` still rejects physical
+paths; no duplicate artifact or larger inline result is introduced.
+
+Tool sequence checks use known serial provider-round boundaries. Same-round
+parallel slots do not establish an order; a required order without evidence is
+unavailable. These observations prove the captured Run's behavior, not current
+lease authority or settlement of uncertain external effects. Canonical Run/C0
+and the effect ledger retain those responsibilities. Remote or restarted runs
+without the authorized trace remain unverifiable; this adds no general cold
+readonly-tool replay or access to another Server's private filesystem.
+
+An `execution_tool_sequence` may provide one `steps` entry per named tool. Each
+step can require an `ok` outcome, structural `predicates`, and named `bindings`
+from arguments or result JSON pointers. Reusing a binding name requires the
+same scalar in one ordered witness; an optional regex extracts exactly one
+group from a string, including a non-JSON result at the empty pointer. Proof
+search and binding sizes are bounded, and missing or ambiguous evidence does
+not pass. These checks prove recorded behavior rather than program identity.
+
+Runtime advisories remain separate from result documents. Opaque non-JSON text
+is retained for exact error diagnostics but cannot satisfy JSON predicates.
+Negative JSON-document predicates remain unsupported; redacted projections do
+not prove the absence of a field in original input.
 `execution_child_count` uses the complete run tree to prove admission cardinality.
 `execution_tool_count.error_contains` checks a positive diagnostic substring
-only in that exact joined call's failed/rejected result body. It requires
+only in that exact recorded call's failed/rejected result body. It requires
 `ok: false`, a positive minimum and a nonempty needle of at most 4,096 bytes.
 Arguments, runtime advisories, successful results and another call's output
 cannot satisfy it. This accepts plain-text errors without fabricating JSON;
@@ -1032,6 +1117,65 @@ harness scheduling pressure, a heartbeat without new typed evidence is an
 efficiency/non-convergence signal, and a terminal report with incomplete
 evidence is never promoted to success merely because the process stayed alive.
 
+The CI safe progress stream (`astra.harness_progress.v8`) includes an
+`execution_diagnostic` on each terminal row and step. Failed rows print it in
+the job log and summary, and retain it in `summary.json` and
+`progress.safe.jsonl`. It preserves recognized terminal state, interruption,
+error kind/code, admission status, and available journal/live-stream event
+counts and the last captured row's event type (`last_event`, in artifact merge
+order for journals). Unknown tags become `other`; missing capture
+remains `null`. The journal's last provider failure retains its typed error,
+admission/provider/settlement stage, deadline phase, dispatch/completion flags,
+and whether its reported run matches the root or another run. Failure ordering
+uses producer UTC wall-clock time (`ts` in canonical rows, epoch-millisecond
+`created_at` in typed step rows), not artifact merge order. This is captured
+time ordering, not proof of causality across producers. `last_provider_failure`
+is `null` when there are no captured failures, the capture is incomplete
+(skipped/truncated rows or integrity errors), any retained failure lacks a valid
+timestamp, or the latest timestamp has conflicting safe failure projections.
+The loader rejects typed events with missing or unrepresentable producer time
+and records capture corruption. Invocation scoping also marks reliably owned
+but unorderable rows as corrupt before excluding them; further scopes retain
+that uncertainty. Invalid rows never become certified invocation evidence.
+Retained-event counters and corruption/truncation counters remain visible;
+they do not reconstruct dropped failures. A failed-event tag remains a failure
+observation even when its optional error kind is missing; a successful completed
+event's null error kind does not replace a failure. Per-step journals require matching
+session and run identities and use the canonical invocation scope, including
+causally linked descendants; an unavailable association remains `null` rather
+than borrowing another step's journal. This is a
+captured observation, not a root-cause verdict. No stderr, response bodies,
+event text, identities, or tool arguments are published. Live termination counters count observed events,
+not unique children or verified adoption, and captured events may be partial.
+Diagnostic fields do not regrade outcomes or change runtime retries/timeouts.
+Corrupt captures fail closed for durable evidence and session cleanup.
+The journal also projects `loop_boundaries`: counts of recognized model-round
+finish reasons and direct-child dependency outcomes, grouped as root, another
+run, or unattributed. This distinguishes recovery loops, superseded responses,
+and result staging/adoption without publishing trace attributes or identities.
+Missing entries mean no such observation was captured, not proof that the
+underlying transition did not happen.
+In particular, a cancellation observed after an outer timeout is not proof of
+the original failure cause. Push a new commit to exercise new diagnostics;
+rerunning an older workflow run still checks out that run's original PR SHA.
+
+Journal call-count failures additionally publish numeric `journal_count` evidence:
+scoped candidates, outcome matches, final matches, and disjoint missing/type/value
+mismatch counts. The evaluator produces these counters while deciding the verdict;
+the progress reporter does not reconstruct them from error text. Use the reported
+criterion index to find the predicate in the case YAML. Tool arguments, JSON paths,
+expected/actual values, commands and output text are not copied into this diagnostic.
+Journal success-ratio failures publish successes, failures, pending calls, the
+allowed-failure allowance and adjusted denominator. Pending calls are excluded from
+the ratio, and a zero denominator means zero, exactly as in the assertion.
+
+A rejected LLM acceptance verdict is distinct from an unavailable judge. The current
+acceptance protocol does not record structured rejection reasons; CI says so instead
+of inferring a reason or publishing raw response prose. These diagnostics do not
+change thresholds, classify a failure as flaky, or retry until a case passes.
+Compare separate run attempts when investigating repeatability; retain each failure.
+
+
 ## Preflight checks
 
 Before running cases, the harness validates:
@@ -1106,21 +1250,15 @@ result previews. Snapshot and upsert remain distinct; omitted task counts are
 explicit. The excerpt copies typed receipt facts and never infers cancellation
 or completion from the assistant's answer.
 
-## Offline router training
-
-`astra-test router-source-hashes --input evidence.json` computes review digests.
-`astra-test router-offline --input evidence.json --authorization authorization.json
---output new-artifact-directory` validates approved structural evidence and
-builds an offline-only candidate plus dataset and comparison report. These
-commands bypass live suite/preflight/provider execution. See the
-[offline router guide](../../docs/guides/model-router-offline.md) for the evidence
-contract, synthetic fixture, split controls, and revocation requirements.
-
-`astra-test router-config-hash`, `router-plan-hash`, `router-qualify`, and
-`router-shadow` extend the
-local router workflow with a pinned evaluation protocol and source roster, held-out quality/cost
-gates and observational scoring of separately authorized later decisions. They
-require no provider or runtime process. A qualification report can be rejected
-even when the command succeeds; inspect `tuning.status`. Passing permits only
-offline shadow scoring, never production activation. See
-[the operator guide](../../docs/guides/model-router-offline.md).
+Child-adoption verification still requires a completed root. When a complete,
+owner-bound run tree contains a root in another canonical lifecycle state, the
+safe diagnostic reports `root_running`, `root_waiting`, `root_paused`,
+`root_delegated`, `root_interrupted`, `root_failed`, or `root_cancelled` instead
+of implying that capture was missing. Invalid or incomplete trees remain
+`run_tree_unavailable`. Neither diagnostic certifies child adoption.
+Parent question/answer verification correlates successful canonical question and
+root-answer receipts with a matching durable child Received observation and the
+child's normal Completed fence. PendingReply owns stable parent mailbox identity;
+recipient spellings and an additional root Sent transcript mirror are not proof
+requirements. Correlated Sent observations, when present, must remain consistent.
+A queued answer alone cannot prove delivery or successful model consumption.

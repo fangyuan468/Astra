@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<AppState> {
+pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
     router
         .route(
             "/sessions",
@@ -82,10 +82,6 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
             post(session::session_handlers::get_session_segments_handler),
         )
         .route(
-            "/sessions/{session_id}/context/segments:upload",
-            post(session::session_handlers::upload_session_segments_handler),
-        )
-        .route(
             "/sessions/{session_id}/execution-grants",
             post(session::session_handlers::issue_session_execution_grant_handler),
         )
@@ -110,6 +106,14 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
             post(session::session_handlers::activate_session_handoff_handler),
         )
         .route(
+            "/sessions/{session_id}/runs/{run_id}/cursor",
+            get(session::session_handlers::get_session_run_cursor_handler),
+        )
+        .route(
+            "/sessions/{session_id}/forks/{fork_id}/activate-for-continuation",
+            post(session::session_handlers::activate_session_fork_for_continuation_handler),
+        )
+        .route(
             "/sessions/{session_id}/forks",
             get(session::session_handlers::list_session_forks_handler)
                 .post(session::session_handlers::prepare_session_fork_handler),
@@ -128,7 +132,12 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
         )
         .route(
             "/sessions/{session_id}/cancel",
-            post(session::session_handlers::cancel_session_handler),
+            post(session::session_handlers::cancel_session_handler)
+                .get(session::session_handlers::get_session_execution_settlement_handler),
+        )
+        .route(
+            "/sessions/{session_id}/runs/{run_id}/activity",
+            get(session::session_handlers::run_activity_handler),
         )
         .route(
             "/sessions/{session_id}/activity",
@@ -149,10 +158,6 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
         .route(
             "/sessions/{session_id}/artifacts/{artifact_id}/download",
             get(session::session_handlers::download_session_artifact_handler),
-        )
-        .nest(
-            "/sessions/{session_id}/harness",
-            harness_routes(state.clone()),
         )
         .route(
             "/sessions/{session_id}/audit/summary",
@@ -179,10 +184,6 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
             get(audit_handlers::audit_errors_handler),
         )
         .route(
-            "/sessions/{session_id}/audit/promotions",
-            get(audit_handlers::audit_runtime_promotions_handler),
-        )
-        .route(
             "/audit/sessions",
             get(audit_handlers::list_sessions_handler),
         )
@@ -194,36 +195,4 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
             "/audit/tools",
             get(audit_handlers::cross_session_tools_handler),
         )
-        .route(
-            "/audit/promotions",
-            get(audit_handlers::cross_session_runtime_promotions_handler),
-        )
-}
-
-#[cfg(feature = "harness")]
-fn harness_routes(state: AppState) -> Router<AppState> {
-    use axum::routing::get;
-    Router::new()
-        .route(
-            "/snapshot",
-            get(crate::server::harness::handlers::get_harness_snapshot),
-        )
-        .route(
-            "/history",
-            get(crate::server::harness::handlers::get_harness_history),
-        )
-        .route(
-            "/diff",
-            get(crate::server::harness::handlers::get_harness_diff),
-        )
-        .route(
-            "/stream",
-            get(crate::server::harness::handlers::stream_harness_snapshots),
-        )
-        .with_state(state)
-}
-
-#[cfg(not(feature = "harness"))]
-fn harness_routes(_state: AppState) -> Router<AppState> {
-    Router::new()
 }

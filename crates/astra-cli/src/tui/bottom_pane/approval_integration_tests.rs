@@ -380,9 +380,7 @@ fn plan_review_receives_ctrl_enter_before_hidden_approval() {
     ));
     assert_eq!(
         plan_rx.blocking_recv().unwrap(),
-        PlanReviewDecision::Approve {
-            mode: PermissionMode::Auto
-        }
+        PlanReviewDecision::Approve { mode: None }
     );
     assert!(matches!(
         approval_rx.try_recv(),
@@ -802,4 +800,31 @@ fn shift_tab_selects_permission_mode_without_changing_pending_approval_focus() {
     let action = bp.handle_key(special(KeyCode::BackTab));
     assert!(matches!(action, BottomPaneAction::CyclePermissionMode));
     assert_eq!(bp.focused_approval_index(), Some(1));
+}
+
+#[test]
+fn accepted_paste_tail_does_not_approve_or_create_a_new_draft() {
+    let mut bp = BottomPane::new();
+    bp.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    let mut rx = enqueue(&mut bp, "bash");
+    bp.composer.force_pending_paste_burst_for_test(
+        "accepted request",
+        std::time::Instant::now() - std::time::Duration::from_secs(1),
+    );
+    assert!(matches!(
+        bp.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        BottomPaneAction::QueueFollowUp(ref text) if text == "accepted request"
+    ));
+    for _ in 0..2 {
+        assert!(matches!(
+            bp.handle_key(special(KeyCode::Enter)),
+            BottomPaneAction::Consumed
+        ));
+        assert!(bp.composer.is_empty());
+        assert!(bp.has_pending_approvals());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+    }
 }

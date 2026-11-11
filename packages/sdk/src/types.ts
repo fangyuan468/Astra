@@ -123,9 +123,18 @@ export type RunFinishedEvent = {
   turn_evaluation?: Record<string, unknown> | null;
   status?: string;
   error?: string | null;
+  /** true: Context lost; false: saved/unchanged; absent: unconfirmed. */
+  context_not_saved?: boolean;
   interrupted?: boolean;
   resumable?: boolean;
   waiting_for?: string | null;
+};
+
+export type RunCancellationResult = {
+  runId: string;
+  status: string;
+  executionSettled: boolean;
+  contextNotSaved?: boolean;
 };
 
 export type RunCancelledEvent = {
@@ -148,6 +157,7 @@ export type RunErrorEvent = {
   error?: string;
   code?: string;
   error_kind?: string;
+  error_code?: string;
 };
 
 export type RunInterruptedEvent = {
@@ -425,30 +435,6 @@ export type ExplainAnalyzeContextSourceV1 = {
 export type ExplainAnalyzeContextAssemblyV1 = {
   basis: "runtime_text_estimate";
   sources: ExplainAnalyzeContextSourceV1[];
-  edge_memory_selection?: MemorySelectionReport[];
-};
-
-/** CLI/Edge selection facts plus runtime-owned final prompt projection. Indices are batch-local. */
-export type MemorySelectionReport = {
-  session_id: string;
-  turn: number;
-  operation: "relevance" | "dismissal" | "reuse";
-  method: "model" | "lexical" | "none" | "reuse";
-  reason: "completed" | "no_candidates" | "no_selector" | "call_unavailable" | "invalid_response" | "retrieval_unavailable" | "retrieval_timeout" | "reused";
-  model: string | null;
-  candidates: Array<{ index: number; selected: boolean; probability_bps: number | null }>;
-  selection_order: number[];
-  elapsed_ms: number;
-  candidate_coverage?: {
-    source_items: number;
-    evaluated_candidates: number;
-    truncated: boolean;
-  };
-  prompt_projection?: {
-    selected_candidates: number;
-    /** null means final inclusion could not be proven. */
-    included_candidates: number | null;
-  };
 };
 
 /** Assembly observations and final request estimates have different scopes.
@@ -1109,6 +1095,8 @@ export type ChatMessage = {
   timestamp: number;
   /** Whether this message is still being streamed. */
   streaming?: boolean;
+  /** null means cancellation ended without confirmed Context-saving evidence. */
+  contextNotSaved?: boolean | null;
 };
 
 export type WorkspaceState = {
@@ -1208,6 +1196,8 @@ export type AstraClientConfig = {
 
 export type SSEClientOptions = {
   url: string;
+  /** Optional request transport for clients that own authentication. */
+  transport?: (url: string, init: RequestInit) => Promise<Response>;
   token?: string;
   headers?: Record<string, string>;
   onEvent: (event: StreamEvent) => void;
@@ -1376,9 +1366,6 @@ export type RunProjectionResponse = {
   transport?: string | null;
   fallback_policy?: string | null;
   run_event_high_watermark: number;
-  projection_event_idx: number;
-  projection_updated_at: string;
-  projection_hash: string;
   latest_event_type?: string | null;
   total_prompt_tokens: number;
   total_completion_tokens: number;
@@ -1390,26 +1377,10 @@ export type RunProjectionResponse = {
     node_seq: number;
     created_at: string;
   } | null;
-  observability: {
-    has_durable_projection: boolean;
-    observability_available: boolean;
-    projection_lag_events: number;
-    prompt_request_count: number;
-    latest_prompt_request?: {
-      request_id: string;
-      request_hash: string;
-      message_count: number;
-      tool_count: number;
-      delta_counts: unknown;
-    } | null;
-  };
   recent_events: Array<StreamEvent | Record<string, unknown>>;
 };
 
-export type RunProjectionRepairResponse = {
-  repaired: boolean;
-  projection: RunProjectionResponse;
-};
+
 
 export type RunInputRequestBody = {
   idempotencyKey: string;
@@ -1430,6 +1401,44 @@ export type SessionInfo = {
   status?: string;
   userId?: string;
   agentId?: string | null;
+};
+
+/** Canonical full hydration returned by POST /sessions/{id}/resume. */
+export type RuntimeSessionResumeResponse = {
+  session_id: string;
+  turn_count: number;
+  total_tokens_in: number;
+  total_tokens_out: number;
+  total_cache_read_tokens?: number;
+  total_cache_creation_tokens?: number;
+  recent_tools: string[];
+  checkpoint_count: number;
+  last_status: string;
+  git_branch: string | null;
+  model: string | null;
+  permission_mode?: string | null;
+  title: string | null;
+  restored_from_cloud: boolean;
+  resume_bundle: {
+    schema_version: number;
+    cursor: {
+      schema_version: number;
+      owner_id: string;
+      session_id: string;
+      branch_id: string;
+      completed_turn: number;
+      journal_event_seq: number;
+      conversation_seq: number;
+      canonical_root_hash: string;
+      projection_schema: number;
+      compaction_generation: number;
+      config_version_id?: string;
+    };
+    source: "canonical_journal";
+    conversation_messages: unknown[];
+    materialized_conversation_root_hash?: string;
+    projections: Record<string, unknown>;
+  };
 };
 
 // ─── Runtime wire response DTOs ───────────────────────────────────
@@ -1497,6 +1506,7 @@ export type RuntimeSessionListParams = {
 };
 
 export type RuntimeTranscriptItemResponse = {
+  source_event_id?: string | null;
   session_id: string;
   item_seq: number;
   run_id?: string | null;
@@ -1513,6 +1523,24 @@ export type RuntimeTranscriptResponse = {
   items: RuntimeTranscriptItemResponse[];
   next_before_seq?: number | null;
   has_more?: boolean;
+};
+
+/** Bounded display projection; opening inputs never acquire raw item sequences. */
+export type RuntimeConversationFailure = { message: string; error_code: string | null };
+export type RuntimeConversationResponse = {
+  kind: "conversation";
+  session: RuntimeSessionResponse;
+  selected_root: { run_id: string; status: string; waiting_for: string | null; created_at: string } | null;
+  items: Array<({ kind: "raw"; failure?: RuntimeConversationFailure; context_not_saved?: boolean | null } & RuntimeTranscriptItemResponse) | {
+    kind: "opening"; id: string; run_id: string; source_event_id: string; created_at: string; content: string;
+  } | {
+    kind: "failure"; id: string; run_id: string; created_at: string; failure: RuntimeConversationFailure;
+  } | {
+    kind: "cancellation"; id: string; run_id: string; created_at: string; context_not_saved: boolean | null;
+  }>;
+  history_loaded: boolean;
+  raw_page: { next_before_seq: number | null; has_more: boolean } | null;
+  truncated: boolean | null;
 };
 
 export type RuntimeTranscriptParams = {
@@ -1541,7 +1569,8 @@ export type RuntimeModelCatalogPricing = {
 };
 
 export type RuntimeModelListItem = {
-  thinking_protocol: "unknown" | "enable_thinking" | "thinking_object" | "reasoning_effort" | "moonshot" | null;
+  supported_reasoning_efforts?: string[];
+  thinking_protocol: "unknown" | "enable_thinking" | "thinking_object" | "reasoning_effort" | "responses_reasoning" | "moonshot" | null;
   offering_id: string;
   access_id: string;
   access_kind: RuntimeModelAccessKind;
@@ -2858,182 +2887,6 @@ export type WorkBranchComparisonReportV2 = {
   coverage_gaps: WorkBranchComparisonCoverageGapV2[];
 };
 
-export type WorkPatchArtifactV1 = {
-  schema_version: 1;
-  work_id: string;
-  branch_id: string;
-  patch_artifact_id: string;
-  source_branch_revision: number;
-  source_graph_revision: number;
-  base_subject_revision: WorkContentHash;
-  result_subject_revision: WorkContentHash;
-  payload_hash: WorkContentHash;
-  payload_bytes: number;
-  format: "unified_diff_v1";
-  provider_invocation_ref: string;
-  source_ref: string;
-  created_at: string;
-};
-
-export type WorkPatchArtifactExportInputV1 = {
-  requestId: string;
-  expectedBranchRevision: number;
-  expectedGraphRevision: number;
-};
-
-export type WorkPatchArtifactContent = {
-  data: string;
-  hash: WorkContentHash;
-  bytes: number;
-};
-
-export type WorkPatchArtifactCursorV1 = {
-  created_at: string;
-  patch_artifact_id: string;
-};
-
-export type WorkPatchArtifactPageV1 = {
-  schema_version: 1;
-  work_id: string;
-  branch_id: string;
-  artifacts: WorkPatchArtifactV1[];
-  next_cursor: WorkPatchArtifactCursorV1 | null;
-};
-
-export type WorkPatchArtifactListParamsV1 = {
-  before?: WorkPatchArtifactCursorV1;
-  limit?: number;
-};
-
-export type WorkPatchMaterializationInputV1 = {
-  requestId: string;
-  patchArtifactId: string;
-  expectedTargetBranchRevision: number;
-  expectedTargetGraphRevision: number;
-};
-
-export type WorkPatchMaterializationCursorV1 = {
-  created_at: string;
-  operation_id: string;
-};
-
-export type WorkPatchMaterializationListParamsV1 = {
-  sourceBranchId: string;
-  before?: WorkPatchMaterializationCursorV1;
-  limit?: number;
-};
-
-export type WorkPatchMaterializationOperationV2 = {
-  schema_version: 2;
-  operation_id: string;
-  work_id: string;
-  request_id: string;
-  patch_artifact_id: string;
-  source_branch_id: string;
-  target_branch_id: string;
-  target_branch_revision: number;
-  target_graph_revision: number;
-  base_subject_revision: WorkContentHash;
-  result_subject_revision: WorkContentHash;
-  payload_hash: WorkContentHash;
-  provider_ref: string;
-  policy_decision_ref: string;
-  state: "pending" | "aborted" | "succeeded" | "conflict" | "failed";
-  phase: "awaiting_dispatch" | "applying" | "reconciling" | "verifying" | "complete";
-  apply_invocation_ref: string | null;
-  observed_subject_revision: WorkContentHash | null;
-  apply_outcome:
-    | "applied"
-    | "not_applied"
-    | "result_mismatch"
-    | "target_changed"
-    | null;
-  failure_code:
-    | "provider_unavailable"
-    | "authorization_denied"
-    | "workspace_unavailable"
-    | "patch_rejected"
-    | "invocation_cancelled"
-    | "provider_internal"
-    | null;
-  verification_evidence_hash: WorkContentHash | null;
-  verification_outcome: "passed" | "target_changed" | null;
-  created_at: string;
-  completed_at: string | null;
-};
-
-export type WorkPatchMaterializationPageV2 = {
-  schema_version: 2;
-  work_id: string;
-  target_branch_id: string;
-  source_branch_id: string;
-  operations: WorkPatchMaterializationOperationV2[];
-  next_cursor: WorkPatchMaterializationCursorV1 | null;
-};
-
-export type WorkPatchCommitInputV1 = {
-  requestId: string;
-  patchArtifactId: string;
-  expectedTargetBranchRevision: number;
-  expectedTargetGraphRevision: number;
-  message: string;
-};
-
-export type WorkPatchCommitCursorV1 = {
-  created_at: string;
-  operation_id: string;
-};
-
-export type WorkPatchCommitListParamsV1 = {
-  before?: WorkPatchCommitCursorV1;
-  limit?: number;
-};
-
-export type WorkPatchCommitOperationV1 = {
-  schema_version: 1;
-  operation_id: string;
-  work_id: string;
-  request_id: string;
-  patch_artifact_id: string;
-  source_branch_id: string;
-  target_branch_id: string;
-  target_branch_revision: number;
-  target_graph_revision: number;
-  base_subject_revision: WorkContentHash;
-  result_subject_revision: WorkContentHash;
-  payload_hash: WorkContentHash;
-  message: string;
-  provider_ref: string;
-  policy_decision_ref: string;
-  state: "pending" | "aborted" | "succeeded" | "conflict" | "failed";
-  phase: "awaiting_dispatch" | "committing" | "reconciling" | "complete";
-  commit_invocation_ref: string | null;
-  commit_sha: string | null;
-  observed_subject_revision: WorkContentHash | null;
-  index_reconciled: boolean | null;
-  failure_code:
-    | "authorization_denied"
-    | "workspace_unavailable"
-    | "provider_unavailable"
-    | "invalid_metadata"
-    | "base_changed"
-    | "result_changed"
-    | "patch_rejected"
-    | "commit_rejected"
-    | "ref_conflict"
-    | null;
-  created_at: string;
-  completed_at: string | null;
-};
-
-export type WorkPatchCommitPageV1 = {
-  schema_version: 1;
-  work_id: string;
-  target_branch_id: string;
-  operations: WorkPatchCommitOperationV1[];
-  next_cursor: WorkPatchCommitCursorV1 | null;
-};
-
 export type WorkDeliverySelectionSubjectV1 = {
   graphRevision: number;
   subjectRef: string;
@@ -3099,7 +2952,6 @@ export type WorkEventKind =
   | "branch_archived"
   | "branch_restored"
   | "subject_changed"
-  | "patch_artifact_exported"
   | "plan_proposed"
   | "criteria_proposed"
   | "proposal_rejected"

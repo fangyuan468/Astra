@@ -4,7 +4,15 @@ vi.mock("@/lib/api/auth-guard", () => ({
   requireRuntimeUser: vi.fn(),
 }));
 
-vi.mock("@/lib/api/web-store", () => ({
+vi.mock("@/lib/api/web-store", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api/web-store")>();
+  return {
+  normalizedActiveSkills: actual.normalizedActiveSkills,
+  normalizedActiveTools: actual.normalizedActiveTools,
+  claimChatStreamProjection: vi.fn(),
+  withChatStreamProjection: vi.fn((_lease, apply) => { apply(); return true; }),
+  releaseChatStreamProjection: vi.fn(),
+  ChatStreamProjectionError: class extends Error {},
   beginStreamingMessage: vi.fn(),
   ensureChatBackendSession: vi.fn(),
   getChat: vi.fn(),
@@ -19,7 +27,8 @@ vi.mock("@/lib/api/web-store", () => ({
   setChatActiveRun: vi.fn(),
   updateChatWorkspaceSelection: vi.fn(),
   updateStreamingAssistantMessage: vi.fn(),
-}));
+  };
+});
 
 vi.mock("@/lib/runtime-client", () => ({
   RuntimeClientError: class RuntimeClientError extends Error {
@@ -50,6 +59,7 @@ vi.mock("@/lib/runtime-client", () => ({
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import {
   beginStreamingMessage,
+  claimChatStreamProjection,
   ensureChatBackendSession,
   getChat,
   resolveModelOfferingSelection,
@@ -67,6 +77,15 @@ const SERVER_INTERACTION_API_MAJOR_HEADER =
   "x-astra-agent-interaction-api-major";
 const SERVER_INTERACTION_API_MAJOR = "3";
 
+const mockClaimProjection = vi.mocked(claimChatStreamProjection);
+beforeEach(() => {
+  mockClaimProjection.mockImplementation((ownerUserId, chatId, assistantMessageId, writer, binding) => ({
+    ownerUserId, chatId, writer, projection: { assistantMessageId, sessionId: binding.sessionId, writer,
+      state: { assistantText: "", assistantRawText: "", reasoningText: "", lastStatus: "streaming",
+        protocolError: false, runLifecycle: "running", runId: binding.runId, nextEventIndex: binding.nextEventIndex ?? 0 } },
+  }));
+});
+
 const mockRequireRuntimeUser = vi.mocked(requireRuntimeUser);
 const mockGetChat = vi.mocked(getChat);
 const mockResolveModelOfferingSelection = vi.mocked(resolveModelOfferingSelection);
@@ -80,6 +99,11 @@ const mockUpdateStreamingAssistantMessage = vi.mocked(
   updateStreamingAssistantMessage,
 );
 const mockRequireRuntimeClient = vi.mocked(requireRuntimeClient);
+function setAdmittedRuntime(value: unknown) {
+  mockRequireRuntimeClient.mockResolvedValue(value as never);
+  const previous = mockRequireRuntimeUser.getMockImplementation();
+  mockRequireRuntimeUser.mockImplementation(async () => ({ ...(await previous!()), client: value }) as never);
+}
 
 function makeBackendStream() {
   let releasePendingRead: (() => void) | null = null;
@@ -111,7 +135,7 @@ function makeBackendStream() {
   };
 }
 
-function makeBackendFrameStream(frames: string[]) {
+function makeBackendFrameStream(frames: string[], readError?: Error) {
   const encoder = new TextEncoder();
   const chunks = frames.map((frame) => encoder.encode(frame));
   let index = 0;
@@ -126,6 +150,7 @@ function makeBackendFrameStream(frames: string[]) {
       getReader: () => ({
         async read() {
           if (index >= chunks.length) {
+            if (readError) throw readError;
             return { value: undefined, done: true };
           }
           const value = chunks[index];
@@ -234,6 +259,46 @@ describe("chat stream route proxy cancellation", () => {
     });
   });
 
+  it("uses the canonical browser proof to retry late chat admission without replaying a different turn", async () => {
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+    const { WebRuntimeClient } = await vi.importActual<typeof import("@/lib/runtime-client/server")>("@/lib/runtime-client/server");
+    const root = "https://runtime.example/";
+    const handle = `bs3.${Buffer.from(root).toString("base64url")}.${Buffer.from("user-id").toString("base64url")}.${Buffer.from("session-id").toString("base64url")}.${Buffer.alloc(32, 1).toString("base64url")}`;
+    const runtime = new WebRuntimeClient({ mode: "live", source: "cookie", apiUrl: root,
+      accessToken: "old", refreshToken: handle, hasAccessToken: true, hasRefreshToken: true,
+      demoMode: false, message: "" });
+    setAdmittedRuntime(runtime);
+    const admissions: Array<{ body: string; bearer: string | null }> = [];
+    const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/auth/refresh") {
+        expect(JSON.parse(String(init?.body)).refresh_token).toBe(handle);
+        return Response.json({ access_token: "current", refresh_token: handle });
+      }
+      if (path === "/chat/stream") {
+        admissions.push({ body: String(init?.body), bearer: new Headers(init?.headers).get("authorization") });
+        if (admissions.length === 1) return new Response("expired", { status: 401 });
+        return new Response('data: {"type":"content","content":"Hello"}\n\ndata: {"type":"done"}\n\n', {
+          headers: { "content-type": "text/event-stream", [SERVER_INTERACTION_API_MAJOR_HEADER]: SERVER_INTERACTION_API_MAJOR },
+        });
+      }
+      return Response.json({ artifacts: [], edges: [] });
+    });
+    vi.stubGlobal("fetch", fetch);
+    try {
+      const response = await POST(new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST", body: JSON.stringify({ content: "hello", options: { model: "sonnet-4.6-adaptive", activeSkills: [] } }),
+      }) as never, { params: Promise.resolve({ chatId: "chat-1" }) });
+      expect(response.status).toBe(200);
+      await response.text();
+      expect(admissions).toHaveLength(2);
+      expect(admissions[0].bearer).toBe("Bearer old");
+      expect(admissions[1]).toEqual({ body: admissions[0].body, bearer: "Bearer current" });
+      expect(JSON.parse(admissions[1].body).session_id).toBe("chat-1");
+      expect(response.headers.has("set-cookie")).toBe(false);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
   it("cancels the backend SSE reader when the web client disconnects", async () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();
@@ -248,7 +313,7 @@ describe("chat stream route proxy cancellation", () => {
         body: backend.body,
       }),
     };
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    setAdmittedRuntime(runtime as never);
 
     const response = await POST(
       new Request("http://web.test/api/chats/chat-1/stream", {
@@ -302,7 +367,7 @@ describe("chat stream route proxy cancellation", () => {
         body: backend.body,
       }),
     };
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    setAdmittedRuntime(runtime as never);
 
     const response = await POST(
       new Request("http://web.test/api/chats/chat-1/stream", {
@@ -350,7 +415,7 @@ describe("chat stream route proxy cancellation", () => {
         body: backend.body,
       }),
     };
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    setAdmittedRuntime(runtime as never);
 
     const response = await POST(
       new Request("http://web.test/api/chats/chat-1/stream", {
@@ -389,7 +454,7 @@ describe("chat stream route proxy cancellation", () => {
       'data: {"type":"run_started","run_id":"run-stop"}\n\n',
       'data: {"type":"run_finished","run_id":"run-stop","status":"cancelled"}\n\n',
     ]);
-    mockRequireRuntimeClient.mockResolvedValue({
+    setAdmittedRuntime({
       sdk: {
         getRuntimeSession: vi.fn().mockResolvedValue({}),
         listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
@@ -454,7 +519,7 @@ describe("chat stream route proxy cancellation", () => {
       'data: {"type":"run_started","run_id":"run-blocked"}\n\n',
       'data: {"type":"run_blocked","session_id":"chat-1","reason":"executor_offline","message":"Edge executor MacBook Pro is offline."}\n\n',
     ]);
-    mockRequireRuntimeClient.mockResolvedValue({
+    setAdmittedRuntime({
       sdk: {
         getRuntimeSession: vi.fn().mockResolvedValue({}),
         listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
@@ -587,8 +652,9 @@ describe("chat stream route proxy cancellation", () => {
     const backend = makeBackendFrameStream([
       'data: {"type":"run_started","run_id":"run-soft","index":"bad"}\n\n',
       'data: {"type":"text_done","full_text":"done"}\n\n',
+      'data: {"type":"run_finished","run_id":"run-soft","status":"completed"}\n\n',
     ]);
-    mockRequireRuntimeClient.mockResolvedValue({
+    setAdmittedRuntime({
       sdk: {
         getRuntimeSession: vi.fn().mockResolvedValue({}),
         listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
@@ -667,7 +733,7 @@ describe("chat stream route proxy cancellation", () => {
       },
       fetchResponse,
     };
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    setAdmittedRuntime(runtime as never);
 
     const response = await POST(
       new Request("http://web.test/api/chats/chat-1/stream", {
@@ -712,7 +778,7 @@ describe("chat stream route proxy cancellation", () => {
         body: backend.body,
       }),
     };
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    setAdmittedRuntime(runtime as never);
     mockGetChat.mockReturnValue({
       chat: {
         id: "chat-1",
@@ -836,7 +902,7 @@ describe("chat stream route proxy cancellation", () => {
           body: backend.body,
         }),
       };
-      mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+      setAdmittedRuntime(runtime as never);
       mockGetChat.mockReturnValue({
         chat: {
           id: "chat-1",
@@ -935,7 +1001,7 @@ describe("chat stream route proxy cancellation", () => {
       },
       fetchResponse,
     };
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    setAdmittedRuntime(runtime as never);
     mockGetChat.mockReturnValue({
       chat: {
         id: "chat-1",
@@ -998,7 +1064,7 @@ describe("chat stream route proxy cancellation", () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();
     const runtime = makeRuntimeWithEdgeStatus(backend);
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    setAdmittedRuntime(runtime as never);
 
     const response = await POST(
       new Request("http://web.test/api/chats/chat-1/stream", {
@@ -1077,7 +1143,7 @@ describe("chat stream route proxy cancellation", () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();
     const runtime = makeRuntimeWithEdgeStatus(backend);
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    setAdmittedRuntime(runtime as never);
 
     const response = await POST(
       new Request("http://web.test/api/chats/chat-1/stream", {
@@ -1137,7 +1203,7 @@ describe("chat stream route proxy cancellation", () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();
     const runtime = makeRuntimeWithEdgeStatus(backend);
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    setAdmittedRuntime(runtime as never);
 
     const response = await POST(
       new Request("http://web.test/api/chats/chat-1/stream", {
@@ -1167,7 +1233,7 @@ describe("chat stream route proxy cancellation", () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();
     const runtime = makeRuntimeWithEdgeStatus(backend);
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    setAdmittedRuntime(runtime as never);
 
     const response = await POST(
       new Request("http://web.test/api/chats/chat-1/stream", {
@@ -1238,7 +1304,7 @@ describe("chat stream route proxy cancellation", () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();
     const runtime = makeRuntimeWithEdgeStatus(backend, []);
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    setAdmittedRuntime(runtime as never);
 
     const response = await POST(
       new Request("http://web.test/api/chats/chat-1/stream", {
@@ -1298,7 +1364,7 @@ describe("chat stream route proxy cancellation", () => {
       },
       fetchResponse: vi.fn(),
     };
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    setAdmittedRuntime(runtime as never);
 
     const response = await POST(
       new Request("http://web.test/api/chats/chat-1/stream", {
@@ -1326,38 +1392,6 @@ describe("chat stream route proxy cancellation", () => {
       "chat-1",
       expect.objectContaining({ runtime }),
     );
-    await reader?.cancel();
-  });
-
-  it("returns local SSE messages before the runtime client is ready", async () => {
-    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
-    mockRequireRuntimeClient.mockImplementation(() => new Promise(() => {}));
-
-    const response = await POST(
-      new Request("http://web.test/api/chats/chat-1/stream", {
-        method: "POST",
-        body: JSON.stringify({
-          content: "hello",
-          options: {
-            model: "sonnet-4.6-adaptive",
-            webSearch: false,
-            thinking: true,
-            activeSkills: [],
-          },
-        }),
-      }) as never,
-      { params: Promise.resolve({ chatId: "chat-1" }) },
-    );
-
-    const reader = response.body?.getReader();
-    expect(reader).toBeDefined();
-    const first = await reader!.read();
-    const text = new TextDecoder().decode(first.value);
-    expect(text).toContain('"type":"local_messages"');
-    expect(mockRequireRuntimeClient).toHaveBeenCalledWith({
-      auth: "required",
-      operation: "stream web chat turn",
-    });
     await reader?.cancel();
   });
 
@@ -1394,7 +1428,7 @@ describe("chat stream route proxy cancellation", () => {
     });
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();
-    mockRequireRuntimeClient.mockResolvedValue({
+    setAdmittedRuntime({
       sdk: {
         getRuntimeSession: vi.fn().mockResolvedValue({}),
         listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
@@ -1470,7 +1504,7 @@ describe("chat stream route proxy cancellation", () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();
     const runtime = makeRuntimeWithEdgeStatus(backend);
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    setAdmittedRuntime(runtime as never);
 
     const response = await POST(
       new Request("http://web.test/api/chats/chat-1/stream", {
@@ -1558,7 +1592,7 @@ describe("chat stream route proxy cancellation", () => {
         connected_secs: 1,
       },
     ]);
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    setAdmittedRuntime(runtime as never);
 
     const response = await POST(
       new Request("http://web.test/api/chats/chat-1/stream", {
@@ -1676,7 +1710,7 @@ describe("chat stream route startup", () => {
         body: backend.body,
       }),
     };
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    setAdmittedRuntime(runtime as never);
 
     const response = await POST(
       new Request("http://web.test/api/chats/chat-1/stream", {
@@ -1743,7 +1777,7 @@ describe("chat stream route startup", () => {
         body: backend.body,
       }),
     };
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    setAdmittedRuntime(runtime as never);
 
     const response = await POST(
       new Request("http://web.test/api/chats/chat-1/stream", {
@@ -1801,7 +1835,7 @@ describe("chat stream route startup", () => {
         body: backend.body,
       }),
     };
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    setAdmittedRuntime(runtime as never);
 
     const response = await POST(
       new Request("http://web.test/api/chats/chat-1/stream", {
@@ -1872,7 +1906,7 @@ describe("chat stream route startup", () => {
         body: backend.body,
       }),
     };
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    setAdmittedRuntime(runtime as never);
 
     const response = await POST(
       new Request("http://web.test/api/chats/chat-1/stream", {
@@ -1956,6 +1990,82 @@ describe("chat existing run stream route", () => {
     });
   });
 
+  it.each([
+    { coalesced: false, resumed: false },
+    { coalesced: true, resumed: false },
+    { coalesced: false, resumed: true },
+  ])("preserves partial output through failure (coalesced=$coalesced, cursor=$resumed)", async ({ coalesced, resumed }) => {
+    const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
+    if (resumed) {
+      const stored = mockGetChat("user-a", "web-chat-1")!.messages.find(message => message.id === "assistant-1")!;
+      stored.content = "Useful partial answer";
+      stored.reasoning = "Partial reasoning";
+      const { applyStreamEvent } = await import("@/lib/api/stream-event-handler");
+      const lease = mockClaimProjection("user-a", "web-chat-1", "assistant-1", new AbortController(),
+        { sessionId: "runtime-session-1", runId: "root" });
+      const ctx = { ownerUserId: "user-a", chatId: "web-chat-1", assistantMessageId: "assistant-1", getSessionId: () => "runtime-session-1" };
+      applyStreamEvent({ type: "text_delta", content: stored.content }, ctx, lease.projection.state);
+      applyStreamEvent({ type: "reasoning_delta", content: stored.reasoning, index: 7 }, ctx, lease.projection.state);
+      mockClaimProjection.mockReturnValue(lease);
+    }
+    const frames = [
+      { type: "session_info", session_id: "runtime-session-1", run_id: "root" },
+      { type: "text_delta", content: "Useful partial answer" },
+      { type: "reasoning_delta", content: "Partial reasoning" },
+      { type: "run_finished", run_id: "child", status: "cancelled" },
+      { type: "run_error", run_id: "root", error: "Save failed", error_code: "canonical_persistence_failed" },
+      { type: "run_finished", run_id: "root", status: "failed", error: "Save failed" },
+    ].filter(event => !resumed || !["text_delta", "reasoning_delta"].includes(event.type))
+      .map(event => `data: ${JSON.stringify(event)}\n\n`);
+    frames.push("data: [DONE]\n\n");
+    const backend = makeBackendFrameStream(coalesced ? [frames.join("")] : frames);
+    setAdmittedRuntime({ sdk: { listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }) },
+      fetchResponse: vi.fn().mockResolvedValue({ ok: true, headers: backend.headers, body: backend.body }) } as never);
+    const url = `http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=root${resumed ? "&last_index=8" : ""}`;
+    const request = new Request(url, { method: "GET" });
+    Object.defineProperty(request, "nextUrl", { value: new URL(url) });
+    const response = await GET(request as never, { params: Promise.resolve({ chatId: "web-chat-1" }) });
+    const wire = await response.text();
+    expect(wire).toContain('"run_id":"child"');
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith("user-a", "web-chat-1", "assistant-1",
+      expect.objectContaining({ content: "Useful partial answer\n\nSave failed", reasoning: "Partial reasoning",
+        reasoningStatus: undefined, status: "failed" }));
+    expect(mockSetChatActiveRun.mock.calls.every(([, , run]) => run?.runId !== "child")).toBe(true);
+  });
+
+  it.each([true, false])("preserves the proxy failure cause through a reset (canonical=%s)", async (canonical) => {
+    const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
+    const { streamExistingChatRun } = await import("@/lib/api/chats");
+    const events = [
+      { type: "session_info", session_id: "runtime-session-1", run_id: "root" },
+      { type: "text_delta", content: "Useful partial answer" },
+      ...(canonical ? [{ type: "run_error", run_id: "root", error: "Save failed",
+        error_code: "canonical_persistence_failed" }] : []),
+    ];
+    const backend = makeBackendFrameStream(events.map(event => `data: ${JSON.stringify(event)}\n\n`), new Error("upstream reset"));
+    setAdmittedRuntime({ sdk: { listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }) }, fetchResponse: vi.fn().mockResolvedValue({
+      ok: true, headers: backend.headers, body: backend.body,
+    }) } as never);
+    const url = "http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=root";
+    const request = new Request(url);
+    Object.defineProperty(request, "nextUrl", { value: new URL(url) });
+    const response = await GET(request as never, { params: Promise.resolve({ chatId: "web-chat-1" }) });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
+    const onText = vi.fn(), onDone = vi.fn();
+    try {
+      await expect(streamExistingChatRun("web-chat-1", "root", { onText, onDone })).rejects.toMatchObject({
+        code: canonical ? "canonical_persistence_failed" : "stream_observation_interrupted",
+      });
+      expect(onText).toHaveBeenLastCalledWith("Useful partial answer");
+      expect(onDone).not.toHaveBeenCalled();
+      expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith("user-a", "web-chat-1", "assistant-1",
+        expect.objectContaining({ content: canonical ? "Useful partial answer\n\nSave failed" : "Useful partial answer", status: canonical ? "failed" : "streaming" }));
+      expect(backend.releaseLock).toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
   it("uses the backend session id when reconnecting an existing run stream", async () => {
     const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendFrameStream([
@@ -1964,7 +2074,7 @@ describe("chat existing run stream route", () => {
       'data: {"type":"run_finished","run_id":"run-1","status":"completed"}\n\n',
     ]);
     const listSessionArtifacts = vi.fn().mockResolvedValue({ artifacts: [] });
-    mockRequireRuntimeClient.mockResolvedValue({
+    setAdmittedRuntime({
       sdk: {
         listSessionArtifacts,
       },
@@ -1976,13 +2086,13 @@ describe("chat existing run stream route", () => {
     } as never);
 
     const request = new Request(
-      "http://web.test/api/chats/web-chat-1/stream?runId=run-1",
+      "http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=run-1",
       {
         method: "GET",
       },
     );
     Object.defineProperty(request, "nextUrl", {
-      value: new URL("http://web.test/api/chats/web-chat-1/stream?runId=run-1"),
+      value: new URL("http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=run-1"),
     });
 
     const response = await GET(request as never, {
@@ -2026,7 +2136,7 @@ describe("chat existing run stream route", () => {
     const backend = makeBackendFrameStream([
       'data: {"type":"session_info","session_id":"wrong-session","run_id":"run-1"}\n\n',
     ]);
-    mockRequireRuntimeClient.mockResolvedValue({
+    setAdmittedRuntime({
       sdk: {
         listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
       },
@@ -2037,11 +2147,11 @@ describe("chat existing run stream route", () => {
       }),
     } as never);
     const request = new Request(
-      "http://web.test/api/chats/web-chat-1/stream?runId=run-1",
+      "http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=run-1",
       { method: "GET" },
     );
     Object.defineProperty(request, "nextUrl", {
-      value: new URL("http://web.test/api/chats/web-chat-1/stream?runId=run-1"),
+      value: new URL("http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=run-1"),
     });
 
     const response = await GET(request as never, {
@@ -2073,14 +2183,14 @@ describe("chat existing run stream route", () => {
     );
   });
 
-  it("fails the local run state when a backend stream event has a malformed cursor", async () => {
+  it("ignores a malformed event cursor but requires a terminal receipt", async () => {
     const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendFrameStream([
       'data: {"type":"session_info","session_id":"runtime-session-1","run_id":"run-1"}\n\n',
       'data: {"type":"run_input_queued","run_id":"run-1","index":"4"}\n\n',
       'data: {"type":"text_done","full_text":"should not win"}\n\n',
     ]);
-    mockRequireRuntimeClient.mockResolvedValue({
+    setAdmittedRuntime({
       sdk: {
         listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
       },
@@ -2091,11 +2201,11 @@ describe("chat existing run stream route", () => {
       }),
     } as never);
     const request = new Request(
-      "http://web.test/api/chats/web-chat-1/stream?runId=run-1",
+      "http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=run-1",
       { method: "GET" },
     );
     Object.defineProperty(request, "nextUrl", {
-      value: new URL("http://web.test/api/chats/web-chat-1/stream?runId=run-1"),
+      value: new URL("http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=run-1"),
     });
 
     const response = await GET(request as never, {
@@ -2116,18 +2226,15 @@ describe("chat existing run stream route", () => {
     expect(body).not.toContain("Malformed stream event index.");
     expect(body).toContain("should not win");
     expect(backend.cancel).not.toHaveBeenCalled();
-    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
-      "user-a",
-      "web-chat-1",
-      undefined,
-    );
+    expect(mockSetChatActiveRun).not.toHaveBeenCalledWith("user-a", "web-chat-1", undefined);
+    expect(body).toContain("stream_observation_interrupted");
     expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
       "user-a",
       "web-chat-1",
       "assistant-1",
       expect.objectContaining({
         content: "should not win",
-        status: "complete",
+        status: "streaming",
       }),
     );
     expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalledWith(

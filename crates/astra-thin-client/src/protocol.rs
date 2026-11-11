@@ -54,8 +54,6 @@ pub struct ChatStreamRequest {
     /// Tool names this edge instance can run (bash, fs, git, …).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conversation_authority: Option<astra_turn_types::ConversationAuthorityEnvelopeV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,7 +94,6 @@ impl ChatStreamRequest {
             is_plan_subtask: None,
             edge_executor_id: None,
             capabilities: Vec::new(),
-            conversation_authority: None,
         }
     }
 }
@@ -198,6 +195,25 @@ pub struct SessionTranscriptToolResult {
     pub status: Option<String>,
     #[serde(default)]
     pub duration_ms: Option<u64>,
+}
+
+/// A separate C3 cursor domain; indices are never C1 transcript item sequences.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunActivityPage {
+    pub session_id: String,
+    pub run_id: String,
+    /// Immutable root C3 source; event indices belong to this run.
+    pub source_run_id: String,
+    pub events: Vec<RunActivityEvent>,
+    pub next_before_event_idx: Option<i64>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunActivityEvent {
+    pub event_idx: i64,
+    /// Missing/oversized evidence is explicit, never reconstructed as success.
+    pub event: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1176,7 +1192,7 @@ mod tests {
     fn chat_stream_request_serde_roundtrip() {
         let r = ChatStreamRequest {
             message: "hi".into(),
-            conversation_authority: None,
+
             parts: vec![json!({"type": "text", "text": "hi"})],
             attachments: vec![json!({"id": "att-1", "kind": "file"})],
             session_id: Some("s-1".into()),

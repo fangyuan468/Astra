@@ -4,10 +4,9 @@
 
 use super::model::{CategoryKind, ContextBreakdown, PressureBand, summarize_session_read_activity};
 use astra_turn_core::context_assembly_trace::{
-    Alternative, CompressionMethod, ContextAssemblyTrace, DecisionExplanation, DecisionType,
-    HistorySelectionTrace, MemoryInjection, MemoryRejection, MemorySelection, MemorySource,
-    PromptContextSignals, PromptGuidanceSignals, RejectionReason, SkillInjection,
-    SystemPromptBreakdown, TokenBudgetTrace, TurnCompression, TurnRetention, VisibleTool,
+    ContextAssemblyTrace, HistorySelectionTrace, MemoryInjection, MemoryRejection, MemorySelection,
+    MemorySource, PromptContextSignals, PromptGuidanceSignals, RejectionReason, SkillInjection,
+    SystemPromptBreakdown, TokenBudgetTrace, TurnRetention, VisibleTool,
 };
 
 fn trace(max: u32, sys: u32, hist: u32, mem: u32, tools: u32, user: u32) -> ContextAssemblyTrace {
@@ -306,51 +305,6 @@ fn skills_sorted_desc_by_tokens() {
 // ─── History summary ───────────────────────────────────────────────
 
 #[test]
-fn history_summary_counts_retained_compressed_dropped() {
-    let mut t = trace(100_000, 1_000, 5_000, 0, 0, 0);
-    t.history = HistorySelectionTrace {
-        total_turns_available: 10,
-        turns_retained: vec![TurnRetention {
-            turn_index: 0,
-            role: "user".into(),
-            tokens: 200,
-            has_tool_calls: false,
-            content_preview: String::new(),
-        }],
-        turns_compressed: vec![
-            TurnCompression {
-                turn_index: 1,
-                role: "assistant".into(),
-                original_tokens: 400,
-                compressed_tokens: 80,
-                compression_method: CompressionMethod::ReactiveCompact,
-                information_lost: Vec::new(),
-            },
-            TurnCompression {
-                turn_index: 2,
-                role: "assistant".into(),
-                original_tokens: 300,
-                compressed_tokens: 60,
-                compression_method: CompressionMethod::ReactiveCompact,
-                information_lost: Vec::new(),
-            },
-        ],
-        turns_dropped: vec![3, 4, 5],
-        compression_stages: vec![],
-        compression_ratio: 0.2,
-        tokens_before: 10_000,
-        tokens_after: 2_000,
-    };
-    let b = ContextBreakdown::from_trace(&t);
-    assert_eq!(b.history.total_turns, 10);
-    assert_eq!(b.history.retained, 1);
-    assert_eq!(b.history.compressed, 2);
-    assert_eq!(b.history.dropped, 3);
-    assert_eq!(b.history.tokens_before, 10_000);
-    assert_eq!(b.history.tokens_after, 2_000);
-}
-
-#[test]
 fn history_summary_is_empty_when_trace_has_no_history_data() {
     let t = trace(100_000, 1_000, 5_000, 0, 0, 0);
     let b = ContextBreakdown::from_trace(&t);
@@ -475,32 +429,6 @@ fn prompt_signals_empty_when_no_flags_set() {
     assert!(b.prompt_signals.is_empty());
 }
 
-// ─── Decisions ─────────────────────────────────────────────────────
-
-#[test]
-fn decisions_populated_from_explanations() {
-    let mut t = trace(100_000, 1_000, 0, 0, 0, 0);
-    t.explanations = vec![DecisionExplanation {
-        decision_type: DecisionType::ToolSurface {
-            visible_tools: vec!["bash".into(), "read_file".into()],
-        },
-        reasoning: "Query mentioned files and shell commands.".into(),
-        alternatives_considered: vec![Alternative {
-            description: "grep-only shortlist".into(),
-            score: 0.4,
-            why_not_chosen: "user's prompt referenced shell execution".into(),
-        }],
-        confidence: 0.82,
-    }];
-    let b = ContextBreakdown::from_trace(&t);
-    assert_eq!(b.decisions.len(), 1);
-    let d = &b.decisions[0];
-    assert!(d.label.contains("Tool surface"));
-    assert!(d.label.contains("bash"));
-    assert!((d.confidence - 0.82).abs() < 0.001);
-    assert_eq!(d.alternatives.len(), 1);
-}
-
 // ─── Session summary ───────────────────────────────────────────────
 
 // ─── Selected skill fallback + Compaction section ──────────────────
@@ -550,38 +478,6 @@ fn compaction_section_empty_when_no_events_and_not_triggered() {
 }
 
 #[test]
-fn compaction_section_populated_from_trace_and_snapshot() {
-    use super::model::ContextSnapshot;
-    let mut t = trace(100_000, 1_000, 10_000, 0, 0, 0);
-    t.token_budget.compression_triggered = true;
-    t.history.tokens_before = 15_000;
-    t.history.tokens_after = 8_000;
-    t.history.turns_compressed = vec![TurnCompression {
-        turn_index: 3,
-        role: "assistant".into(),
-        original_tokens: 5_000,
-        compressed_tokens: 500,
-        compression_method: CompressionMethod::ReactiveCompact,
-        information_lost: vec![
-            "Tool outputs from turn 3 were truncated".into(),
-            "Assistant reasoning shortened to 1 sentence".into(),
-        ],
-    }];
-    let mut snap = ContextSnapshot::default();
-    snap.compressed_turns = vec![3, 7, 12];
-    let b = ContextBreakdown::from_trace_with(&t, &snap);
-    assert!(b.compaction.triggered_this_turn);
-    assert_eq!(b.compaction.compressed_turns, vec![3, 7, 12]);
-    assert_eq!(b.compaction.events.len(), 1);
-    let e = &b.compaction.events[0];
-    assert_eq!(e.turn_index, 3);
-    assert!(e.method.contains("ReactiveCompact"));
-    assert_eq!(e.original_tokens, 5_000);
-    assert_eq!(e.information_lost.len(), 2);
-    assert_eq!(b.compaction.tokens_saved(), 7_000);
-}
-
-#[test]
 fn session_summary_flows_through_snapshot() {
     use super::model::{ContextSnapshot, SessionSummary};
     let t = trace(100_000, 1_000, 0, 0, 0, 0);
@@ -625,4 +521,40 @@ fn system_sections_populated_from_scalar_fields_and_zero_filtered() {
     let b = ContextBreakdown::from_trace(&t);
     let names: Vec<&str> = b.system_sections.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, vec!["Persona", "Environment"]);
+}
+
+#[test]
+fn admission_history_distinguishes_unavailable_empty_and_observed_input() {
+    use super::model::HistoryEvidenceSource;
+    let mut trace = trace(100_000, 1_000, 5_000, 0, 0, 0);
+    trace.token_budget.compression_triggered = true;
+    let unavailable = ContextBreakdown::from_trace(&trace);
+    assert_eq!(
+        unavailable.history.evidence_source,
+        HistoryEvidenceSource::Unavailable
+    );
+    assert!(unavailable.compaction.triggered_this_turn);
+    trace.history = Some(HistorySelectionTrace::default());
+    let empty = ContextBreakdown::from_trace(&trace);
+    assert!(!empty.history.is_empty());
+    assert!(empty.history.turns.is_empty());
+    assert_eq!(
+        empty.history.evidence_source,
+        HistoryEvidenceSource::AdmissionInput
+    );
+    trace.history = Some(HistorySelectionTrace {
+        turns_retained: vec![TurnRetention {
+            turn_index: 0,
+            role: "assistant".into(),
+            tokens: 41,
+            has_tool_calls: true,
+            content_preview: "submitted tool evidence".into(),
+        }],
+        total_tokens: 41,
+    });
+    let observed = ContextBreakdown::from_trace(&trace);
+    assert_eq!(observed.history.total_tokens, 41);
+    assert_eq!(observed.history.turns[0].preview, "submitted tool evidence");
+    assert!(observed.history.turns[0].has_tool_calls);
+    assert!(observed.compaction.triggered_this_turn);
 }

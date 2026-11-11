@@ -8,8 +8,6 @@
 //! `messages: Vec<Value>` + [`SessionStateCompact`]. Prompt-facing history is
 //! a projection of this state, not the stored source of truth.
 
-#[cfg(feature = "db-store")]
-pub mod db_store;
 pub mod file_store;
 pub mod manager;
 
@@ -346,30 +344,13 @@ pub fn materialize(entries: &[CslEntry]) -> Result<MaterializedState, Materializ
     })
 }
 
-// ─── Append metadata ───────────────────────────────────────────────────────
-
-/// Metadata carried alongside each [`CslStore::append`] call.
-/// `FileCslStore` ignores these (JSONL has no columns); `DbCslStore` writes
-/// them to dedicated DB columns for audit/query.
-#[derive(Debug, Clone, Default)]
-pub struct AppendMeta {
-    pub trace_id: Option<String>,
-    pub message_count: Option<u32>,
-}
-
 // ─── Store trait ────────────────────────────────────────────────────────────
 
-/// Persistence backend for the CSL. Implementations exist for local files
-/// ([`file_store::FileCslStore`]) and database ([`db_store::DbCslStore`]).
+/// Persistence interface for local conversation state logs.
 #[async_trait]
 pub trait CslStore: Send + Sync {
     /// Append an entry to the log for `session_id`.
-    async fn append(
-        &self,
-        session_id: &str,
-        entry: &CslEntry,
-        meta: &AppendMeta,
-    ) -> Result<(), CslStoreError>;
+    async fn append(&self, session_id: &str, entry: &CslEntry) -> Result<(), CslStoreError>;
 
     /// Load entries from the latest [`Snapshot`](CslEntry::Snapshot) onward.
     /// Returns entries in seq order, starting with the Snapshot.
@@ -407,9 +388,7 @@ pub trait CslStore: Send + Sync {
     /// Used by GC to find which snapshots to retain without deserializing payloads.
     ///
     /// The default implementation falls back to `load_after(0)` + filter, which
-    /// deserializes every entry. Store backends with indexed metadata (e.g.
-    /// [`DbCslStore`](db_store::DbCslStore) with `entry_type` column) should
-    /// override this to avoid the deserialization cost.
+    /// deserializes every entry.
     async fn snapshot_seqs(&self, session_id: &str) -> Result<Vec<u64>, CslStoreError> {
         validate_session_id(session_id)?;
         let entries = self.load_after(session_id, 0).await?;

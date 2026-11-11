@@ -23,6 +23,10 @@ name = "system_matrix_http_e2e"
 path = "tests/system_matrix_http_e2e/main.rs"
 required-features = ["e2e-hooks"]
 
+[[test]]
+name = "chat_sql_budget"
+required-features = ["e2e-hooks"]
+
 [[bin]]
 name = "astra-server"
 path = "src/main.rs"
@@ -31,7 +35,12 @@ path = "src/main.rs"
 name = "moi_fresh_astra"
 required-features = ["moi-compat-tests"]
 
+[[test]]
+name = "client_compatibility"
+required-features = ["moi-compat-tests"]
+
 [dependencies]
+astra-build-info.workspace = true
 crc32fast = "1.4"
 dirs = "6.0.0"
 fastrand = "2"
@@ -52,7 +61,7 @@ astra-server-types = { workspace = true, features = ["server"] }
 astra-sync-protocol.workspace = true
 astra-mcp.workspace = true
 astra-skills.workspace = true
-astra-turn-core = { workspace = true, features = ["db-store"] }
+astra-turn-core.workspace = true
 astra-turn-types.workspace = true
 astra-services.workspace = true
 astra-tools.workspace = true
@@ -62,6 +71,7 @@ async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
+data-encoding.workspace = true
 dotenvy.workspace = true
 flate2.workspace = true
 futures-util.workspace = true
@@ -84,10 +94,13 @@ thiserror.workspace = true
 astra-harness = { workspace = true, optional = true }
 notify = { version = "8.2", default-features = false, features = ["macos_kqueue"] }
 dashmap = "6.1.0"
+indexmap = "2"
 fs2 = "0.4"
 tempfile = "3"
 
 [dev-dependencies]
+rsa = "0.9"
+jsonwebtoken.workspace = true
 astra-services = { workspace = true, features = ["e2e-hooks"] }
 astra-test-harness = { path = "../astra-test-harness" }
 astra-core = { workspace = true, features = ["dev-defaults"] }

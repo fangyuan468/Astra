@@ -98,32 +98,22 @@ pub fn validate_path(policy: &SandboxPolicy, path: &str) -> Result<PathBuf, Sand
         return Ok(resolved);
     }
 
-    // Resolve symlinks safely: canonicalize what exists, normalize the rest.
-    // This mitigates TOCTOU attacks where a symlink is created between exists() and
-    // canonicalize(), and prevents new-file paths from silently escaping via
-    // symlinked parent directories. Note: a small race window remains between
-    // exists() and canonicalize(); true prevention requires openat2(RESOLVE_BENEATH).
-    let canonical = if resolved.exists() {
-        resolved
-            .canonicalize()
-            .map_err(|e| SandboxPathError::ResolutionFailed {
-                requested: path.to_string(),
-                reason: e.to_string(),
-            })?
-    } else {
-        // For new files: canonicalize the nearest existing ancestor to resolve
-        // symlinks in parent components, then append the remaining path segments.
-        canonicalize_parent_and_append(&resolved)?
-    };
+    // Resolve existing components before normalizing missing tails. Authorization
+    // remains subject to filesystem changes after this check.
+    let canonical = canonicalize_parent_and_append(&resolved)?;
 
-    if is_never_readable_path(&canonical) {
+    if is_never_readable_path(&resolved) || is_never_readable_path(&canonical) {
         return Err(SandboxPathError::SensitivePath {
             requested: path.to_string(),
         });
     }
 
     // Check boundary
-    if policy.is_path_allowed(&canonical) {
+    if if raw.is_absolute() {
+        policy.is_resolved_path_allowed(&canonical)
+    } else {
+        policy.is_within_project_root(&canonical)
+    } {
         Ok(canonical)
     } else {
         Err(SandboxPathError::BoundaryEscape {
@@ -181,40 +171,45 @@ pub fn normalize_path(path: &Path) -> PathBuf {
 /// Example: if `/home/user/proj/subdir` exists but `newfile.txt` doesn't, canonicalize
 /// `/home/user/proj/subdir` then append `newfile.txt`.
 pub fn canonicalize_parent_and_append(path: &Path) -> Result<PathBuf, SandboxPathError> {
-    let mut current = path.to_path_buf();
-    let mut suffix = Vec::new();
-
-    // Walk up until we find an existing ancestor
-    while !current.exists() {
-        if let Some(name) = current.file_name() {
-            suffix.push(name.to_os_string());
-        } else {
-            break;
-        }
-        if !current.pop() {
-            break;
-        }
-    }
-
-    // Canonicalize the existing ancestor
-    let canonical_base = if current.exists() {
-        current
-            .canonicalize()
-            .map_err(|e| SandboxPathError::ResolutionFailed {
-                requested: path.display().to_string(),
-                reason: e.to_string(),
-            })?
-    } else {
-        // Fallback: couldn't find any existing ancestor, normalize the whole path
-        return Ok(normalize_path(path));
+    let failure = |error: std::io::Error| SandboxPathError::ResolutionFailed {
+        requested: path.display().to_string(),
+        reason: error.to_string(),
     };
-
-    // Append the suffix in reverse order (we collected bottom-up)
-    let mut result = canonical_base;
-    for segment in suffix.into_iter().rev() {
-        result.push(segment);
+    match path.canonicalize() {
+        Ok(canonical) => return Ok(canonical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(failure(error)),
     }
 
+    let mut result = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        Path::new(".").canonicalize().map_err(failure)?
+    };
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            other => result.push(other.as_os_str()),
+        }
+        match result.canonicalize() {
+            Ok(canonical) => result = canonical,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling symlink is not a new file. Do not authorize its
+                // spelling as though it were an ordinary missing component.
+                match std::fs::symlink_metadata(&result) {
+                    Ok(metadata) if metadata.is_symlink() => return Err(failure(error)),
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(failure(error));
+                    }
+                    _ => {}
+                }
+            }
+            Err(error) => return Err(failure(error)),
+        }
+    }
     Ok(result)
 }
 
@@ -228,6 +223,109 @@ mod tests {
 
     fn strict_policy(root: &str) -> SandboxPolicy {
         SandboxPolicy::strict(root)
+    }
+
+    #[test]
+    fn relative_workspace_resolves_missing_targets_from_the_current_directory() {
+        let root = Path::new(".").canonicalize().unwrap();
+        let name = format!("astra-missing-{}", uuid::Uuid::new_v4());
+        let policy = SandboxPolicy::for_project(".");
+        assert_eq!(validate_path(&policy, ".").unwrap(), root);
+        for input in [name.clone(), format!("{name}/new/deep.txt")] {
+            assert!(!root.join(&input).exists());
+            let expected = root.join(&input);
+            assert_eq!(validate_path(&policy, &input).unwrap(), expected);
+            assert_eq!(
+                validate_path(&SandboxPolicy::for_project(&root), &input).unwrap(),
+                expected
+            );
+        }
+        let outside = format!("../{name}/new.txt");
+        assert_eq!(
+            canonicalize_parent_and_append(Path::new(&outside)).unwrap(),
+            root.parent().unwrap_or(&root).join(&name).join("new.txt")
+        );
+        if root.parent().is_some() {
+            assert!(matches!(
+                validate_path(&policy, &outside),
+                Err(SandboxPathError::BoundaryEscape { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn relative_authority_stays_in_workspace_despite_absolute_grants() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("marker"), "outside").unwrap();
+        for mut policy in [
+            SandboxPolicy::for_project(&root),
+            SandboxPolicy::strict(&root),
+        ] {
+            policy.allowed_paths.push(outside.clone());
+            for input in ["../outside/marker", "../outside/new/deep/file"] {
+                assert!(
+                    matches!(
+                        validate_path(&policy, input),
+                        Err(SandboxPathError::BoundaryEscape { .. })
+                    ),
+                    "{input}"
+                );
+            }
+            assert!(validate_path(&policy, outside.join("marker").to_str().unwrap()).is_ok());
+            assert_eq!(
+                validate_path(&policy, "new/deep/../file").unwrap(),
+                root.canonicalize().unwrap().join("new/file")
+            );
+        }
+        assert!(validate_path(&SandboxPolicy::permissive(&root), "../outside/marker").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_resolution_precedes_parent_normalization_and_missing_tails() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let outside = temp.path().join("outside/child");
+        std::fs::create_dir_all(root.join("inside")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("external")).unwrap();
+        symlink(root.join("inside"), root.join("internal")).unwrap();
+        symlink(&root, temp.path().join("alias")).unwrap();
+        symlink(root.join("absent"), root.join("dangling")).unwrap();
+        symlink(root.join("loop"), root.join("loop")).unwrap();
+        let policy = SandboxPolicy::for_project(temp.path().join("alias"));
+        for input in [
+            "external",
+            "external/../marker",
+            "external/new/deep/file",
+            "missing/../external/new",
+        ] {
+            assert!(
+                matches!(
+                    validate_path(&policy, input),
+                    Err(SandboxPathError::BoundaryEscape { .. })
+                ),
+                "{input}"
+            );
+        }
+        assert_eq!(
+            validate_path(&policy, "internal/new/deep").unwrap(),
+            root.canonicalize().unwrap().join("inside/new/deep")
+        );
+        for input in ["dangling", "dangling/new", "loop", "loop/new"] {
+            assert!(
+                matches!(
+                    validate_path(&policy, input),
+                    Err(SandboxPathError::ResolutionFailed { .. })
+                ),
+                "{input}"
+            );
+        }
     }
 
     // ── Permissive isolation ─────────────────────────────────────────────

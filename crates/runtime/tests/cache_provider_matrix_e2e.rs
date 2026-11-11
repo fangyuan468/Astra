@@ -2,7 +2,7 @@
 #![cfg(feature = "e2e-hooks")]
 
 use astra_runtime::server::provider_test_support::{
-    InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+    ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
     bind_server_workspace, loop_state, server_host_builder,
 };
 use astra_runtime::server::tool_transport::{
@@ -87,6 +87,18 @@ const PROVIDER_MATRIX: &[ProviderCase] = &[
         }),
     },
     ProviderCase {
+        label: "prefix-after-user-all-context",
+        provider: "openai",
+        model: "prefix-after-user-fixture",
+        is_marker_isolated: false,
+        cache_capability: Some(CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::TailAfterUser,
+            volatile_delivery: VolatileDeliveryPolicy::All,
+            reuse_scope: Some(CacheReuseScope::ConversationTurns),
+        }),
+    },
+    ProviderCase {
         label: "minimax",
         provider: "openai",
         model: "MiniMax-M2.7",
@@ -149,7 +161,7 @@ fn response(case: ProviderCase, text: &str, call: Option<(&str, &str)>) -> Provi
                 message["tool_calls"] = calls;
             }
             ProviderResponse::OpenAi(
-                json!({"id":format!("native-response-{}", uuid::Uuid::new_v4()),"model":case.model,"choices":[{"index":0,"message":message,"finish_reason":if call.is_some(){"tool_calls"}else{"stop"}}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}),
+                json!({"id":format!("native-response-{}", uuid::Uuid::new_v4()),"model":case.model,"choices":[{"index":0,"message":message,"finish_reason":if call.is_some(){"tool_calls"}else{"stop"}}],"usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}),
             )
         }
         other => panic!("unsupported explicit native provider {other}"),
@@ -162,7 +174,7 @@ fn distinct_native_usage(mut response: ProviderResponse, index: usize) -> Provid
     match &mut response {
         ProviderResponse::OpenAi(body) => {
             body["usage"] = json!({
-                "prompt_tokens":prompt,"completion_tokens":completion,"total_tokens":prompt + completion
+                "prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":prompt,"completion_tokens":completion,"total_tokens":prompt + completion
             })
         }
         ProviderResponse::Anthropic(body) => {
@@ -356,7 +368,7 @@ async fn matrix_actual_tool_and_user_journeys_preserve_native_prefix_and_pairing
         std::fs::write(workspace.path().join("a.txt"), "actual evidence alpha\n").unwrap();
         std::fs::write(workspace.path().join("b.txt"), "actual evidence beta\n").unwrap();
         let session = format!("matrix-{}", uuid::Uuid::new_v4());
-        let ledger = InferenceLedgerFixture::default();
+        let ledger = ProviderObservationsFixture::default();
         let mut host = server_host_builder(
             &gateway,
             &ledger,
@@ -500,7 +512,7 @@ async fn matrix_runtime_injections_keep_canonical_history_and_delivery_policy() 
             vec![response(case, "The explanation is complete.", None)],
         )])
         .await;
-        let ledger = InferenceLedgerFixture::default();
+        let ledger = ProviderObservationsFixture::default();
         let session = format!("volatile-{}", uuid::Uuid::new_v4());
         let mut host = server_host_builder(
             &gateway,
@@ -593,10 +605,13 @@ async fn matrix_runtime_injections_keep_canonical_history_and_delivery_policy() 
 }
 
 async fn completed_read_prefix() -> Vec<Value> {
-    completed_read_state().await.messages
+    completed_read_state().await.0.messages
 }
 
-async fn completed_read_state() -> astra_runtime::turn::agentic_loop::host::AgenticLoopState {
+async fn completed_read_state() -> (
+    astra_runtime::turn::agentic_loop::host::AgenticLoopState,
+    ProviderGateway,
+) {
     let case = *PROVIDER_MATRIX
         .iter()
         .find(|case| case.label == "openai-gpt")
@@ -617,7 +632,7 @@ async fn completed_read_state() -> astra_runtime::turn::agentic_loop::host::Agen
     )
     .unwrap();
     let session = format!("prefix-{}", uuid::Uuid::new_v4());
-    let ledger = InferenceLedgerFixture::default();
+    let ledger = ProviderObservationsFixture::default();
     let mut host =
         server_host_builder(&gateway, &ledger, &session, case.provider, case.model, None)
             .with_static_tool_catalog_admissible(true)
@@ -643,7 +658,7 @@ async fn completed_read_state() -> astra_runtime::turn::agentic_loop::host::Agen
     assert_eq!(ledger.attempt_count(), 2);
     ledger.assert_quiescent();
     gateway.assert_complete();
-    state
+    (state, gateway)
 }
 
 #[tokio::test]
@@ -670,7 +685,7 @@ async fn deepseek_required_settlement_keeps_stable_system_prefix() {
         )])
         .await;
         let session = format!("settlement-{}", uuid::Uuid::new_v4());
-        let ledger = InferenceLedgerFixture::default();
+        let ledger = ProviderObservationsFixture::default();
         let mut host = server_host_builder(
             &gateway,
             &ledger,
@@ -740,14 +755,14 @@ async fn append_only_metadata_drives_real_output_cap_continuation_and_wal() {
         model: "append-alias",
         is_marker_isolated: false,
         cache_capability: Some(CacheCapability {
-            protocol: CacheProtocol::OpenAiAutoPrefix,
+            protocol: CacheProtocol::StrictHistoryMatch,
             volatile_placement: VolatilePlacement::AppendOnlyUserTail,
-            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            volatile_delivery: VolatileDeliveryPolicy::All,
             reuse_scope: Some(CacheReuseScope::ConversationTurns),
         }),
     };
-    let ProviderResponse::OpenAi(mut partial) =
-        response(case, "Partial answer with more detail to follow.", None)
+    // Exercise UTF-8 merging after a real provider length terminal and retry.
+    let ProviderResponse::OpenAi(mut partial) = response(case, "论文实验结果尚未讲完。", None)
     else {
         unreachable!()
     };
@@ -757,11 +772,11 @@ async fn append_only_metadata_drives_real_output_cap_continuation_and_wal() {
         |request| request.path == "/v1/chat/completions" && request.body["model"] == "append-alias",
         vec![
             ProviderResponse::OpenAi(partial),
-            response(case, "The complete explanation is now available.", None),
+            response(case, "—实验结果与结论已补全。", None),
         ],
     )])
     .await;
-    let ledger = InferenceLedgerFixture::default();
+    let ledger = ProviderObservationsFixture::default();
     let session = format!("append-{}", uuid::Uuid::new_v4());
     let mut host = server_host_builder(
         &gateway,
@@ -787,7 +802,7 @@ async fn append_only_metadata_drives_real_output_cap_continuation_and_wal() {
         .unwrap();
     assert_eq!(
         state.final_text,
-        "Partial answer with more detail to follow.\nThe complete explanation is now available."
+        "论文实验结果尚未讲完。\n—实验结果与结论已补全。"
     );
     assert_eq!(
         state.llm_rounds_completed, 1,
@@ -795,7 +810,6 @@ async fn append_only_metadata_drives_real_output_cap_continuation_and_wal() {
     );
     assert_eq!(ledger.attempt_count(), 2);
     assert_eq!((state.total_prompt, state.total_completion), (84, 14));
-    assert_eq!(ledger.canonical_transition_hashes().len(), 2);
     ledger.assert_quiescent();
     gateway.assert_complete();
     assert_eq!(
@@ -811,7 +825,7 @@ async fn append_only_metadata_drives_real_output_cap_continuation_and_wal() {
             .messages
             .iter()
             .any(|message| message["role"] == "assistant"
-                && message["content"] == "Partial answer with more detail to follow.")
+                && message["content"] == "论文实验结果尚未讲完。")
     );
     assert!(
         state
@@ -885,7 +899,7 @@ async fn provider_switch_replaces_live_authority_without_leaking_frame_syntax() 
         ),
     ])
     .await;
-    let ledger = InferenceLedgerFixture::default();
+    let ledger = ProviderObservationsFixture::default();
     let session = format!("switch-{}", uuid::Uuid::new_v4());
     let mut state = loop_state(
         &session,
@@ -916,7 +930,6 @@ async fn provider_switch_replaces_live_authority_without_leaking_frame_syntax() 
     state.record_local_llm_round();
     assert_eq!(gateway.requests.lock().await.len(), 1);
     assert_eq!(ledger.attempt_count(), 1);
-    assert_eq!(ledger.canonical_transition_hashes().len(), 1);
     ledger.assert_quiescent();
     let old_frame = state
         .messages
@@ -980,8 +993,19 @@ async fn optional_revisions_distinguish_current_user_only_from_tail_suffix() {
             .iter()
             .find(|case| case.label == label)
             .unwrap();
-        let mut state = completed_read_state().await;
+        let (mut state, source_gateway) = completed_read_state().await;
         let canonical = state.messages.clone();
+        // This host uses a different admitted endpoint. Its public history
+        // must use the canonical ID, not the previous provider's ID.
+        let canonical_call_id = canonical
+            .iter()
+            .filter_map(|message| message["tool_calls"].as_array())
+            .flatten()
+            .find(|call| call["function"]["name"] == "read_file")
+            .and_then(|call| call["id"].as_str())
+            .expect("completed read has a canonical call ID")
+            .to_string();
+        assert_ne!(canonical_call_id, "prefix-read");
         let gateway = ProviderGateway::start(vec![ProviderScript::new(
             "current-user-only revisions",
             move |request| {
@@ -994,7 +1018,8 @@ async fn optional_revisions_distinguish_current_user_only_from_tail_suffix() {
             ],
         )])
         .await;
-        let ledger = InferenceLedgerFixture::default();
+        assert_ne!(source_gateway.base_url, gateway.base_url);
+        let ledger = ProviderObservationsFixture::default();
         let session = state.current_session_id.clone().unwrap();
         let mut host = server_host_builder(
             &gateway,
@@ -1079,15 +1104,29 @@ async fn optional_revisions_distinguish_current_user_only_from_tail_suffix() {
         assert_native_pair(
             case,
             &requests[0].body,
-            "prefix-read",
+            &canonical_call_id,
             "actual prefix evidence",
         );
         assert_native_pair(
             case,
             &requests[2].body,
-            "prefix-read",
+            &canonical_call_id,
             "actual prefix evidence",
         );
+        for request in [&requests[0], &requests[2]] {
+            assert!(!request.body.to_string().contains("prefix-read"));
+            let call = request.body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message["tool_calls"].as_array())
+                .flatten()
+                .find(|call| call["id"] == canonical_call_id)
+                .unwrap();
+            let args: Value =
+                serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(args["path"], "evidence.txt");
+        }
         assert_eq!(&a[..index], &b[..index]);
         assert_eq!(
             &a[index + 1..],

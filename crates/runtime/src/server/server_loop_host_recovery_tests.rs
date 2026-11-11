@@ -176,7 +176,7 @@ async fn recovery_effort_only_wire_can_deliver_after_the_suppressed_cap() {
         vec![stream],
     )])
     .await;
-    let ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+    let ledger = crate::server::provider_test_support::ProviderObservationsFixture::default();
     let mut execution = test_gateway_execution(
         format!("{}/v1/chat/completions", provider.base_url),
         Some(2000),
@@ -184,7 +184,7 @@ async fn recovery_effort_only_wire_can_deliver_after_the_suppressed_cap() {
     execution.thinking_capability = Some(ThinkingCapability::EffortOnly);
     execution.thinking_protocol = Some(ThinkingProtocol::ReasoningEffort);
     let mut host = test_host_builder("recovery-user", "recovery-session")
-        .with_test_inference_ledger(ledger.clone())
+        .with_provider_observations(ledger.clone())
         .with_admitted_model_execution(Some(execution))
         .build();
     let (tx, mut rx) = tokio::sync::mpsc::channel(128);
@@ -272,7 +272,8 @@ async fn assert_exhausted_provider_recovery_trace(measured: bool) {
         let mut chunk =
             json!({"choices":[{"delta":{"reasoning_content":"fixture"},"finish_reason":null}]});
         if measured {
-            chunk["usage"] = json!({"prompt_tokens":8,"completion_tokens":3});
+            chunk["usage"] =
+                json!({"prompt_tokens":8,"prompt_cache_miss_tokens":8,"completion_tokens":3});
         }
         ProviderResponse::Stream {
             content_type: "text/event-stream",
@@ -286,9 +287,9 @@ async fn assert_exhausted_provider_recovery_trace(measured: bool) {
         vec![response(), response()],
     )])
     .await;
-    let ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+    let ledger = crate::server::provider_test_support::ProviderObservationsFixture::default();
     let mut host = test_host_builder("recovery-user", "exhausted-recovery")
-        .with_test_inference_ledger(ledger.clone())
+        .with_provider_observations(ledger.clone())
         .with_admitted_model_execution(Some(test_gateway_execution(
             format!("{}/v1/chat/completions", provider.base_url),
             Some(2000),
@@ -385,7 +386,7 @@ async fn clean_empty_recovery_reaches_run_finalizer_with_intervention() {
     let responses = [(8, 3), (5, 2)].map(|(input, output)| ProviderResponse::Stream {
         content_type: "text/event-stream",
         chunks: vec![format!(
-            "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"fixture\"}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{input},\"completion_tokens\":{output}}}}}\n\ndata: [DONE]\n\n"
+            "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"fixture\"}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens_details\":{{\"cached_tokens\":0,\"cache_write_tokens\":0}},\"prompt_tokens\":{input},\"completion_tokens\":{output}}}}}\n\ndata: [DONE]\n\n"
         ).into_bytes()],
         release_before_chunk: None,
     });
@@ -395,9 +396,9 @@ async fn clean_empty_recovery_reaches_run_finalizer_with_intervention() {
         responses.into(),
     )])
     .await;
-    let ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+    let ledger = crate::server::provider_test_support::ProviderObservationsFixture::default();
     let mut host = test_host_builder("empty-user", "empty-recovery")
-        .with_test_inference_ledger(ledger.clone())
+        .with_provider_observations(ledger.clone())
         .with_admitted_model_execution(Some(test_gateway_execution(
             format!("{}/v1/chat/completions", provider.base_url),
             Some(2000),
@@ -414,7 +415,19 @@ async fn clean_empty_recovery_reaches_run_finalizer_with_intervention() {
     state.user_intent = state.message.clone();
     let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
     crate::server::run::lifecycle::tests::assert_empty_recovery_run_finalization(outcome, &state);
-    assert!(state.final_text.contains("unfinished"));
+    assert!(state.final_text.is_empty());
+    assert!(
+        state
+            .interruption
+            .as_ref()
+            .is_some_and(|record| record.user_message.contains("unfinished"))
+    );
+    assert!(
+        state
+            .messages
+            .iter()
+            .all(|message| message["role"] != "assistant")
+    );
     assert_eq!(provider.requests.lock().await.len(), 2);
     assert_eq!(state.qualified_usage.unwrap().input_tokens(), Some(13));
     assert_eq!(state.qualified_usage.unwrap().output_tokens(), Some(5));
@@ -450,7 +463,7 @@ async fn clean_empty_recovery_reaches_run_finalizer_with_intervention() {
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-async fn provider_completion_trace_survives_ledger_terminalization_deadline() {
+async fn provider_completion_trace_needs_no_inference_receipt() {
     let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
     let _budget = EnvVarGuard::set("ASTRA_LLM_TOTAL_BUDGET_S", "1");
     let provider = ProviderGateway::start(vec![ProviderScript::new(
@@ -458,14 +471,13 @@ async fn provider_completion_trace_survives_ledger_terminalization_deadline() {
         |request| request.path == "/v1/chat/completions",
         vec![ProviderResponse::OpenAi(json!({
             "choices":[{"message":{"content":"completed provider result"},"finish_reason":"stop"}],
-            "usage":{"prompt_tokens":8,"completion_tokens":3}
+            "usage":{"prompt_tokens":8,"prompt_cache_miss_tokens":8,"completion_tokens":3}
         }))],
     )])
     .await;
-    let ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
-    ledger.delay_next_provider_terminalization(Duration::from_secs(2));
+    let ledger = crate::server::provider_test_support::ProviderObservationsFixture::default();
     let mut host = test_host_builder("trace-user", "ledger-trace")
-        .with_test_inference_ledger(ledger.clone())
+        .with_provider_observations(ledger.clone())
         .with_admitted_model_execution(Some(test_gateway_execution(
             format!("{}/v1/chat/completions", provider.base_url),
             Some(2000),
@@ -478,12 +490,8 @@ async fn provider_completion_trace_survives_ledger_terminalization_deadline() {
     state.message = "return the supplied result".into();
     state.user_intent = state.message.clone();
     state.step_recorder.begin_turn(0);
-    let error = host
-        .execute_turn(&mut state)
-        .await
-        .err()
-        .expect("unsettled receipt grants no response authority");
-    assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
+    let result = host.execute_turn(&mut state).await.unwrap();
+    assert!(result.error_kind.is_none());
     use astra_pipeline::step_protocol::StepEventType;
     let traces = state.step_recorder.events();
     let completed: Vec<_> = traces
@@ -497,26 +505,439 @@ async fn provider_completion_trace_survives_ledger_terminalization_deadline() {
             .any(|event| event.event_type == StepEventType::LlmRoundFailed)
     );
     let payload = completed[0].payload.as_ref().unwrap();
-    assert_eq!(payload["failure_stage"], "settlement");
-    assert_eq!(payload["dispatch_started"], true);
-    assert_eq!(payload["provider_completed"], true);
-    assert_eq!(payload["error_kind"], "database_error");
-    let returned: Value = serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
-    assert_eq!(returned["qualified_usage"]["input_tokens"], 8);
-    assert_eq!(returned["qualified_usage"]["output_tokens"], 3);
-    assert_eq!(payload["qualified_usage"], returned["qualified_usage"]);
-    assert!(payload["qualified_usage"]["cached_input_tokens"].is_null());
-    assert!(payload["qualified_usage"]["cache_creation_tokens"].is_null());
+    assert_eq!(payload["input_tokens"], 8);
+    assert_eq!(payload["output_tokens"], 3);
+    let usage = result.accum.qualified_usage.unwrap().to_json();
+    assert_eq!(usage["input_tokens"], 8);
+    assert_eq!(usage["output_tokens"], 3);
+    assert!(usage["cached_input_tokens"].is_null());
+    assert!(usage["cache_creation_tokens"].is_null());
     assert_eq!(provider.requests.lock().await.len(), 1);
-    // The foreground transfers settlement. The global coordinator waiter is
-    // a no-op in lib tests; wait for this fixture's exact owner facts instead.
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while !ledger.is_quiescent() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("detached exact settlement must converge");
     ledger.assert_quiescent();
     provider.assert_complete();
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+async fn completed_empty_response_uses_loop_settlement_once() {
+    let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+    for final_text in ["settled answer", ""] {
+        let response = |text: &str| {
+            ProviderResponse::Stream {
+            content_type: "text/event-stream",
+            chunks: vec![format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices":[{"delta":{"content":text},"finish_reason":"stop"}],"usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":8,"completion_tokens":3}})).into_bytes()],
+            release_before_chunk: None,
+        }
+        };
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "complete empty response then one settlement",
+            |request| request.path == "/v1/chat/completions",
+            vec![response(""), response(final_text)],
+        )])
+        .await;
+        let ledger = crate::server::provider_test_support::ProviderObservationsFixture::default();
+        let mut host = test_host_builder("settlement-user", "empty-settlement")
+            .with_provider_observations(ledger.clone())
+            .with_admitted_model_execution(Some(test_gateway_execution(
+                format!("{}/v1/chat/completions", provider.base_url),
+                Some(2000),
+            )))
+            .build();
+        let mut state = create_durable_execution_test_state("empty-settlement");
+        state
+            .messages
+            .push(json!({"role":"user","content":"answer from available evidence"}));
+        state.message = "answer from available evidence".into();
+        state.user_intent = state.message.clone();
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1].body["messages"]
+                .to_string()
+                .contains("textless_provider_response")
+        );
+        drop(requests);
+        assert_eq!(state.final_text, final_text);
+        assert_eq!(
+            state.interruption.as_ref().map(|r| r.kind),
+            final_text
+                .is_empty()
+                .then_some(astra_turn_core::interruption::InterruptionKind::EmptyCompletion)
+        );
+        ledger.assert_quiescent();
+        provider.assert_complete();
+    }
+}
+
+#[tokio::test]
+async fn length_continuation_failure_keeps_inclusive_input_when_cache_lane_becomes_unknown() {
+    let temp = tempfile::tempdir().unwrap();
+    let _journal = astra_services::session_journal::JournalDirGuard::new(temp.path());
+    let provider = ProviderGateway::start(vec![ProviderScript::new(
+        "length then failure", |request| request.path == "/v1/chat/completions",
+        vec![
+            ProviderResponse::OpenAi(json!({
+                "choices":[{"message":{"content":"partial"},"finish_reason":"length"}],
+                "usage":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":40},"completion_tokens":2}
+            })),
+            ProviderResponse::Json { status: axum::http::StatusCode::BAD_REQUEST,
+                body: json!({"error":{"message":"continuation rejected"}}) },
+        ],
+    )]).await;
+    let session = "00000000-0000-0000-0000-000000000129";
+    let ledger = crate::server::provider_test_support::ProviderObservationsFixture::default();
+    let mut host = test_host_builder("input-retry-owner", session)
+        .with_provider_observations(ledger.clone())
+        .with_admitted_model_execution(Some(test_gateway_execution(
+            format!("{}/v1/chat/completions", provider.base_url),
+            Some(2000),
+        )))
+        .build();
+    let mut state = create_durable_execution_test_state(session);
+    state
+        .messages
+        .push(json!({"role":"user","content":"continue the answer"}));
+    state.message = "continue the answer".into();
+    state.user_intent = state.message.clone();
+    state.step_recorder.begin_turn(0);
+    let error = host
+        .execute_turn(&mut state)
+        .await
+        .err()
+        .expect("second provider call fails");
+    assert_eq!(
+        provider.requests.lock().await.len(),
+        2,
+        "unexpected failure boundary: {}",
+        error.message
+    );
+    assert_eq!(
+        state.provider_input_tokens(),
+        100,
+        "unknown retry qualification must not erase the observed 40-token lane"
+    );
+    assert_eq!(
+        state.total_prompt, 0,
+        "inclusive input never becomes fresh input"
+    );
+    let details: Value = serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        details["qualified_usage"]["cached_input_tokens"],
+        Value::Null
+    );
+    ledger.assert_quiescent();
+    provider.assert_complete();
+}
+
+#[tokio::test]
+async fn work_abort_settles_usage_received_before_terminal_once() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let provider = ProviderGateway::start(vec![ProviderScript::new(
+        "interrupted auxiliary stream",
+        |request| request.path == "/v1/chat/completions",
+        vec![ProviderResponse::Stream {
+            content_type: "text/event-stream",
+            chunks: vec![
+                b"data: {\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":3},\"choices\":[{\"delta\":{\"content\":\"seen\"}}]}\n\n".to_vec(),
+                b"data: [DONE]\n\n".to_vec(),
+            ],
+            release_before_chunk: Some((1, release.clone())),
+        }],
+    )]).await;
+    let observations = crate::server::provider_test_support::ProviderObservationsFixture::default();
+    let scope = astra_turn_types::InferenceInvocationScope::Run {
+        session_id: "aux-session".into(),
+        run_id: "aux-run".into(),
+        turn: 1,
+        round: 0,
+        operation_id: "work_test".into(),
+        logical_attempt: 0,
+    };
+    let config = summary_test_config(format!("{}/v1", provider.base_url));
+    let authority = crate::turn::llm::durable::DurableInferenceRunAuthority::new(
+        0, "owner", 0, None, None, None,
+    );
+    let client = RuntimeSummaryClient::new(config.execution_route(), 64, authority)
+        .with_observations(observations.clone(), scope);
+    let judge = SummaryClientWorkAdmissionJudge::new(Box::new(client));
+    let usage = Arc::clone(&judge.usage);
+    let handle = tokio::spawn(async move {
+        let result = judge
+            .summarize(
+                "work_test",
+                "initial",
+                &[json!({"role":"user","content":"decide"})],
+            )
+            .await;
+        (
+            result.map(|_| unreachable!("terminal remains blocked")),
+            Instant::now(),
+        )
+    });
+    let mut host = test_host_builder("aux-user", "aux-session").build();
+    host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+        purpose: SemanticJudgmentPurpose::WorkAdmission,
+        wait_node_id: None,
+        handle,
+        usage,
+        started_at: Instant::now(),
+        round_index: 0,
+        source: None,
+    });
+    observations.wait_for_measured_input(17).await;
+    host.abort_pending_work_admission().await;
+    let mut state = create_test_state();
+    let outcome = host
+        .finalize_work_admission_usage_at_turn_exit(
+            &mut state,
+            Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Cancelled,
+                "cancelled",
+            )),
+        )
+        .await;
+    assert!(outcome.is_err());
+    assert_eq!(state.provider_input_tokens(), 17);
+    assert_eq!(state.total_completion, 3);
+    assert_eq!(state.qualified_usage.unwrap().input_tokens(), None);
+    assert_eq!(state.qualified_usage.unwrap().output_tokens(), Some(3));
+    let _ = host
+        .finalize_work_admission_usage_at_turn_exit(&mut state, outcome)
+        .await;
+    assert_eq!(
+        state.provider_input_tokens(),
+        17,
+        "settlement is exactly once"
+    );
+    assert_eq!(state.total_completion, 3);
+    observations.assert_quiescent();
+    release.notify_waiters();
+    provider.assert_complete();
+}
+
+#[tokio::test]
+async fn cancelled_compaction_settles_usage_before_turn_facts_once() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let provider = ProviderGateway::start(vec![ProviderScript::new(
+        "interrupted compaction", |request| request.path == "/v1/chat/completions",
+        vec![ProviderResponse::Stream { content_type: "text/event-stream", chunks: vec![
+            b"data: {\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":3},\"choices\":[{\"delta\":{\"content\":\"seen\"}}]}\n\n".to_vec(),
+            b"data: [DONE]\n\n".to_vec(),
+        ], release_before_chunk: Some((1, release.clone())) }],
+    )]).await;
+    let observations = crate::server::provider_test_support::ProviderObservationsFixture::default();
+    let scope = astra_turn_types::InferenceInvocationScope::Run {
+        session_id: "compact-session".into(),
+        run_id: "compact-run".into(),
+        turn: 1,
+        round: 0,
+        operation_id: "compact_test".into(),
+        logical_attempt: 0,
+    };
+    let config = summary_test_config(format!("{}/v1", provider.base_url));
+    let authority = crate::turn::llm::durable::DurableInferenceRunAuthority::new(
+        0, "owner", 0, None, None, None,
+    );
+    let mut client = RuntimeSummaryClient::new(config.execution_route(), 64, authority)
+        .with_observations(observations.clone(), scope);
+    let mut host = test_host_builder("compact-user", "compact-session").build();
+    install_interrupted_summary_sink(&mut client, &host.auxiliary_summary_usage);
+    let accounted = AccountedSummaryClient::new(&client, Arc::clone(&host.auxiliary_summary_usage));
+    let messages = [json!({"role":"user","content":"summarize"})];
+    {
+        let request = accounted.summarize(
+            astra_turn_types::InferencePurpose::RequiredCompaction,
+            &messages,
+        );
+        tokio::pin!(request);
+        tokio::select! { biased; _ = observations.wait_for_measured_input(17) => {}, result = &mut request => panic!("unexpected completion: {result:?}") }
+    }
+    let mut state = create_test_state();
+    host.on_turn_usage_settlement(&mut state).await;
+    assert_eq!(state.provider_input_tokens(), 17);
+    assert_eq!(state.total_completion, 3);
+    assert_eq!(state.qualified_usage.unwrap().input_tokens(), None);
+    assert_eq!(state.qualified_usage.unwrap().output_tokens(), Some(3));
+    host.on_turn_usage_settlement(&mut state).await;
+    assert_eq!(state.provider_input_tokens(), 17);
+    assert_eq!(state.total_completion, 3);
+    observations.assert_quiescent();
+    release.notify_waiters();
+    provider.assert_complete();
+}
+
+#[tokio::test]
+async fn fenced_summary_settles_received_usage_once() {
+    for (lease_loss, input, output) in [(false, 17, Some(3)), (true, 17, None), (false, 0, None)] {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let usage = match (input, output) {
+            (17, Some(3)) => json!({"prompt_tokens":17,"completion_tokens":3}),
+            (17, None) => json!({"prompt_tokens":17}),
+            (0, None) => json!({"prompt_tokens":0}),
+            _ => unreachable!(),
+        };
+        let frame = format!(
+            "data: {}\n\n",
+            json!({"usage":usage,"choices":[{"delta":{"content":"seen"}}]})
+        )
+        .into_bytes();
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "fenced summary",
+            |request| request.path == "/v1/chat/completions",
+            vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks: vec![frame, b"data: [DONE]\n\n".to_vec()],
+                release_before_chunk: Some((1, release.clone())),
+            }],
+        )])
+        .await;
+        let observations =
+            crate::server::provider_test_support::ProviderObservationsFixture::default();
+        let scope = astra_turn_types::InferenceInvocationScope::Run {
+            session_id: "fence-session".into(),
+            run_id: "fence-run".into(),
+            turn: 1,
+            round: 0,
+            operation_id: "fence_test".into(),
+            logical_attempt: 0,
+        };
+        let cancelled = Arc::new(tokio_util::sync::CancellationToken::new());
+        let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let authority = crate::turn::llm::durable::DurableInferenceRunAuthority::new(
+            0,
+            "owner",
+            0,
+            None,
+            Some(cancelled.clone()),
+            Some(lost.clone()),
+        );
+        let config = summary_test_config(format!("{}/v1", provider.base_url));
+        let mut client = RuntimeSummaryClient::new(config.execution_route(), 64, authority)
+            .with_observations(observations.clone(), scope);
+        let mut host = test_host_builder("fence-user", "fence-session").build();
+        install_interrupted_summary_sink(&mut client, &host.auxiliary_summary_usage);
+        let accounted =
+            AccountedSummaryClient::new(&client, Arc::clone(&host.auxiliary_summary_usage));
+        let messages = [json!({"role":"user","content":"summarize"})];
+        let request = accounted.summarize(
+            astra_turn_types::InferencePurpose::RequiredCompaction,
+            &messages,
+        );
+        tokio::pin!(request);
+        tokio::select! { biased; _ = observations.wait_for_measured_input(input) => {}, result = &mut request => panic!("unexpected completion: {result:?}") }
+        if lease_loss {
+            lost.store(true, std::sync::atomic::Ordering::Release);
+        } else {
+            cancelled.cancel();
+        }
+        let error = request.await.unwrap_err();
+        assert_eq!(
+            host.auxiliary_summary_usage
+                .lock()
+                .unwrap()
+                .provider_reported,
+            1
+        );
+        assert_eq!(
+            error.kind,
+            if lease_loss {
+                astra_core::ErrorKind::ContractViolation
+            } else {
+                astra_core::ErrorKind::Cancelled
+            }
+        );
+        let mut state = create_test_state();
+        host.on_turn_usage_settlement(&mut state).await;
+        assert_eq!(state.provider_input_tokens(), input);
+        assert_eq!(state.total_completion, output.unwrap_or(0));
+        assert_eq!(state.qualified_usage.unwrap().input_tokens(), None);
+        assert_eq!(state.qualified_usage.unwrap().output_tokens(), output);
+        host.on_turn_usage_settlement(&mut state).await;
+        assert_eq!(state.provider_input_tokens(), input);
+        assert_eq!(state.total_completion, output.unwrap_or(0));
+        observations.assert_quiescent();
+        release.notify_waiters();
+        provider.assert_complete();
+    }
+}
+
+#[tokio::test]
+async fn dropped_delegation_judgment_settles_through_host() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let provider = ProviderGateway::start(vec![ProviderScript::new(
+        "interrupted delegation", |request| request.path == "/v1/chat/completions",
+        vec![ProviderResponse::Stream { content_type: "text/event-stream", chunks: vec![
+            b"data: {\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":3},\"choices\":[{\"delta\":{\"content\":\"seen\"}}]}\n\n".to_vec(),
+            b"data: [DONE]\n\n".to_vec(),
+        ], release_before_chunk: Some((1, release.clone())) }],
+    )]).await;
+    let observations = crate::server::provider_test_support::ProviderObservationsFixture::default();
+    let scope = astra_turn_types::InferenceInvocationScope::Run {
+        session_id: "delegation-session".into(),
+        run_id: "delegation-run".into(),
+        turn: 1,
+        round: 0,
+        operation_id: "delegation_test".into(),
+        logical_attempt: 0,
+    };
+    let config = summary_test_config(format!("{}/v1", provider.base_url));
+    let authority = crate::turn::llm::durable::DurableInferenceRunAuthority::new(
+        0, "owner", 0, None, None, None,
+    );
+    let mut client = RuntimeSummaryClient::new(config.execution_route(), 64, authority)
+        .with_observations(observations.clone(), scope);
+    let mut host = test_host_builder("delegation-user", "delegation-session").build();
+    install_interrupted_summary_sink(&mut client, &host.auxiliary_summary_usage);
+    let messages = [json!({"role":"user","content":"decide"})];
+    {
+        let call = host.summarize_delegation_judgment_once(
+            &client,
+            "delegation_test",
+            "initial",
+            "initial",
+            &messages,
+        );
+        tokio::pin!(call);
+        tokio::select! { biased; _ = observations.wait_for_measured_input(17) => {}, result = &mut call => panic!("unexpected completion: {result:?}") }
+    }
+    let mut state = create_test_state();
+    host.on_turn_usage_settlement(&mut state).await;
+    assert_eq!(state.provider_input_tokens(), 17);
+    assert_eq!(state.total_completion, 3);
+    assert_eq!(state.qualified_usage.unwrap().output_tokens(), Some(3));
+    host.on_turn_usage_settlement(&mut state).await;
+    assert_eq!(state.provider_input_tokens(), 17);
+    assert_eq!(state.total_completion, 3);
+    observations.assert_quiescent();
+    release.notify_waiters();
+    provider.assert_complete();
+}
+
+#[tokio::test]
+async fn tool_admission_settles_complete_work_usage_without_loss() {
+    let mut host = test_host_builder("work-user", "work-session").build();
+    host.work_admission_usage = WorkAdmissionUsage {
+        attempts: 1,
+        completed_calls: 1,
+        provider_reported: 1,
+        unpartitioned_input_tokens: 17,
+        usage: crate::turn::token_usage::TokenUsage {
+            output_tokens: 3,
+            ..Default::default()
+        },
+        qualified_usage: Some(
+            astra_turn_types::CanonicalTokenUsage::new(None, None, None, Some(3)).unwrap(),
+        ),
+    };
+    let mut state = create_test_state();
+    let outcome = host.handle_admitted_tool_invocations(&mut state, &[]).await;
+    assert!(outcome.auxiliary_usage.is_none());
+    assert_eq!(state.provider_input_tokens(), 17);
+    assert_eq!(state.total_completion, 3);
+    assert_eq!(state.qualified_usage.unwrap().output_tokens(), Some(3));
+    host.on_turn_usage_settlement(&mut state).await;
+    assert_eq!(state.provider_input_tokens(), 17);
+    assert_eq!(state.total_completion, 3);
 }

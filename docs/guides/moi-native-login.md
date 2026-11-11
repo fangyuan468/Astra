@@ -41,6 +41,56 @@ selection and the normal server-side IAM decision. Login does not perform a paid
 model request or require a positive balance. Invalid default-model configuration
 does reject login preparation, without replacing an existing local session.
 
+## Sign in from a headless terminal
+
+On a server, container, remote shell or other machine without a browser, select
+the trusted MOI deployment and run:
+
+```sh
+astra login --device-code
+```
+
+This opt-in command requires device authorization to be enabled by that UC
+deployment. It prints a verification URL and a short code. Open the URL in a
+browser on another device, enter the code, check the account and permissions,
+and explicitly approve or deny access. Only approve a request that you started.
+The terminal polls UC; it does not expose a callback port or launch a browser.
+There is no automatic fallback from ordinary browser login or `--manual`.
+
+Device login uses a fresh nonce and S256 PKCE and validates the same issuer,
+ID token and MOI/Astra bootstraps as browser login. The grant secret is held only
+in memory. Pending, denial, expiry and failures before publication preserve the
+previous local sign-in. Ctrl+C stops authorization waiting. An already-sent token
+request is settled for up to 15 seconds after cancellation or the local deadline;
+if cancellation wins, Astra attempts to revoke a received token without publishing.
+An uncertain token response is reported explicitly and never replays the grant.
+
+Product preparation has a 60-second timeout and can be cancelled. Credential
+publication waits at most 10 seconds for the local lock and checks cancellation
+again immediately before admitting the atomic rename. Cancellation is joined,
+not detached: it cannot cause a later background credential replacement. Once
+commit is admitted, the operation settles rather than claiming it was cancelled.
+These budgets do not guarantee a wall-clock bound for a stalled filesystem call.
+If directory sync fails after rename, the new sign-in is already visible: Astra
+warns that crash durability is unconfirmed and still attempts to revoke the old
+session. It never treats that outcome as a failed, uncommitted login or revokes
+the newly saved session. Revocation attempts have a separate two-second timeout.
+
+The CLI waits at most 600 seconds, or the server's shorter device-code lifetime.
+A longer server lifetime is accepted, but reaching the local limit reports a
+waiting timeout, not a claim that the server grant has expired. Polling intervals
+and retry delays are never shortened to fit one last request before the deadline.
+Ambiguous token-request failures, including 429 and 5xx, are not automatically
+retried because they may follow consumption of the grant. If device-code
+creation is rate limited, wait before retrying; a temporarily unavailable UC
+service is reported separately from a rejected request.
+
+UC binds the browser identity to the original device session; Keycloak owns the
+single final approval/denial and the resulting grant. Existing browser SSO does
+not approve a device automatically. Each approved terminal gets an independent
+native session and then uses the existing refresh, logout and moi-cli credential
+helper. This feature does not extend the deployment's session lifetimes.
+
 ## Credential ownership
 
 The canonical store is `~/.moi/auth.json`; `MOI_AUTH_DIR` selects an isolated

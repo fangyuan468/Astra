@@ -30,15 +30,16 @@ function makeRuntime(overrides: Partial<{ accessToken: string | null }> = {}) {
     tokenExpiresAtMs: null as number | null,
   };
 
+  const getTokens = vi.fn((): { accessToken: string | null; refreshToken: string | null } => ({ accessToken: mockConfig.accessToken, refreshToken: mockConfig.refreshToken }));
   MockedWRC.mockImplementation(function () {
     return {
       config: mockConfig,
-      sdk: { listModels: mockListModels },
+      sdk: { listModels: mockListModels, getTokens },
     };
   });
 
   const client = new WebRuntimeClient(mockConfig as any);
-  return { client, mockListModels };
+  return { client, mockListModels, getTokens };
 }
 
 describe("resolveModelOfferingSelection", () => {
@@ -80,6 +81,13 @@ describe("resolveModelOfferingSelection", () => {
       code: "invalid_selection",
     });
     expect(mockListModels).not.toHaveBeenCalled();
+  });
+
+  it("checks live credentials after logout rather than initialization config", async () => {
+    const { client, getTokens } = makeRuntime();
+    getTokens.mockReturnValue({ accessToken: null, refreshToken: null });
+    await expect(resolveModelOfferingSelection(client, "offering"))
+      .rejects.toMatchObject({ code: "authentication_required" });
   });
 
   it("rejects unauthenticated selection without querying the catalog", async () => {

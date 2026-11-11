@@ -61,7 +61,58 @@ pub(crate) enum ImmediateControl {
     StopCurrentRun,
 }
 
+/// Classify raw composer text before command dispatch. Queues retain the raw
+/// spelling; literal escapes are removed only when projecting or delivering it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubmissionInput<'a> {
+    Conversation(&'a str),
+    Literal(&'a str),
+    Command(&'a str),
+}
+
+impl<'a> SubmissionInput<'a> {
+    pub(crate) fn text(self) -> &'a str {
+        match self {
+            Self::Conversation(text) | Self::Literal(text) | Self::Command(text) => text,
+        }
+    }
+
+    pub(crate) fn is_command(self) -> bool {
+        matches!(self, Self::Command(_))
+    }
+
+    pub(crate) fn is_literal(self) -> bool {
+        matches!(self, Self::Literal(_))
+    }
+}
+
+pub(crate) fn parse_submission(text: &str) -> SubmissionInput<'_> {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("//") {
+        SubmissionInput::Literal(&trimmed[1..])
+    } else if trimmed.starts_with('/') {
+        SubmissionInput::Command(text)
+    } else {
+        SubmissionInput::Conversation(text)
+    }
+}
+
+/// Return semantic conversation text to the command-aware composer. Custody
+/// returns carry already decoded text, so escape it again before an Enter can
+/// interpret it as a local control.
+pub(crate) fn conversation_for_composer(text: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with('/') {
+        std::borrow::Cow::Owned(format!("/{trimmed}"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 pub(crate) fn immediate_control(text: &str) -> Option<ImmediateControl> {
+    let SubmissionInput::Command(text) = parse_submission(text) else {
+        return None;
+    };
     let (command, _args) = parse_slash(text);
     match command_registry::resolve_command(command).ok()? {
         "/exit" => Some(ImmediateControl::Exit),
@@ -332,11 +383,11 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 let hints: Vec<&'static str> = scored.into_iter().take(3).map(|(_, n)| n).collect();
                 if hints.is_empty() {
                     ctx.show_error(format!(
-                        "Unknown command: {cmd}  ·  type / to browse all commands"
+                        "Unknown command: {cmd}  ·  type / to browse all commands\nFor literal slash text, use // (for example //tmp/path)."
                     ));
                 } else {
                     ctx.show_error(format!(
-                        "Unknown command: {cmd}  ·  did you mean: {}?",
+                        "Unknown command: {cmd}  ·  did you mean: {}?\nFor literal slash text, use // (for example //tmp/path).",
                         hints.join(", ")
                     ));
                 }
@@ -368,28 +419,10 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         }
 
         // ── Help ────────────────────────────────────────────────────
-        "/help" => match help_command_route(args) {
-            HelpCommandRoute::Commands => {
-                use crate::tui::bottom_pane::help_view::HelpView;
-                ctx.open_view("Opened command help", Box::new(HelpView::new()));
-                SlashResult::Handled
-            }
-            HelpCommandRoute::Keys => {
-                use crate::tui::bottom_pane::info_view::InfoView;
-                ctx.open_view(
-                    "Opened keyboard shortcuts",
-                    Box::new(InfoView::from_key_value(
-                        "Keyboard shortcuts",
-                        keyboard_shortcut_pairs(),
-                    )),
-                );
-                SlashResult::Handled
-            }
-            HelpCommandRoute::Unsupported => {
-                ctx.show_error("Usage: /help [keys]".into());
-                SlashResult::Handled
-            }
-        },
+        "/help" => {
+            open_help(args, ctx.bottom_pane, ctx.chat_widget);
+            SlashResult::Handled
+        }
 
         // ── Auth forms (inline TUI card instead of dropping out to
         //    bare-terminal prompts that looked disjoint and stole keys) ─
@@ -416,6 +449,17 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
             let (sub, rest) = split_sub(trimmed);
             match sub {
+                "add" => {
+                    crate::tui::model_setup::sources(ctx.bottom_pane);
+                    SlashResult::Handled
+                }
+                "manage" => {
+                    crate::tui::model_setup::open(
+                        ctx.bottom_pane,
+                        crate::tui::model_setup::Action::Manage,
+                    );
+                    SlashResult::Handled
+                }
                 "info" => handle_model_info(ctx, rest).await,
                 "clear" => handle_model_clear(ctx).await,
                 // Everything else is the `/model <name>` shorthand.
@@ -688,8 +732,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                         .iter()
                         .filter(|manifest| manifest.user_invocable)
                         .count();
-                    ctx.bottom_pane.composer.set_text("$");
-                    ctx.bottom_pane.sync_popups();
+                    ctx.bottom_pane.start_composer_draft("$");
                     ctx.show_response(format!(
                         "Opened skills · {skill_count} available · type to filter"
                     ));
@@ -1406,7 +1449,7 @@ fn context_breakdown_for_panel(
     }
 
     if let Some(trace) = state.latest_context_assembly_trace.as_ref() {
-        return ContextBreakdown::from_trace_with(trace, snapshot);
+        return ContextBreakdown::from_trace_with(&trace.trace, snapshot);
     }
 
     let Some(session) = state.observability_session.as_ref() else {
@@ -1596,7 +1639,7 @@ pub(crate) fn handle_display_view_result(result: ViewResult, bottom_pane: &mut B
             ));
         }
         ViewResult::InsertCommand(command) => {
-            bottom_pane.composer.set_text(&format!("{command} "));
+            bottom_pane.start_composer_draft(&format!("{command} "));
         }
         _ => {}
     }
@@ -1671,7 +1714,8 @@ pub(crate) fn handle_view_result(
         // These results have async or state-transition handling in the event
         // loop. Keeping them explicit prevents a future picker from silently
         // falling through based on its rendered label.
-        ViewResult::Login { .. }
+        ViewResult::ModelSetup(_)
+        | ViewResult::Login { .. }
         | ViewResult::Register { .. }
         | ViewResult::ConfigEdit { .. }
         | ViewResult::Model { .. }
@@ -2889,6 +2933,65 @@ fn help_command_route(args: &str) -> HelpCommandRoute {
     }
 }
 
+fn open_help(
+    args: &str,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
+) {
+    use crate::tui::bottom_pane::{help_view::HelpView, info_view::InfoView};
+    match help_command_route(args) {
+        HelpCommandRoute::Commands => {
+            chat_widget.commit_concurrent_system(SystemCell::response("Opened command help"));
+            bottom_pane.push_view(Box::new(HelpView::new()));
+        }
+        HelpCommandRoute::Keys => {
+            chat_widget.commit_concurrent_system(SystemCell::response("Opened keyboard shortcuts"));
+            bottom_pane.push_view(Box::new(InfoView::from_key_value(
+                "Keyboard shortcuts",
+                keyboard_shortcut_pairs(),
+            )));
+        }
+        HelpCommandRoute::Unsupported => {
+            chat_widget.commit_concurrent_system(SystemCell::error("Usage: /help [keys]"))
+        }
+    }
+}
+
+pub(crate) fn open_active_help(
+    text: &str,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
+) -> bool {
+    let SubmissionInput::Command(text) = parse_submission(text) else {
+        return false;
+    };
+    let (command, args) = parse_slash(text);
+    if !matches!(command_registry::resolve_command(command), Ok("/help")) {
+        return false;
+    }
+    open_help(args, bottom_pane, chat_widget);
+    true
+}
+
+pub(crate) fn active_permission_command(
+    text: &str,
+) -> Option<crate::cli::permission_command::PermissionCommandAction<'_>> {
+    use crate::cli::permission_command::{PermissionCommandAction, parse_permission_command};
+    let SubmissionInput::Command(text) = parse_submission(text) else {
+        return None;
+    };
+    let (command, args) = parse_slash(text);
+    if !matches!(command_registry::resolve_command(command), Ok("/allow")) {
+        return None;
+    }
+    match parse_permission_command(args) {
+        action @ (PermissionCommandAction::ChooseMode | PermissionCommandAction::SetMode(_)) => {
+            Some(action)
+        }
+        _ => None,
+    }
+}
+
 /// Key bindings that are meaningful in the current workbench.  This is an
 /// action-oriented panel, not a dump of every editor binding: it answers the
 /// user's high-frequency questions about recovery, transcript navigation,
@@ -2903,6 +3006,7 @@ fn keyboard_shortcut_pairs() -> Vec<(&'static str, String)> {
             "Ctrl+Q",
             "queue conversational input for the next turn while working; send normally when idle".into(),
         ),
+        ("//", "send literal slash text: //tmp/path sends /tmp/path; //stop stays a message".into()),
         ("Shift+Enter", "insert a newline in the composer".into()),
         (
             "Ctrl+C",
@@ -2915,6 +3019,10 @@ fn keyboard_shortcut_pairs() -> Vec<(&'static str, String)> {
         (
             "Ctrl+G",
             "open the run navigator; Enter/Right opens the selected conversation".into(),
+        ),
+        (
+            "Alt+U",
+            "review unsent or unconfirmed messages".into(),
         ),
         (
             "Shift+Left/Right",
@@ -2975,9 +3083,33 @@ pub(crate) const MODEL_THINKING_PICKER_FOOTER_HINT: &str =
 /// from direct model selection so the event loop can fetch the catalog without
 /// borrowing its UI state across a network wait.
 pub(crate) fn is_model_picker_request(text: &str) -> bool {
+    let SubmissionInput::Command(text) = parse_submission(text) else {
+        return false;
+    };
     let (command, args) = parse_slash(text);
     matches!(command_registry::resolve_command(command), Ok("/model"))
         && matches!(args.trim(), "" | "list")
+}
+
+/// Direct model choices are configuration for future turns. Management and
+/// info remain separate actions, and a bare `/model` opens the picker.
+pub(crate) fn active_model_override(text: &str) -> Option<Option<String>> {
+    let SubmissionInput::Command(text) = parse_submission(text) else {
+        return None;
+    };
+    let (command, args) = parse_slash(text);
+    if !matches!(command_registry::resolve_command(command), Ok("/model")) {
+        return None;
+    }
+    let args = args.trim();
+    let (sub, _) = split_sub(args);
+    if args.is_empty() || matches!(sub, "list" | "add" | "manage" | "info") {
+        return None;
+    }
+    if sub == "clear" {
+        return Some(None);
+    }
+    Some(crate::cli::cli_config::cli_utils::normalize_model_override(Some(args)).map(str::to_owned))
 }
 
 /// Build the model picker view from a fetched model list and push it.
@@ -2990,43 +3122,92 @@ pub(crate) fn push_model_picker(
     bottom_pane: &mut BottomPane,
     chat_widget: &mut crate::tui::chat_widget::ChatWidget,
     models: Vec<String>,
+    personal: bool,
+) -> bool {
+    push_model_picker_for_choice(
+        state.model.as_ref(),
+        bottom_pane,
+        chat_widget,
+        models,
+        personal,
+    )
+}
+
+pub(crate) fn push_model_picker_for_choice(
+    current: Option<&crate::cli::session::session_state::SessionModelChoice>,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
+    models: Vec<String>,
+    personal: bool,
 ) -> bool {
     // Strip any `-thinking:*` suffix from the cached model when
     // highlighting the current row — the picker shows base names only,
     // and the suffix is re-applied by the thinking stage.
-    let current_raw = state
-        .model
-        .as_deref()
+    let current_raw = current
+        .map(|choice| &**choice)
         .map(str::to_string)
         .unwrap_or_default();
     let current_base = current_raw
         .split_once("-thinking:")
         .map(|(b, _)| b.to_string())
         .unwrap_or(current_raw);
-    let items: Vec<SelectionItem> = models
+    let catalog: Vec<_> = bottom_pane
+        .current_model_catalog()
         .iter()
-        .map(|m| {
-            let is_current = *m == current_base;
-            SelectionItem {
-                name: m.clone(),
-                description: None,
-                is_current,
-            }
-        })
+        .filter(|row| crate::cli::session::session_runtime::model_list_entry_name(row).is_some())
         .collect();
+    let exact_catalog = catalog
+        .iter()
+        .map(|row| row.name.as_str())
+        .eq(models.iter().map(String::as_str));
+    let selected_id = match current {
+        Some(crate::cli::session::session_state::SessionModelChoice::Selected(choice)) => {
+            Some(choice.offering_id.as_str())
+        }
+        _ => None,
+    };
+    let (mut items, mut results): (Vec<_>, Vec<_>) = models
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let entry = exact_catalog.then(|| catalog[index]);
+            let id = entry.map(|row| row.offering_id.as_str()).unwrap_or(name);
+            (
+                SelectionItem {
+                    name: name.clone(),
+                    description: entry.map(|row| row.access_label.clone()),
+                    is_current: selected_id
+                        .map(|selected| selected == id)
+                        .unwrap_or(*name == current_base),
+                },
+                ViewResult::Model {
+                    name: id.to_owned(),
+                },
+            )
+        })
+        .unzip();
+    if personal {
+        if items.is_empty() {
+            crate::tui::model_setup::sources(bottom_pane);
+            return true;
+        }
+        items.push(SelectionItem {
+            name: "Add or manage my models…".into(),
+            description: Some("Personal API keys and ChatGPT accounts".into()),
+            is_current: false,
+        });
+        results.push(ViewResult::ModelSetup(
+            crate::tui::model_setup::Action::Sources,
+        ));
+    }
     if items.is_empty() {
-        chat_widget.commit_system(SystemCell::info("No models available"));
+        chat_widget.commit_concurrent_system(SystemCell::info("No models available"));
         false
     } else {
         let view = ListSelectionView::new(items, Some("Select model:".into()))
             .with_footer_hint(MODEL_PICKER_FOOTER_HINT)
-            .with_results(
-                models
-                    .into_iter()
-                    .map(|name| ViewResult::Model { name })
-                    .collect(),
-            );
-        chat_widget.commit_system(SystemCell::response("Opened model picker"));
+            .with_results(results);
+        chat_widget.commit_concurrent_system(SystemCell::response("Opened model picker"));
         bottom_pane.push_view(Box::new(view));
         true
     }
@@ -3040,6 +3221,23 @@ pub(crate) fn apply_model_picker_result(
     bottom_pane: &mut BottomPane,
     chat_widget: &mut crate::tui::chat_widget::ChatWidget,
 ) -> Option<bool> {
+    match prepare_model_picker_result(result, bottom_pane, chat_widget)? {
+        Ok(Some(selection)) => {
+            apply_model_selection(state, bottom_pane, chat_widget, selection);
+            Some(false)
+        }
+        Ok(None) => Some(true),
+        Err(()) => Some(false),
+    }
+}
+
+/// Validate the same catalog and thinking selection for both idle and active turns.
+/// `Ok(None)` means the second picker is now open.
+pub(crate) fn prepare_model_picker_result(
+    result: &ViewResult,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
+) -> Option<Result<Option<crate::cli::session::session_runtime::ServerModelSelection>, ()>> {
     let (base_model, config) = match result {
         ViewResult::Model { name } => (name, None),
         ViewResult::ModelThinking { base_model, config } => (base_model, Some(config)),
@@ -3048,42 +3246,69 @@ pub(crate) fn apply_model_picker_result(
     let entry = crate::cli::session::session_runtime::find_model_entry_by_name(
         bottom_pane.current_model_catalog(),
         base_model,
-    );
+    )
+    .filter(|entry| crate::cli::session::session_runtime::model_list_entry_is_active(entry));
     let resolved = entry.and_then(|entry| {
         crate::cli::session::session_runtime::model_selection_from_list_entry(entry)
             .map(|selection| (entry, selection))
     });
     let Some((entry, mut selection)) = resolved else {
-        chat_widget.commit_system(SystemCell::error(
+        chat_widget.commit_concurrent_system(SystemCell::error(
             "Selected model is no longer available in this account's catalog. Reopen /model.",
         ));
-        return Some(false);
+        return Some(Err(()));
     };
-    let opts = astra_turn_core::thinking_config::thinking_options(
+    let protocol = entry.thinking_protocol.unwrap_or_default();
+    let personal_responses = entry.access_kind
+        == astra_services::models::ModelAccessKind::CloudByok
+        && entry.access_id == "cloud-byok"
+        && protocol == astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning;
+    let observed_capability = entry.thinking_capability.map(|value| value.as_str());
+    let picker_capability =
+        if personal_responses && !matches!(observed_capability, Some("both" | "effort_only")) {
+            Some("effort_only")
+        } else {
+            observed_capability
+        };
+    let opts: Vec<_> = astra_turn_core::thinking_config::thinking_options(
         (!entry.provider.trim().is_empty()).then_some(entry.provider.trim()),
-        entry.thinking_capability.map(|value| value.as_str()),
-        entry.thinking_protocol.unwrap_or_default(),
-    );
+        picker_capability,
+        protocol,
+    )
+    .into_iter()
+    .filter(|option| {
+        option
+            .config
+            .is_within_declared_efforts(entry.supported_reasoning_efforts.as_deref())
+    })
+    .collect();
     if let Some(config) = config {
         if !opts.iter().any(|option| &option.config == config) {
-            chat_widget.commit_system(SystemCell::error(
+            chat_widget.commit_concurrent_system(SystemCell::error(
                 "Selected thinking mode is no longer supported. Reopen /model.",
             ));
-            return Some(false);
+            return Some(Err(()));
         }
     } else if !opts.is_empty() {
         let items = opts
             .iter()
             .map(|option| SelectionItem {
                 name: option.label.into(),
-                description: None,
+                description: (protocol
+                    == astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning
+                    && entry.supported_reasoning_efforts.is_none()
+                    && !matches!(
+                        option.config,
+                        astra_turn_core::thinking_config::ThinkingConfig::ModelDefault
+                    ))
+                .then(|| "Provider support for this setting is not verified".into()),
                 is_current: option.is_default,
             })
             .collect();
         bottom_pane.push_view(Box::new(
             ListSelectionView::new(
                 items,
-                Some(format!("Select thinking mode for {base_model}:")),
+                Some(format!("Select thinking mode for {}:", entry.name)),
             )
             .with_footer_hint(MODEL_THINKING_PICKER_FOOTER_HINT)
             .with_results(
@@ -3095,18 +3320,27 @@ pub(crate) fn apply_model_picker_result(
                     .collect(),
             ),
         ));
-        return Some(true);
+        return Some(Ok(None));
     }
     let suffix = config
         .map(astra_turn_core::thinking_config::thinking_suffix_for)
         .unwrap_or_default();
-    let name = format!("{base_model}{suffix}");
+    let name = format!("{}{suffix}", entry.name);
     selection.name = name.clone();
+    Some(Ok(Some(selection)))
+}
+
+pub(crate) fn apply_model_selection(
+    state: &mut SessionState,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
+    selection: crate::cli::session::session_runtime::ServerModelSelection,
+) {
+    let name = selection.name.clone();
     state.cli_context.select_model(Some(&name));
     state.model = Some(crate::cli::session::session_state::SessionModelChoice::Selected(selection));
     bottom_pane.footer.model = Some(name.clone());
     chat_widget.commit_system(SystemCell::response(format!("Set model to {name}")));
-    Some(false)
 }
 
 async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
@@ -3123,7 +3357,11 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
                 .filter_map(crate::cli::session::session_runtime::model_list_entry_name)
                 .map(ToOwned::to_owned)
                 .collect();
-            if push_model_picker(ctx.state, ctx.bottom_pane, ctx.chat_widget, names) {
+            let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+            let personal = owner.server_account_id.is_some()
+                && owner.native_binding.is_none()
+                && !crate::cli::session::session_runtime::uses_environment_access_token(&token);
+            if push_model_picker(ctx.state, ctx.bottom_pane, ctx.chat_widget, names, personal) {
                 return SlashResult::Deferred;
             }
         }
@@ -3139,26 +3377,29 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
         ctx.show_error("Model name cannot be empty — choose one with `/model`.".into());
         return;
     }
-    let Some(name) = crate::cli::cli_config::cli_utils::normalize_model_override(Some(name)) else {
-        ctx.state.cli_context.select_model(None);
-        ctx.state.model = None;
-        ctx.bottom_pane.footer.model = None;
-        ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
-        return;
-    };
-    ctx.state.cli_context.select_model(Some(name));
-    ctx.state.model = Some((name.to_string()).into());
-    ctx.bottom_pane.footer.model = Some(name.to_string());
-    ctx.show_response(format!("Set model to {name}"));
+    let name = crate::cli::cli_config::cli_utils::normalize_model_override(Some(name));
+    apply_requested_model(ctx.state, ctx.bottom_pane, ctx.chat_widget, name);
+}
+
+pub(crate) fn apply_requested_model(
+    state: &mut SessionState,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
+    name: Option<&str>,
+) {
+    state.cli_context.select_model(name);
+    state.model = name.map(|name| name.to_owned().into());
+    bottom_pane.footer.model = name.map(str::to_owned);
+    chat_widget.commit_system(SystemCell::response(match name {
+        Some(name) => format!("Set model to {name}"),
+        None => "Model selection cleared — choose a model before the next turn.".into(),
+    }));
 }
 
 /// `/model clear` — unset the session model. Reports the change to
 /// scrollback so the user sees the footer switch.
 async fn handle_model_clear(ctx: &mut DispatchContext<'_>) -> SlashResult {
-    ctx.state.cli_context.select_model(None);
-    ctx.state.model = None;
-    ctx.bottom_pane.footer.model = None;
-    ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
+    apply_requested_model(ctx.state, ctx.bottom_pane, ctx.chat_widget, None);
     SlashResult::Handled
 }
 
@@ -3955,6 +4196,21 @@ mod routing_tests {
         assert!(!is_model_picker_request("/model info"));
         assert!(!is_model_picker_request("/model gpt-5"));
         assert!(!is_model_picker_request("/context"));
+        assert_eq!(
+            super::active_model_override("/model gpt-5"),
+            Some(Some("gpt-5".into()))
+        );
+        assert_eq!(super::active_model_override("/model clear"), Some(None));
+        for text in [
+            "/model",
+            "/model list",
+            "/model info",
+            "/model add",
+            "/model manage",
+            "please use /model gpt-5",
+        ] {
+            assert_eq!(super::active_model_override(text), None, "{text}");
+        }
     }
 
     #[test]
@@ -4113,19 +4369,24 @@ mod routing_tests {
     #[test]
     fn context_panel_uses_committed_trace_when_observability_ring_is_empty() {
         let mut state = SessionState::default();
-        state.latest_context_assembly_trace = Some(ContextAssemblyTrace {
-            turn_id: "turn-7".into(),
-            token_budget: astra_turn_core::context_assembly_trace::TokenBudgetTrace {
-                max_tokens: 100_000,
-                system_prompt_tokens: 5_000,
-                history_tokens: 12_000,
-                tool_schema_tokens: 3_000,
-                user_message_tokens: 200,
-                total_used: 20_200,
-                ..Default::default()
+        state.latest_context_assembly_trace = Some(
+            crate::cli::session::session_state::LocalContextAssemblyTrace {
+                local_turn: 7,
+                trace: ContextAssemblyTrace {
+                    turn_id: "turn-7".into(),
+                    token_budget: astra_turn_core::context_assembly_trace::TokenBudgetTrace {
+                        max_tokens: 100_000,
+                        system_prompt_tokens: 5_000,
+                        history_tokens: 12_000,
+                        tool_schema_tokens: 3_000,
+                        user_message_tokens: 200,
+                        total_used: 20_200,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
             },
-            ..Default::default()
-        });
+        );
         let mut snapshot = ContextSnapshot::default();
 
         let breakdown = context_breakdown_for_panel(&state, &mut snapshot);
@@ -4176,7 +4437,7 @@ mod routing_tests {
         assert_eq!(breakdown.limit, 0, "do not fabricate a prompt budget");
         assert!(breakdown.categories.is_empty());
         assert!(breakdown.session_summary.is_some());
-        assert_eq!(breakdown.history.retained, 1);
+        assert_eq!(breakdown.history.turns.len(), 1);
         assert_eq!(breakdown.history.turns[0].preview, "first request");
         assert!(breakdown.has_observable_data());
     }
@@ -4732,10 +4993,12 @@ mod model_catalog_loading_tests {
         CredentialsFile, Profile, cli_owner_auth_snapshot, install_cli_profile_identity_for_test,
         load_credentials, save_credentials,
     };
-    use crate::cli::session::session_runtime::{ModelCatalogError, fetch_owner_model_catalog};
+    use crate::cli::session::session_runtime::{
+        AdmittedAuth, ModelCatalogError, fetch_admitted_model_catalog, fetch_owner_model_catalog,
+    };
     use crate::test_utils::ProcessEnvGuard;
     use crate::tests::isolate_credentials;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[derive(Debug)]
@@ -4770,6 +5033,479 @@ mod model_catalog_loading_tests {
             },
         );
         save_credentials(&credentials).expect("save isolated credentials");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_setup_sends_selected_api_format() {
+        use crate::tui::{
+            login_control::LoginControl,
+            model_setup::{self, Action, Outcome},
+        };
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        save_profile("valid-access", "refresh-unused");
+        let _identity =
+            install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+        for succeeds in [true, false] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/me/model-connections"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"management_available":true})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+            .and(path("/me/models"))
+            .and(body_partial_json(
+                serde_json::json!({"inference_protocol":"openai_responses"}),
+            ))
+            .respond_with(if succeeds {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"model_id":"fixture"}))
+            } else {
+                ResponseTemplate::new(502).set_body_json(serde_json::json!({"detail":"Could not connect","error_code":"model_probe_network", "metadata":{"model_saved":false}}))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+            Mock::given(method("GET"))
+                .and(path("/models"))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(usize::from(succeeds) as u64)
+                .mount(&server)
+                .await;
+            let (progress, _) = tokio::sync::mpsc::unbounded_channel();
+            let owner = cli_owner_auth_snapshot();
+            let result = model_setup::run(
+                Action::Create {
+                    request: astra_services::UserModelCreateRequestData {
+                        connection_id: None,
+                        responses_reasoning_history: None,
+                        name: "mine".into(),
+                        provider: "openai".into(),
+                        inference_protocol: Some(
+                            astra_core::model_wire::LlmProviderProtocol::OpenAiResponses,
+                        ),
+                        model: "fixture".into(),
+                        base_url: None,
+                        api_key: "synthetic-key".into(),
+                        context_window: 128000,
+                        is_default: false,
+                    },
+                    owner: owner.clone(),
+                },
+                astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+                owner,
+                tokio_util::sync::CancellationToken::new(),
+                std::sync::Arc::new(LoginControl::default()),
+                progress,
+            )
+            .await;
+            if succeeds {
+                assert!(
+                    matches!(result, Ok(Outcome::Saved { model_id, .. }) if model_id == "fixture")
+                );
+            } else {
+                let Ok(Outcome::CreateRejected { request, message }) = result else {
+                    panic!("probe failure must retain the editable request");
+                };
+                assert!(message.contains("model was not saved"), "{message}");
+                assert!(message.contains("DNS, proxy and TLS"), "{message}");
+                assert_eq!(request.api_key, "synthetic-key");
+                assert_eq!(request.model, "fixture");
+                assert_eq!(
+                    request.inference_protocol,
+                    Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses)
+                );
+                assert!(!message.contains("synthetic-key"));
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_setup_never_sends_a_form_under_a_different_account() {
+        use crate::tui::{
+            login_control::LoginControl,
+            model_setup::{self, Action},
+        };
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        save_profile("valid-access", "refresh-unused");
+        let _first = install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+        let form_owner = cli_owner_auth_snapshot();
+        let _second = install_cli_profile_identity_for_test("other", Some("user-id-2")).unwrap();
+        let server = MockServer::start().await;
+        let (progress, _) = tokio::sync::mpsc::unbounded_channel();
+        let result = model_setup::run(
+            Action::Create {
+                request: astra_services::UserModelCreateRequestData {
+                    connection_id: None,
+                    responses_reasoning_history: None,
+                    name: "mine".into(),
+                    provider: "openai".into(),
+                    inference_protocol: None,
+                    model: "fixture".into(),
+                    base_url: None,
+                    api_key: "synthetic-key".into(),
+                    context_window: 128000,
+                    is_default: false,
+                },
+                owner: form_owner,
+            },
+            astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+            cli_owner_auth_snapshot(),
+            tokio_util::sync::CancellationToken::new(),
+            std::sync::Arc::new(LoginControl::default()),
+            progress,
+        )
+        .await;
+        assert!(matches!(result, Err(error) if error.contains("Account changed")));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_setup_keeps_acknowledged_write_when_catalog_read_fails() {
+        use crate::tui::{
+            login_control::LoginControl,
+            model_setup::{self, Action, Outcome},
+        };
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        save_profile("valid-access", "refresh-unused");
+        let _identity =
+            install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/me/model-connections"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"management_available":true})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let id = "00000000-0000-4000-8000-000000000001";
+        Mock::given(method("PUT"))
+            .and(path(format!("/me/models/{id}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"model_id":id})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (progress, _) = tokio::sync::mpsc::unbounded_channel();
+        let result = model_setup::run(
+            Action::Activate(id.into()),
+            astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+            cli_owner_auth_snapshot(),
+            tokio_util::sync::CancellationToken::new(),
+            std::sync::Arc::new(LoginControl::default()),
+            progress,
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(Outcome::Saved { model_id, catalog: Err(_), .. }) if model_id == id)
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_setup_finishes_bound_catalog_after_account_switch() {
+        use crate::tui::{
+            login_control::LoginControl,
+            model_setup::{self, Action, Outcome},
+        };
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::HeaderMap,
+            routing::{get, put},
+        };
+        use std::sync::Arc;
+
+        #[derive(Clone, Default)]
+        struct Gate {
+            write_started: Arc<tokio::sync::Notify>,
+            release_write: Arc<tokio::sync::Notify>,
+        }
+        fn require_old_owner(headers: &HeaderMap) {
+            assert_eq!(
+                headers.get("authorization").and_then(|v| v.to_str().ok()),
+                Some("Bearer valid-access")
+            );
+        }
+        async fn sources(headers: HeaderMap) -> Json<serde_json::Value> {
+            require_old_owner(&headers);
+            Json(serde_json::json!({"management_available": true}))
+        }
+        async fn activate(State(gate): State<Gate>, headers: HeaderMap) -> Json<serde_json::Value> {
+            require_old_owner(&headers);
+            gate.write_started.notify_one();
+            gate.release_write.notified().await;
+            Json(serde_json::json!({}))
+        }
+        async fn models(headers: HeaderMap) -> Json<serde_json::Value> {
+            require_old_owner(&headers);
+            Json(
+                serde_json::json!({"items":[], "next_cursor":null, "limit":50, "total":0, "catalog_revision":"sha256:empty"}),
+            )
+        }
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        save_profile("valid-access", "refresh-unused");
+        let mut creds = load_credentials();
+        creds.profiles.insert(
+            "other".into(),
+            Profile {
+                account_id: Some("other-user".into()),
+                access_token: Some("other-access".into()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+        let _identity =
+            install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+        let owner = cli_owner_auth_snapshot();
+        let gate = Gate::default();
+        let app = Router::new()
+            .route("/me/model-connections", get(sources))
+            .route("/me/models/{id}", put(activate))
+            .route("/models", get(models))
+            .with_state(gate.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let api = astra_thin_client::ThinClient::new(&format!("http://{addr}"), None).unwrap();
+        let (progress, _) = tokio::sync::mpsc::unbounded_channel();
+        let id = "00000000-0000-4000-8000-000000000001";
+        let setup = model_setup::run(
+            Action::Activate(id.into()),
+            api,
+            owner.clone(),
+            tokio_util::sync::CancellationToken::new(),
+            Arc::new(LoginControl::default()),
+            progress,
+        );
+        tokio::pin!(setup);
+        tokio::select! {
+            _ = &mut setup => panic!("model write must be held"),
+            _ = gate.write_started.notified() => {}
+        }
+        creds.current_profile = Some("other".into());
+        save_credentials(&creds).unwrap();
+        let _selected = install_cli_profile_identity_for_test("other", Some("other-user")).unwrap();
+        assert!(!owner.is_current());
+        gate.release_write.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut setup)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result, Outcome::Saved { model_id, catalog: Ok(models) } if model_id == id && models.is_empty())
+        );
+        server.abort();
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_setup_disabled_chatgpt_is_discovered_before_authorization() {
+        use crate::tui::{
+            login_control::LoginControl,
+            model_setup::{self, Action, Outcome},
+        };
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        save_profile("valid-access", "refresh-unused");
+        let _identity =
+            install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/me/model-connections"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [], "management_available": true,
+                "chatgpt": {"available": false, "error_code": "chatgpt_subscription_disabled", "detail": "ChatGPT disabled by Server"}
+            }))).expect(2).mount(&server).await;
+        for action in [Action::Sources, Action::Connect(None)] {
+            let connecting = matches!(action, Action::Connect(_));
+            let (progress, _) = tokio::sync::mpsc::unbounded_channel();
+            let result = model_setup::run(
+                action,
+                astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+                cli_owner_auth_snapshot(),
+                tokio_util::sync::CancellationToken::new(),
+                std::sync::Arc::new(LoginControl::default()),
+                progress,
+            )
+            .await;
+            if connecting {
+                let message = result.err().expect("disabled feature cannot start OAuth");
+                assert!(message.contains("Server operator"));
+                assert!(!message.contains("try again shortly"));
+            } else {
+                assert!(
+                    matches!(result, Ok(Outcome::Sources(value)) if value["available"] == false)
+                );
+            }
+        }
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method == "GET")
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_setup_existing_connection_catalog_retries_without_authorization() {
+        use crate::tui::{
+            login_control::LoginControl,
+            model_setup::{self, Action, Outcome},
+        };
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        save_profile("valid-access", "refresh-unused");
+        let _identity =
+            install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+        for status in [503, 200] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/me/model-connections"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"items":[],"management_available":true})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(
+                    "/me/model-connections/00000000-0000-4000-8000-000000000001/models",
+                ))
+                .respond_with(ResponseTemplate::new(status).set_body_json(
+                    serde_json::json!({"items":[{"slug":"fixture"}],"configured_models":[]}),
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (progress, _) = tokio::sync::mpsc::unbounded_channel();
+            let result = model_setup::run(
+                Action::Models("00000000-0000-4000-8000-000000000001".into()),
+                astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+                cli_owner_auth_snapshot(),
+                tokio_util::sync::CancellationToken::new(),
+                std::sync::Arc::new(LoginControl::default()),
+                progress,
+            )
+            .await;
+            if status == 200 {
+                assert!(
+                    matches!(result, Ok(Outcome::Models { slugs, .. }) if slugs == ["fixture"])
+                );
+            } else {
+                assert!(matches!(result, Err(error) if error.contains("Choose models")));
+            }
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.method == "GET")
+            );
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_setup_cancel_releases_stalled_read_without_starting_a_write() {
+        use crate::tui::{
+            login_control::LoginControl,
+            model_setup::{self, Action},
+        };
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        save_profile("valid-access", "refresh-unused");
+        let _identity =
+            install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+        // Exercise both preflight and the subsequent personal-model list.
+        for stalled_path in [
+            "/me/model-connections",
+            "/me/models",
+            "/me/model-connections/00000000-0000-4000-8000-000000000001/models",
+        ] {
+            let server = MockServer::start().await;
+            let dispatched = std::sync::Arc::new(tokio::sync::Notify::new());
+            let notified = dispatched.clone();
+            Mock::given(method("GET"))
+                .and(path(stalled_path))
+                .and(header("authorization", "Bearer valid-access"))
+                .respond_with(move |_: &wiremock::Request| {
+                    notified.notify_one();
+                    ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30))
+                })
+                .expect(1)
+                .mount(&server)
+                .await;
+            if stalled_path != "/me/model-connections" {
+                Mock::given(method("GET"))
+                    .and(path("/me/model-connections"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"items":[], "management_available":true}),
+                    ))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let phase = std::sync::Arc::new(LoginControl::default());
+            let (progress, _) = tokio::sync::mpsc::unbounded_channel();
+            let task = model_setup::run(
+                if stalled_path.ends_with("/models") && stalled_path != "/me/models" {
+                    Action::Models("00000000-0000-4000-8000-000000000001".into())
+                } else {
+                    Action::Manage
+                },
+                astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+                cli_owner_auth_snapshot(),
+                cancel.clone(),
+                phase.clone(),
+                progress,
+            );
+            tokio::pin!(task);
+            tokio::select! {
+                _ = &mut task => panic!("stalled read completed before cancellation"),
+                () = dispatched.notified() => {}
+            }
+            assert!(phase.cancel(), "read must remain cancellable");
+            cancel.cancel();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .expect("cancel must not await the HTTP timeout");
+            assert!(matches!(result, Err(ref error) if error.contains("cancelled")));
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.method == "GET")
+            );
+        }
     }
 
     #[serial_test::serial]
@@ -4853,6 +5589,14 @@ mod model_catalog_loading_tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None)
             .unwrap()
             .with_bearer_provider(std::sync::Arc::new(UnrelatedBearer));
+
+        // A new UI action cannot use the old owner after the account switch.
+        // The already-bound operation below can still finish with that owner.
+        assert!(matches!(
+            fetch_admitted_model_catalog(&api, &AdmittedAuth::Owner(owner.clone())).await,
+            Err(ModelCatalogError::NotAuthenticated)
+        ));
+        assert!(server.received_requests().await.unwrap().is_empty());
 
         let models = fetch_owner_model_catalog(&api, &owner)
             .await
@@ -5046,7 +5790,7 @@ mod model_catalog_loading_tests {
         let error = fetch_owner_model_catalog(&api, &cli_owner_auth_snapshot())
             .await
             .expect_err("invalid catalog shape must fail visibly");
-        assert!(matches!(error, ModelCatalogError::InvalidJson(_)));
+        assert!(matches!(error, ModelCatalogError::UnsupportedSchema(_)));
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
         assert_eq!(
             load_credentials()

@@ -158,7 +158,9 @@ impl SkillContext {
 pub struct InvokedSkill {
     /// Canonical skill name.
     pub name: String,
-    /// Full instructions returned on first invocation.
+    /// Complete safety-governed instructions captured at activation, before
+    /// model-budget truncation. Recovery/resume reuse these bytes and their
+    /// emitted redaction markers without resolving or sanitizing them again.
     pub content: String,
     /// Turn number captured at activation time, **before** the LLM turn that
     /// triggered the activation has committed.
@@ -264,6 +266,18 @@ impl SkillSurfacingPolicy {
             }
         }
         true
+    }
+
+    pub(crate) fn allows_resolved(&self, skill: &ResolvedSkill) -> bool {
+        self.allows(skill)
+    }
+
+    pub(crate) fn allows_dynamic_plugin_catalog(&self) -> bool {
+        self.allowed_names.is_none()
+            && self
+                .allowed_sources
+                .as_ref()
+                .is_none_or(|sources| sources.contains(&SkillSourceKind::Plugin))
     }
 }
 
@@ -391,12 +405,25 @@ impl SkillResolver for PolicyScopedSkillResolver {
         }
     }
 
+    async fn read_resource(
+        &self,
+        name: &str,
+        path: &str,
+    ) -> Result<astra_skills::traits::SkillResource, crate::skills::SkillError> {
+        self.resolve_for_execution(name).await?;
+        self.inner.read_resource(name, path).await
+    }
+
     fn available_skills(&self) -> Vec<SkillToolInfo> {
         self.visible_skills.clone()
     }
 
     fn catalog_is_authoritative(&self) -> bool {
         self.inner.catalog_is_authoritative()
+    }
+
+    fn has_dynamic_catalog(&self) -> bool {
+        self.policy.allows_dynamic_plugin_catalog() && self.inner.has_dynamic_catalog()
     }
 
     fn execution_catalog_contains(&self, name: &str) -> bool {
@@ -619,6 +646,11 @@ pub fn is_skill_call(tool_call: &Value) -> bool {
         == Some(SKILL_TOOL_NAME)
 }
 
+pub fn is_skill_activation_call(tool_call: &Value) -> bool {
+    is_skill_call(tool_call)
+        && !extract_tool_args(tool_call).is_some_and(|args| args.get("resource_path").is_some())
+}
+
 /// Parse tool call arguments from either stringified JSON (OpenAI) or direct
 /// object (Anthropic) format into a `Value`.
 pub fn extract_tool_args(tool_call: &Value) -> Option<Value> {
@@ -646,7 +678,7 @@ pub fn extract_skill_name(tool_call: &Value) -> Option<String> {
 pub fn selected_skill_names_from_tool_calls(tool_calls: &[Value]) -> Vec<String> {
     tool_calls
         .iter()
-        .filter(|tool_call| is_skill_call(tool_call))
+        .filter(|tool_call| is_skill_activation_call(tool_call))
         .filter_map(extract_skill_name)
         .collect()
 }
@@ -664,9 +696,51 @@ pub async fn execute_skill_inline(
     args: &Value,
     skill_ctx: &SkillContext,
 ) -> SkillCallResult {
-    let skill_name = args.get("skill_name").and_then(Value::as_str).unwrap_or("");
-    let task_hint = args.get("task").and_then(Value::as_str).unwrap_or("");
-    execute_skill(resolver, None, skill_name, task_hint, None, skill_ctx).await
+    execute_skill_arguments(resolver, None, args, None, skill_ctx).await
+}
+
+async fn execute_skill_arguments(
+    resolver: &dyn SkillResolver,
+    executor: Option<&Arc<dyn SkillExecutor>>,
+    args: &Value,
+    composition_ctx: Option<&crate::skills::composition::CompositionContext>,
+    skill_ctx: &SkillContext,
+) -> SkillCallResult {
+    let name = args.get("skill_name").and_then(Value::as_str).unwrap_or("");
+    let task = args.get("task").and_then(Value::as_str).unwrap_or("");
+    let resource_path = match args.get("resource_path") {
+        None => None,
+        Some(Value::String(path)) if valid_skill_resource_path(path) => Some(path.as_str()),
+        Some(_) => {
+            return SkillCallResult {
+                output: "skill_resource_path_invalid".into(),
+                success: false,
+                activation: None,
+                verification: None,
+            };
+        }
+    };
+    execute_skill_with_origin(
+        resolver,
+        executor,
+        name,
+        task,
+        composition_ctx,
+        skill_ctx,
+        SkillInvocationOrigin::Public,
+        resource_path,
+    )
+    .await
+}
+
+pub(crate) fn valid_skill_resource_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 1024
+        && !path.contains(['\\', ':'])
+        && !path.chars().any(char::is_control)
+        && !path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
 }
 
 pub async fn execute_skill_direct(
@@ -897,18 +971,15 @@ pub async fn partition_and_execute_skills(
             Some(args) => {
                 let skill_name = args.get("skill_name").and_then(Value::as_str).unwrap_or("");
 
-                let task_hint = args.get("task").and_then(Value::as_str).unwrap_or("");
-
                 let start = std::time::Instant::now();
                 let mut invocation_skill_ctx = skill_ctx.clone();
                 invocation_skill_ctx
                     .extra
                     .insert("__astra_invocation_id".to_string(), call_id.clone());
-                let r = execute_skill(
+                let r = execute_skill_arguments(
                     resolver,
                     executor,
-                    skill_name,
-                    task_hint,
+                    &args,
                     composition_ctx,
                     &invocation_skill_ctx,
                 )
@@ -950,7 +1021,7 @@ pub async fn partition_and_execute_skills(
                     .as_ref()
                     .map(|v| v.all_required_passed)
                     .unwrap_or(skill_success);
-                let result = if effective_success {
+                let result = if effective_success && is_skill_activation_call(tc) {
                     append_skill_loaded_marker(&skill_output, skill_name)
                     // Contract: skill body MUST precede the <skill-loaded> marker.
                     // Locked by web_agent_e2e.rs::skill_resolve_round_trip_carries_instructions_to_next_turn
@@ -1095,6 +1166,7 @@ async fn execute_pipeline(
             ctx_ref,
             &step_skill_ctx,
             SkillInvocationOrigin::TrustedPipelineStep,
+            None,
         )
         .await;
         let SkillCallResult {
@@ -1580,8 +1652,12 @@ async fn execute_remote_skill(
     for (name, value) in forwarded_headers {
         request = request.header(name, value);
     }
-    let response = request
-        .send()
+    let mut request = request
+        .build()
+        .map_err(|err| format!("request failed: {err}"))?;
+    crate::server::outbound_trace::rewrite(&mut request);
+    let response = remote_skill_http_client()
+        .execute(request)
         .await
         .map_err(|err| format!("request failed: {err}"))?;
     let status = response.status();
@@ -1647,6 +1723,7 @@ fn execute_skill<'a>(
         composition_ctx,
         skill_ctx,
         SkillInvocationOrigin::Public,
+        None,
     )
 }
 
@@ -1717,6 +1794,7 @@ fn execute_skill_with_origin<'a>(
     composition_ctx: Option<&'a crate::skills::composition::CompositionContext>,
     skill_ctx: &'a SkillContext,
     origin: SkillInvocationOrigin,
+    resource_path: Option<&'a str>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SkillCallResult> + Send + 'a>> {
     Box::pin(async move {
         // The public skill schema permits omitting `task` so a skill can act
@@ -1750,6 +1828,16 @@ fn execute_skill_with_origin<'a>(
 
         match resolve_admitted_skill(resolver, skill_name, skill_ctx, origin).await {
             Ok(skill) => {
+                if let Some(path) = resource_path {
+                    return match resolver.read_resource(skill_name, path).await {
+                        Ok(resource) if resource.path == path && resource.content.len() <= 64 * 1024 && !resource.content.contains('\0') => SkillCallResult {
+                            output: serde_json::json!({"skill_name": skill_name, "resource_path": path, "content": resource.content}).to_string(),
+                            success: true, activation: None, verification: None,
+                        },
+                        Ok(_) => SkillCallResult { output: "skill_resource_contract_invalid".into(), success: false, activation: None, verification: None },
+                        Err(error) => SkillCallResult { output: format!("Failed to read skill resource: {error}"), success: false, activation: None, verification: None },
+                    };
+                }
                 // Composability gate: nested calls must target composable skills
                 if let Some(ctx) = composition_ctx {
                     if ctx.is_nested() {
@@ -2180,6 +2268,19 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn skill_schema_accepts_exact_discovered_source_selection() {
+        let schema = astra_tools::schemas::skill_tool_schema();
+        let description = schema["function"]["description"].as_str().unwrap();
+        let name_description =
+            schema["function"]["parameters"]["properties"]["skill_name"]["description"]
+                .as_str()
+                .unwrap();
+        assert!(description.contains("copy its exact selection_key"));
+        assert!(description.contains("title is only a display label"));
+        assert!(name_description.contains("exact selection_key"));
+    }
 
     #[test]
     fn read_only_skill_hook_does_not_execute_shell() {

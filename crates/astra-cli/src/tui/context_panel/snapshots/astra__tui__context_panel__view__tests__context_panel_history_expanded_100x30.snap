@@ -1,6 +1,5 @@
 ---
 source: crates/astra-cli/src/tui/context_panel/view.rs
-assertion_line: 2338
 expression: buffer_to_string(&buf)
 ---
   2.0k / 100.0k tokens  current prompt (2.0%)
@@ -13,14 +12,14 @@ expression: buffer_to_string(&buf)
   ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶
 
  ▼ History · conversation turns
-    └ 3 turns  (3 retained · 0 compressed · 0 dropped)
+    └ 3 admission input groups · ~4.3k tokens
     ↑/↓ select · Enter drill · Tab next · Esc back
-        └ #0 user   80 tokens
+        └ #0 user   ~80 tokens
              user: Can you refactor the auth module so the session validator
              lives in its own file?
-      ▸ └ #1 assistant   4.2k tokens  [tools]
+      ▸ └ #1 assistant   ~4.2k tokens  [tools]
              assistant: I'll start by reading auth.rs and mapping out every
              caller. Let me look at the module structure first, then identify
              what to move. The validate_session function has three call site…
-        └ #2 user   40 tokens
+        └ #2 user   ~40 tokens
              user: Thanks — now make the helper private.

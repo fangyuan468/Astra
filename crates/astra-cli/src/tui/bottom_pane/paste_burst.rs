@@ -91,26 +91,36 @@ impl PasteBurstDetector {
             .unwrap_or(u64::MAX);
 
         if idle > FLUSH_IDLE_MS {
-            let text = std::mem::take(&mut self.buffer);
-            self.active = false;
-            self.consecutive_fast_chars = 0;
-            self.last_flush_time = Some(now);
-            if text.is_empty() { None } else { Some(text) }
+            self.flush(now)
         } else {
             None
         }
+    }
+
+    pub fn flush(&mut self, now: Instant) -> Option<String> {
+        if !self.active {
+            return None;
+        }
+        let text = std::mem::take(&mut self.buffer);
+        self.active = false;
+        self.consecutive_fast_chars = 0;
+        self.last_flush_time = Some(now);
+        (!text.is_empty()).then_some(text)
     }
 
     pub fn is_active(&self) -> bool {
         self.active
     }
 
-    pub fn reset(&mut self) {
+    /// Replacing or clearing text must still reject a trailing pasted newline.
+    pub fn reset_preserving_enter_guard(&mut self) {
+        if self.active {
+            self.last_flush_time = Some(Instant::now());
+        }
         self.last_char_time = None;
         self.consecutive_fast_chars = 0;
         self.buffer.clear();
         self.active = false;
-        self.last_flush_time = None;
     }
 
     #[cfg(test)]
@@ -131,6 +141,18 @@ impl PasteBurstDetector {
 mod tests {
     use super::{BurstDecision, PasteBurstDetector};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn text_replacement_preserves_the_flush_enter_guard() {
+        let now = Instant::now();
+        let mut detector = PasteBurstDetector::new();
+        detector.force_due_buffer_for_test("pasted", now);
+        assert_eq!(detector.flush_if_due(now).as_deref(), Some("pasted"));
+        detector.reset_preserving_enter_guard();
+        assert!(!detector.is_active());
+        assert!(detector.enter_should_insert_newline(now + Duration::from_millis(100)));
+        assert!(!detector.enter_should_insert_newline(now + Duration::from_millis(150)));
+    }
 
     #[test]
     fn slow_typing_is_not_burst() {
@@ -205,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_drops_active_buffer_and_timing_state() {
+    fn reset_drops_active_buffer_but_keeps_newline_protection() {
         let mut d = PasteBurstDetector::new();
         let t0 = Instant::now();
         d.on_char('a', t0);
@@ -213,7 +235,8 @@ mod tests {
         d.on_char('c', t0 + Duration::from_millis(4));
         assert!(d.is_active());
 
-        d.reset();
+        d.reset_preserving_enter_guard();
+        assert!(d.enter_should_insert_newline(Instant::now()));
 
         assert!(!d.is_active());
         assert!(d.flush_if_due(t0 + Duration::from_millis(20)).is_none());

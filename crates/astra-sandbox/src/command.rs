@@ -57,7 +57,7 @@ pub fn sandbox_command(
 
 /// Build a restricted bash command string.
 ///
-/// Applies shell hardening (extglob disable, IFS reset, stdin redirect)
+/// Applies shell hardening (extglob disable, IFS reset)
 /// for Standard+ isolation.
 ///
 /// Note: ulimit-based resource limits were removed (relies on timeouts
@@ -455,7 +455,9 @@ fn workspace_out_write_target(
         return Some(target);
     }
 
-    let Some(commands) = super::bash_ast::parse_plain_bash_commands(command) else {
+    let Some((commands, redirect_targets)) =
+        super::bash_ast::parse_bash_commands_for_write_analysis(command)
+    else {
         if super::bash_ast::contains_command_named(
             command,
             &["cp", "mv", "touch", "mkdir", "install", "tee", "rsync"],
@@ -464,6 +466,11 @@ fn workspace_out_write_target(
         }
         return None;
     };
+    for target in redirect_targets {
+        if is_workspace_out_path(&target, workspace) {
+            return Some(target);
+        }
+    }
     for words in commands {
         let Some((executable, arguments)) = effective_mutation_command(&words) else {
             continue;
@@ -1348,15 +1355,12 @@ mod tests {
     fn permissive_applies_minimal_hardening() {
         let p = SandboxPolicy::permissive("/tmp");
         let wrapped = wrap_command_with_limits(&p, "echo hello");
-        // Permissive now applies shell hardening (stdin redirect, extglob disable).
+        // Permission level does not change shell parsing hardening.
         assert!(
             wrapped.contains("echo hello"),
             "should contain user command"
         );
-        assert!(
-            wrapped.contains("< /dev/null"),
-            "should redirect stdin from /dev/null"
-        );
+        assert!(wrapped.contains("extglob"), "should disable extglob");
     }
 
     #[test]
@@ -1647,6 +1651,100 @@ mod tests {
                     .iter()
                     .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
                 "copy destination outside the workspace must be rejected: {command}: {risks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn static_workspace_internal_redirects_are_allowed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_path = workspace.path().display().to_string();
+
+        for command in [
+            format!(
+                "mkdir -p {workspace_path}/results && printf ok > {workspace_path}/results/out.txt"
+            ),
+            format!(
+                "mkdir -p {workspace_path}/results && printf ok >> {workspace_path}/results/out.txt"
+            ),
+            format!("cat seed.txt | tee {workspace_path}/out.txt"),
+            format!("cat seed.txt | tee -a {workspace_path}/out.txt"),
+            format!("mkdir {workspace_path}/d 2>&1 && printf ok > {workspace_path}/out.txt"),
+            format!("printf ok 2>{workspace_path}/err.log > {workspace_path}/out.txt"),
+            format!("printf ok &> {workspace_path}/combined.log"),
+            format!("printf ok &>> {workspace_path}/combined.log"),
+            format!("printf ok > {workspace_path}/out.txt 2>&1"),
+            format!("printf ok > {workspace_path}/out.txt 2>/dev/null"),
+            format!("head -1 < input.txt > {workspace_path}/out.txt"),
+            format!(
+                "mkdir -p '{workspace_path}/with spaces' && printf ok > '{workspace_path}/with spaces/out file.txt'"
+            ),
+        ] {
+            let risks = analyze_command_risks_in_workspace(&command, workspace.path());
+            assert!(
+                !risks
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
+                "strictly internal static writes must be allowed: {command}: {risks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn static_redirects_only_allow_writes_inside_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let workspace_path = workspace.path().display().to_string();
+        let outside_path = outside.path().display().to_string();
+
+        for command in [
+            format!("mkdir -p {workspace_path}/results && printf ok > {outside_path}/out.txt"),
+            format!("mkdir -p {outside_path}/results && printf ok > {workspace_path}/out.txt"),
+            format!("cat seed.txt | tee {outside_path}/out.txt"),
+            format!("cat seed.txt | tee -a {outside_path}/out.txt"),
+            format!("printf ok >> {outside_path}/out.txt"),
+            format!("printf ok 2>{outside_path}/err.log"),
+            format!("printf ok 2>&1 > {outside_path}/out.txt"),
+            format!(
+                "mkdir -p {workspace_path}/results && printf ok > '{outside_path}/out file.txt'"
+            ),
+            format!("cp seed.txt '{outside_path}/out file.txt' > {workspace_path}/out.txt"),
+            format!("touch <&- '{outside_path}/out.txt'"),
+            format!("mkdir <&- '{outside_path}/new-directory'"),
+            format!("cp seed.txt <&- '{outside_path}/out.txt'"),
+            format!("touch >&- '{outside_path}/out.txt'"),
+        ] {
+            let risks = analyze_command_risks_in_workspace(&command, workspace.path());
+            assert!(
+                risks
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
+                "external static writes must be rejected: {command}: {risks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_or_ambiguous_redirects_fail_closed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_path = workspace.path().display().to_string();
+
+        for command in [
+            format!("touch {workspace_path}/a > $TARGET"),
+            format!("touch {workspace_path}/a > \"${{TARGET}}\""),
+            format!("touch {workspace_path}/a > ~/out.txt"),
+            format!("touch {workspace_path}/a > $(pwd)/out.txt"),
+            format!("(touch {workspace_path}/a) > out.txt"),
+            format!("if true; then touch {workspace_path}/a; fi > out.txt"),
+            format!("echo x | tee {workspace_path}/a $(pwd)/b"),
+            format!("echo x | tee {workspace_path}/a ~/b"),
+        ] {
+            let risks = analyze_command_risks_in_workspace(&command, workspace.path());
+            assert!(
+                risks
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
+                "dynamic or ambiguous write forms must fail closed: {command}: {risks:?}"
             );
         }
     }

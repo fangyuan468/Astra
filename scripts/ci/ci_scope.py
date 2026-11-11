@@ -3,7 +3,9 @@
 
 The classifier is deliberately conservative: an unknown diff or a change to CI
 itself enables every scope. Documentation and repository-governance changes are
-handled by the always-on lightweight repository checks.
+handled by the always-on lightweight repository checks. The same event also
+selects macOS runners by a static PR-author ID allowlist, with hosted execution
+for known noneligible sources and no paid route for unavailable metadata.
 """
 
 from __future__ import annotations
@@ -16,6 +18,47 @@ import subprocess
 import sys
 
 
+# GitHub account IDs survive login renames. Login values are review annotations.
+MACOS_RUNNER_AUTHORS = {
+    39627130: "XuPeng-SH",
+    52204121: "loveRhythm1990",
+    26336316: "gouhongshen",
+    49699333: "dependabot[bot]",
+    2245572: "zuyu",
+    4965857: "dengn",
+    85048713: "MatrixAdventurer",
+    176287284: "endlesschasey-ai",
+    49832303: "aptend",
+    169294: "fengttt",
+    28526327: "plane-hjh",
+    523063: "aunjgr",
+    134036682: "Lundomn",
+}
+MACOS_SELF_HOSTED_LABELS = ["self-hosted", "macOS", "ARM64", "mac-arm64-mini"]
+MACOS_MAIN_LABELS = ["self-hosted", "macOS", "ARM64", "mac-arm64-main"]
+
+
+def select_macos_runner(event_name: str, event: dict, *, main_enabled: bool = False) -> list[str]:
+    # Main has a dedicated host that never executes PR code.
+    if main_enabled and event_name == "push" and isinstance(event, dict) and event.get("ref") == "refs/heads/main":
+        return MACOS_MAIN_LABELS.copy()
+    if event_name == "pull_request":
+        if not isinstance(event, dict):
+            return []
+        pull_request = event.get("pull_request")
+        author = pull_request.get("user") if isinstance(pull_request, dict) else None
+        author_id = author.get("id") if isinstance(author, dict) else None
+        if type(author_id) is not int or author_id <= 0:
+            return []
+        if author_id in MACOS_RUNNER_AUTHORS:
+            return MACOS_SELF_HOSTED_LABELS.copy()
+        return ["macos-15"]
+    if (event_name == "push" and isinstance(event, dict)
+            and isinstance(event.get("ref"), str) and event["ref"].startswith("refs/")):
+        return ["macos-15"]
+    return []
+
+
 SCOPES = (
     "rust",
     "sdk",
@@ -26,6 +69,7 @@ SCOPES = (
     "test_runtime",
     "test_services",
     "test_core",
+    "test_macos",
     "online_core",
     "online_integration",
 )
@@ -35,6 +79,7 @@ RUST_SCOPES = (
     "test_runtime",
     "test_services",
     "test_core",
+    "test_macos",
     "online_core",
     "online_integration",
 )
@@ -101,16 +146,19 @@ def _rust_scope_for(path: str, result: dict[str, bool]) -> None:
     is_test_only = "/tests/" in path or path.endswith(("/tests.rs", "/test.rs"))
 
     if crate == "astra-cli":
-        _enable(result, "test_cli")
+        _enable(result, "test_cli", "test_macos")
         return
     if crate == "runtime":
         _enable(result, "test_runtime")
         if is_test_only:
+            if path == "crates/runtime/tests/client_compatibility.rs":
+                # This ignored integration runs in the shared CLI job only.
+                _enable(result, "test_cli")
             online_lane = "online_integration" if "/tests/" in path else "online_core"
             _enable(result, online_lane)
         else:
             # Runtime is consumed by the CLI and the bridge-hook tests in shard D.
-            _enable(result, "test_cli", "test_core", "online_core", "online_integration")
+            _enable(result, "test_cli", "test_core", "test_macos", "online_core", "online_integration")
         return
     if crate in SERVICE_CRATES:
         _enable(result, "test_services")
@@ -122,10 +170,10 @@ def _rust_scope_for(path: str, result: dict[str, bool]) -> None:
             _enable(result, "online_core")
         if not is_test_only:
             # These crates feed both runtime orchestration and CLI execution.
-            _enable(result, "test_runtime", "test_cli")
+            _enable(result, "test_runtime", "test_cli", "test_macos")
         return
 
-    _enable(result, "test_core")
+    _enable(result, "test_core", "test_macos")
     if not is_test_only:
         # Core crates are shared broadly. Keep their downstream behavioral gates
         # conservative; workspace clippy also compiles every downstream target.
@@ -156,8 +204,10 @@ def classify(paths: list[str]) -> dict[str, bool]:
         ):
             _enable(result, *RUST_SCOPES)
             continue
+        # Node/reflow consumers run on Linux; native Mac selection is separate
+        # and monotone so a mixed diff still retains its native coverage.
         if path == ".nvmrc":
-            _enable(result, "sdk", "web", "test_cli")
+            _enable(result, "sdk", "web", "test_cli", "online_integration")
             continue
         if path.startswith("vendor/"):
             # Vendored Rust code is a compiler input, not an unknown-area
@@ -165,11 +215,11 @@ def classify(paths: list[str]) -> dict[str, bool]:
             _enable(result, *RUST_SCOPES)
             continue
         if path.startswith("packages/sdk/"):
-            # The web workspace consumes the local SDK package.
-            _enable(result, "sdk", "web")
+            # Web consumes the SDK; real Next/runtime tests run in integration.
+            _enable(result, "sdk", "web", "online_integration")
             continue
         if path.startswith("web/"):
-            _enable(result, "web")
+            _enable(result, "web", "online_integration")
             continue
         if path.startswith("scripts/tui-reflow/"):
             _enable(result, "test_cli")
@@ -185,6 +235,7 @@ def classify(paths: list[str]) -> dict[str, bool]:
                 result,
                 "rust",
                 "test_core",
+                "test_macos",
                 "test_runtime",
                 "online_core",
                 "online_integration",
@@ -193,7 +244,7 @@ def classify(paths: list[str]) -> dict[str, bool]:
         if path in {"Dockerfile", ".dockerignore"}:
             # Lint checks the pinned toolchain; core's repo_layout_contract
             # checks Docker stages and workspace inputs as well.
-            _enable(result, "rust", "test_core")
+            _enable(result, "rust", "test_core", "test_macos")
             continue
         if path.startswith("crates/"):
             _rust_scope_for(path, result)
@@ -214,14 +265,36 @@ def changed_paths_from_event() -> list[str]:
     event = json.loads(Path(event_path).read_text(encoding="utf-8"))
     if "pull_request" in event:
         base = event["pull_request"]["base"]["sha"]
-        head = event["pull_request"]["head"]["sha"]
+        pull_request_head = event["pull_request"]["head"]["sha"]
+        head = os.environ.get("GITHUB_SHA")
+        if not head:
+            raise RuntimeError("GITHUB_SHA is not set for pull request scope detection")
+
+        # GitHub tests pull requests at a synthetic merge commit. Diffing the
+        # current base tip directly against the feature head also includes
+        # base-only changes when the branches have diverged, which can select
+        # unrelated expensive lanes. Trust the tested merge only after its
+        # parents match the event's base and head commits exactly.
+        parents = subprocess.check_output(
+            ["git", "rev-list", "--parents", "-n", "1", head],
+            stderr=subprocess.STDOUT,
+            text=True,
+        ).strip().split()
+        if parents != [head, base, pull_request_head]:
+            raise RuntimeError(
+                "GITHUB_SHA is not the pull request merge commit described by the event"
+            )
     else:
         base = event.get("before")
         head = event.get("after") or os.environ.get("GITHUB_SHA")
     if not base or not head or set(base) == {"0"}:
         return []
+    # A rename affects both the source and destination scopes. Name-only
+    # output with rename detection reports just the destination, which can
+    # silently skip validation for the code removed from the source area.
     output = subprocess.check_output(
-        ["git", "diff", "--name-only", "-z", base, head], stderr=subprocess.STDOUT
+        ["git", "diff", "--no-renames", "--name-only", "-z", base, head],
+        stderr=subprocess.STDOUT,
     )
     return [item.decode("utf-8") for item in output.split(b"\0") if item]
 
@@ -233,11 +306,23 @@ def emit(scopes: dict[str, bool], paths: list[str], *, fallback: str | None = No
         print(f"{scope}={'true' if scopes[scope] else 'false'}")
     print("changed_paths=" + (", ".join(sorted(paths)) or "<unknown; full fallback>"))
 
+    try:
+        event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+        labels = select_macos_runner(
+            os.environ.get("GITHUB_EVENT_NAME", ""), event,
+            main_enabled=os.environ.get("ASTRA_MACOS_MAIN_ENABLED") == "1"
+        )
+    except (KeyError, OSError, ValueError, TypeError):
+        labels = []
+    runner_json = json.dumps(labels, separators=(",", ":"))
+    print("macos_runner=" + runner_json)
+
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
         with Path(github_output).open("a", encoding="utf-8") as output:
             for scope in SCOPES:
                 output.write(f"{scope}={'true' if scopes[scope] else 'false'}\n")
+            output.write("macos_runner=" + runner_json + "\n")
 
 
 def main() -> int:

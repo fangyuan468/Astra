@@ -18,15 +18,20 @@ use sha2::{Digest, Sha256};
 
 use crate::history_work::{HistoryWorkSite, HistoryWorkSnapshot, instrumentation_enabled};
 
-pub const PRODUCTION_BASELINE_SCHEMA: &str = "astra.history_work.production_baseline.v4";
-pub const PROCESS_CAPTURE_SCHEMA: &str = "astra.history_work.production_process_capture.v3";
+pub const PRODUCTION_BASELINE_SCHEMA: &str = "astra.history_work.production_baseline.v5";
+pub const PROCESS_CAPTURE_SCHEMA: &str = "astra.history_work.production_process_capture.v4";
 const PROCESS_CAPTURE_PATH_ENV: &str = "ASTRA_HISTORY_WORK_BASELINE_FRAGMENT";
 pub const BASELINE_RUN_ID_ENV: &str = "ASTRA_HISTORY_WORK_BASELINE_RUN_ID";
 pub const BASELINE_GIT_SHA_ENV: &str = "ASTRA_HISTORY_WORK_BASELINE_GIT_SHA";
 pub const BASELINE_CAPTURE_SCOPE_ENV: &str = "ASTRA_HISTORY_WORK_BASELINE_CAPTURE_SCOPE";
-pub const BUILD_GIT_SHA: &str = env!("ASTRA_BUILD_GIT_SHA");
-pub const BUILD_GIT_DIRTY: &str = env!("ASTRA_BUILD_GIT_DIRTY");
-pub const BUILD_ATTESTATION_NONCE: &str = env!("ASTRA_BUILD_ATTESTATION_NONCE");
+/// Identity embedded by the executable's build, supplied without runtime overrides.
+#[derive(Debug, Clone, Copy)]
+pub struct BuildAttestation {
+    pub git_sha: &'static str,
+    pub git_dirty: &'static str,
+    pub nonce: &'static str,
+}
+
 const MAX_BASELINE_RUN_SECONDS: u64 = 24 * 60 * 60;
 const ATOMIC_WRITE_CREATE_ATTEMPTS: usize = 64;
 static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -182,7 +187,10 @@ pub struct ProductionProcessCaptureGuard {
 }
 
 impl ProductionProcessCaptureGuard {
-    pub fn from_env(role: ProductionProcessRole) -> io::Result<Option<Self>> {
+    pub fn from_env(
+        role: ProductionProcessRole,
+        build: BuildAttestation,
+    ) -> io::Result<Option<Self>> {
         let Some(path) = std::env::var_os(PROCESS_CAPTURE_PATH_ENV) else {
             return Ok(None);
         };
@@ -207,7 +215,8 @@ impl ProductionProcessCaptureGuard {
                 format!("{PROCESS_CAPTURE_PATH_ENV} requires {BASELINE_GIT_SHA_ENV}"),
             )
         })?;
-        let git_sha = verify_current_build_attestation(&configured_git_sha, &baseline_run_id)?;
+        let git_sha =
+            verify_current_build_attestation(&configured_git_sha, &baseline_run_id, build)?;
         let scope = std::env::var(BASELINE_CAPTURE_SCOPE_ENV)
             .map_err(|_| {
                 io::Error::new(
@@ -470,13 +479,14 @@ fn verify_clean_build_attestation(built_dirty: &str) -> io::Result<()> {
 pub fn verify_current_build_attestation(
     expected_sha: &str,
     expected_run_id: &str,
+    build: BuildAttestation,
 ) -> io::Result<String> {
     verify_build_attestation(
         expected_sha,
         expected_run_id,
-        BUILD_GIT_SHA,
-        BUILD_GIT_DIRTY,
-        BUILD_ATTESTATION_NONCE,
+        build.git_sha,
+        build.git_dirty,
+        build.nonce,
     )
 }
 
@@ -891,10 +901,8 @@ pub struct CacheEvidence {
 pub enum ProjectionEvidence {
     DurableRun {
         durable_event_index: u64,
-        projected_event_index: u64,
-        lag_events: u64,
     },
-    /// A session-scoped CLI bridge has no `agent_runs` projection or replay.
+    /// A session-scoped CLI bridge has no Server Run or durable Run replay.
     CliSessionBridgeNotApplicable,
 }
 
@@ -1891,7 +1899,7 @@ fn verify_scenario(scenario: &ProductionScenario, violations: &mut Vec<String>) 
             );
             require(
                 matches!(&scenario.projection, ProjectionEvidence::DurableRun { .. }),
-                "Server/Edge topology must provide durable projection evidence",
+                "Server/Edge topology must provide canonical Run event evidence",
                 violations,
             );
         }
@@ -2207,34 +2215,16 @@ fn verify_cache(
 }
 
 fn verify_projection(projection: &ProjectionEvidence, violations: &mut Vec<String>) {
-    let ProjectionEvidence::DurableRun {
+    if let ProjectionEvidence::DurableRun {
         durable_event_index,
-        projected_event_index,
-        lag_events,
     } = projection
-    else {
-        return;
-    };
-    require(
-        *durable_event_index > 0,
-        "durable projection cursor is zero",
-        violations,
-    );
-    require(
-        *projected_event_index > 0,
-        "projected cursor is zero",
-        violations,
-    );
-    require(
-        projected_event_index <= durable_event_index,
-        "projection index exceeds durable event index",
-        violations,
-    );
-    require(
-        *lag_events == durable_event_index.saturating_sub(*projected_event_index),
-        "projection lag is inconsistent with durable/projected indices",
-        violations,
-    );
+    {
+        require(
+            *durable_event_index > 0,
+            "canonical Run event watermark is zero",
+            violations,
+        );
+    }
 }
 
 fn verify_compaction(
@@ -2780,8 +2770,6 @@ mod tests {
             } else {
                 ProjectionEvidence::DurableRun {
                     durable_event_index: 1,
-                    projected_event_index: 1,
-                    lag_events: 0,
                 }
             },
             compaction: CompactionEvidence {

@@ -63,6 +63,27 @@ descriptor and provider decision.
 Static and dynamic describe how a declaration enters Astra. They do not create
 different execution semantics.
 
+## Model-issued invocation identity
+
+The shared Server host accepts a selected model response once, before tool
+admission. After validating every provider call ID, it derives a 64-character
+canonical ID from the owner, Session, Run, turn chain, logical loop round and
+original ID using a domain-separated SHA-256 tuple. A later round reusing a
+provider ID is a new invocation; replay uses the stored canonical identity.
+Physical inference retries and optional observation counters do not define it.
+
+Execution, approvals, callbacks, result artifacts, receipts, journal records and
+trace/transcript evidence all retain their existing single canonical-ID path.
+Native runtime-owned calls retain their own IDs. Accepted assistant calls retain
+one bounded original-ID metadata field solely for provider-history projection.
+The existing request adapter restores original assistant/tool pairing and removes
+that field before serializing any provider protocol. Public tool events omit it.
+It grants no execution authority and is not a replay alias or a separate store.
+
+Provider-history ID restoration includes structural tool-result blocks created by
+cache annotation. Their output and cache markers survive native wire conversion;
+result payload data and unowned IDs are not rewritten.
+
 ## First principles
 
 ### Astra owns semantics; protocols supply evidence
@@ -654,6 +675,22 @@ reconciliation/deferred events, and compaction cursor progress. Reflect keeps
 the lifecycle events in its durable evidence graph even when they are not
 children of a context decision.
 
+## MCP gateway transport budget
+
+An authenticated MCP capability descriptor may declare
+`metadata.tool_call_timeout_ms`, an integer from 1 through 3,600,000. It bounds
+the gateway's tool-invocation response wait (`tools/call` and effectful
+capability-source RPCs); the existing default is 120,000 ms.
+Malformed explicit declarations fail capability admission before either MCP or
+skill discovery starts, with the same error for live and snapshot preparation.
+
+The gateway chooses a budget that covers its admitted operations and terminal
+receipts. Astra treats tool arguments as provider-owned data and does not infer
+transport deadlines from business-specific arguments. Discovery keeps its
+existing budget. Cancellation signals the same protocol exchange and retains a
+maximum 120-second settlement wait, even for longer configured calls. Without a
+matching terminal response, execution remains outcome-unknown.
+
 ## Resource context
 
 A complete provider-resource subsystem must normalize provider resources,
@@ -806,9 +843,13 @@ source is returned through the existing input settlement owner before later
 guidance is delivered. Persistence retries settle that source without another
 physical steer; only applied sources enter model context. Refusal does not close
 the stage's guidance or mailbox lanes. Internal
-or unknown error codes and lost/timed-out ACKs leave delivery unknown, disable
+or unknown error codes and lost ACKs leave delivery unknown, disable
 further steering for that stage, and do not interrupt a healthy task. Malformed
 frames or conflicting request/turn identities use ordinary protocol cleanup.
+After socket delivery, the invocation retains its original input waiter until
+the matching ACK, cancellation, or invocation settlement. A slow ACK alone does
+not release that waiter or permit another send. Adapter loss of the ACK channel
+is reported explicitly through the same connection and delivery generation.
 
 The native JSON-RPC envelope budget is independent of the retained answer:
 up to 4 MiB per frame with one queued frame; the presentation remains at most
@@ -882,7 +923,7 @@ objective, or authorize another provider action. Completion retains the existing
 dispatch custody for a bounded final application drain. If settlement is still
 unconfirmed, existing invocation facts prevent the source from being returned as
 safe to resend. The active task itself has no implicit five-minute deadline.
-Protocol negotiation, input acknowledgements and socket delivery remain bounded;
+Protocol negotiation and socket queue admission remain bounded;
 physical Edge disconnection cancels and settles its owned processes before a new
 attachment can admit work. Session context and durable results remain available
 for subsequent stages and replay.

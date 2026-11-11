@@ -305,7 +305,7 @@ mod tests {
         prepare_turn_post_commit_job,
     };
     use crate::cli::session::session_state::SessionState;
-    use astra_turn_core::conversation_log::{AppendMeta, CslEntry, CslStore, CslStoreError};
+    use astra_turn_core::conversation_log::{CslEntry, CslStore, CslStoreError};
     use std::time::Instant;
 
     fn test_api() -> astra_thin_client::ThinClient {
@@ -316,12 +316,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CslStore for DelayedCslStore {
-        async fn append(
-            &self,
-            _session_id: &str,
-            _entry: &CslEntry,
-            _meta: &AppendMeta,
-        ) -> Result<(), CslStoreError> {
+        async fn append(&self, _session_id: &str, _entry: &CslEntry) -> Result<(), CslStoreError> {
             tokio::time::sleep(self.0).await;
             Ok(())
         }

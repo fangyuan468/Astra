@@ -14,6 +14,53 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 
+/// Exercise provider/binding execution without a persistent Session. This
+/// test-only boundary uses production request conversion, runtime injection,
+/// lifecycle execution and SSE projection; it does not test inbound HTTP
+/// authentication or Session creation/scope admission.
+pub async fn ephemeral_provider_chat_stream(
+    state: &super::AppState,
+    principal: &astra_services::AuthPrincipal,
+    payload: Value,
+) -> Response {
+    let request: super::ChatRequest = serde_json::from_value(payload).expect("test chat request");
+    assert!(
+        request.session_id.is_none(),
+        "ephemeral fixture cannot address a persistent Session"
+    );
+    let mut request = super::chat_request_into_data(request);
+    let result = async {
+        super::provider_runtime_context::inject_effective_runtime_context(
+            state,
+            principal,
+            &mut request,
+        )
+        .await?;
+        state
+            .execution
+            .run_lifecycle_service
+            .stream_chat(principal.user.user_id.clone(), request)
+            .await
+    }
+    .await;
+    match result {
+        Ok(mut stream) => super::sse_streaming_response(
+            stream.session_id,
+            stream.run_id,
+            None,
+            stream
+                .event_rx
+                .take()
+                .expect("a new ephemeral run streams its events"),
+        ),
+        Err((status, error)) => super::sse_error_response_from_error_with_context(
+            status,
+            error.0,
+            super::SseErrorContext::default(),
+        ),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProviderRequest {
     pub method: Method,
@@ -121,6 +168,7 @@ impl ProviderGateway {
         };
         let app = Router::new()
             .route("/v1/chat/completions", post(provider_handler))
+            .route("/v1/responses", post(provider_handler))
             .route("/v1/messages", post(provider_handler))
             .route("/v1/systemone", post(provider_handler))
             .route("/model/{model}/converse", post(provider_handler))
@@ -525,36 +573,115 @@ pub(crate) fn eventstream_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// Reuse the real inference ledger's existing test persistence implementation.
-/// This supplies invocation/attempt settlement, never a simulated host loop.
+/// Observations of the production transport. This fixture provides no model
+/// admission, storage, lease or settlement implementation.
 #[derive(Clone, Default)]
-pub struct InferenceLedgerFixture {
-    pub(crate) persistence: crate::turn::llm::durable::TestInferenceLedgerPersistence,
+pub struct ProviderObservationsFixture {
+    calls: Arc<Mutex<std::collections::BTreeMap<String, ObservedCall>>>,
+    changed: Arc<tokio::sync::Notify>,
 }
 
-impl InferenceLedgerFixture {
-    #[cfg(feature = "e2e-hooks")]
-    pub fn admissions(
+struct ObservedCall {
+    scope: astra_turn_types::InferenceInvocationScope,
+    authority: astra_services::InferenceRunAdmissionAuthority,
+    attempts: Vec<crate::turn::llm::client::ProviderAttemptObservation>,
+    finished: bool,
+}
+
+impl ProviderObservationsFixture {
+    pub(crate) fn record(
+        &self,
+        id: &str,
+        scope: &astra_turn_types::InferenceInvocationScope,
+        authority: &astra_services::InferenceRunAdmissionAuthority,
+        attempts: Vec<crate::turn::llm::client::ProviderAttemptObservation>,
+        finished: bool,
+    ) {
+        if attempts.is_empty() {
+            return;
+        }
+        self.calls.lock().unwrap().insert(
+            id.to_string(),
+            ObservedCall {
+                scope: scope.clone(),
+                authority: authority.clone(),
+                attempts,
+                finished,
+            },
+        );
+        self.changed.notify_one();
+    }
+
+    pub fn requests(
         &self,
     ) -> Vec<(
         astra_turn_types::InferenceInvocationScope,
         Option<astra_services::InferenceRunAdmissionAuthority>,
     )> {
-        self.persistence.admissions()
+        self.calls
+            .lock()
+            .unwrap()
+            .values()
+            .map(|call| (call.scope.clone(), Some(call.authority.clone())))
+            .collect()
     }
-    /// Await the existing settlement owner without closing provider admission.
-    /// Cancellation returns after handoff; logical ledger settlement may follow.
-    pub async fn wait_for_settlements(&self, timeout: std::time::Duration) -> bool {
-        crate::turn::llm::durable::wait_for_provider_settlement_coordinator(timeout).await
+
+    pub async fn wait_for_completion(&self, timeout: std::time::Duration) -> bool {
+        tokio::time::timeout(timeout, async {
+            loop {
+                let changed = self.changed.notified();
+                if self
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .all(|call| call.finished)
+                {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .is_ok()
     }
+
+    pub async fn wait_for_measured_input(&self, expected: u64) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let changed = self.changed.notified();
+                if self.calls.lock().unwrap().values().any(|call| {
+                    call.attempts
+                        .iter()
+                        .any(|attempt| attempt.measured_input_tokens == Some(expected))
+                }) {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("provider usage must be observed before cancellation");
+    }
+
     pub fn assert_quiescent(&self) {
-        self.persistence.assert_quiescent();
+        assert!(
+            self.calls
+                .lock()
+                .unwrap()
+                .values()
+                .all(|call| call.finished),
+            "provider transport still has an active request"
+        );
     }
+
     pub fn attempt_count(&self) -> usize {
-        self.persistence.attempt_count()
-    }
-    pub fn canonical_transition_hashes(&self) -> Vec<String> {
-        self.persistence.canonical_transition_hashes()
+        self.calls
+            .lock()
+            .unwrap()
+            .values()
+            .map(|call| call.attempts.len())
+            .sum()
     }
 }
 
@@ -569,6 +696,10 @@ pub fn admitted_execution(
     let offering = astra_services::ResolvedModelOffering {
         offering_id: format!("fixture-{provider}"),
         model: astra_services::ResolvedActiveLlmModel {
+            responses_reasoning_history: None,
+            inference_protocol: None,
+            response_scope_key: None,
+            supported_reasoning_efforts: None,
             price_snapshot: None,
             model_name: model.into(),
             wire_model_name: None,
@@ -598,7 +729,7 @@ pub fn admitted_execution(
 /// these defaults exercise primary request/response execution only.
 pub fn server_host_builder(
     gateway: &ProviderGateway,
-    ledger: &InferenceLedgerFixture,
+    ledger: &ProviderObservationsFixture,
     session_id: &str,
     provider: &str,
     model: &str,
@@ -627,7 +758,7 @@ pub fn server_host_builder(
         "provider-fixture-user".into(),
         session_id.into(),
     )
-    .with_test_inference_ledger(ledger.persistence.clone())
+    .with_provider_observations(ledger.clone())
     .with_model_service(Some(Arc::new(OfferingCatalogFixture {
         execution: execution.clone(),
     })))
@@ -664,25 +795,26 @@ pub async fn bind_server_workspace(
     state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
     root: &std::path::Path,
 ) {
+    let owner = state
+        .owner_user_id
+        .clone()
+        .unwrap_or_else(|| "provider-fixture-user".into());
     let session = state.current_session_id.clone().expect("fixture session");
     let run = state.current_run_id.clone().expect("fixture run");
     let engine = crate::server::run::engine::RunEngine::new(Arc::new(
         astra_services::runs::InMemoryRunStateStore::new(),
     ));
     let authority = engine
-        .start_run(&run, "provider-fixture-user", &session)
+        .start_run(&run, &owner, &session)
         .await
         .expect("admit fixture run");
     state.current_run_owner_generation = Some(authority.owner_generation);
-    state.context_manifest_user_id = Some("provider-fixture-user".into());
+    state.owner_user_id = Some(owner.clone());
     state.permission_context = Some(crate::orchestration::PermissionSyncContext::shared_root(
         crate::orchestration::PermissionMode::Auto,
     ));
-    state.step_recorder = astra_pipeline::step_recorder::StepRecorder::new(
-        "provider-fixture-user",
-        &session,
-        "provider-fixture-task",
-    );
+    state.step_recorder =
+        astra_pipeline::step_recorder::StepRecorder::new(&owner, &session, "provider-fixture-task");
     let ledger =
         crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new_process_local(
             engine,
@@ -690,7 +822,7 @@ pub async fn bind_server_workspace(
         .expect("process-local tool ledger");
     let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
         root.into(),
-        "provider-fixture-user".into(),
+        owner,
         session,
         None,
         None,
@@ -833,7 +965,7 @@ mod tests {
                 vec![response],
             )])
             .await;
-            let ledger = InferenceLedgerFixture::default();
+            let ledger = ProviderObservationsFixture::default();
             let session = format!("child-read-{}", uuid::Uuid::new_v4());
             let mut host =
                 server_host_builder(&gateway, &ledger, &session, "openai", "fixture-model", None)
@@ -898,7 +1030,7 @@ mod tests {
 
     #[cfg(feature = "e2e-hooks")]
     #[tokio::test]
-    async fn execute_turn_replans_tier_after_compaction_memory_refresh() {
+    async fn execute_turn_refreshes_memory_only_during_real_compaction() {
         use crate::session_memory::runner::{SESSION_MEMORY_PREFIX, encode_session_memory_entry};
         use crate::turn::agentic_loop::host::AgenticLoopHost;
         use astra_memoria::{MemoriaMemory, MemoriaOperationError, MemoriaPort};
@@ -907,7 +1039,6 @@ mod tests {
 
         struct RefreshingSessionMemory {
             session_id: String,
-            initial: String,
             refreshed: String,
             snapshot_reads: Mutex<Vec<bool>>,
         }
@@ -935,19 +1066,16 @@ mod tests {
             ) -> Result<Vec<MemoriaMemory>, MemoriaOperationError> {
                 assert_eq!(session_id, Some(self.session_id.as_str()));
                 assert!(filter_session);
-                // Initial prompt recall and snapshot loading run concurrently.
-                // Identify the canonical snapshot query, never their call order.
-                let initial = query.starts_with(SESSION_MEMORY_PREFIX);
-                self.snapshot_reads.lock().unwrap().push(initial);
+                assert!(
+                    !query.starts_with(SESSION_MEMORY_PREFIX),
+                    "ordinary preparation must not load an implicit memory snapshot"
+                );
+                self.snapshot_reads.lock().unwrap().push(false);
                 Ok(vec![MemoriaMemory {
                     memory_id: "session-snapshot".into(),
                     session_id: Some(self.session_id.clone()),
                     memory_type: "working".into(),
-                    content: if initial {
-                        self.initial.clone()
-                    } else {
-                        self.refreshed.clone()
-                    },
+                    content: self.refreshed.clone(),
                     ..Default::default()
                 }])
             }
@@ -994,19 +1122,10 @@ mod tests {
             ),
         ])
         .await;
-        let ledger = InferenceLedgerFixture::default();
+        let ledger = ProviderObservationsFixture::default();
         let session = format!("memory-refresh-{}", uuid::Uuid::new_v4());
         let memory = Arc::new(RefreshingSessionMemory {
             session_id: session.clone(),
-            // The initial bound snapshot alone exceeds the Offering's input
-            // window; the refreshed snapshot leaves this fixed history small.
-            initial: encode_session_memory_entry(
-                &session,
-                &format!(
-                    "## Current State\n- Initial snapshot: {}",
-                    "earlier detail ".repeat(40_000)
-                ),
-            ),
             refreshed: encode_session_memory_entry(
                 &session,
                 "## Current State\n- Refreshed snapshot: review remains active.",
@@ -1020,7 +1139,7 @@ mod tests {
         let history = (0..12)
             .map(|index| json!({
                 "role": if index % 2 == 0 { "user" } else { "assistant" },
-                "content": format!("Historical exchange {index}: {}", "review evidence ".repeat(200)),
+                "content": format!("Historical exchange {index}: {}", "review evidence ".repeat(if index < 4 { 30_000 } else { 32 })),
             }))
             .collect();
         let mut state = loop_state(&session, history, "Summarize the review evidence.");
@@ -1030,13 +1149,9 @@ mod tests {
             .await
             .expect("refreshed turn must finish");
 
-        // Compaction retrieves only at a non-Normal initial tier. Ending at
-        // Normal proves the real execute_turn rerun crossed the old assertion.
-        assert_eq!(*memory.snapshot_reads.lock().unwrap(), [true, false]);
-        assert_eq!(
-            state.last_llm_context_manifest_trace.as_ref().unwrap()["compaction_tier"],
-            "Normal"
-        );
+        // A real history compaction owns the only memory read; ordinary
+        // preparation does not fetch a session snapshot before it.
+        assert_eq!(*memory.snapshot_reads.lock().unwrap(), [false]);
         assert_eq!(state.compact_tier_applied, CompactionTier::AggressivePrune);
         assert_eq!(result.accum.full_text, "Review complete.");
         assert_eq!(result.accum.finish_reason.as_deref(), Some("stop"));

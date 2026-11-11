@@ -21,7 +21,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn check_service_auth(headers: &HeaderMap) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+pub(super) fn check_service_auth(
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let expected = match std::env::var(SERVICE_KEY_ENV) {
         Ok(k) if !k.is_empty() => k,
         _ => {

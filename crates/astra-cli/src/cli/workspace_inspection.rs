@@ -414,8 +414,6 @@ pub(crate) async fn handle_review_command(
         recent_tools: &state.recent_tools,
         tool_health_entries: &state.tool_health_entries,
         resume_restricted_tools: &state.resume_restricted_tools,
-        session_lessons: &state.session_lessons,
-        memory_selection_reports: &[],
 
         latest_turn_quality_feedback: state.latest_turn_quality_feedback.as_ref(),
         unified_skill_registry: astra_runtime::skills::default_unified_registry(),
@@ -425,6 +423,7 @@ pub(crate) async fn handle_review_command(
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
@@ -446,9 +445,9 @@ pub(crate) async fn handle_review_command(
 
         git_worktree_journal: None,
         session_state_journal: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,

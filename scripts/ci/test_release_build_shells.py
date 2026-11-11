@@ -543,23 +543,58 @@ esac
         script = script.replace("${{ matrix.target }}", "test-target")
         # POSIX positional parameters also work on macOS's Bash 3.2.
         # Run that portion under sh as well as bash to guard portability.
-        for shell in ("bash", "sh"):
-            for features in ("", "astra-cli/release-vendored-openssl"):
-                with self.subTest(shell=shell, features=features):
-                    body = script if shell == "bash" else script.replace("set -euo pipefail", "set -eu")
-                    result = subprocess.run(
-                        [shell, "-c", 'cargo() { printf "%s\\n" "$@"; };\n' + body],
-                        env={**os.environ, "RELEASE_FEATURES": features},
-                        capture_output=True, text=True,
-                    )
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    expected = ["build", "--release", "--locked", "--no-default-features"]
-                    if features:
-                        expected += ["--features", features]
-                    expected += ["--manifest-path", "Cargo.toml", "--target", "test-target",
-                                 "-p", "astra-cli", "--bin", "astra",
-                                 "-p", "astra-edge", "--bin", "astra-edge"]
-                    self.assertEqual(result.stdout.splitlines(), expected)
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+
+            def git(*args):
+                return subprocess.run(["git", *args], cwd=fixture, check=True,
+                                      capture_output=True, text=True).stdout.strip()
+
+            git("init", "-b", "main")
+            git("config", "user.name", "Release Fixture")
+            git("config", "user.email", "fixture@example.invalid")
+            tracked = fixture / "source.txt"
+            tracked.write_text("original")
+            git("add", ".")
+            git("-c", "commit.gpgsign=false", "commit", "-m", "fixture")
+            sha = git("rev-parse", "HEAD")
+            env_file = fixture / "job-env"
+            stub = '''cargo() {
+    [ "$ASTRA_BUILD_SOURCE_GIT_SHA" = "$RELEASE_SOURCE_SHA" ] || return 91
+    [ "$ASTRA_BUILD_SOURCE_GIT_DIRTY" = false ] || return 92
+    printf "%s\\n" "$@"
+}
+'''
+            for shell in ("bash", "sh"):
+                for features in ("", "astra-cli/release-vendored-openssl"):
+                    for state in ("clean", "dirty", "wrong-revision", "missing-git"):
+                        with self.subTest(shell=shell, features=features, state=state):
+                            tracked.write_text("edited" if state == "dirty" else "original")
+                            env_file.write_text("")
+                            body = script if shell == "bash" else script.replace("set -euo pipefail", "set -eu")
+                            result = subprocess.run(
+                                [shell, "-c", stub + body], cwd=fixture,
+                                env={**os.environ, "RELEASE_FEATURES": features,
+                                     "GITHUB_ENV": str(env_file),
+                                     "RELEASE_SOURCE_SHA": "0" * 40 if state == "wrong-revision" else sha,
+                                     "GIT_DIR": str(fixture / ("absent" if state == "missing-git" else ".git"))},
+                                capture_output=True, text=True,
+                            )
+                            if state != "clean":
+                                self.assertNotEqual(result.returncode, 0)
+                                self.assertEqual(result.stdout, "", "Must reject before invoking Cargo")
+                                self.assertEqual(env_file.read_text(), "")
+                                continue
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual(env_file.read_text(),
+                                             f"ASTRA_BUILD_SOURCE_GIT_SHA={sha}\nASTRA_BUILD_SOURCE_GIT_DIRTY=false\n")
+                            expected = ["build", "--release", "--locked", "--no-default-features"]
+                            if features:
+                                expected += ["--features", features]
+                            expected += ["--manifest-path", "Cargo.toml", "--target", "test-target",
+                                         "-p", "astra-cli", "--bin", "astra",
+                                         "-p", "astra-edge", "--bin", "astra-edge"]
+                            self.assertEqual(result.stdout.splitlines(), expected)
 
     def test_release_tag_creation_requires_default_branch_ancestry(self):
         script = ROOT / "scripts/reconcile-release-tag.sh"

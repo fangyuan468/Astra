@@ -34,7 +34,7 @@ fn update_notice_stays_below_composer_and_status_without_consuming_draft() {
             assert!(text.find("test-model").unwrap() < text.find("Update available").unwrap());
             assert_eq!(pane.composer.text(), "my unsent draft");
             let (_, cursor_y) = pane.cursor_position(area).unwrap();
-            assert!(cursor_y < height - pane.update_notice_lines(width).len() as u16);
+            assert!(cursor_y < height - pane.notice_lines(width).len() as u16);
 
             pane.update_notice = None;
             assert_eq!(pane.desired_height(width), before);

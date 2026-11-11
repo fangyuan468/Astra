@@ -60,7 +60,11 @@ impl ReplUiAdapter for TuiUiAdapter {
 
     fn restore_input(&mut self, text: &str, session_id: Option<&str>) -> bool {
         let request = RestoreInputRequest {
-            text: text.to_string(),
+            text: if self.continuation.is_some() {
+                text.to_string()
+            } else {
+                super::slash_dispatch::conversation_for_composer(text).into_owned()
+            },
             continuation: self.continuation.clone(),
             session_id: session_id.map(str::to_string),
             submission_id: self.submission_id.clone(),

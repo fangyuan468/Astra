@@ -42,9 +42,11 @@ use std::sync::LazyLock;
 /// enums, and required fields, while verbose per-parameter prose remains in
 /// the canonical catalog selected through `tool_search`. The extra headroom
 /// covers direct provider-stage and exact collaborator-resume fields; those
-/// are part of the normal spawn contract, not a second discovery path.
+/// are part of the normal spawn contract, not a second discovery path. Direct
+/// waiting and basic diagnostic depth/window fields also belong to this surface;
+/// a sub-kilobyte increase avoids separate discovery/model round trips.
 #[cfg(test)]
-pub(crate) const DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET: usize = 9 * 1024;
+pub(crate) const DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET: usize = 10 * 1024;
 
 /// Default T1 always_load candidate tool names, derived from the single
 /// authority [`astra_runtime_env::ToolSpec`] classification.
@@ -385,6 +387,8 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "mode",
                 "timeout",
                 "force",
+                "stdin",
+                "yield_time_ms",
                 // These fields are present only on the CLI edge projection.
                 // The shared/server Bash schema does not declare them, so
                 // retaining them here cannot widen a foreground executor.
@@ -392,7 +396,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "ready_check",
                 "background_ttl",
             ][..],
-            "Omit mode for inspection; verify adds an explicit unchanged-workspace proof.",
+            astra_tools::schemas::BASH_COMMAND_GUIDANCE,
         ),
         "str_replace" => (
             &[
@@ -435,12 +439,14 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
             ][..],
             concat!(
                 astra_tools::agent_parent_scope_guidance!(),
-                " No substitution. launch≠done. Wait. Mailbox:send_message;provider follow-up:exact collaborator_id."
+                " Auto results. wait receives messages; answers need request_id. collaborator_id: provider-owned only."
             ),
         ),
         "introspect" => (
             &[
                 "facet",
+                "depth",
+                "horizon",
                 "question",
                 "artifact",
                 "explain",
@@ -488,9 +494,16 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
         "notify" => (&["message", "notification_type"][..], "Notify."),
         "start_work" => (
             &["goal", "activation", "tasks"][..],
-            "One Work graph; no repeat start; revision-pinned proposal.",
+            function["parameters"]["x-astra-discovery-summary"]
+                .as_str()
+                .unwrap_or_default(),
         ),
-        "run_next_work_item" => (&[][..], "Next Work only if assignment absent."),
+        "run_next_work_item" => (
+            &[][..],
+            function["parameters"]["x-astra-discovery-summary"]
+                .as_str()
+                .unwrap_or_default(),
+        ),
         "settle_work_item" => (
             &[
                 "outcome",
@@ -498,7 +511,9 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "blocker_kind",
                 "unavailable_capabilities",
             ][..],
-            "Settle assigned WorkItem; never child wait.",
+            function["parameters"]["x-astra-discovery-summary"]
+                .as_str()
+                .unwrap_or_default(),
         ),
         _ => return schema,
     };
@@ -604,6 +619,9 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
     for property in properties.values_mut() {
         astra_tools::tool_search::compact_parameter_descriptions(property, true);
     }
+    let interactive_shell = name == "bash"
+        && properties.contains_key("stdin")
+        && properties.contains_key("yield_time_ms");
     // A managed edge Bash schema is a real executable contract, not a rare
     // catalog-only option: without these fields the model cannot keep a
     // service alive across calls. Preserve the small lifecycle shape when the
@@ -629,6 +647,11 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 Value::String("Maximum managed service lifetime in seconds.".to_string());
         }
     }
+    let description = if interactive_shell {
+        format!("{description} stdin=true enables task_input; task_output observes running tasks.")
+    } else {
+        description.to_string()
+    };
     function.insert(
         "description".to_string(),
         Value::String(if managed_background {

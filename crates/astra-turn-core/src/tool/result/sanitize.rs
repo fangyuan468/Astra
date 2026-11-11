@@ -29,7 +29,8 @@ fn str_replace_diff_block_re() -> &'static Regex {
 /// presentations are
 /// either replaced with an owner-scoped artifact by the runtime or kept behind
 /// a typed tool recovery API so omitted evidence remains recoverable.
-pub const MAX_TOOL_RESULT_CHARS: usize = 8_000;
+pub const MAX_TOOL_RESULT_CHARS: usize =
+    astra_core::runtime_limits::DEFAULT_TOOL_RESULT_INLINE_CHARS;
 /// Maximum `read_file`/`view` payload size that is delivered to the model.
 ///
 /// File read state must use this as an upper bound for "content seen by the
@@ -49,7 +50,7 @@ pub const INTROSPECT_MODEL_RESULT_CHARS: usize = 4_000;
 /// with `introspect` before it can follow the workflow it just loaded.
 pub const SKILL_MODEL_RESULT_CHARS: usize = crate::tool_result_storage::PERSIST_THRESHOLD_CHARS;
 const HIGH_CHURN_DIFF_RESULT_CHARS: usize = 8_000;
-const HIGH_CHURN_SHELL_RESULT_CHARS: usize = 8_000;
+const HIGH_CHURN_SHELL_RESULT_CHARS: usize = MAX_TOOL_RESULT_CHARS;
 
 /// Remove `_cli_*` keys from JSON tool results and diff sentinels from `str_replace` text.
 ///
@@ -361,6 +362,18 @@ mod tests {
             out.contains("truncated") || out.contains("elided"),
             "truncation or compression notice present"
         );
+    }
+
+    #[test]
+    fn bounded_bash_file_receipt_survives_model_projection() {
+        let receipt = format!(
+            "[bash full output: stdout=/workspace/astra-bash-outputs/one.stdout (48000 bytes, sha256={}); stderr=/workspace/astra-bash-outputs/one.stderr (0 bytes, sha256={}); complete=true]\n\n{}",
+            "a".repeat(64),
+            "b".repeat(64),
+            "preview\n".repeat(350),
+        );
+        assert!(receipt.len() <= astra_core::runtime_limits::DEFAULT_TOOL_RESULT_INLINE_CHARS / 2);
+        assert_eq!(tool_result_content_for_model("bash", &receipt), receipt);
     }
 
     #[test]

@@ -10,6 +10,10 @@ mkdir -p "${fixture_dir}/bin"
 
 cat > "${fixture_dir}/bin/sccache" <<'EOF'
 #!/usr/bin/env bash
+if [[ "$1" == --stop-server ]]; then
+  printf 'stopped\n' >> "${FAKE_SCCACHE_STOPS}"
+  exit 0
+fi
 printf 'called\n' >> "${FAKE_SCCACHE_CALLS}"
 if [[ "${FAKE_SCCACHE_STATUS}" != "0" ]]; then
   exit "${FAKE_SCCACHE_STATUS}"
@@ -56,7 +60,9 @@ assert_env_line() {
 export PATH="${fixture_dir}/bin:${PATH}"
 export SCCACHE_PATH="${fixture_dir}/bin/sccache"
 export FAKE_SCCACHE_CALLS="${fixture_dir}/sccache-calls"
+export FAKE_SCCACHE_STOPS="${fixture_dir}/sccache-stops"
 export FAKE_RUSTC_CALLS="${fixture_dir}/rustc-calls"
+export ASTRA_CI_RUNNER_ENVIRONMENT=github-hosted
 
 # A healthy backend enables the installed sccache binary and native I/O
 # fallback without invoking rustc outside the cache probe.
@@ -101,5 +107,22 @@ if grep -Fq "RUSTC_WRAPPER=" "${GITHUB_ENV}"; then
   echo "compiler failure must not emit a successful cache configuration" >&2
   exit 1
 fi
+
+# Self-hosted jobs can warm only their own bounded local cache. The previous
+# daemon must stop before probing the new backend; failure still falls back.
+export ASTRA_CI_RUNNER_ENVIRONMENT=self-hosted
+export FAKE_RUSTC_STATUS=0
+export GITHUB_ENV="${fixture_dir}/local.env"
+"${configure}"
+assert_env_line "SCCACHE_GHA_ENABLED=false"
+assert_env_line "SCCACHE_DIRECT=false"
+assert_env_line "SCCACHE_CACHE_SIZE=5G"
+assert_env_line "RUSTC_WRAPPER=${SCCACHE_PATH}"
+assert_count 1 "${FAKE_SCCACHE_STOPS}"
+export FAKE_SCCACHE_STATUS=2
+export GITHUB_ENV="${fixture_dir}/local-failure.env"
+"${configure}"
+assert_env_line "RUSTC_WRAPPER="
+assert_count 2 "${FAKE_SCCACHE_STOPS}"
 
 echo "sccache fallback contract: ok"

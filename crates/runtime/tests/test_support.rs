@@ -117,6 +117,10 @@ impl ModelService for StaticTestModelService {
         Ok(ResolvedModelOffering {
             offering_id,
             model: ResolvedActiveLlmModel {
+                responses_reasoning_history: None,
+                inference_protocol: None,
+                response_scope_key: None,
+                supported_reasoning_efforts: None,
                 price_snapshot: None,
                 model_name: self.model_name.clone(),
                 wire_model_name: None,
@@ -258,4 +262,21 @@ pub fn assert_contract_json(actual: &Value, expected: &Value, label: &str) {
     }
 
     assert_eq!(actual, expected, "{label}");
+}
+
+pub fn call_id_for(events: &[Value], name: &str, matches: impl Fn(&Value) -> bool) -> String {
+    let calls: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "tool_call")
+        .filter(|event| {
+            let call = &event["tool_call"];
+            call["function"]["name"] == name
+                && serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap())
+                    .is_ok_and(|args| matches(&args))
+        })
+        .collect();
+    assert_eq!(calls.len(), 1, "one matching {name} invocation");
+    let id = calls[0]["tool_call"]["id"].as_str().unwrap();
+    assert_eq!(id.len(), 64, "accepted provider invocation ID");
+    id.to_owned()
 }

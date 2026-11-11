@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-SCHEMA = "astra.harness_progress.v3"
+SCHEMA = "astra.harness_progress.v8"
 MAX_RECORD = 262_144
 MAX_FILE = 32 * 1024 * 1024
 STATUSES = ("passed", "failed", "cancelled", "unavailable")
@@ -27,7 +27,8 @@ question_unanswered logical_rounds_mismatch child_result_conflict
 expected_result_mismatch result_digest_mismatch finalization_before_adoption
 """.split())
 CHILD_PROOF_UNAVAILABLE = frozenset("""
-run_tree_unavailable fanout_receipt_unavailable model_identity_unavailable
+run_tree_unavailable root_running root_waiting root_paused root_delegated
+root_interrupted root_failed root_cancelled fanout_receipt_unavailable model_identity_unavailable
 fanout_rejection_execution_unknown fanout_selection_unavailable
 offering_identity_unavailable thinking_unavailable mutation_unavailable
 question_evidence_unavailable logical_rounds_unavailable child_result_unavailable
@@ -47,10 +48,121 @@ ERROR_KINDS = {"rate_limit", "payment_required", "server_error", "auth", "contex
                "tool_rounds_exhausted", "network", "tool_not_found", "tool_invalid_args",
                "policy_denied", "tool_timeout", "tool_unavailable", "tool_binding",
                "tool_outcome_unknown", "resource_limit", "database_error", "stall",
-               "missing_model_selection", "cancelled", "unknown", "other", "not_reported",
+               "missing_model_selection", "cancelled", "unknown"}
+OUTCOME_ERROR_KINDS = ERROR_KINDS | {"other", "not_reported",
                "delegation_model_scope_unresolved", "delegation_model_unavailable",
                "delegation_preparation_unavailable", "delegation_model_assessment_unavailable",
                "invalid_delegation_model_scope", "execution_time_budget_exhausted"}
+INTERRUPTION_KINDS = frozenset("""
+budget_exhausted empty_completion token_budget_exceeded rate_limited cooldown_rejected
+user_cancelled context_overflow auth_failure critical_verdict approval_rejected server_overload
+stream_transport stream_idle provider_deadline harness_blocked harness_paused interrupted
+execution_incomplete executor_dropped timeout cancelled other
+""".split())
+TERMINAL_ERROR_KINDS = ERROR_KINDS | {"api_error", "tool_failure", "persistence_error",
+    "partial", "unfinished", "session_cancellation_pending", "other"}
+ERROR_CODES = TERMINAL_ERROR_KINDS | INTERRUPTION_KINDS | {
+    "canonical_persistence_failed", "crash_recovery", "genesis_unavailable",
+    "terminal_handoff_window_closed", "internal_error", "tool_error", "api_error"}
+STREAM_EVENTS = frozenset("""
+run_started transcript_committed output_delta terminated_completed terminated_delegated
+terminated_failed terminated_interrupted terminated_cancelled gap other
+""".split())
+JOURNAL_EVENTS = frozenset("""
+llm_round turn turn_error tool_invocation llm_round_started llm_round_completed llm_round_failed
+ tool_call_started tool_call_completed tool_call_failed tool_call_skipped
+step_started step_completed step_incomplete step_failed other
+""".split())
+DEADLINE_PHASES = frozenset("""
+semantic_progress actionable_output provider_work consuming_provider_stream waiting_provider_response
+sending_provider_request provider_attempt_admission provider_attempt_terminalization
+provider_attempt_persistence other
+""".split())
+LOOP_FINISH_REASONS = frozenset("""
+stop content_filter function_call length tool_calls continue interrupted superseded_by_runtime_input direct_child_completion_wait
+runtime_input_arrived_before_settlement textless_response_retry canonical_work_revalidation_unavailable
+paused_after_provider_response canonical_work_synthesis_revoked work_settlement_retry
+completion_action_no_tool_retry completion_action_incomplete workspace_completion_retry
+explicit_verification_retry round_slice_without_typed_completion completion_contract_incomplete token_budget_exceeded
+other not_reported
+""".split())
+CHILD_BOUNDARY_OUTCOMES = frozenset("""
+results_staged results_adopted wait_started cancelled readmission_failed synthesis_ready runtime_input_ready
+observation_timed_out synthesis_budget_exhausted deadline finalization_accepted finalization_incomplete
+finalization_interrupted other not_reported
+""".split())
+
+
+def safe_loop_boundaries(value):
+    if not isinstance(value, dict) or set(value) != {"llm_round", "child_barrier"}:
+        raise ValueError("invalid loop boundaries")
+    for kind, tags in (("llm_round", LOOP_FINISH_REASONS), ("child_barrier", CHILD_BOUNDARY_OUTCOMES)):
+        scopes = value[kind]
+        if not isinstance(scopes, dict) or not set(scopes) <= {"root", "other_run", "unattributed"}:
+            raise ValueError("invalid loop scope")
+        for counts in scopes.values():
+            if not isinstance(counts, dict) or not set(counts) <= tags:
+                raise ValueError("invalid loop codes")
+            for count in counts.values():
+                integer(count)
+
+
+def safe_execution_diagnostic(value):
+    if (not isinstance(value, dict) or set(value) != {
+        "final_state", "interruption_kind", "error_kind", "error_code",
+        "server_admission_not_dispatched", "stream", "journal"}):
+        raise ValueError("invalid execution diagnostic")
+    for key, allowed in (("final_state", {"completed", "failed", "interrupted", "other"}),
+                         ("interruption_kind", INTERRUPTION_KINDS),
+                         ("error_kind", TERMINAL_ERROR_KINDS), ("error_code", ERROR_CODES)):
+        tag = value[key]
+        if tag is not None and (not isinstance(tag, str) or tag not in allowed):
+            raise ValueError("invalid execution tag")
+    if type(value["server_admission_not_dispatched"]) is not bool:
+        raise ValueError("invalid admission diagnostic")
+    for key, allowed, fields in (
+        ("stream", STREAM_EVENTS, {"identity_verified", "has_diagnostics"}),
+        ("journal", JOURNAL_EVENTS, {"skipped_lines", "dropped_lines", "integrity_errors"})):
+        capture = value[key]
+        if capture is None:
+            continue
+        expected = fields | {"last_event", "event_counts"}
+        if key == "journal":
+            expected.add("last_provider_failure")
+            expected.add("loop_boundaries")
+        if not isinstance(capture, dict) or set(capture) != expected:
+            raise ValueError("invalid capture diagnostic")
+        if key == "stream":
+            if any(type(capture[field]) is not bool for field in fields):
+                raise ValueError("invalid capture identity")
+        else:
+            for field in fields:
+                integer(capture[field])
+            safe_loop_boundaries(capture["loop_boundaries"])
+        counts = capture["event_counts"]
+        if not isinstance(counts, dict) or not set(counts) <= allowed:
+            raise ValueError("invalid event counters")
+        for count in counts.values():
+            integer(count)
+        last = capture["last_event"]
+        if last is not None and (not isinstance(last, str) or last not in allowed):
+            raise ValueError("invalid last event")
+        if key == "journal" and capture["last_provider_failure"] is not None:
+            failure = capture["last_provider_failure"]
+            if not isinstance(failure, dict) or set(failure) != {
+                "event", "run_scope", "error_kind", "failure_stage", "deadline_phase", "dispatch_started", "provider_completed"}:
+                raise ValueError("invalid provider failure diagnostic")
+            for field, tags in (("event", {"llm_round_failed", "llm_round_completed"}),
+                                ("run_scope", {"root", "other_run", "unattributed"}),
+                                ("error_kind", TERMINAL_ERROR_KINDS),
+                                ("failure_stage", {"admission", "provider", "settlement", "other"}),
+                                ("deadline_phase", DEADLINE_PHASES)):
+                tag = failure[field]
+                if tag is not None and (not isinstance(tag, str) or tag not in tags):
+                    raise ValueError("invalid provider failure tag")
+            for field in ("dispatch_started", "provider_completed"):
+                if failure[field] is not None and type(failure[field]) is not bool:
+                    raise ValueError("invalid provider failure flag")
 
 VALIDATION_CODES = frozenset("""
 required type const enum min_length max_length minimum maximum unique_items
@@ -103,13 +215,59 @@ def safe_diagnostic(value, depth):
         return
     kind = value.get("kind")
     fields = {"count": {"min", "max", "actual"}, "exit": {"expected", "actual"},
-              "tool_count": {"min", "max", "actual", "considered", "expected_ok", "outcome_matches", "error_matches", "predicate_matches", "observed_outcomes", "outcomes_omitted"},
+              "tool_count": {"min", "max", "actual", "considered", "expected_ok", "outcome_matches", "error_matches", "predicate_matches", "predicate_mismatches", "observed_outcomes", "outcomes_omitted"},
+              "journal_count": {"min", "max", "actual", "considered", "outcome_matches", "missing", "type_mismatch", "value_mismatch"},
+              "journal_ratio": {"min", "min_calls", "allowed_failures", "terminal", "succeeded", "failed", "pending", "adjusted_terminal"},
               "sequence": {"matched", "expected"}, "proof": {"proven"},
-              "judge": {"threshold", "assessment"}, "unavailable": set(), "composite": {"checks"},
+              "judge": {"threshold", "assessment", "failure"}, "unavailable": set(), "composite": {"checks"},
               "child_adoption": {"status", "reason"}}
+    fields["cache_scope"] = {"scope", "observations", "post_cold_cache_read_tokens", "executions", "executions_omitted"}
+    if kind == "child_adoption" and "mutation" in value:
+        fields[kind] = fields[kind] | {"mutation"}
     if kind not in fields or set(value) != {"kind"} | fields[kind]:
         raise ValueError("unexpected diagnostic payload")
-    if kind == "composite":
+    if kind == "cache_scope":
+        if value["scope"] not in ("conversation_turns", "intra_turn_rounds"):
+            raise ValueError("invalid cache scope")
+        observations, reads = value["observations"], value["post_cold_cache_read_tokens"]
+        if (observations is None) != (reads is None):
+            raise ValueError("incomplete cache observation")
+        if observations is not None:
+            integer(observations)
+            if (not isinstance(reads, str) or not 1 <= len(reads) <= 39
+                or any(c not in "0123456789" for c in reads) or int(reads) >= 1 << 128):
+                raise ValueError("invalid cache read sum")
+        integer(value["executions_omitted"])
+        if not isinstance(value["executions"], list) or len(value["executions"]) > 16:
+            raise ValueError("invalid cache execution evidence")
+        for execution in value["executions"]:
+            if (not isinstance(execution, dict) or set(execution) != {
+                "capture", "run_matches", "session_matches", "scope_count", "cache_read_tokens"}
+                or execution["capture"] not in ("missing", "identity_unverified", "capture_diagnostic",
+                                                "snapshot_pending", "stream_gap", "verified")):
+                raise ValueError("invalid cache capture diagnostic")
+            for key in ("run_matches", "session_matches"):
+                if execution[key] is not None and type(execution[key]) is not bool:
+                    raise ValueError("invalid cache identity diagnostic")
+            for key in ("scope_count", "cache_read_tokens"):
+                if execution[key] is not None:
+                    integer(execution[key])
+    elif kind == "journal_count":
+        for key in fields[kind]:
+            integer(value[key])
+        if (value["min"] > value["max"] or value["outcome_matches"] > value["considered"]
+            or value["actual"] + value["missing"] + value["type_mismatch"] + value["value_mismatch"] != value["outcome_matches"]):
+            raise ValueError("inconsistent journal count accounting")
+    elif kind == "journal_ratio":
+        for key in fields[kind] - {"min"}:
+            integer(value[key])
+        if (type(value["min"]) not in (int, float) or not math.isfinite(value["min"])
+            or not 0 <= value["min"] <= 1 or value["min_calls"] < 1
+            or value["allowed_failures"] >= value["min_calls"]
+            or value["succeeded"] + value["failed"] != value["terminal"]
+            or value["adjusted_terminal"] != value["succeeded"] + max(0, value["failed"] - value["allowed_failures"])):
+            raise ValueError("inconsistent journal ratio accounting")
+    elif kind == "composite":
         safe_criteria(value["checks"], owner_passed=False, depth=depth+1)
     elif kind == "child_adoption":
         status, reason = value["status"], value["reason"]
@@ -123,11 +281,32 @@ def safe_diagnostic(value, depth):
         elif (not isinstance(reason, str) or status not in allowed
               or reason not in allowed[status]):
             raise ValueError("invalid child proof diagnostic")
+        if "mutation" in value:
+            mutation = value["mutation"]
+            intents = {"unknown", "read_only", "may_mutate", "must_mutate"}
+            personas = {"omitted", "explore", "code_review", "task", "general_purpose", "custom", "unavailable"}
+            if (status != "contradicted" or reason != "mutation_mismatch"
+                or not isinstance(mutation, dict) or set(mutation) != {"expected", "actual", "requested_persona"}
+                or not isinstance(mutation["expected"], str) or mutation["expected"] not in intents
+                or (mutation["actual"] is not None and (not isinstance(mutation["actual"], str) or mutation["actual"] not in intents))
+                or not isinstance(mutation["requested_persona"], str) or mutation["requested_persona"] not in personas):
+                raise ValueError("invalid mutation observation")
     elif kind == "judge":
         if value["assessment"] not in ("graded", "accepted", "rejected", "unavailable", "unreported"):
             raise ValueError("invalid judge assessment")
         if type(value["threshold"]) not in (int, float) or not math.isfinite(value["threshold"]) or not 0 <= value["threshold"] <= 1:
             raise ValueError("invalid judge threshold")
+        failure = value["failure"]
+        if (value["assessment"] == "unavailable") != (failure is not None):
+            raise ValueError("inconsistent judge failure")
+        if failure is not None and (not isinstance(failure, dict)
+            or set(failure) != {"error_kind", "stage"}
+            or not isinstance(failure["error_kind"], str)
+            or failure["error_kind"] not in ERROR_KINDS
+            or not isinstance(failure["stage"], str)
+            or failure["stage"] not in {"request_preparation", "subprocess", "completion",
+                "response_validation", "assessment", "aggregation", "unknown"}):
+            raise ValueError("invalid judge failure")
     elif kind == "proof":
         if type(value["proven"]) is not bool:
             raise ValueError("invalid proof")
@@ -135,7 +314,7 @@ def safe_diagnostic(value, depth):
         if any(type(value[k]) is not int or not -(1 << 31) <= value[k] < (1 << 31) for k in fields[kind]):
             raise ValueError("invalid exit diagnostic")
     else:
-        for key in fields[kind] - {"expected_ok", "error_matches", "predicate_matches", "observed_outcomes"}:
+        for key in fields[kind] - {"expected_ok", "error_matches", "predicate_matches", "predicate_mismatches", "observed_outcomes"}:
             integer(value[key])
         if kind == "tool_count":
             if value["expected_ok"] is not None and type(value["expected_ok"]) is not bool:
@@ -146,6 +325,7 @@ def safe_diagnostic(value, depth):
                 raise ValueError("invalid predicate counts")
             for count in value["predicate_matches"]:
                 integer(count)
+            safe_predicate_mismatches(value)
             outcomes = value["observed_outcomes"]
             if (not isinstance(outcomes, list) or len(outcomes) > 16
                 or len(json.dumps(outcomes, separators=(",", ":"), ensure_ascii=False).encode()) > 8192):
@@ -159,7 +339,7 @@ def safe_diagnostic(value, depth):
                     or (outcome["ok"] is not None and type(outcome["ok"]) is not bool)
                     or outcome["disposition"] not in ("executed", "rejected", "reused", "suppressed", "deferred")
                     or outcome["status"] not in OUTCOME_STATUSES
-                    or outcome["error_kind"] not in ERROR_KINDS
+                    or outcome["error_kind"] not in OUTCOME_ERROR_KINDS
                     or outcome["execution"] not in ("executed", "not_executed", "unknown", "not_reported")):
                     raise ValueError("invalid outcome tags")
                 safe_validation(outcome["validation"])
@@ -168,6 +348,52 @@ def safe_diagnostic(value, depth):
                 observed += entry["count"]
             if observed != value["considered"]:
                 raise ValueError("incomplete outcome accounting")
+
+
+def safe_predicate_mismatches(value):
+    entries = value["predicate_mismatches"]
+    if not isinstance(entries, list) or len(entries) > 16:
+        raise ValueError("invalid predicate mismatches")
+    seen = set()
+    types = {"missing", "null", "boolean", "number", "string", "array", "object"}
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"predicate_index", "failure_count", "first_mismatch"}:
+            raise ValueError("invalid predicate mismatch")
+        index = integer(entry["predicate_index"])
+        if (index >= len(value["predicate_matches"]) or index in seen
+            or integer(entry["failure_count"]) == 0
+            or entry["failure_count"] != value["outcome_matches"] - value["predicate_matches"][index]):
+            raise ValueError("invalid predicate mismatch accounting")
+        seen.add(index)
+        detail = entry["first_mismatch"]
+        if not isinstance(detail, dict):
+            raise ValueError("invalid predicate mismatch detail")
+        reason = detail.get("reason")
+        if reason == "truncated":
+            if set(detail) != {"reason", "limit"} or detail["limit"] not in ("path", "structure"):
+                raise ValueError("invalid predicate truncation")
+            continue
+        fields = {"missing": {"expected_type", "actual_type"},
+                  "type_mismatch": {"expected_type", "actual_type"},
+                  "scalar_mismatch": {"expected_type", "actual_type"},
+                  "substring_absent": {"expected_type", "actual_type"},
+                  "unexpected_members": {"count"},
+                  "array_length_mismatch": {"expected_length", "actual_length"}}
+        if not isinstance(reason, str) or reason not in fields or set(detail) != {"reason", "path"} | fields[reason]:
+            raise ValueError("unexpected predicate mismatch detail")
+        path = detail["path"]
+        if (not isinstance(path, str) or len(path.encode()) > 512
+            or (path and not path.startswith("/"))):
+            raise ValueError("invalid predicate mismatch path")
+        for key in fields[reason]:
+            if key.endswith("_type"):
+                if not isinstance(detail[key], str) or detail[key] not in types:
+                    raise ValueError("invalid predicate JSON type")
+            else:
+                integer(detail[key])
+    failed = sum(count < value["outcome_matches"] for count in value["predicate_matches"])
+    if len(seen) != failed:
+        raise ValueError("incomplete predicate mismatch accounting")
 
 
 def safe_criteria(items, *, owner_passed, depth=0):
@@ -213,17 +439,27 @@ def check_lines(items, prefix):
             threshold = diagnostic.get("threshold", "unknown")
             assessment = diagnostic.get("assessment")
             if assessment == "unavailable":
-                reason = "LLM judge unavailable: evaluation failed; this is NOT a negative quality verdict"
+                failure = diagnostic["failure"]
+                reason = (f"LLM judge unavailable: {failure['error_kind']} at {failure['stage']}; "
+                          "this is NOT a negative quality verdict")
             elif assessment in ("accepted", "rejected"):
                 reason = f"LLM judge {assessment} the declared criterion (acceptance verdict, not a numeric grade)"
+                if assessment == "rejected":
+                    reason += "; structured rejection reason was not captured; do not infer one from this verdict"
             elif check["evaluation"] == "scored":
                 reason = f"LLM judge score={check['score']}, threshold={threshold}; passed={check['passed']}"
             elif check["evaluation"] == "unscored":
                 reason = "LLM judge unscored; no usable score (not a pass)"
             else:
                 reason = f"Required judge passed={check['passed']}; decision diagnostics unreported (do not infer a model verdict)"
-        elif kind in ("count", "tool_count"):
+        elif kind in ("count", "tool_count", "journal_count"):
             reason = f"expected {diagnostic['min']}..{diagnostic['max']}, observed {diagnostic['actual']}"
+            if kind == "journal_count":
+                reason += (f"; tool/scope candidates={diagnostic['considered']}, "
+                           f"matching outcomes={diagnostic['outcome_matches']}; "
+                           f"predicate mismatches: missing={diagnostic['missing']}, "
+                           f"type={diagnostic['type_mismatch']}, value={diagnostic['value_mismatch']}; "
+                           "predicate definition is in the case YAML at this criterion index; raw values withheld")
             if kind == "tool_count":
                 reason += (f"; tool/scope candidates={diagnostic['considered']}; "
                            f"expected ok={diagnostic['expected_ok']}, matching outcomes={diagnostic['outcome_matches']}")
@@ -231,6 +467,8 @@ def check_lines(items, prefix):
                     reason += f"; error-text matches={diagnostic['error_matches']}"
                 reason += f"; independent predicate matches (YAML order)={diagnostic['predicate_matches']}"
                 reason += "; all predicates must match the SAME call"
+                if diagnostic["predicate_mismatches"]:
+                    reason += "; first predicate mismatches=" + json.dumps(diagnostic["predicate_mismatches"], sort_keys=True)
                 reason += "; observed outcomes=" + json.dumps(diagnostic["observed_outcomes"], sort_keys=True)
                 if diagnostic["outcomes_omitted"]:
                     reason += f"; omitted observations={diagnostic['outcomes_omitted']}"
@@ -253,14 +491,28 @@ def check_lines(items, prefix):
                     reason += "; Attribution: invalid request reported; the safe code alone does not identify which input was invalid"
                 else:
                     reason += "; Attribution: contract mismatch observed; root cause is not established by these counts"
+        elif kind == "journal_ratio":
+            reason = (f"success={diagnostic['succeeded']}, failed={diagnostic['failed']}, "
+                      f"terminal={diagnostic['terminal']}, pending={diagnostic['pending']}; "
+                      f"allowed failures={diagnostic['allowed_failures']}; "
+                      f"adjusted ratio={diagnostic['succeeded']}/{diagnostic['adjusted_terminal']} "
+                      f"(zero denominator means 0); required ratio>={diagnostic['min']}, "
+                      f"terminal calls>={diagnostic['min_calls']}")
         elif kind == "exit":
             reason = f"expected exit={diagnostic['expected']}, observed exit={diagnostic['actual']}"
+        elif kind == "cache_scope":
+            reason = (f"required scope={diagnostic['scope']}; observations={diagnostic['observations']}; "
+                      f"post-cold cache reads={diagnostic['post_cold_cache_read_tokens']}; "
+                      "execution evidence=" + json.dumps(diagnostic["executions"], sort_keys=True) +
+                      f"; omitted executions={diagnostic['executions_omitted']}")
         elif kind == "sequence":
             reason = f"matched {diagnostic['matched']} of {diagnostic['expected']} ordered tool receipts"
         elif kind == "unavailable":
             reason = "Canonical execution evidence unavailable or incomplete; cannot verify this contract"
         elif kind == "child_adoption":
             reason = f"Child adoption verification {diagnostic['status']}: {diagnostic['reason']}"
+            if "mutation" in diagnostic:
+                reason += "; mutation observations (not causal attribution)=" + json.dumps(diagnostic["mutation"], sort_keys=True)
         elif kind == "proof":
             reason = f"Canonical child identity/result adoption proven={diagnostic['proven']}"
         elif kind == "composite":
@@ -274,19 +526,30 @@ def check_lines(items, prefix):
 
 def row_checks(row):
     lines = list(check_lines(row["criteria"], "root"))
+    if row["status"] != "passed":
+        lines.append("Execution diagnostics (observations, not causal attribution): " +
+                     json.dumps(row["execution_diagnostic"], sort_keys=True))
     if row["token_usage_coverage"] is None:
         lines.append("Provider usage coverage unavailable; terminal-reported zero counters do not prove zero usage or no tool execution.")
     for step in row["steps"]:
         lines.extend(check_lines(step["criteria"], f"step[{step['step_index']}]"))
+        if not step["passed"]:
+            lines.append(f"step[{step['step_index']}] execution diagnostics: " +
+                         json.dumps(step["execution_diagnostic"], sort_keys=True))
     if not any(c["type"] in ("judger", "hard_judger") for checks in
                [row["criteria"], *(s["criteria"] for s in row["steps"])] for c in checks):
         lines.append("LLM judge: not configured for this case; checks are deterministic, not an LLM assessment.")
     return lines
 
 
+def display_status(row):
+    return "passed (warnings)" if row["status"] == "passed" and row["has_warnings"] else row["status"]
+
+
 def safe_row(row):
     if set(row) != {"case", "model", "run_index", "status", "has_warnings", "failure_class",
-                    "exit_code", "criteria", "steps", "token_usage_coverage", "terminal_reported"}:
+                    "exit_code", "criteria", "steps", "token_usage_coverage", "terminal_reported",
+                    "execution_diagnostic"}:
         raise ValueError("unexpected row payload")
     identity(row["case"]), identity(row["model"]), integer(row["run_index"])
     if row["status"] not in STATUSES or type(row["has_warnings"]) is not bool or type(row["exit_code"]) is not int:
@@ -294,15 +557,17 @@ def safe_row(row):
     if row["failure_class"] is not None:
         identity(row["failure_class"])
     safe_criteria(row["criteria"], owner_passed=row["status"] == "passed")
+    safe_execution_diagnostic(row["execution_diagnostic"])
     if not isinstance(row["steps"], list) or set(row["terminal_reported"]) != set(METRICS):
         raise ValueError("invalid steps or metrics")
     for value in row["terminal_reported"].values():
         integer(value)
     for step in row["steps"]:
-        if set(step) != {"step_index", "passed", "duration_ms", "criteria"} or type(step["passed"]) is not bool:
+        if set(step) != {"step_index", "passed", "duration_ms", "criteria", "execution_diagnostic"} or type(step["passed"]) is not bool:
             raise ValueError("unexpected step payload")
         integer(step["step_index"]), integer(step["duration_ms"])
         safe_criteria(step["criteria"], owner_passed=step["passed"])
+        safe_execution_diagnostic(step["execution_diagnostic"])
     if row["status"] == "passed" and any(not step["passed"] for step in row["steps"]):
         raise ValueError("passed status contradicts canonical checks")
     coverage = row["token_usage_coverage"]
@@ -429,7 +694,7 @@ class Replay:
             counts = self.counts()
             elapsed = "not executed" if row["case_elapsed_ms"] is None else f"{row['case_elapsed_ms']/1000:.2f}s"
             label = json.dumps(f"{row['case']} / {row['model']} / run {row['run_index']+1}", ensure_ascii=False)
-            print(f"[harness] {row['status'].upper()} [{counts['completed']}/{self.total}] {label} · {elapsed}"
+            print(f"[harness] {display_status(row).upper()} [{counts['completed']}/{self.total}] {label} · {elapsed}"
                   f" · exit={row['exit_code']} · error={row['failure_class'] or 'none'}"
                   f" · counts: {counts['passed']} passed, {counts['failed']} failed,"
                   f" {counts['cancelled']} cancelled, {counts['unavailable']} unavailable", flush=True)
@@ -530,10 +795,12 @@ def run(root, command, timeout, grace, started_at=None):
             replay.read(root / "progress.jsonl", final=True, emit=True)
             return execution["exit_code"] or (0 if replay.summary(execution, "success")["success"] else 1)
     finally:
-        for sig, handler in handlers.items():
-            signal.signal(sig, handler)
-        write_json(root / "execution.json", execution)
-        write_json(root / "summary.json", replay.summary(execution))
+        try:
+            write_json(root / "execution.json", execution)
+            write_json(root / "summary.json", replay.summary(execution))
+        finally:
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
 
 
 def publish(root):
@@ -581,7 +848,7 @@ def publish(root):
         out.write("| Case / model / repetition | Result | Case elapsed | Error class |\n|---|---|---:|---|\n")
         for row in summary["runs"]:
             elapsed = "—" if row["case_elapsed_ms"] is None else f"{row['case_elapsed_ms']/1000:.2f}s"
-            out.write(f"| {cell(row['case'])} / {cell(row['model'])} / {row['run_index']+1} | {row['status']} | {elapsed} | {cell(row['failure_class'] or '—')} |\n")
+            out.write(f"| {cell(row['case'])} / {cell(row['model'])} / {row['run_index']+1} | {display_status(row)} | {elapsed} | {cell(row['failure_class'] or '—')} |\n")
         for group in ("running", "waiting"):
             for item in summary[group]:
                 out.write(f"| {cell(item['case'])} / {cell(item['model'])} / {item['run_index']+1} | {group} (not completed) | {item.get('elapsed_ms',0)/1000:.2f}s last observed | — |\n")

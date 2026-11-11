@@ -285,6 +285,7 @@ pub struct PreparedSubRunModel {
 /// Producer-owned result and the child-scoped user changes applied to it.
 #[derive(Debug, Clone)]
 pub struct SubRunExecutionResult {
+    pub cancellation_origin: crate::orchestration::CancellationOrigin,
     pub result: AgentResult,
     pub committed_frontier: Option<SpawnRunFrontier>,
     pub applied_user_intents: Vec<crate::turn::agentic_loop::host::AppliedUserIntent>,
@@ -648,7 +649,7 @@ fn delegated_spawn_projection(
         applied_user_intents: execution.applied_user_intents.clone(),
         status: projection.status.into(),
         finish_reason: projection.finish_reason,
-        cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
+        cancellation_origin: execution.cancellation_origin,
         output: result.output.clone(),
         error: projection.error,
         prompt_tokens: result.prompt_tokens,
@@ -964,6 +965,7 @@ async fn reconcile_agent_result_with_durable_authority(
             _ => None,
         };
         return SubRunExecutionResult {
+            cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
             result,
             committed_frontier: frontier,
             applied_user_intents: applied_user_intents.to_vec(),
@@ -994,6 +996,7 @@ async fn reconcile_agent_result_with_durable_authority(
                 result.run_id
             ));
             return SubRunExecutionResult {
+                cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                 result,
                 committed_frontier: None,
                 applied_user_intents: Vec::new(),
@@ -1007,12 +1010,15 @@ async fn reconcile_agent_result_with_durable_authority(
                 result.run_id
             ));
             return SubRunExecutionResult {
+                cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                 result,
                 committed_frontier: None,
                 applied_user_intents: Vec::new(),
             };
         }
     };
+    let cancellation_origin =
+        crate::orchestration::spawner::durable_run_cancellation_origin(&durable);
     let frontier = Some(SpawnRunFrontier::from_durable(&durable));
     if let Some(mailbox) = mailbox {
         mailbox.request_if_terminal(&durable.status);
@@ -1050,6 +1056,7 @@ async fn reconcile_agent_result_with_durable_authority(
         result.completion_tokens = durable.total_completion_tokens;
         result.tool_calls = durable.total_tool_calls;
         return SubRunExecutionResult {
+            cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
             result,
             committed_frontier: frontier,
             applied_user_intents,
@@ -1064,7 +1071,7 @@ async fn reconcile_agent_result_with_durable_authority(
         durable_status = %durable.status,
         "replaced stale delegated executor outcome with durable authority"
     );
-    result.output = None;
+    result.output = crate::orchestration::spawner::durable_run_output(&durable);
     result.prompt_tokens = durable.total_prompt_tokens;
     result.completion_tokens = durable.total_completion_tokens;
     result.tool_calls = durable.total_tool_calls;
@@ -1095,6 +1102,7 @@ async fn reconcile_agent_result_with_durable_authority(
         }
     }
     SubRunExecutionResult {
+        cancellation_origin,
         result,
         committed_frontier: frontier,
         applied_user_intents: Vec::new(),
@@ -1472,6 +1480,7 @@ pub struct StubSubRunExecutor;
 impl SubRunExecutor for StubSubRunExecutor {
     async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
         Ok(SubRunExecutionResult {
+            cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
             result: AgentResult {
                 agent_id: config.agent_profile.agent_id,
                 run_id: config.run_id,
@@ -2475,6 +2484,7 @@ impl DelegationEngine {
         delegation_id: &str,
         agent_id: &str,
         retry_of: Option<&str>,
+        original_input: &str,
         interaction_mode: RequestedTurnInteractionMode,
         request_constraints: &RequestConstraints,
         execution_restrictions: astra_services::runs::DurableExecutionRestrictions,
@@ -2507,6 +2517,7 @@ impl DelegationEngine {
                 Some(agent_id),
                 retry_of,
                 crate::server::run::engine::RunStartContext {
+                    original_input: Some(original_input.to_owned()),
                     interaction_mode,
                     execution_restrictions: Some(execution_restrictions),
                     execution_metadata: execution_metadata
@@ -3257,6 +3268,7 @@ impl DelegationEngine {
                 let queued_execution = async {
                     if cancel.is_cancelled() {
                         return Ok(SubRunExecutionResult {
+                cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                             result: cancelled_agent_result(&execution_agent_id, &execution_run_id),
                             committed_frontier: None,
                             applied_user_intents: Vec::new(),
@@ -3273,6 +3285,7 @@ impl DelegationEngine {
                     // durable settlement authority from scheduler to executor.
                     if cancel.is_cancelled() {
                         return Ok(SubRunExecutionResult {
+                cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                             result: cancelled_agent_result(&execution_agent_id, &execution_run_id),
                             committed_frontier: None,
                             applied_user_intents: Vec::new(),
@@ -3294,7 +3307,8 @@ impl DelegationEngine {
                         cancel.cancel();
                         match tokio::time::timeout(FANOUT_CANCELLATION_DRAIN_TIMEOUT, &mut queued_execution).await {
                             Ok(Ok(result)) => Ok(result),
-                            failed => Ok(SubRunExecutionResult { result: AgentResult {
+                            failed => Ok(SubRunExecutionResult {
+                cancellation_origin: crate::orchestration::CancellationOrigin::Unverified, result: AgentResult {
                                 agent_id: execution_agent_id.clone(),
                                 run_id: execution_run_id.clone(),
                                 status: match stop {
@@ -3351,6 +3365,7 @@ impl DelegationEngine {
                         &applied_user_intents,
                     ),
                 ).await.unwrap_or(SubRunExecutionResult {
+                cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                     result: pending,
                     committed_frontier: None,
                     applied_user_intents: Vec::new(),
@@ -3400,6 +3415,7 @@ impl DelegationEngine {
                 )
                 .await
                 .unwrap_or(SubRunExecutionResult {
+                    cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                     result: pending,
                     committed_frontier: None,
                     applied_user_intents: Vec::new(),
@@ -3620,6 +3636,17 @@ impl DelegationEngine {
                 break;
             }
             let sub_run_id = uuid::Uuid::new_v4().to_string();
+            // Inject coordination prompt into task.
+            let coordination_prompt = coordination_prompts::fan_out_agent_prompt(
+                &agent_id,
+                &agent_id_strs,
+                aggregation_name,
+            );
+            let enhanced_task = coordination_prompts::wrap_task_with_coordination(
+                &coordination_prompt,
+                &request.task,
+            );
+
             let delegation_authority = DelegationAuthority::Allowed;
             let execution_authority = match self
                 .start_delegated_run(
@@ -3630,6 +3657,7 @@ impl DelegationEngine {
                     &request.delegation_id,
                     &agent_id,
                     None,
+                    &enhanced_task,
                     interaction_mode,
                     &slot_constraints,
                     slot_constraints.durable_execution_restrictions(
@@ -3745,17 +3773,6 @@ impl DelegationEngine {
                 .get_mut(&sub_run_id)
                 .expect("admitted child generation")
                 .1 = MailboxRetirement::from_mailbox(&self.mailbox_router, mailbox.as_ref());
-
-            // Inject coordination prompt into task.
-            let coordination_prompt = coordination_prompts::fan_out_agent_prompt(
-                &agent_id,
-                &agent_id_strs,
-                aggregation_name,
-            );
-            let enhanced_task = coordination_prompts::wrap_task_with_coordination(
-                &coordination_prompt,
-                &request.task,
-            );
 
             let inherited_prefix = prepared_model.as_ref().and_then(|model| {
                 self.resolve_inherited_prefix_for_delegate(
@@ -4008,6 +4025,20 @@ impl DelegationEngine {
                 }
             };
 
+            // Inject sequential coordination prompt
+            let has_prev = previous_output.is_some();
+            let coordination_prompt = coordination_prompts::sequential_stage_prompt(
+                stage_index,
+                total_stages,
+                agent_id,
+                has_prev,
+                stop_on_success,
+            );
+            let enhanced_task = coordination_prompts::wrap_task_with_coordination(
+                &coordination_prompt,
+                &request.task,
+            );
+
             let delegation_authority = DelegationAuthority::Allowed;
             let execution_authority = match self
                 .start_delegated_run(
@@ -4018,6 +4049,7 @@ impl DelegationEngine {
                     &request.delegation_id,
                     agent_id,
                     None,
+                    &enhanced_task,
                     interaction_mode,
                     &slot_constraints,
                     slot_constraints.durable_execution_restrictions(
@@ -4173,20 +4205,6 @@ impl DelegationEngine {
             } else {
                 None
             };
-
-            // Inject sequential coordination prompt
-            let has_prev = previous_output.is_some();
-            let coordination_prompt = coordination_prompts::sequential_stage_prompt(
-                stage_index,
-                total_stages,
-                agent_id,
-                has_prev,
-                stop_on_success,
-            );
-            let enhanced_task = coordination_prompts::wrap_task_with_coordination(
-                &coordination_prompt,
-                &request.task,
-            );
 
             let config = SubRunConfig {
                 execution_contract: Some(execution_contract.clone()),
@@ -4384,6 +4402,12 @@ impl DelegationEngine {
                 break;
             }
             let run_id = uuid::Uuid::new_v4().to_string();
+            let has_parent_ctx = !parent_messages.as_array().map_or(true, |a| a.is_empty());
+            let fork_coordination =
+                coordination_prompts::fork_child_prompt(i, tasks.len(), has_parent_ctx);
+            let fork_task =
+                coordination_prompts::wrap_task_with_coordination(&fork_coordination, task);
+
             let execution_authority = match self
                 .start_delegated_run(
                     &run_id,
@@ -4393,6 +4417,7 @@ impl DelegationEngine {
                     &request.delegation_id,
                     agent_id,
                     None,
+                    &fork_task,
                     interaction_mode,
                     &request_constraints,
                     request_constraints.durable_execution_restrictions(
@@ -4549,12 +4574,6 @@ impl DelegationEngine {
                 ),
             );
             fork_context.insert("is_fork_child".to_string(), serde_json::json!(true));
-
-            let has_parent_ctx = !parent_messages.as_array().map_or(true, |a| a.is_empty());
-            let fork_coordination =
-                coordination_prompts::fork_child_prompt(i, tasks.len(), has_parent_ctx);
-            let fork_task =
-                coordination_prompts::wrap_task_with_coordination(&fork_coordination, task);
 
             let mut fork_profile = profile.clone();
             fork_profile.can_delegate = false;
@@ -5208,6 +5227,7 @@ mod tests {
                 prepared.model_name.clone(),
             ));
             Ok(SubRunExecutionResult {
+                cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                 result: AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
@@ -5374,6 +5394,7 @@ mod tests {
                 &request.delegation_id,
                 "coder",
                 None,
+                "unlaunched task",
                 RequestedTurnInteractionMode::Auto,
                 &RequestConstraints::default(),
                 RequestConstraints::default().durable_execution_restrictions(None, None),
@@ -5749,6 +5770,7 @@ mod tests {
                 "delegation",
                 "reviewer",
                 None,
+                "child task",
                 RequestedTurnInteractionMode::Auto,
                 &constraints,
                 restrictions.clone(),
@@ -5762,6 +5784,12 @@ mod tests {
             .await
             .unwrap();
         let child = run_engine.load_run("user", "child").await.unwrap().unwrap();
+        let input = child.opening.loaded().unwrap().unwrap().input().unwrap();
+        assert_eq!(input.original_input, "child task");
+        assert!(
+            input.context_authority.is_none(),
+            "a child input is not a Root Context grant"
+        );
         assert_eq!(child.execution_restrictions().unwrap(), Some(restrictions));
         assert_eq!(
             crate::server::run::engine::durable_run_delegated_model_requirements(&child).unwrap(),
@@ -6654,6 +6682,7 @@ mod tests {
                 format!("[{}] {}", config.agent_profile.agent_id, config.task)
             };
             Ok(SubRunExecutionResult {
+                cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                 result: AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
@@ -6728,6 +6757,7 @@ mod tests {
                 execution_metadata: config.execution_metadata.clone(),
             });
             Ok(SubRunExecutionResult {
+                cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                 result: AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
@@ -6959,6 +6989,7 @@ mod tests {
             self.cancel_observed.notify_one();
             self.release.notified().await;
             Ok(SubRunExecutionResult {
+                cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                 result: AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
@@ -7322,6 +7353,7 @@ mod tests {
                 self.0.send(config.run_id.clone()).unwrap();
                 tokio::time::sleep(std::time::Duration::from_secs(20)).await;
                 Ok(SubRunExecutionResult {
+                    cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                     result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
@@ -7397,6 +7429,7 @@ mod tests {
     impl SubRunExecutor for StatusExecutor {
         async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
             Ok(SubRunExecutionResult {
+                cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                 result: AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
@@ -7423,6 +7456,7 @@ mod tests {
         async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
             if self.fail_agents.contains(&config.agent_profile.agent_id) {
                 Ok(SubRunExecutionResult {
+                    cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                     result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
@@ -7438,6 +7472,7 @@ mod tests {
                 })
             } else {
                 Ok(SubRunExecutionResult {
+                    cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                     result: AgentResult {
                         agent_id: config.agent_profile.agent_id.clone(),
                         run_id: config.run_id,
@@ -7753,6 +7788,7 @@ mod tests {
                 self.calls.fetch_add(1, Ordering::Relaxed);
                 self.parent_cancel.cancel();
                 Ok(SubRunExecutionResult {
+                    cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                     result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
@@ -7872,6 +7908,7 @@ mod tests {
             async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
                 let has_key = config.context.contains_key("test_key");
                 Ok(SubRunExecutionResult {
+                    cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                     result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
@@ -7933,6 +7970,7 @@ mod tests {
                     .context
                     .contains_key(crate::server::delegation::FORWARD_HEADERS_CONTEXT_KEY);
                 Ok(SubRunExecutionResult {
+                    cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                     result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
@@ -8017,6 +8055,7 @@ mod tests {
                     })
                     .unwrap_or_else(|| "none".to_string());
                 Ok(SubRunExecutionResult {
+                    cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                     result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
@@ -8117,6 +8156,7 @@ mod tests {
                     .model_selection
                     .map(|selection| selection.offering_id);
                 Ok(SubRunExecutionResult {
+                    cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                     result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
@@ -8247,6 +8287,7 @@ mod tests {
                     .context
                     .contains_key(crate::server::delegation::FORWARD_HEADERS_CONTEXT_KEY);
                 Ok(SubRunExecutionResult {
+                    cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                     result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
@@ -8417,6 +8458,7 @@ mod tests {
                     .unwrap_or("none")
                     .to_string();
                 Ok(SubRunExecutionResult {
+                    cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                     result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
@@ -8925,10 +8967,7 @@ mod tests {
                 }
             );
             assert_eq!(receipt.result.error.as_deref(), Some("committed outcome"));
-            assert_eq!(
-                receipt.result.output.as_deref(),
-                typed_partial.then_some("committed output")
-            );
+            assert_eq!(receipt.result.output.as_deref(), Some("committed output"));
             assert_eq!(
                 receipt.applied_user_intents,
                 if typed_partial {
@@ -9281,6 +9320,7 @@ mod tests {
                 }
                 self.parent_cancel.cancel();
                 Ok(SubRunExecutionResult {
+                    cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                     result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
@@ -9364,6 +9404,7 @@ mod tests {
             async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
                 self.executions.fetch_add(1, Ordering::Relaxed);
                 Ok(SubRunExecutionResult {
+                    cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                     result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
@@ -9753,6 +9794,11 @@ mod tests {
 
         let records = vec![
             DurableRunRecord {
+                opening: Default::default(),
+                opening_hash: None,
+                context_admission_hash: None,
+                terminal_receipt_json: None,
+                terminal_at: None,
                 run_id: "sub-1".into(),
                 user_id: "u1".into(),
                 session_id: "s1".into(),
@@ -9770,8 +9816,8 @@ mod tests {
                 owner_lease_expires_at: None,
                 run_generation: 0,
                 last_event_idx: -1,
-                checkpoint_version: None,
-                checkpoint_json: None,
+                last_guidance_event_idx: -1,
+                current_checkpoint: None,
                 error_code: None,
                 error_message: None,
                 total_prompt_tokens: 0,
@@ -9790,6 +9836,11 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".into(),
             },
             DurableRunRecord {
+                opening: Default::default(),
+                opening_hash: None,
+                context_admission_hash: None,
+                terminal_receipt_json: None,
+                terminal_at: None,
                 run_id: "sub-2".into(),
                 user_id: "u1".into(),
                 session_id: "s1".into(),
@@ -9807,8 +9858,8 @@ mod tests {
                 owner_lease_expires_at: None,
                 run_generation: 0,
                 last_event_idx: -1,
-                checkpoint_version: None,
-                checkpoint_json: None,
+                last_guidance_event_idx: -1,
+                current_checkpoint: None,
                 error_code: None,
                 error_message: None,
                 total_prompt_tokens: 0,
@@ -9827,6 +9878,11 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".into(),
             },
             DurableRunRecord {
+                opening: Default::default(),
+                opening_hash: None,
+                context_admission_hash: None,
+                terminal_receipt_json: None,
+                terminal_at: None,
                 run_id: "sub-3".into(),
                 user_id: "u1".into(),
                 session_id: "s1".into(),
@@ -9844,8 +9900,8 @@ mod tests {
                 owner_lease_expires_at: None,
                 run_generation: 0,
                 last_event_idx: -1,
-                checkpoint_version: None,
-                checkpoint_json: None,
+                last_guidance_event_idx: -1,
+                current_checkpoint: None,
                 error_code: None,
                 error_message: None,
                 total_prompt_tokens: 0,
@@ -9865,6 +9921,11 @@ mod tests {
             },
             // Root run — should be skipped
             DurableRunRecord {
+                opening: Default::default(),
+                opening_hash: None,
+                context_admission_hash: None,
+                terminal_receipt_json: None,
+                terminal_at: None,
                 run_id: "root-run".into(),
                 user_id: "u1".into(),
                 session_id: "s1".into(),
@@ -9882,8 +9943,8 @@ mod tests {
                 owner_lease_expires_at: None,
                 run_generation: 0,
                 last_event_idx: -1,
-                checkpoint_version: None,
-                checkpoint_json: None,
+                last_guidance_event_idx: -1,
+                current_checkpoint: None,
                 error_code: None,
                 error_message: None,
                 total_prompt_tokens: 0,
@@ -10278,6 +10339,7 @@ mod tests {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 }
                 Ok(SubRunExecutionResult {
+                    cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                     result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
@@ -10449,6 +10511,7 @@ mod tests {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(999);
                 Ok(SubRunExecutionResult {
+                    cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                     result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
@@ -10895,6 +10958,7 @@ mod tests {
         async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
             tokio::time::sleep(self.delay).await;
             Ok(SubRunExecutionResult {
+                cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                 result: AgentResult {
                     agent_id: config.agent_profile.agent_id.clone(),
                     run_id: config.run_id.clone(),
@@ -10919,6 +10983,7 @@ mod tests {
     impl SubRunExecutor for MailboxEchoExecutor {
         async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
             Ok(SubRunExecutionResult {
+                cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                 result: AgentResult {
                     agent_id: config.agent_profile.agent_id.clone(),
                     run_id: config.run_id.clone(),
@@ -11008,6 +11073,7 @@ mod tests {
                     .push(config.execution_deadline);
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 Ok(SubRunExecutionResult {
+                    cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                     result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,

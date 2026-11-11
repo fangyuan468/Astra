@@ -6,10 +6,10 @@ use sqlx::{MySql, QueryBuilder, Row, query};
 use astra_core::canonical_names::{metadata_duration_ms, metadata_tool_name};
 use astra_core::{matrixone_null_shape_comment, matrixone_statement_with_null_shape};
 use astra_services::observation_capture::{
-    DurableCaptureOutcome, ObservationCollisionReceipt, ObservationPayloadDomain,
-    canonical_observation_payload_hash, classify_capture, record_observation_collisions,
+    DurableCaptureOutcome, ObservationCollisionReceipt, all_agent_event_rows_were_inserted,
+    canonical_agent_event_payload_hash, classify_capture, record_observation_collisions,
 };
-use astra_turn_core::contracts::{TurnAuxiliaryEventRecord, TurnSkillSelectionRecord};
+use astra_turn_core::contracts::TurnAuxiliaryEventRecord;
 use astra_turn_core::trace_event::TraceEvent;
 use uuid::Uuid;
 
@@ -195,7 +195,6 @@ pub(crate) async fn classify_agent_event_capture_attempts(
                 attempted_payload_hash,
             } => Some(ObservationCollisionReceipt {
                 user_id: attempt.user_id,
-                domain: ObservationPayloadDomain::AgentEvent,
                 identity_id: attempt.event_id,
                 session_id: attempt.session_id,
                 stored_payload_hash,
@@ -264,7 +263,7 @@ fn persisted_token_usage_json(
 }
 
 fn hash_agent_event_payload(payload: serde_json::Value) -> String {
-    canonical_observation_payload_hash(ObservationPayloadDomain::AgentEvent, &payload)
+    canonical_agent_event_payload_hash(&payload)
 }
 
 /// Runtime trace identities carry the complete producer envelope. Journal
@@ -389,7 +388,7 @@ pub(crate) async fn insert_trace_events(
             .iter()
             .flat_map(|index| values[*index].nullable_shape(&events[*index])),
     ));
-    insert.build().execute(&mut **tx).await?;
+    let inserted_rows = insert.build().execute(&mut **tx).await?.rows_affected();
 
     let attempts = events
         .iter()
@@ -401,13 +400,24 @@ pub(crate) async fn insert_trace_events(
             payload_hash: &values.payload_hash,
         })
         .collect::<Vec<_>>();
-    let outcomes = classify_agent_event_capture_attempts(
-        tx,
-        &attempts,
-        &ingestion_write_id,
-        TRACE_EVENT_COLLISION_SOURCE,
-    )
-    .await?;
+    let outcomes = if !first.user_id.is_empty()
+        && first.user_id.len() <= 128
+        && !first.session_id.is_empty()
+        && first.session_id.len() <= 128
+        && all_agent_event_rows_were_inserted(
+            inserted_rows,
+            events.iter().map(|event| event.event_id.as_str()),
+        ) {
+        vec![DurableCaptureOutcome::Inserted; events.len()]
+    } else {
+        classify_agent_event_capture_attempts(
+            tx,
+            &attempts,
+            &ingestion_write_id,
+            TRACE_EVENT_COLLISION_SOURCE,
+        )
+        .await?
+    };
     let inserted_indices = outcomes
         .iter()
         .enumerate()
@@ -456,9 +466,7 @@ mod tests {
         unique_trace_event_indices,
     };
     use astra_core::matrixone_statement_with_null_shape;
-    use astra_services::observation_capture::{
-        ObservationPayloadDomain, canonical_observation_payload_hash,
-    };
+    use astra_services::observation_capture::canonical_agent_event_payload_hash;
     use astra_turn_core::trace_event::TraceEvent;
 
     #[tokio::test]
@@ -725,10 +733,7 @@ mod tests {
 
         assert_eq!(
             trace_event_payload_hash(&event).unwrap(),
-            canonical_observation_payload_hash(
-                ObservationPayloadDomain::AgentEvent,
-                &serde_json::to_value(&event).unwrap(),
-            )
+            canonical_agent_event_payload_hash(&serde_json::to_value(&event).unwrap(),)
         );
     }
 
@@ -755,7 +760,7 @@ mod tests {
         );
 
         assert_ne!(without_chain_sql, with_chain_sql);
-        assert!(with_chain_sql.contains("astra-null-shape:001"));
+        assert!(with_chain_sql.as_str().contains("astra-null-shape:001"));
     }
 
     #[test]
@@ -821,29 +826,4 @@ mod tests {
             "trace token usage must be canonical-only: {err}"
         );
     }
-}
-
-pub(crate) async fn insert_turn_skill_selection(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    record: &TurnSkillSelectionRecord,
-) -> Result<(), sqlx::Error> {
-    query(
-        "INSERT INTO skill_selection_events \
-         (event_id, session_id, user_id, agent_id, user_query, selected_skills, skill_name, skill_version, selection_method, execution_success, execution_time_ms, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
-    )
-    .bind(&record.event_id)
-    .bind(&record.session_id)
-    .bind(&record.user_id)
-    .bind(&record.agent_id)
-    .bind(&record.user_query)
-    .bind(serde_json::json!(record.selected_skills).to_string())
-    .bind(&record.skill_name)
-    .bind(&record.skill_version)
-    .bind(&record.selection_method)
-    .bind(record.execution_success)
-    .bind(record.execution_time_ms)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
 }

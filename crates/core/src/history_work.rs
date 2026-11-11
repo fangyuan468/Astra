@@ -59,13 +59,6 @@ pub enum HistoryWorkSite {
     CslFileRead,
     CslFileAppendSerialization,
     CslFileRewriteSerialization,
-    CslDatabaseRead,
-    CslDatabaseSerialization,
-    CslDatabaseRows,
-    PromptDeltaHash,
-    PromptDeltaRead,
-    PromptDeltaRows,
-    PromptDeltaUnchangedPrefix,
     RunAdmission,
     FinalizationCheckpointClone,
     FinalizationRecoveryComparison,
@@ -88,7 +81,6 @@ pub enum HistoryWorkSite {
     ProviderBodySerialization,
     LlmCaptureArtifactClone,
     LlmCaptureArtifactSerialization,
-    ServerCslPersistClone,
     ServerObserverQueue,
     ServerCompactionFixedContextClone,
     ServerToolPolicySchemaClone,
@@ -111,7 +103,6 @@ pub enum HistoryWorkSite {
     ServerContextTraceClone,
     ToolSchemaCacheStabilizationClone,
     ToolSchemaWireSortSerialization,
-    SessionRestoreHydration,
     ResumeHintHistoryClone,
     TailPersistHistoryClone,
     CompactionHistoryClone,
@@ -140,7 +131,7 @@ pub enum HistoryWorkSite {
 }
 
 impl HistoryWorkSite {
-    const COUNT: usize = 120;
+    const COUNT: usize = 111;
 
     /// Current instrumented sites; retired producers do not retain zero-only entries.
     pub const ALL: [Self; Self::COUNT] = [
@@ -186,13 +177,6 @@ impl HistoryWorkSite {
         Self::CslFileRead,
         Self::CslFileAppendSerialization,
         Self::CslFileRewriteSerialization,
-        Self::CslDatabaseRead,
-        Self::CslDatabaseSerialization,
-        Self::CslDatabaseRows,
-        Self::PromptDeltaHash,
-        Self::PromptDeltaRead,
-        Self::PromptDeltaRows,
-        Self::PromptDeltaUnchangedPrefix,
         Self::RunAdmission,
         Self::FinalizationCheckpointClone,
         Self::FinalizationRecoveryComparison,
@@ -215,7 +199,6 @@ impl HistoryWorkSite {
         Self::ProviderBodySerialization,
         Self::LlmCaptureArtifactClone,
         Self::LlmCaptureArtifactSerialization,
-        Self::ServerCslPersistClone,
         Self::ServerObserverQueue,
         Self::ServerCompactionFixedContextClone,
         Self::ServerToolPolicySchemaClone,
@@ -238,7 +221,6 @@ impl HistoryWorkSite {
         Self::ServerContextTraceClone,
         Self::ToolSchemaCacheStabilizationClone,
         Self::ToolSchemaWireSortSerialization,
-        Self::SessionRestoreHydration,
         Self::ResumeHintHistoryClone,
         Self::TailPersistHistoryClone,
         Self::CompactionHistoryClone,
@@ -318,13 +300,6 @@ impl HistoryWorkSite {
             Self::CslFileRead => "csl_file_read",
             Self::CslFileAppendSerialization => "csl_file_append_serialization",
             Self::CslFileRewriteSerialization => "csl_file_rewrite_serialization",
-            Self::CslDatabaseRead => "csl_database_read",
-            Self::CslDatabaseSerialization => "csl_database_serialization",
-            Self::CslDatabaseRows => "csl_database_rows",
-            Self::PromptDeltaHash => "prompt_delta_hash",
-            Self::PromptDeltaRead => "prompt_delta_read",
-            Self::PromptDeltaRows => "prompt_delta_rows",
-            Self::PromptDeltaUnchangedPrefix => "prompt_delta_unchanged_prefix",
             Self::RunAdmission => "run_admission",
             Self::FinalizationCheckpointClone => "finalization_checkpoint_clone",
             Self::FinalizationRecoveryComparison => "finalization_recovery_comparison",
@@ -347,7 +322,6 @@ impl HistoryWorkSite {
             Self::ProviderBodySerialization => "provider_body_serialization",
             Self::LlmCaptureArtifactClone => "llm_capture_artifact_clone",
             Self::LlmCaptureArtifactSerialization => "llm_capture_artifact_serialization",
-            Self::ServerCslPersistClone => "server_csl_persist_clone",
             Self::ServerObserverQueue => "server_observer_queue",
             Self::ServerCompactionFixedContextClone => "server_compaction_fixed_context_clone",
             Self::ServerToolPolicySchemaClone => "server_tool_policy_schema_clone",
@@ -370,7 +344,6 @@ impl HistoryWorkSite {
             Self::ServerContextTraceClone => "server_context_trace_clone",
             Self::ToolSchemaCacheStabilizationClone => "tool_schema_cache_stabilization_clone",
             Self::ToolSchemaWireSortSerialization => "tool_schema_wire_sort_serialization",
-            Self::SessionRestoreHydration => "session_restore_hydration",
             Self::ResumeHintHistoryClone => "resume_hint_history_clone",
             Self::TailPersistHistoryClone => "tail_persist_history_clone",
             Self::CompactionHistoryClone => "compaction_history_clone",
@@ -453,14 +426,7 @@ impl HistoryWorkSite {
             Self::CslFileRead
             | Self::CslFileAppendSerialization
             | Self::CslFileRewriteSerialization => "turn_core.csl_file_store",
-            Self::CslDatabaseRead | Self::CslDatabaseSerialization | Self::CslDatabaseRows => {
-                "turn_core.csl_database_store"
-            }
-            Self::PromptDeltaHash | Self::PromptDeltaRead | Self::PromptDeltaRows => {
-                "services.prompt_delta"
-            }
             Self::RunAdmission => "runtime.run_admission",
-            Self::PromptDeltaUnchangedPrefix => "services.prompt_delta",
             Self::FinalizationCheckpointClone | Self::FinalizationRecoveryComparison => {
                 "runtime.agentic_loop.finalization"
             }
@@ -482,7 +448,6 @@ impl HistoryWorkSite {
             Self::LlmCaptureArtifactClone | Self::LlmCaptureArtifactSerialization => {
                 "runtime.turn.llm_capture"
             }
-            Self::ServerCslPersistClone => "runtime.server.csl",
             Self::ServerObserverQueue => "runtime.server.observer",
             Self::ServerCompactionFixedContextClone => "runtime.server.compaction",
             Self::ServerToolPolicySchemaClone => "runtime.server.tool_policy",
@@ -508,7 +473,6 @@ impl HistoryWorkSite {
             Self::ServerContextTraceClone => "runtime.server.llm_trace",
             Self::ToolSchemaCacheStabilizationClone => "runtime.turn.llm_context",
             Self::ToolSchemaWireSortSerialization => "runtime.turn.llm_context",
-            Self::SessionRestoreHydration => "services.session_restore",
             Self::ResumeHintHistoryClone => "turn_core.resume_hydration",
             Self::TailPersistHistoryClone => "turn_core.tail_persist",
             Self::CompactionHistoryClone => "turn_core.compaction",
@@ -552,8 +516,7 @@ impl HistoryWorkSite {
             | Self::CliTurnUserInputProjection
             | Self::ObservabilityRollbackSnapshotClone
             | Self::ObservabilityRollbackRestoreClone => 1,
-            Self::SessionRestoreHydration
-            | Self::ResumeHintHistoryClone
+            Self::ResumeHintHistoryClone
             | Self::CliDisplayHistoryProjectionClone
             | Self::CliRecoveryCslLogRead
             | Self::CliRecoveryCslSnapshotClone
@@ -1534,9 +1497,9 @@ mod tests {
 
     #[test]
     fn multidimensional_measurement_counts_one_operation() {
-        let before = measurement(HistoryWorkSite::CslDatabaseRead);
-        record_operation(HistoryWorkSite::CslDatabaseRead, 41, 3, 0);
-        let after = measurement(HistoryWorkSite::CslDatabaseRead);
+        let before = measurement(HistoryWorkSite::ForkPrefixMaterialization);
+        record_operation(HistoryWorkSite::ForkPrefixMaterialization, 41, 3, 0);
+        let after = measurement(HistoryWorkSite::ForkPrefixMaterialization);
 
         assert_eq!(after.events - before.events, 1);
         assert_eq!(after.bytes - before.bytes, 41);

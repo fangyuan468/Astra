@@ -30,6 +30,8 @@ request is assembled by a budgeted pipeline you can EXPLAIN, every attempt
 leaves evidence you can inspect, diff, and roll back, and execution runs
 through a Runner inside your own environment.
 
+**[Current capability status](docs/reference/capabilities.md)** — supported profiles, defaults, dependencies, verification lanes and known limits for this source version.
+
 ### Jev agent integration
 
 Astra integrates **Jev (TypeSafe AI's System One model)** at the agent-runtime

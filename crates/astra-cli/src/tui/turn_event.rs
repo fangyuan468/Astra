@@ -114,10 +114,7 @@ pub(crate) enum TurnEvent {
         tokens_in: Option<u64>,
         #[serde(default)]
         tokens_out: Option<u64>,
-        /// Of `tokens_in`, how many were served from the provider's
-        /// prompt cache. Drives the `💾 N%` segment. Absent on older
-        /// transcripts and on providers that don't surface cache
-        /// stats — `#[serde(default)]` keeps the schema additive.
+        /// Cached input, separate from fresh `tokens_in`; absent means unreported.
         #[serde(default)]
         cache_read_tokens: Option<u64>,
         /// Fresh tokens written to the provider cache. Kept separate from
@@ -130,6 +127,9 @@ pub(crate) enum TurnEvent {
         /// Human-readable summary of auxiliary judgment/memory calls.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auxiliary_summary: Option<String>,
+        /// Complete primary-input coverage across attempts, independent of output usage.
+        #[serde(default)]
+        input_usage_complete: bool,
         /// True when primary usage attribution was observed but not complete.
         #[serde(default)]
         usage_partial: bool,
@@ -347,6 +347,7 @@ mod tests {
             cache_creation_tokens: None,
             model_name: None,
             auxiliary_summary: None,
+            input_usage_complete: false,
             usage_partial: false,
             tools: 0,
             cumulative_tokens: None,

@@ -51,7 +51,7 @@ type GuardFn = fn(&mut AgenticLoopState, &GuardConfig) -> GuardOutcome;
 ///
 /// Ordering matters: earlier guards set state flags that later guards
 /// check to defer when a stronger intervention is already active
-/// (e.g. redundant_reads defers to round_budget_phase1).
+/// when a stronger runtime signal is already present.
 pub(crate) fn default_guards() -> Vec<(&'static str, GuardFn)> {
     vec![
         ("work_evidence_sufficiency", check_work_evidence_sufficiency),
@@ -108,7 +108,7 @@ pub(crate) fn refresh_work_evidence_context(state: &mut AgenticLoopState) {
     state.clear_volatile(VolatileKind::WorkEvidenceContext);
     let (Some(executor), Some(user), Some(session), Some(run)) = (
         state.runtime_tool_executor.as_deref(),
-        state.context_manifest_user_id.as_deref(),
+        state.owner_user_id.as_deref(),
         state.current_session_id.as_deref(),
         state.current_run_id.as_deref(),
     ) else {
@@ -449,8 +449,7 @@ mod tests {
 /// Detect wasteful cache reads (repeated reads hitting the stale-cache
 /// guard without follow-up writes) and surface advisory evidence.
 ///
-/// Defers to redundant_reads when both would fire on the same round, and
-/// to the same stronger interventions as `check_redundant_reads`.
+/// Defers to stronger runtime signals on the same round.
 fn check_cache_waste(state: &mut AgenticLoopState, cfg: &GuardConfig) -> GuardOutcome {
     if state.stall.cache_waste_advisory_emitted
         || !should_emit_cache_waste_advisory(state, cfg.cache_waste_threshold)

@@ -281,8 +281,12 @@ fn enter_submits_selected_command() {
 }
 
 #[test]
-fn command_arguments_are_submitted_unchanged() {
+fn command_arguments_and_literal_slashes_are_submitted_unchanged() {
     for text in [
+        "//",
+        "//stop",
+        "//help",
+        "//tmp/624/path",
         "/resume 01234567-89ab-4cde-8123-456789abcdef",
         "/model 5.2",
         "/unknown 123",
@@ -292,34 +296,45 @@ fn command_arguments_are_submitted_unchanged() {
         "/mcp inspect github:list_prs 123 \"quoted argument\"",
     ] {
         for paste in [false, true] {
-            let mut bp = fresh();
-            bp.set_slash_items(vec![
-                SlashItem {
-                    name: "/mcp".into(),
-                    subcommands: &[("inspect", "Inspect server")],
-                    extra_subcommands: vec![("inspect github:list_prs".into(), "List PRs".into())],
-                    ..Default::default()
-                },
-                SlashItem::simple("/resume", "Resume"),
-                SlashItem::simple("/model", "Model"),
-                SlashItem::simple("/help", "Help"),
-            ]);
-            if paste {
-                bp.handle_paste(text);
-            } else {
-                for c in text.chars() {
-                    let event = if c == '\n' {
-                        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
-                    } else {
-                        key(c)
-                    };
-                    let _ = bp.handle_key(event);
+            for followup in [false, true] {
+                let mut bp = fresh();
+                bp.set_slash_items(vec![
+                    SlashItem {
+                        name: "/mcp".into(),
+                        subcommands: &[("inspect", "Inspect server")],
+                        extra_subcommands: vec![(
+                            "inspect github:list_prs".into(),
+                            "List PRs".into(),
+                        )],
+                        ..Default::default()
+                    },
+                    SlashItem::simple("/resume", "Resume"),
+                    SlashItem::simple("/model", "Model"),
+                    SlashItem::simple("/help", "Help"),
+                ]);
+                if paste {
+                    bp.handle_paste(text);
+                } else {
+                    for c in text.chars() {
+                        let event = if c == '\n' {
+                            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+                        } else {
+                            key(c)
+                        };
+                        let _ = bp.handle_key(event);
+                    }
                 }
-            }
-            assert!(!bp.slash_menu_is_open(), "{text:?}, paste={paste}");
-            match bp.handle_key(special(KeyCode::Enter)) {
-                BottomPaneAction::SubmitInput(actual) => assert_eq!(actual, text),
-                other => panic!("expected unchanged submission, got {other:?}"),
+                assert!(!bp.slash_menu_is_open(), "{text:?}, paste={paste}");
+                let submit = if followup {
+                    KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)
+                } else {
+                    special(KeyCode::Enter)
+                };
+                match (bp.handle_key(submit), followup) {
+                    (BottomPaneAction::SubmitInput(actual), false)
+                    | (BottomPaneAction::QueueFollowUp(actual), true) => assert_eq!(actual, text),
+                    other => panic!("expected unchanged submission, got {other:?}"),
+                }
             }
         }
     }

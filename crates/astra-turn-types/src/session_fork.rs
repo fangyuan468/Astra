@@ -11,6 +11,13 @@ use crate::{
 
 pub const SESSION_FORK_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
+/// Provider and workspace authenticated by the server, never a client claim.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRunOwner {
+    pub provider_id: String,
+    pub provider_scope_id: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ForkBasisDimensionV1 {
@@ -103,6 +110,10 @@ pub struct SessionForkManifestV1 {
     pub parent_key: SessionKeyV1,
     pub child_key: SessionKeyV1,
     pub parent_head: SessionContextHeadV1,
+    /// Immutable scope proof for this exact retained prefix and child identity.
+    /// Older manifests remain readable but cannot establish provider ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_owner: Option<ProviderRunOwner>,
     pub dimensions: Vec<ForkDimensionEvidenceV1>,
     pub excluded_authority: Vec<ForkExcludedAuthorityV1>,
     pub state: SessionForkStateV1,
@@ -129,6 +140,13 @@ impl SessionForkManifestV1 {
             return Err(SessionForkValidationError::UnsupportedSchema);
         }
         validate_identity(&self.fork_id)?;
+        if let Some(owner) = &self.provider_owner {
+            for identity in [&owner.provider_id, &owner.provider_scope_id] {
+                if identity.is_empty() || identity.trim() != identity {
+                    return Err(SessionForkValidationError::InvalidIdentity);
+                }
+            }
+        }
         self.shared_prefix().validate_for_child(&self.child_key)?;
         if self.parent_head.schema_version != SESSION_COORDINATION_SCHEMA_VERSION
             || self.parent_head.key != self.parent_key
@@ -308,6 +326,7 @@ mod tests {
             fork_id: "fork-a".into(),
             parent_key: parent_key.clone(),
             child_key: child_key.clone(),
+            provider_owner: None,
             parent_head: SessionContextHeadV1 {
                 schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
                 key: parent_key,

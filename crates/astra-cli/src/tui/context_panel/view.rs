@@ -220,7 +220,7 @@ pub(crate) fn line_count_with(b: &ContextBreakdown, inner_width: u16, state: Vie
 
 /// How many items in the given section are selectable when it's
 /// expanded. Sections where item-level drill-in is meaningful
-/// (History turns, Memories, Tools, Decisions) return their
+/// (History groups, Memories, Tools) return their
 /// element count; other sections return 0 to signal "nothing to
 /// select".  The wrapper uses this to clamp `selected_item`.
 pub(crate) fn section_item_count(b: &ContextBreakdown, section: Section) -> usize {
@@ -228,8 +228,7 @@ pub(crate) fn section_item_count(b: &ContextBreakdown, section: Section) -> usiz
         Section::History => b.history.turns.len(),
         Section::Memory => b.memories.len(),
         Section::Tools => b.tools.len(),
-        Section::Decisions => b.decisions.len(),
-        Section::Compaction => b.compaction.events.len(),
+        Section::Compaction => 0,
         Section::SystemPrompt | Section::PromptSignals | Section::Session | Section::Skills => 0,
     }
 }
@@ -372,7 +371,6 @@ pub(crate) fn build_layout_with(
     render_section(&mut layout, b, state, Section::Memory);
     render_section(&mut layout, b, state, Section::History);
     render_section(&mut layout, b, state, Section::Compaction);
-    render_section(&mut layout, b, state, Section::Decisions);
 
     // Drop the last blank line if we pushed one — trailing blanks
     // render as empty lines at the bottom of the scroll view which
@@ -489,32 +487,8 @@ fn render_section(
             append_prompt_signals_section(out, &b.prompt_signals, focused, expanded);
             None
         }
-        Section::Decisions => {
-            if state.is_drilled(Section::Decisions) {
-                out.push(section_heading_for(Section::Decisions, focused, expanded));
-                render_decision_drill(out, &b.decisions, state.selected_item);
-                out.push(Line::default());
-                None
-            } else {
-                append_decisions_section(out, &b.decisions, focused, expanded, state.selected_item)
-            }
-        }
-        Section::Compaction => {
-            if state.is_drilled(Section::Compaction) {
-                out.push(section_heading_for(Section::Compaction, focused, expanded));
-                render_compaction_drill(out, &b.compaction, state.selected_item);
-                out.push(Line::default());
-                None
-            } else {
-                append_compaction_section(
-                    out,
-                    &b.compaction,
-                    focused,
-                    expanded,
-                    state.selected_item,
-                )
-            }
-        }
+
+        Section::Compaction => append_compaction_section(out, &b.compaction, focused, expanded),
     };
     layout.record_selected_item(selected_item);
 }
@@ -737,86 +711,41 @@ fn append_history_section(
     expanded: bool,
     selected_item: usize,
 ) -> Option<Range<usize>> {
-    if h.is_empty() {
-        return None;
-    }
-    let mut selected_lines = None;
     out.push(section_heading_for(Section::History, focused, expanded));
-    // Collapsed view: just the aggregate counts.
-    let mut turn_spans: Vec<Span<'static>> = vec![Span::raw("    └ ")];
-    match h.evidence_source {
-        HistoryEvidenceSource::PromptTrace => {
-            turn_spans.push(Span::raw(format!("{} turns", h.total_turns)));
-        }
-        HistoryEvidenceSource::LocalVisibleConversation => {
-            turn_spans.push(Span::raw(format!(
-                "{} visible conversation items",
-                h.total_turns
-            )));
-            turn_spans.push(Span::styled(
-                "  (prompt trace unavailable)",
-                Style::default().fg(Color::DarkGray),
+    let summary = match h.evidence_source {
+        HistoryEvidenceSource::Unavailable => "Admission input history unavailable".to_string(),
+        HistoryEvidenceSource::AdmissionInput => format!(
+            "{} admission input group{} · ~{} tokens",
+            h.turns.len(),
+            if h.turns.len() == 1 { "" } else { "s" },
+            fmt_tokens(h.total_tokens)
+        ),
+        HistoryEvidenceSource::LocalVisibleConversation => format!(
+            "{} visible conversation items (admission input history unavailable)",
+            h.turns.len()
+        ),
+    };
+    out.push(Line::from(format!("    └ {summary}")));
+    let mut selected_lines = None;
+    if expanded {
+        if !h.turns.is_empty() {
+            out.push(Line::from(
+                "    ↑/↓ select · Enter drill · Tab next · Esc back",
             ));
         }
-    }
-    if h.retained > 0 || h.compressed > 0 || h.dropped > 0 {
-        turn_spans.push(Span::styled(
-            format!(
-                "  ({} retained · {} compressed · {} dropped)",
-                h.retained, h.compressed, h.dropped
-            ),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    out.push(Line::from(turn_spans));
-    if h.tokens_before > 0 && h.tokens_before != h.tokens_after {
-        let pct_saved = (1.0 - h.tokens_after as f64 / h.tokens_before as f64) * 100.0;
-        out.push(Line::from(vec![
-            Span::raw("    └ "),
-            Span::raw(format!(
-                "{} → {} tokens",
-                fmt_tokens(h.tokens_before),
-                fmt_tokens(h.tokens_after)
-            )),
-            Span::styled(
-                format!("  (−{pct_saved:.0}%)"),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-    }
-    if expanded {
-        out.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(
-                "↑/↓ select · Enter drill · Tab next · Esc back",
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ]));
-        // Walk turns in the model's order (sorted ascending by
-        // turn index); item selection uses that same flat index.
-        for (i, t) in h.turns.iter().enumerate() {
-            let item_start = out.len();
-            let selected = i == selected_item;
-            let compressed = t.compressed_from.is_some();
-            out.extend(turn_detail_lines(t, compressed, selected));
-            if selected {
-                selected_lines = Some(item_start..out.len());
+        for (i, turn) in h.turns.iter().enumerate() {
+            let start = out.len();
+            out.extend(turn_detail_lines(turn, i == selected_item));
+            if i == selected_item {
+                selected_lines = Some(start..out.len());
             }
-        }
-        if !h.dropped_indices.is_empty() {
-            let rendered_indices: Vec<String> =
-                h.dropped_indices.iter().map(|i| format!("#{i}")).collect();
-            out.push(Line::from(vec![
-                Span::raw("    └ "),
-                Span::raw(format!("Dropped: {}", rendered_indices.join(", "))),
-            ]));
         }
     }
     out.push(Line::default());
     selected_lines
 }
 
-fn turn_detail_lines(t: &TurnDetail, compressed: bool, selected: bool) -> Vec<Line<'static>> {
+fn turn_detail_lines(t: &TurnDetail, selected: bool) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     // Leading marker reserves two columns: `▸ ` when this row is
     // the ↑/↓-selected item, two spaces otherwise. Keeps column
@@ -840,28 +769,15 @@ fn turn_detail_lines(t: &TurnDetail, compressed: bool, selected: bool) -> Vec<Li
         Style::default()
     };
     spans.push(Span::styled(format!("#{} {}", t.index, t.role), id_style));
-    if compressed {
-        if let Some((orig, method)) = &t.compressed_from {
-            spans.push(Span::styled(
-                format!("   {} → {} tokens", fmt_tokens(*orig), fmt_tokens(t.tokens)),
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-            spans.push(Span::styled(
-                format!("  via {method}"),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-    } else {
+    spans.push(Span::styled(
+        format!("   ~{} tokens", fmt_tokens(t.tokens)),
+        Style::default().add_modifier(Modifier::DIM),
+    ));
+    if t.has_tool_calls {
         spans.push(Span::styled(
-            format!("   {} tokens", fmt_tokens(t.tokens)),
-            Style::default().add_modifier(Modifier::DIM),
+            "  [tools]",
+            Style::default().fg(crate::tui::theme::current().command),
         ));
-        if t.has_tool_calls {
-            spans.push(Span::styled(
-                "  [tools]".to_string(),
-                Style::default().fg(crate::tui::theme::current().command),
-            ));
-        }
     }
     out.push(Line::from(spans));
     // Multi-line wrapped preview under each turn row. Width
@@ -985,19 +901,6 @@ fn render_history_drill(out: &mut Vec<Line<'static>>, turns: &[TurnDetail], sele
             Style::default().fg(crate::tui::theme::current().command),
         ),
     ]));
-    if let Some((orig, method)) = &t.compressed_from {
-        out.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(
-                format!(
-                    "compressed {} → {} tokens  via {method}",
-                    fmt_tokens(*orig),
-                    fmt_tokens(t.tokens)
-                ),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-    }
     // Body — wrap to a generous window so the user can read in
     // one pass. Fall back to preview when body wasn't captured.
     let body = if !t.body.is_empty() {
@@ -1051,74 +954,6 @@ fn render_memory_drill(
     ]));
     for line in wrap_text(m.preview.trim(), 70, 40) {
         out.push(Line::from(vec![Span::raw("        "), Span::raw(line)]));
-    }
-}
-
-/// Drill view for a single decision — full reasoning + ALL
-/// alternatives (the collapsed view only showed the first three).
-fn render_decision_drill(
-    out: &mut Vec<Line<'static>>,
-    decisions: &[super::model::DecisionItem],
-    selected_item: usize,
-) {
-    let Some(d) = decisions.get(selected_item) else {
-        return;
-    };
-    out.push(Line::from(vec![
-        Span::raw("    "),
-        Span::styled(
-            "Esc back · drill: ",
-            Style::default().add_modifier(Modifier::DIM),
-        ),
-        Span::styled(
-            d.label.clone(),
-            Style::default()
-                .fg(crate::tui::theme::current().accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("   conf {:.2}", d.confidence),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]));
-    if !d.reasoning.is_empty() {
-        out.push(Line::from(vec![
-            Span::raw("        "),
-            Span::styled("Reasoning", Style::default().add_modifier(Modifier::BOLD)),
-        ]));
-        for line in wrap_text(d.reasoning.trim(), 68, 20) {
-            out.push(Line::from(vec![Span::raw("          "), Span::raw(line)]));
-        }
-    }
-    if !d.alternatives.is_empty() {
-        out.push(Line::from(vec![
-            Span::raw("        "),
-            Span::styled(
-                format!("Alternatives ({})", d.alternatives.len()),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ]));
-        for a in &d.alternatives {
-            out.push(Line::from(vec![
-                Span::raw("          ~ "),
-                Span::raw(a.description.clone()),
-                Span::styled(
-                    format!("   score {:.2}", a.score),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-            if !a.why_not_chosen.is_empty() {
-                for line in wrap_text(a.why_not_chosen.trim(), 60, 6) {
-                    out.push(Line::from(vec![
-                        Span::raw("               "),
-                        Span::styled(
-                            format!("rejected: {line}"),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]));
-                }
-            }
-        }
     }
 }
 
@@ -1740,329 +1575,33 @@ fn append_prompt_signals_section(
     out.push(Line::default());
 }
 
-fn append_decisions_section(
-    out: &mut Vec<Line<'static>>,
-    decisions: &[super::model::DecisionItem],
-    focused: bool,
-    expanded: bool,
-    selected_item: usize,
-) -> Option<Range<usize>> {
-    if decisions.is_empty() {
-        return None;
-    }
-    let mut selected_lines = None;
-    out.push(section_heading_for(Section::Decisions, focused, expanded));
-    if expanded {
-        out.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(
-                "↑/↓ select · Enter drill · Tab next · Esc back",
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ]));
-    }
-    for (i, d) in decisions.iter().enumerate() {
-        let item_start = out.len();
-        let selected = expanded && i == selected_item;
-        let marker: Span<'static> = if selected {
-            Span::styled(
-                "▸ ",
-                Style::default()
-                    .fg(crate::tui::theme::current().accent)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::raw("  ")
-        };
-        let name_style = if selected {
-            Style::default()
-                .fg(crate::tui::theme::current().accent)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        out.push(Line::from(vec![
-            Span::raw("    "),
-            marker,
-            Span::raw("└ "),
-            Span::styled(d.label.clone(), name_style),
-            Span::styled(
-                format!("   conf {:.2}", d.confidence),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-        if expanded {
-            if !d.reasoning.is_empty() {
-                for line in wrap_text(&d.reasoning, 66, EXPANDED_PREVIEW_ROWS) {
-                    out.push(Line::from(vec![
-                        Span::raw("          "),
-                        Span::styled(line, Style::default().add_modifier(Modifier::DIM)),
-                    ]));
-                }
-            }
-            for a in d.alternatives.iter().take(3) {
-                out.push(Line::from(vec![
-                    Span::raw("          ~ "),
-                    Span::raw(truncate_preview(&a.description, 60)),
-                    Span::styled(
-                        format!("   score {:.2}", a.score),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]));
-                if !a.why_not_chosen.is_empty() {
-                    out.push(Line::from(vec![
-                        Span::raw("             "),
-                        Span::styled(
-                            format!("rejected: {}", truncate_preview(&a.why_not_chosen, 100)),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]));
-                }
-            }
-        }
-        if selected {
-            selected_lines = Some(item_start..out.len());
-        }
-    }
-    out.push(Line::default());
-    selected_lines
-}
-
 fn append_compaction_section(
     out: &mut Vec<Line<'static>>,
     c: &super::model::CompactionSummary,
     focused: bool,
     expanded: bool,
-    selected_item: usize,
 ) -> Option<Range<usize>> {
     if c.is_empty() {
         return None;
     }
-    let mut selected_lines = None;
     out.push(section_heading_for(Section::Compaction, focused, expanded));
-    // Aggregate lines (always shown).
-    let trig = if c.triggered_this_turn {
-        "⚠ fired this turn"
-    } else {
-        "not triggered this turn"
-    };
-    out.push(Line::from(vec![
-        Span::raw("    └ "),
-        Span::styled(
-            trig.to_string(),
-            if c.triggered_this_turn {
-                Style::default().fg(crate::tui::theme::current().warn)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            },
-        ),
-    ]));
-    if c.tokens_before > 0 && c.tokens_before != c.tokens_after {
-        let pct_saved = (1.0 - c.tokens_after as f64 / c.tokens_before as f64) * 100.0;
-        out.push(Line::from(vec![
-            Span::raw("    └ "),
-            Span::raw(format!(
-                "{} → {} tokens",
-                fmt_tokens(c.tokens_before),
-                fmt_tokens(c.tokens_after)
-            )),
-            Span::styled(
-                format!(
-                    "  (saved {}, −{:.0}%)",
-                    fmt_tokens(c.tokens_saved()),
-                    pct_saved
-                ),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
+    if c.triggered_this_turn {
+        out.push(Line::from("    └ Compaction observed in the latest turn"));
     }
     if !c.compressed_turns.is_empty() {
-        let rendered: Vec<String> = c.compressed_turns.iter().map(|i| i.to_string()).collect();
-        out.push(Line::from(vec![
-            Span::raw("    └ "),
-            Span::raw(format!(
-                "{} compaction{} in session — turns: {}",
-                c.compressed_turns.len(),
-                if c.compressed_turns.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                },
-                rendered.join(", "),
-            )),
-        ]));
-    }
-    if !c.stages.is_empty() {
-        out.push(Line::from(vec![
-            Span::raw("    └ "),
-            Span::styled(
-                format!(
-                    "{} pipeline stage{} freed {}",
-                    c.stages.len(),
-                    if c.stages.len() == 1 { "" } else { "s" },
-                    fmt_tokens(c.stages.iter().map(|stage| stage.tokens_freed).sum()),
-                ),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-        if expanded {
-            for stage in &c.stages {
-                out.push(Line::from(vec![
-                    Span::raw("        └ "),
-                    Span::raw(stage.stage.clone()),
-                    Span::styled(
-                        format!(
-                            " · {} · freed {}",
-                            stage.method,
-                            fmt_tokens(stage.tokens_freed)
-                        ),
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
-                ]));
-            }
-        }
-    }
-    // Per-event detail on expand.
-    if expanded && !c.events.is_empty() {
-        out.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(
-                "↑/↓ select · Enter drill · Tab next · Esc back",
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ]));
-        for (i, e) in c.events.iter().enumerate() {
-            let item_start = out.len();
-            let selected = i == selected_item;
-            let marker: Span<'static> = if selected {
-                Span::styled(
-                    "▸ ",
-                    Style::default()
-                        .fg(crate::tui::theme::current().accent)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                Span::raw("  ")
-            };
-            let name_style = if selected {
-                Style::default()
-                    .fg(crate::tui::theme::current().accent)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            out.push(Line::from(vec![
-                Span::raw("    "),
-                marker,
-                Span::raw("└ "),
-                Span::styled(format!("#{} {}", e.turn_index, e.role), name_style),
-                Span::styled(
-                    format!(
-                        "   {} → {} tokens",
-                        fmt_tokens(e.original_tokens),
-                        fmt_tokens(e.compressed_tokens)
-                    ),
-                    Style::default().add_modifier(Modifier::DIM),
-                ),
-                Span::styled(
-                    format!("  via {}", e.method),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-            if selected && !e.information_lost.is_empty() {
-                for lost in e.information_lost.iter().take(3) {
-                    for line in wrap_text(lost, 66, 2) {
-                        out.push(Line::from(vec![
-                            Span::raw("          · "),
-                            Span::styled(line, Style::default().add_modifier(Modifier::DIM)),
-                        ]));
-                    }
-                }
-            }
-            if selected {
-                selected_lines = Some(item_start..out.len());
-            }
-        }
+        let turns = c
+            .compressed_turns
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(Line::from(format!(
+            "    └ {} turns with recorded compaction markers: {turns}",
+            c.compressed_turns.len()
+        )));
     }
     out.push(Line::default());
-    selected_lines
-}
-
-fn render_compaction_drill(
-    out: &mut Vec<Line<'static>>,
-    c: &super::model::CompactionSummary,
-    selected_item: usize,
-) {
-    let Some(event) = c.events.get(selected_item) else {
-        return;
-    };
-    out.push(Line::from(vec![
-        Span::raw("    "),
-        Span::styled(
-            "Esc back · drill: compaction ",
-            Style::default().add_modifier(Modifier::DIM),
-        ),
-        Span::styled(
-            format!("#{} {}", event.turn_index, event.role),
-            Style::default()
-                .fg(crate::tui::theme::current().accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    let pct_saved = if event.original_tokens > 0 {
-        (1.0 - event.compressed_tokens as f64 / event.original_tokens as f64) * 100.0
-    } else {
-        0.0
-    };
-    out.push(Line::from(vec![
-        Span::raw("        "),
-        Span::raw(format!(
-            "{} → {} tokens",
-            fmt_tokens(event.original_tokens),
-            fmt_tokens(event.compressed_tokens)
-        )),
-        Span::styled(
-            format!(
-                "  (saved {}, −{:.0}%)",
-                fmt_tokens(
-                    event
-                        .original_tokens
-                        .saturating_sub(event.compressed_tokens)
-                ),
-                pct_saved
-            ),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]));
-    out.push(Line::from(vec![
-        Span::raw("        "),
-        Span::styled(
-            format!("method: {}", event.method),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]));
-    if !event.information_lost.is_empty() {
-        out.push(Line::from(vec![
-            Span::raw("        "),
-            Span::styled(
-                format!("Information lost ({})", event.information_lost.len()),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ]));
-        for lost in &event.information_lost {
-            for line in wrap_text(lost, 66, 4) {
-                out.push(Line::from(vec![Span::raw("          · "), Span::raw(line)]));
-            }
-        }
-    } else {
-        out.push(Line::from(vec![
-            Span::raw("        "),
-            Span::styled(
-                "(no information-lost notes recorded)".to_string(),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ]));
-    }
+    None
 }
 
 fn fmt_tokens_u64(n: u64) -> String {
@@ -2269,11 +1808,18 @@ mod tests {
     use super::*;
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
     use astra_turn_core::context_assembly_trace::{
-        Alternative, CompressionMethod, ContextAssemblyTrace, DecisionExplanation, DecisionType,
-        MemoryInjection, MemoryRejection, MemorySelection, MemorySource, PromptContextSignals,
-        PromptGuidanceSignals, RejectionReason, SkillInjection, SystemPromptBreakdown,
-        TokenBudgetTrace, TurnCompression, TurnRetention, VisibleTool,
+        ContextAssemblyTrace, HistorySelectionTrace, MemoryInjection, MemoryRejection,
+        MemorySelection, MemorySource, PromptContextSignals, PromptGuidanceSignals,
+        RejectionReason, SkillInjection, SystemPromptBreakdown, TokenBudgetTrace, TurnRetention,
+        VisibleTool,
     };
+
+    fn admission_history(turns: Vec<TurnRetention>) -> HistorySelectionTrace {
+        HistorySelectionTrace {
+            total_tokens: turns.iter().map(|turn| turn.tokens).sum(),
+            turns_retained: turns,
+        }
+    }
 
     fn trace(
         max: u32,
@@ -2320,6 +1866,31 @@ mod tests {
     // ─── Snapshot tests ──────────────────────────────────────────
 
     #[test]
+    fn history_availability_and_compaction_markers_render_without_invented_detail() {
+        let mut trace = trace(100_000, 1_000, 0, 0, 0, 0);
+        trace.token_budget.compression_triggered = true;
+        let text = |breakdown: &ContextBreakdown| {
+            build_lines(breakdown, 100)
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let unavailable = ContextBreakdown::from_trace(&trace);
+        assert!(text(&unavailable).contains("Admission input history unavailable"));
+        assert!(text(&unavailable).contains("Compaction observed"));
+        trace.history = Some(Default::default());
+        let mut empty = ContextBreakdown::from_trace(&trace);
+        let rendered = text(&empty);
+        assert!(rendered.contains("0 admission input groups"), "{rendered}");
+        assert!(!rendered.contains("history unavailable"), "{rendered}");
+        assert!(!rendered.contains("tokens saved"), "{rendered}");
+        empty.compaction.compressed_turns = vec![3, 9];
+        assert!(text(&empty).contains("2 turns with recorded compaction markers: 3, 9"));
+        assert_eq!(section_item_count(&empty, Section::Compaction), 0);
+    }
+
+    #[test]
     fn snapshot_low_pressure_80x14() {
         let b = ContextBreakdown::from_trace(&trace(100_000, 2_000, 15_000, 500, 4_000, 200));
         crate::tui::testing::assert_tui_snapshot!(
@@ -2358,8 +1929,7 @@ mod tests {
     #[test]
     fn snapshot_history_expanded_with_wrapped_previews_100x30() {
         let mut t = trace(100_000, 2_000, 0, 0, 0, 0);
-        t.history.total_turns_available = 3;
-        t.history.turns_retained = vec![
+        t.history = Some(admission_history(vec![
             TurnRetention {
                 turn_index: 0,
                 role: "user".into(),
@@ -2381,7 +1951,7 @@ mod tests {
                 has_tool_calls: false,
                 content_preview: "user: Thanks — now make the helper private.".into(),
             },
-        ];
+        ]));
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
             focus: Some(Section::History),
@@ -2402,15 +1972,14 @@ mod tests {
     #[test]
     fn snapshot_history_drill_100x30() {
         let mut t = trace(100_000, 2_000, 0, 0, 0, 0);
-        t.history.total_turns_available = 1;
-        t.history.turns_retained = vec![TurnRetention {
+        t.history = Some(admission_history(vec![TurnRetention {
             turn_index: 0,
             role: "assistant".into(),
             tokens: 4_200,
             has_tool_calls: true,
             content_preview:
                 "assistant: I'll start by reading auth.rs and mapping out every caller.".into(),
-        }];
+        }]));
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
             focus: Some(Section::History),
@@ -2431,14 +2000,13 @@ mod tests {
     #[test]
     fn build_lines_renders_history_section_when_populated() {
         let mut t = trace(100_000, 2_000, 8_000, 0, 0, 0);
-        t.history.total_turns_available = 5;
-        t.history.turns_retained = vec![TurnRetention {
+        t.history = Some(admission_history(vec![TurnRetention {
             turn_index: 0,
             role: "user".into(),
             tokens: 50,
             has_tool_calls: false,
             content_preview: String::new(),
-        }];
+        }]));
         let b = ContextBreakdown::from_trace(&t);
         let text: String = build_lines(&b, 80)
             .iter()
@@ -2446,7 +2014,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(text.contains("History"), "history header missing: {text}");
-        assert!(text.contains("5 turns"), "turn count missing: {text}");
+        assert!(
+            text.contains("1 admission input group"),
+            "turn count missing: {text}"
+        );
     }
 
     #[test]
@@ -2560,8 +2131,7 @@ mod tests {
     #[test]
     fn expanded_history_uses_prompt_trace_previews() {
         let mut t = trace(100_000, 2_000, 8_000, 0, 0, 0);
-        t.history.total_turns_available = 2;
-        t.history.turns_retained = vec![
+        t.history = Some(admission_history(vec![
             TurnRetention {
                 turn_index: 0,
                 role: "user".into(),
@@ -2576,7 +2146,7 @@ mod tests {
                 has_tool_calls: true,
                 content_preview: "assistant: I'll start by reading auth.rs…".into(),
             },
-        ];
+        ]));
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
             focus: Some(Section::History),
@@ -2769,99 +2339,6 @@ mod tests {
     }
 
     #[test]
-    fn decisions_section_renders_reasoning_and_alternatives_on_expand() {
-        let mut t = trace(100_000, 1_000, 0, 0, 0, 0);
-        t.explanations = vec![DecisionExplanation {
-            decision_type: DecisionType::StrategyChoice {
-                strategy: "code-intel".into(),
-            },
-            reasoning: "Need symbol-aware context.".into(),
-            alternatives_considered: vec![Alternative {
-                description: "grep-only".into(),
-                score: 0.4,
-                why_not_chosen: "would miss imports".into(),
-            }],
-            confidence: 0.9,
-        }];
-        let b = ContextBreakdown::from_trace(&t);
-        let state = ViewState {
-            focus: Some(Section::Decisions),
-            expanded: Some(Section::Decisions),
-            selected_item: 0,
-            drilled: false,
-        };
-        let text: String = build_lines_with(&b, 80, state)
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(text.contains("code-intel"));
-        assert!(text.contains("Need symbol-aware context"));
-        assert!(text.contains("grep-only"));
-        assert!(text.contains("would miss imports"));
-    }
-
-    #[test]
-    fn compaction_section_renders_counts_and_timeline_when_collapsed() {
-        use super::super::model::ContextSnapshot;
-        let mut t = trace(100_000, 1_000, 0, 0, 0, 0);
-        t.token_budget.compression_triggered = true;
-        t.history.tokens_before = 30_000;
-        t.history.tokens_after = 12_000;
-        t.history.turns_compressed = vec![TurnCompression {
-            turn_index: 2,
-            role: "assistant".into(),
-            original_tokens: 18_000,
-            compressed_tokens: 1_000,
-            compression_method: CompressionMethod::TieredCompaction,
-            information_lost: Vec::new(),
-        }];
-        let mut snap = ContextSnapshot::default();
-        snap.compressed_turns = vec![2, 5];
-        let b = ContextBreakdown::from_trace_with(&t, &snap);
-        let state = ViewState::collapsed(Some(Section::Compaction));
-        let text: String = build_lines_with(&b, 80, state)
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(text.contains("fired this turn"));
-        assert!(text.contains("30.0k → 12.0k"));
-        assert!(text.contains("turns: 2, 5"));
-    }
-
-    #[test]
-    fn compaction_drill_shows_information_lost_bullets() {
-        let mut t = trace(100_000, 1_000, 0, 0, 0, 0);
-        t.history.turns_compressed = vec![TurnCompression {
-            turn_index: 4,
-            role: "assistant".into(),
-            original_tokens: 8_000,
-            compressed_tokens: 500,
-            compression_method: CompressionMethod::LlmSummarization,
-            information_lost: vec![
-                "Tool result for read_file truncated (1.2k → 0.1k chars)".into(),
-                "Assistant draft #2 dropped (superseded by #3)".into(),
-            ],
-        }];
-        let b = ContextBreakdown::from_trace(&t);
-        let state = ViewState {
-            focus: Some(Section::Compaction),
-            expanded: Some(Section::Compaction),
-            selected_item: 0,
-            drilled: true,
-        };
-        let text: String = build_lines_with(&b, 100, state)
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(text.contains("LlmSummarization"));
-        assert!(text.contains("Tool result for read_file"));
-        assert!(text.contains("Assistant draft #2 dropped"));
-    }
-
-    #[test]
     fn session_section_renders_when_snapshot_carries_summary() {
         use super::super::model::{
             ContextSnapshot, RequestContextEvidence, RequestContextScope, SessionSummary,
@@ -2998,7 +2475,7 @@ mod tests {
         assert!(text.contains("Exact prompt composition is not available yet"));
         assert!(text.contains("Session · budget & state"));
         assert!(text.contains("History · conversation turns"));
-        assert!(text.contains("prompt trace unavailable"));
+        assert!(text.contains("admission input history unavailable"));
         assert!(text.contains("keep this task moving"));
     }
 
@@ -3058,8 +2535,7 @@ mod tests {
     #[test]
     fn expanded_history_section_shows_per_turn_detail() {
         let mut t = trace(100_000, 2_000, 8_000, 0, 0, 0);
-        t.history.total_turns_available = 4;
-        t.history.turns_retained = vec![
+        t.history = Some(admission_history(vec![
             TurnRetention {
                 turn_index: 0,
                 role: "user".into(),
@@ -3074,18 +2550,8 @@ mod tests {
                 has_tool_calls: true,
                 content_preview: String::new(),
             },
-        ];
-        t.history.turns_compressed = vec![TurnCompression {
-            turn_index: 1,
-            role: "assistant".into(),
-            original_tokens: 800,
-            compressed_tokens: 120,
-            compression_method: CompressionMethod::ReactiveCompact,
-            information_lost: Vec::new(),
-        }];
-        t.history.turns_dropped = vec![3];
-        t.history.tokens_before = 5_180;
-        t.history.tokens_after = 4_500;
+        ]));
+
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
             focus: Some(Section::History),
@@ -3105,12 +2571,8 @@ mod tests {
             "retained turn missing: {text}"
         );
         assert!(text.contains("[tools]"), "tool marker missing: {text}");
-        assert!(
-            text.contains("#1 assistant"),
-            "compressed turn missing: {text}"
-        );
-        assert!(text.contains("via"), "compression method missing: {text}");
-        assert!(text.contains("Dropped: #3"), "dropped turn missing: {text}");
+        assert!(!text.contains("compressed"), "{text}");
+        assert!(!text.contains("Dropped:"), "{text}");
     }
 
     #[test]
@@ -3143,14 +2605,13 @@ mod tests {
     #[test]
     fn collapsed_history_section_omits_per_turn_detail() {
         let mut t = trace(100_000, 2_000, 8_000, 0, 0, 0);
-        t.history.total_turns_available = 2;
-        t.history.turns_retained = vec![TurnRetention {
+        t.history = Some(admission_history(vec![TurnRetention {
             turn_index: 0,
             role: "user".into(),
             tokens: 100,
             has_tool_calls: false,
             content_preview: String::new(),
-        }];
+        }]));
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState::collapsed(Some(Section::History));
         let text: String = build_lines_with(&b, 80, state)
@@ -3214,8 +2675,7 @@ mod tests {
     #[test]
     fn expanded_history_exposes_typed_selected_item_geometry() {
         let mut t = trace(100_000, 2_000, 0, 0, 0, 0);
-        t.history.total_turns_available = 3;
-        t.history.turns_retained = vec![
+        t.history = Some(admission_history(vec![
             TurnRetention {
                 turn_index: 0,
                 role: "user".into(),
@@ -3237,7 +2697,7 @@ mod tests {
                 has_tool_calls: false,
                 content_preview: String::new(),
             },
-        ];
+        ]));
         let b = ContextBreakdown::from_trace(&t);
         let first = ViewState {
             focus: Some(Section::History),
@@ -3305,14 +2765,13 @@ mod tests {
     fn prompt_trace_history_drill_does_not_join_an_unrelated_local_body() {
         use super::super::model::VisibleConversationItem;
         let mut t = trace(100_000, 2_000, 0, 0, 0, 0);
-        t.history.total_turns_available = 1;
-        t.history.turns_retained = vec![TurnRetention {
+        t.history = Some(admission_history(vec![TurnRetention {
             turn_index: 0,
             role: "user".into(),
             tokens: 300,
             has_tool_calls: false,
             content_preview: "user: First prompt-history item.".into(),
-        }];
+        }]));
         let mut snap = ContextSnapshot::default();
         snap.visible_conversation.push(VisibleConversationItem {
             role: "user".into(),
@@ -3405,14 +2864,13 @@ mod tests {
     #[test]
     fn section_item_count_reflects_each_section_type() {
         let mut t = trace(100_000, 1_000, 0, 500, 1_000, 0);
-        t.history.total_turns_available = 2;
-        t.history.turns_retained = vec![TurnRetention {
+        t.history = Some(admission_history(vec![TurnRetention {
             turn_index: 0,
             role: "user".into(),
             tokens: 50,
             has_tool_calls: false,
             content_preview: String::new(),
-        }];
+        }]));
         t.memory.memories_selected = vec![MemorySelection {
             memory_id: "m".into(),
             memory_type: "semantic".into(),
@@ -3534,5 +2992,48 @@ mod tests {
         let cells = render_grid_cells(&b);
         assert_eq!(cells.len(), GRID_CELLS);
         assert_eq!(cells.len(), 50, "5 × 10 grid: one glyph ≈ 2% of budget");
+    }
+
+    #[test]
+    fn grid_represents_provider_usage_missing_from_category_estimates() {
+        let mut t = trace(102_400, 6_255, 0, 0, 11_269, 344);
+        t.token_budget.total_used = 57_802;
+        let b = ContextBreakdown::from_trace(&t);
+        assert_eq!(b.free_space_tokens, 44_598);
+        let unattributed = b
+            .categories
+            .iter()
+            .find(|c| c.kind.label() == "Unattributed");
+        assert_eq!(unattributed.map(|c| c.tokens), Some(39_934));
+        let occupied = render_grid_cells(&b)
+            .iter()
+            .filter(|cell| cell.content == "⛁ ")
+            .count();
+        assert!((27..=29).contains(&occupied), "occupied cells: {occupied}");
+        let legend = legend_lines(&b, 80);
+        let text = legend
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("Unattributed"));
+        assert!(text.contains("39.9k"));
+    }
+
+    #[test]
+    fn grid_represents_usage_without_any_category_estimates() {
+        let mut t = trace(100_000, 0, 0, 0, 0, 0);
+        t.token_budget.total_used = 60_000;
+        let b = ContextBreakdown::from_trace(&t);
+        assert_eq!(b.categories.len(), 1);
+        assert_eq!(b.categories[0].kind.label(), "Unattributed");
+        assert_eq!(b.categories[0].tokens, 60_000);
+        assert_eq!(
+            render_grid_cells(&b)
+                .iter()
+                .filter(|cell| cell.content == "⛁ ")
+                .count(),
+            30
+        );
     }
 }

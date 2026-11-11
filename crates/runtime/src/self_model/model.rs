@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use astra_config::runtime_config::RuntimeConfig;
 use astra_config::user_profile::Scenario;
 use astra_core::feedback::{FeedbackSignal, SignalType};
-use astra_services::LessonHint;
 use astra_text_utils::str_preview::truncate_str;
 use astra_turn_core::context_assembly_trace::TokenBudgetTrace;
 use astra_turn_core::tool_health::ToolHealthTracker;
@@ -57,11 +56,6 @@ pub struct SelfModel {
     /// before the session-wide fallback actually fires.
     #[serde(default)]
     pub denial_pressure: Option<DenialPressureView>,
-    /// Gap 2: names of tests that failed in recent tool outcomes (e.g., the
-    /// last few `cargo test` / `pytest` / `npm test` invocations). Empty
-    /// when the session has no recent test failures.
-    #[serde(default)]
-    pub recent_failing_tests: Vec<String>,
     /// Gap 3: recent permission-rejection reasons keyed by tool, bounded to
     /// a small ring so the agent perceives *why* the runtime is refusing
     /// specific calls and can adjust scope instead of retrying blindly.
@@ -95,13 +89,6 @@ pub struct SelfModel {
     /// behavior (batching, repeat calls, stall recovery).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_quality_feedback: Option<TurnQualityFeedback>,
-    /// Cross-session lessons carried over from prior sessions with the same
-    /// `(user_id, persona, workload_tag)` scope (see
-    /// `astra_services::agent_lessons`). Bounded projection of the DAO's
-    /// `Lesson` rows — only the fields the LLM needs for prompt reasoning.
-    /// Empty when no prior lessons apply.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub lessons: Vec<LessonHint>,
 }
 
 /// Actionable feedback derived from the previous turn's passive evaluator.
@@ -401,14 +388,12 @@ impl SelfModel {
             recent_signals: signal_summaries,
             constraints: ConstraintSet::default(),
             denial_pressure: None,
-            recent_failing_tests: Vec::new(),
             recent_rejections: Vec::new(),
             recent_correction_excerpts: Vec::new(),
             outcome_bias: std::collections::BTreeMap::new(),
             stale_runtime_signals: Vec::new(),
             low_confidence_tools: Vec::new(),
             turn_quality_feedback: None,
-            lessons: Vec::new(),
         }
     }
 
@@ -417,13 +402,6 @@ impl SelfModel {
     /// as "unknown ceiling" and will still render the raw count.
     pub fn with_denial_pressure(mut self, view: DenialPressureView) -> Self {
         self.denial_pressure = Some(view);
-        self
-    }
-
-    /// Gap 2: attach names of tests that failed in recent tool outcomes.
-    /// Empty vectors are preserved as empty (renderer skips).
-    pub fn with_recent_failing_tests(mut self, names: Vec<String>) -> Self {
-        self.recent_failing_tests = names;
         self
     }
 
@@ -472,16 +450,6 @@ impl SelfModel {
     /// `None` clears stale feedback once a healthy turn completes.
     pub fn with_turn_quality_feedback(mut self, feedback: Option<TurnQualityFeedback>) -> Self {
         self.turn_quality_feedback = feedback;
-        self
-    }
-
-    /// Attach cross-session lessons retrieved via
-    /// `astra_services::AgentLessonsService::load_recent` at session
-    /// bootstrap. The lessons are rendered as a bounded prompt block so the
-    /// LLM carries prior learning forward. Empty input clears any
-    /// previously-attached set.
-    pub fn with_lessons(mut self, lessons: Vec<LessonHint>) -> Self {
-        self.lessons = lessons;
         self
     }
 }
@@ -616,31 +584,6 @@ impl SelfModel {
                     );
                 }
             }
-        }
-
-        // ── Gap 2: recent test failure names ──
-        // Specific failing test names are high-density signal — the agent
-        // can retry just those or inspect their code, rather than reruning
-        // the whole suite.
-        if !self.recent_failing_tests.is_empty() {
-            let sample: Vec<&str> = self
-                .recent_failing_tests
-                .iter()
-                .take(5)
-                .map(String::as_str)
-                .collect();
-            let extra = self.recent_failing_tests.len().saturating_sub(sample.len());
-            let suffix = if extra > 0 {
-                format!(" (+{extra} more)")
-            } else {
-                String::new()
-            };
-            let _ = writeln!(
-                s,
-                "Recent test failures: {}{} — fix or investigate these specifically before re-running the whole suite",
-                sample.join(", "),
-                suffix
-            );
         }
 
         // ── Gap 3: recent permission-rejection reasons ──
@@ -780,80 +723,13 @@ impl SelfModel {
                 feedback.turn
             );
             for finding in feedback.findings.iter().take(5) {
-                let _ = writeln!(s, "  - {}", astra_services::sanitize_for_prompt(finding));
+                let _ = writeln!(s, "  - {}", sanitize_for_prompt(finding));
             }
             let _ = writeln!(
                 s,
                 "  → {}",
-                astra_services::sanitize_for_prompt(&feedback.recommended_action)
+                sanitize_for_prompt(&feedback.recommended_action)
             );
-        }
-
-        // ── Cross-session lessons (from Memoria L3) ──
-        // Pressure-adaptive: under high pressure, show fewer lessons with
-        // compact text. Under low pressure, show more with full detail.
-        if !self.lessons.is_empty() {
-            let pressure = self
-                .state
-                .token_budget
-                .as_ref()
-                .map(|b| b.pressure)
-                .unwrap_or(0.0);
-            let (max_shown, use_compact) = if pressure > 0.75 {
-                (2, true)
-            } else if pressure > 0.5 {
-                (3, true)
-            } else {
-                (5, false)
-            };
-            let tool_set: std::collections::HashSet<&str> = self
-                .capabilities
-                .tool_names
-                .iter()
-                .map(String::as_str)
-                .collect();
-            // Filter relevant + dedup conflicting tool advice (e.g.,
-            // ToolAvoidance("grep") + ToolBoost("grep")). Lessons are
-            // pre-sorted by confidence DESC, so the first occurrence for
-            // a tool name wins.
-            let mut seen_tools: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            let relevant: Vec<&LessonHint> = self
-                .lessons
-                .iter()
-                .filter(|l| is_lesson_relevant(l, &tool_set))
-                .filter(|l| {
-                    if let Some(tool) = extract_tool_from_trigger(&l.trigger_signal) {
-                        seen_tools.insert(tool.to_string())
-                    } else {
-                        true // non-tool lessons always pass
-                    }
-                })
-                .collect();
-            if !relevant.is_empty() {
-                let total = relevant.len();
-                s.push_str("📚 Lessons from prior sessions:\n");
-                for l in relevant.iter().take(max_shown) {
-                    let scope = l
-                        .workload_tag
-                        .as_deref()
-                        .map(|t| format!(" @{t}"))
-                        .unwrap_or_default();
-                    let display_text = if use_compact {
-                        l.compact.as_deref().unwrap_or(&l.action)
-                    } else {
-                        &l.action
-                    };
-                    let _ = writeln!(
-                        s,
-                        "  - [{}{}] {} — {}",
-                        l.kind, scope, l.trigger_signal, display_text
-                    );
-                }
-                if total > max_shown {
-                    let _ = writeln!(s, "  … {} more", total - max_shown);
-                }
-            }
         }
 
         s
@@ -875,7 +751,6 @@ impl SelfModel {
     /// - recent failing tests / rejections / correction excerpts
     /// - per-tool outcome bias entries
     /// - unmet postconditions from the last plan
-    /// - non-empty lessons
     /// - token budget under pressure (> 0.7) or already compressed
     /// - recorded recent feedback signals
     #[must_use]
@@ -896,10 +771,7 @@ impl SelfModel {
         {
             return true;
         }
-        if !self.recent_failing_tests.is_empty()
-            || !self.recent_rejections.is_empty()
-            || !self.recent_correction_excerpts.is_empty()
-        {
+        if !self.recent_rejections.is_empty() || !self.recent_correction_excerpts.is_empty() {
             return true;
         }
         if !self.outcome_bias.is_empty() {
@@ -914,9 +786,6 @@ impl SelfModel {
         if self.turn_quality_feedback.is_some() {
             return true;
         }
-        if !self.lessons.is_empty() {
-            return true;
-        }
         if let Some(ref b) = self.state.token_budget
             && (b.pressure > 0.7 || b.compression_triggered)
         {
@@ -926,28 +795,6 @@ impl SelfModel {
             return true;
         }
         false
-    }
-}
-
-/// Extract the tool name from a trigger_signal like "tool_failures:grep".
-/// Returns None for non-tool-specific triggers.
-fn extract_tool_from_trigger(trigger: &str) -> Option<&str> {
-    trigger.split_once(':').map(|(_, tool)| tool)
-}
-
-/// Tool-specific lesson kinds whose trigger_signal encodes a tool name
-/// as `"tool_failures:<name>"` or similar. These are only relevant when
-/// the named tool is in the current session's capability set.
-fn is_lesson_relevant(l: &LessonHint, tool_set: &std::collections::HashSet<&str>) -> bool {
-    match l.kind {
-        astra_services::LessonKind::ToolAvoidance | astra_services::LessonKind::ToolBoost => {
-            if let Some((_prefix, tool_name)) = l.trigger_signal.split_once(':') {
-                tool_set.is_empty() || tool_set.contains(tool_name)
-            } else {
-                true
-            }
-        }
-        _ => true,
     }
 }
 
@@ -1600,42 +1447,6 @@ mod tests {
     }
 
     #[test]
-    fn recent_failing_tests_renders_compact_list() {
-        let model = minimal_model().with_recent_failing_tests(vec![
-            "tests::parses_json".into(),
-            "tests::handles_empty".into(),
-        ]);
-        let rendered = model.to_system_prompt_section();
-        assert!(
-            rendered.contains("Recent test failures: tests::parses_json, tests::handles_empty"),
-            "got: {rendered}"
-        );
-        assert!(
-            !rendered.contains("more"),
-            "no +N more when list is short: {rendered}"
-        );
-    }
-
-    #[test]
-    fn recent_failing_tests_truncates_and_counts_overflow() {
-        let tests: Vec<String> = (0..8).map(|i| format!("t{i}")).collect();
-        let model = minimal_model().with_recent_failing_tests(tests);
-        let rendered = model.to_system_prompt_section();
-        assert!(rendered.contains("t0, t1, t2, t3, t4"), "got: {rendered}");
-        assert!(rendered.contains("(+3 more)"), "got: {rendered}");
-    }
-
-    #[test]
-    fn recent_failing_tests_empty_renders_nothing() {
-        let model = minimal_model().with_recent_failing_tests(Vec::new());
-        let rendered = model.to_system_prompt_section();
-        assert!(
-            !rendered.contains("Recent test failures"),
-            "got: {rendered}"
-        );
-    }
-
-    #[test]
     fn recent_rejections_renders_reasons() {
         let model = minimal_model().with_recent_rejections(vec![
             RejectionSummary {
@@ -1861,12 +1672,6 @@ mod tests {
     }
 
     #[test]
-    fn meaningful_when_recent_failing_tests() {
-        let model = minimal_model().with_recent_failing_tests(vec!["t1".into()]);
-        assert!(model.has_meaningful_self_awareness());
-    }
-
-    #[test]
     fn meaningful_when_recent_rejections() {
         let model = minimal_model().with_recent_rejections(vec![RejectionSummary {
             tool: "bash".into(),
@@ -1887,18 +1692,6 @@ mod tests {
             name: "bash".into(),
             fail_rate: 0.6,
             samples: 10,
-        }]);
-        assert!(model.has_meaningful_self_awareness());
-    }
-
-    #[test]
-    fn meaningful_when_lessons_attached() {
-        let model = minimal_model().with_lessons(vec![LessonHint {
-            kind: astra_services::LessonKind::PromptShape,
-            trigger_signal: "memoria".into(),
-            action: "Always run cargo test before commit".into(),
-            compact: None,
-            workload_tag: None,
         }]);
         assert!(model.has_meaningful_self_awareness());
     }
@@ -1984,5 +1777,69 @@ mod tests {
         let mut model = minimal_model();
         model.capabilities.retry_cautioned_tools.push("grep".into());
         assert!(model.has_meaningful_self_awareness());
+    }
+}
+
+fn sanitize_for_prompt(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            if c.is_control() && *c != '\n' {
+                return false;
+            }
+            !is_invisible_unicode(*c)
+        })
+        .collect()
+}
+
+/// Comprehensive invisible/deceptive Unicode character filter.
+fn is_invisible_unicode(c: char) -> bool {
+    matches!(
+        c,
+        // Zero-width spaces and joiners
+        '\u{200B}'..='\u{200F}'
+        // Line/paragraph separators + bidi overrides/isolates
+        | '\u{2028}'..='\u{202F}'
+        // Word joiners and invisible operators
+        | '\u{2060}'..='\u{2064}'
+        // BOM
+        | '\u{FEFF}'
+        // Soft hyphen (renders as nothing unless line break)
+        | '\u{00AD}'
+        // Combining grapheme joiner
+        | '\u{034F}'
+        // Arabic letter mark
+        | '\u{061C}'
+        // Hangul fillers
+        | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}'
+        // Khmer vowel inherent
+        | '\u{17B4}' | '\u{17B5}'
+        // Mongolian vowel separator
+        | '\u{180E}'
+        // Tag characters (U+E0001–U+E007F)
+        | '\u{E0001}'..='\u{E007F}'
+    )
+}
+
+#[cfg(test)]
+mod feedback_sanitization_tests {
+    #[test]
+    fn preserves_text_and_newlines_without_hidden_controls() {
+        assert_eq!(
+            super::sanitize_for_prompt("run\u{200b} tests\u{202e}\nthen commit\u{0000}\u{feff}\t"),
+            "run tests\nthen commit"
+        );
+        for ch in [
+            '\u{00ad}',
+            '\u{034f}',
+            '\u{061c}',
+            '\u{115f}',
+            '\u{17b4}',
+            '\u{180e}',
+            '\u{2060}',
+            '\u{e0001}',
+        ] {
+            assert_eq!(super::sanitize_for_prompt(&format!("a{ch}b")), "ab");
+        }
+        assert_eq!(super::sanitize_for_prompt("运行测试 🦀"), "运行测试 🦀");
     }
 }

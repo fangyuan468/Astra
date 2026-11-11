@@ -84,8 +84,16 @@ beyond a development machine, review the
   `ASTRA_RUNTIME_ROOT_SECRET`, and `MEMORIA_MASTER_KEY`. Never ship the
   template values.
 - Keep `.env`, `.env.production`, and `.models.yaml` out of version control.
+  The CLI loads `.env` from the working directory but refuses one that sets
+  `ASTRA_LOCAL_STATE_ROOT` or `MOI_AUTH_DIR`; set those in the shell.
 - Bind development services to loopback. `ASTRA_BIND_ADDRESS` defaults to
   `127.0.0.1` for a reason.
+- Leave Edge/CLI `[web_fetch] fake_ip` at `block` unless a fake-IP VPN
+  blocks web access. `allow_doh_screened` relaxes the private-network SSRF
+  boundary for fake-IP answers: the VPN picks the real destination, and the
+  DoH screen cannot detect a host that answers the VPN with a private address;
+  see the
+  [configuration reference](docs/reference/configuration.md#local-web_fetch-behind-fake-ip-dns).
 - Remember that Runner placement controls where execution happens, not where
   data goes. Model endpoints, context disclosure, and tool-result handling
   remain explicit policy choices.

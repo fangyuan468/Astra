@@ -36,7 +36,7 @@ use crate::cli::session::session_runtime::{self, ServerDefaultModel};
 use crate::cli::stream::streaming_types::UsageAttribution;
 use agentic_sse_loop::{
     StreamLoopSidecarEprint, StreamResultBuild, build_stream_result, eprint_stream_loop_sidecars,
-    partial_interruption_notice, resolved_tool_metrics,
+    resolved_tool_metrics, stream_interruption_notice,
 };
 use serde_json::{Value, json};
 use server_admission_host::CliServerAdmissionHost;
@@ -99,8 +99,50 @@ async fn refresh_root_permission_context(
     }
 }
 
-pub(crate) async fn stream_chat_sse(
+/// Arc-wrap the fully configured canonical executor and publish that same
+/// instance before admission. A reused observation slot must never hide a
+/// different executor behind an earlier reference.
+#[allow(clippy::result_large_err)]
+pub(crate) fn retain_cli_executor(
+    executor: edge_tools::ToolExecutor,
+    observer: Option<&crate::cli::chat_stream::CliExecutorObserver>,
+) -> Result<Arc<edge_tools::ToolExecutor>, crate::TurnFailure> {
+    let executor = Arc::new(executor);
+    if observer.is_some_and(|observer| observer.set(executor.clone()).is_err()) {
+        return Err(crate::TurnFailure {
+            error: "ordinary SSE executor observer was reused for another executor".into(),
+            partial: crate::PartialTurnData {
+                failure_kind: Some(astra_core::ErrorKind::ContractViolation),
+                ..Default::default()
+            },
+        });
+    }
+    Ok(executor)
+}
+
+/// Keep stream state on the heap at the shared entrypoint. Embedding it in
+/// callers compounds their poll stack before a local tool callback can run.
+pub(crate) fn stream_chat_sse<'a>(
+    p: ChatTurnParams<'a>,
+) -> impl std::future::Future<Output = Result<StreamResult, crate::TurnFailure>> + 'a {
+    Box::pin(async move {
+        // Owned by this physical request, not inferred from an error string or
+        // absence of a run header. Keep it sticky across admission retries.
+        let mut server_admission_dispatched = false;
+        // Boxing only this wrapper still embeds the large execution future in
+        // its poll frame. Pin execution independently so cold local callbacks
+        // keep their stack headroom, including after a Server session restore.
+        let mut result = Box::pin(stream_chat_sse_inner(p, &mut server_admission_dispatched)).await;
+        if let Err(failure) = &mut result {
+            failure.partial.server_admission_not_dispatched = !server_admission_dispatched;
+        }
+        result
+    })
+}
+
+async fn stream_chat_sse_inner(
     mut p: ChatTurnParams<'_>,
+    server_admission_dispatched: &mut bool,
 ) -> Result<StreamResult, crate::TurnFailure> {
     let start = Instant::now();
     p.model = normalize_turn_model(p.model);
@@ -251,6 +293,13 @@ pub(crate) async fn stream_chat_sse(
         let ex = edge_tools::ToolExecutor::new(&project_root)
             .with_cloud(p.api.api_origin(), p.token)
             .with_memory_attribution_id(parent_turn_run_id.clone());
+        // Bind the shared owner before restoring the session so a selected
+        // checkout is validated once per session, not once per turn.
+        let ex = if let Some(ref journal) = p.git_worktree_journal {
+            ex.with_shared_git_worktree_journal(journal.clone())
+        } else {
+            ex
+        };
         let ex = if let Some(session_id) = p.session_id {
             ex.with_active_session_id(session_id.to_string())
         } else {
@@ -274,28 +323,18 @@ pub(crate) async fn stream_chat_sse(
             ex
         };
 
-        let ex = if let Some(ref journal) = p.git_worktree_journal {
-            ex.with_shared_git_worktree_journal(journal.clone())
-        } else {
-            ex
-        };
         let ex = if let Some(ref journal) = p.session_state_journal {
             ex.with_shared_session_state_journal(journal.clone())
         } else {
             ex
         };
-        let ex = if let Some(ref cmds) = p.bg_task_commands {
-            ex.with_bg_task_commands(cmds.clone())
+        let ex = if let Some(ref cmds) = p.background_tasks {
+            ex.with_background_tasks(cmds.clone())
         } else {
             ex
         };
-        let ex = if let Some(ref cache) = p.bg_task_list_cache {
-            ex.with_bg_task_list_cache(cache.clone())
-        } else {
-            ex
-        };
-        let ex = if let Some(ref slot) = p.bash_detach_slot {
-            ex.with_bash_detach_slot(slot.clone())
+        let ex = if let Some(ref slot) = p.foreground_wait_control {
+            ex.with_foreground_wait_control(slot.clone())
         } else {
             ex
         };
@@ -351,11 +390,6 @@ pub(crate) async fn stream_chat_sse(
     if let Some(ref obs) = p.observability_session {
         executor.observability_session = Some(obs.clone());
     }
-    // P6: propagate cross-session lessons (loaded at first-turn bootstrap)
-    // into the ToolExecutor so every SelfModel snapshot this turn carries
-    // prior-session advice. Empty snapshots clear previously dismissed lessons.
-    executor.set_session_lessons(p.session_lessons.to_vec());
-    executor.set_memory_selection_reports(p.memory_selection_reports.to_vec());
     // P8: propagate the previous turn's auto-invoke diagnosis so this
     // turn's LLM reads "the system already noticed X" in the self-awareness
     // section. Cloned because the setter takes ownership; the state-side
@@ -423,11 +457,11 @@ pub(crate) async fn stream_chat_sse(
     };
     let cli_capabilities = edge_tools::cli_default_capabilities(
         p.agent_spawner.is_some(),
-        p.bg_task_commands.is_some(),
+        p.background_tasks.is_some() || p.agent_spawner.is_some(),
     );
     let all_schemas: (Vec<Value>, Vec<Value>) = (
         astra_runtime::capabilities::cli_local_tool_schemas(
-            edge_tools::local_tool_schemas(),
+            executor.bound_local_tool_schemas(),
             mcp_schemas.clone(),
             &cli_capabilities,
         ),
@@ -520,6 +554,7 @@ pub(crate) async fn stream_chat_sse(
 
     // ─── Build host + state ──────────────────────────────────────────────
     let mut host = CliServerAdmissionHost {
+        server_admission_dispatched,
         runtime_config: p.runtime_config.clone(),
         api: p.api,
         token: p.token.to_string(),
@@ -540,7 +575,7 @@ pub(crate) async fn stream_chat_sse(
         history: p.history,
         recent_tools: p.recent_tools,
         project_root: project_root.clone(),
-        executor: std::sync::Arc::new(executor),
+        executor: retain_cli_executor(executor, p.executor_observer.as_ref())?,
         registry,
         all_schemas,
         perm_manager: p.perm_manager,
@@ -557,7 +592,6 @@ pub(crate) async fn stream_chat_sse(
         last_artifact_publication: None,
         pending_artifact_publication: None,
         pending_explain_analyze_snapshot: None,
-        deferred_token_projection: None,
         agent_live_event_sink: p.agent_live_event_sink.clone(),
         approval_request_tx: p.approval_request_tx,
         ask_user_request_tx: p.ask_user_request_tx,
@@ -575,11 +609,22 @@ pub(crate) async fn stream_chat_sse(
         callback_client_detached: false,
         remote_cancel_run_id: None,
         last_physical_run_id: None,
+        failed_run_terminal: None,
         turn_evaluation: None,
         last_error_code: None,
         last_error_metadata: None,
         output_transport_failure: None,
     };
+
+    #[cfg(test)]
+    if let Some(observer) = p.executor_observer.as_ref() {
+        // Public-entry loopback tests verify the actual admission host too,
+        // rather than only the reference returned by the isolated factory.
+        assert!(Arc::ptr_eq(
+            &host.executor,
+            observer.get().expect("published executor")
+        ));
+    }
 
     let completion_checks =
         load_completion_check_declarations(&project_root).map_err(|error| crate::TurnFailure {
@@ -611,8 +656,8 @@ pub(crate) async fn stream_chat_sse(
         run_transcript_capture: Vec::new(),
         current_session_id,
         current_run_id: None,
-        context_manifest_user_id: persist_session_artifacts.then_some(current_user_id),
-        context_manifest_model_name: model_for_policy.map(str::to_string),
+        owner_user_id: persist_session_artifacts.then_some(current_user_id),
+        policy_model_name: model_for_policy.map(str::to_string),
         final_text: String::new(),
         final_text_model_item_id: None,
         total_prompt: 0,
@@ -741,6 +786,7 @@ pub(crate) async fn stream_chat_sse(
         s.stop_clear();
     }
     let loop_result = consume_remote_turn(&mut host, &mut state).await;
+    let failure_kind = loop_result.as_ref().err().map(|error| error.kind);
     let loop_failure = match loop_result {
         Err(error) => Some(error.to_string()),
         Ok(_) => host
@@ -800,11 +846,23 @@ pub(crate) async fn stream_chat_sse(
             state.total_tool_calls,
             state.telemetry.all_tools_used.iter().cloned(),
             &state.stall.tool_call_records,
-            !state.remote_summary.is_none(),
+            state
+                .remote_summary
+                .as_ref()
+                .is_some_and(|summary| summary.has_complete_tool_ledger()),
         );
-        let tool_outcomes = astra_services::session_journal::ToolOutcomeSummary::from_records(
-            &state.stall.tool_call_records,
-        );
+        // Callback records are only local observations, never a complete
+        // Server ledger, even when their count happens to match a fallback.
+        let tool_outcomes = state
+            .remote_summary
+            .as_ref()
+            .filter(|summary| summary.has_complete_tool_ledger())
+            .and_then(|summary| {
+                crate::cli::stream::streaming_types::canonical_tool_outcomes(
+                    summary.tool_ledger_receipt.canonical_aggregate(),
+                    tool_calls_count,
+                )
+            });
         let usage_attribution = UsageAttribution::from_explain_analyze_events(
             &state.telemetry.explain_analyze_events,
             state
@@ -827,9 +885,12 @@ pub(crate) async fn stream_chat_sse(
                 qualified_usage: state.qualified_usage,
                 usage_attribution,
                 tool_calls_count,
-                llm_rounds: Some(state.llm_rounds_completed),
+                llm_rounds: state
+                    .remote_summary
+                    .as_ref()
+                    .map(|summary| summary.llm_rounds),
                 token_usage_coverage: state.token_usage_coverage(),
-                tool_outcomes: Some(tool_outcomes),
+                tool_outcomes,
                 applied_user_intents: state
                     .applied_user_intents
                     .iter()
@@ -846,15 +907,20 @@ pub(crate) async fn stream_chat_sse(
                 session_id: state.current_session_id.clone(),
                 // Only the verified physical Server owner crosses settlement.
                 run_id: host.last_physical_run_id.clone(),
+                failure_kind,
                 error_code: host.last_error_code.clone(),
                 error_metadata: host.last_error_metadata.clone(),
+                cancel_context_not_saved: None,
                 admission_rejected: is_pre_admission_rejection(
                     host.last_error_code.as_deref(),
                     host.last_error_metadata.as_ref(),
                     host.last_physical_run_id.as_deref(),
                 ),
+                server_admission_not_dispatched: false,
                 last_heavy_checkpoint: state.stall.last_heavy_checkpoint.take(),
                 partial_text: std::mem::take(&mut state.final_text),
+                partial_text_model_item_id: state.final_text_model_item_id.take(),
+                failed_run_terminal: host.failed_run_terminal.take(),
                 run_transcript_messages: state.take_run_transcript_capture(),
                 remote_cancel_required: host.remote_cancel_required,
                 callback_client_detached: host.callback_client_detached,
@@ -926,8 +992,16 @@ pub(crate) async fn stream_chat_sse(
     let tool_ledger_aggregate = state
         .remote_summary
         .as_ref()
+        .filter(|summary| summary.has_complete_tool_ledger())
         .map(|summary| summary.tool_ledger_receipt.canonical_aggregate())
-        .unwrap_or_default();
+        .unwrap_or(
+            astra_turn_types::tool_ledger_receipt::ToolLedgerCanonicalAggregate {
+                // An absent receipt is not a measured empty ledger. Reuse the
+                // aggregate's existing evidence-validity bit through JSON/journal.
+                consistent: false,
+                ..Default::default()
+            },
+        );
     let result = build_stream_result(StreamResultBuild {
         turn_evaluation: host.turn_evaluation.take(),
         tool_health_entries: p.tool_health_entries,
@@ -970,14 +1044,16 @@ pub(crate) async fn stream_chat_sse(
         tool_record_coverage_partial: state
             .remote_summary
             .as_ref()
-            .is_some_and(|summary| !summary.has_complete_tool_ledger()),
+            .map_or(state.server_terminal_authoritative, |summary| {
+                !summary.has_complete_tool_ledger()
+            }),
         final_messages,
         deferred_tool_activations: state.deferred_tool_activations.clone(),
         run_transcript_messages,
         applied_user_intents,
     });
     if let Some(ref tx) = p.stream_event_tx
-        && let Some(user_message) = partial_interruption_notice(&result)
+        && let Some(user_message) = stream_interruption_notice(&result)
         && tx
             .send(StreamEvent::RunInterrupted { user_message })
             .await
@@ -1117,6 +1193,30 @@ fn load_turn_messages(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ordinary_executor_observer_rejects_a_second_factory_before_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let observer = crate::cli::chat_stream::CliExecutorObserver::default();
+        let first = super::retain_cli_executor(
+            crate::edge_tools::ToolExecutor::new(root.path()),
+            Some(&observer),
+        )
+        .unwrap();
+        let failure = super::retain_cli_executor(
+            crate::edge_tools::ToolExecutor::new(root.path()),
+            Some(&observer),
+        )
+        .err()
+        .expect("a different executor cannot replace the observed owner");
+        assert_eq!(
+            failure.partial.failure_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
+        );
+        assert!(std::sync::Arc::ptr_eq(&first, observer.get().unwrap()));
+        assert!(failure.partial.run_id.is_none());
+        assert!(!crate::cli::turn::turn_auth_retry::should_retry_after_auth_refresh(&failure));
+    }
+
     use super::{
         TurnMessageLoadError, load_turn_messages, missing_model_selection_journal_event,
         missing_model_selection_turn_failure, non_tty_output_failure, normalize_turn_model,

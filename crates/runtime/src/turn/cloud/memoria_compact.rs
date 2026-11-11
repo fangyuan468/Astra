@@ -454,6 +454,16 @@ impl HttpMemoriaPort {
     }
 
     fn status_error(&self, operation: &str, status: reqwest::StatusCode) -> String {
+        if operation == "idempotent store"
+            && matches!(
+                status,
+                reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+            )
+        {
+            return format!(
+                "Memoria {operation} HTTP {status}: this backend does not provide the required idempotent write endpoint; upgrade Memoria before retrying session memory maintenance"
+            );
+        }
         if self.owner_scoped_master && status == reqwest::StatusCode::UNAUTHORIZED {
             return format!(
                 "Memoria {operation} HTTP {status}: owner-scoped authentication failed; verify MEMORIA_MASTER_KEY and upgrade Memoria to a version that supports the Memoria-Owner authorization scheme"
@@ -563,10 +573,9 @@ impl UserScopedMemoriaPort {
             .as_deref()
             .ok_or_else(|| "Memoria requires an authenticated owner".into())
     }
-    async fn client(
-        &self,
-        write: bool,
-    ) -> Result<(HttpMemoriaPort, String), MemoriaOperationError> {
+    // Resolve fresh authority without constructing an HTTP client. Transport
+    // consumers such as the observer own their request-specific client policy.
+    async fn transport(&self, write: bool) -> Result<MemoriaToolTransport, MemoriaOperationError> {
         let owner_user_id = self
             .owner_user_id()
             .map_err(MemoriaOperationError::AuthorityUnavailable)?;
@@ -581,30 +590,40 @@ impl UserScopedMemoriaPort {
                 if let Some(message) = credential.access.denial_message(write) {
                     return Err(MemoriaOperationError::Disabled(message.into()));
                 }
-                let mut client =
-                    HttpMemoriaPort::new(self.resolver.provider.base_url.clone(), credential.key)
-                        .with_owner_user_id(credential.owner.clone());
-                client.owner_scoped_master = credential.owner_scoped_master;
-                Ok((client, credential.owner))
+                Ok(MemoriaToolTransport {
+                    base_url: self.resolver.provider.base_url.clone(),
+                    credential: credential.key,
+                    owner_user_id: credential.owner,
+                    owner_scoped_master: credential.owner_scoped_master,
+                })
             }
             MemoriaAuthoritySelection::SelfHosted => {
                 let fallback = self
                     .self_hosted_fallback
                     .as_ref()
                     .expect("selection requires a configured fallback");
-                Ok((
-                    HttpMemoriaPort::self_hosted(
-                        fallback.base_url.clone(),
-                        fallback.master_key.clone(),
-                    )
-                    .with_owner_user_id(owner_user_id),
-                    owner_user_id.to_string(),
-                ))
+                Ok(MemoriaToolTransport {
+                    base_url: fallback.base_url.clone(),
+                    credential: fallback.master_key.clone(),
+                    owner_user_id: owner_user_id.to_string(),
+                    owner_scoped_master: true,
+                })
             }
             MemoriaAuthoritySelection::Disabled => Err(MemoriaOperationError::Disabled(
                 "memory access is not enabled".into(),
             )),
         }
+    }
+
+    async fn client(
+        &self,
+        write: bool,
+    ) -> Result<(HttpMemoriaPort, String), MemoriaOperationError> {
+        let transport = self.transport(write).await?;
+        let owner_user_id = transport.owner_user_id.clone();
+        // This client is always owner-bound; unbound self-hosted templates
+        // continue to use HttpMemoriaPort::self_hosted and require bind_owner.
+        Ok((HttpMemoriaPort::from_transport(transport), owner_user_id))
     }
 }
 
@@ -639,16 +658,19 @@ impl MemoriaPort for UserScopedMemoriaPort {
         &self,
         write: bool,
     ) -> Result<Option<MemoriaToolTransport>, String> {
-        let (client, owner_user_id) = self
-            .client(write)
+        let transport = self
+            .transport(write)
             .await
             .map_err(|error| error.to_string())?;
-        Ok(Some(MemoriaToolTransport {
-            base_url: client.base_url,
-            credential: client.api_key,
-            owner_user_id,
-            owner_scoped_master: client.owner_scoped_master,
-        }))
+        Ok(Some(transport))
+    }
+
+    async fn resolve_observer_transport(&self) -> Result<Option<MemoriaToolTransport>, String> {
+        match self.transport(true).await {
+            Ok(transport) => Ok(Some(transport)),
+            Err(MemoriaOperationError::Disabled(_)) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     async fn retrieve_for_prompt(
@@ -1772,6 +1794,30 @@ mod tests {
         (address, captured, server)
     }
 
+    #[tokio::test]
+    async fn missing_idempotent_endpoint_explains_the_backend_requirement() {
+        let (address, captured, server) =
+            capture_one_http_request("405 Method Not Allowed", b"{}").await;
+        let client = HttpMemoriaPort::new(format!("http://{address}"), "fixture".into())
+            .with_owner_user_id("owner");
+        let error = client
+            .store_idempotent("content", "working", "session", "T3", "key")
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(
+            captured
+                .lock()
+                .unwrap()
+                .starts_with("POST /v1/memories/idempotent ")
+        );
+        assert!(
+            error.contains("required idempotent write endpoint"),
+            "{error}"
+        );
+        assert!(error.contains("upgrade Memoria"), "{error}");
+    }
+
     #[test]
     fn long_term_episode_and_scene_writers_emit_recallable_layered_protocol() {
         let episode = encode_episode_memory(
@@ -2360,6 +2406,8 @@ mod tests {
             self.requests.lock().unwrap().push(messages.to_vec());
             match self.response.lock().unwrap().as_ref() {
                 Some(text) => Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                    input_was_measured: false,
+                    unpartitioned_input_tokens: 0,
                     qualified_usage: None,
                     judgment_provenance: None,
                     model_used: "fixture-model".into(),

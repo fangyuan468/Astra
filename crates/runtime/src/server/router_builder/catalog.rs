@@ -3,6 +3,30 @@ use super::*;
 pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
     router
         .route(
+            "/me/model-connections",
+            get(data_layer::model_connections::list),
+        )
+        .route(
+            "/me/model-connections/chatgpt/authorizations",
+            post(data_layer::model_connections::start),
+        )
+        .route(
+            "/me/model-connections/chatgpt/authorizations/{authorization_id}/complete",
+            post(data_layer::model_connections::complete),
+        )
+        .route(
+            "/me/model-connections/chatgpt/authorizations/{authorization_id}",
+            axum::routing::delete(data_layer::model_connections::cancel),
+        )
+        .route(
+            "/me/model-connections/{connection_id}/models",
+            get(data_layer::model_connections::models),
+        )
+        .route(
+            "/me/model-connections/{connection_id}/disconnect",
+            post(data_layer::model_connections::disconnect),
+        )
+        .route(
             "/me/models",
             get(data_layer::models::list_user_models_handler)
                 .post(data_layer::models::create_user_model_handler),
@@ -51,24 +75,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/skills", get(skills::list_skills_handler))
         .route("/skills/status", get(skills::get_skill_status_handler))
         .route("/skills/publish", post(skills::publish_skill_handler))
-        .route(
-            "/skills/user",
-            get(user_skill_handlers::list_user_skills_handler)
-                .post(user_skill_handlers::create_user_skill_handler),
-        )
-        .route(
-            "/skills/user/{skill_name}/versions",
-            get(user_skill_handlers::list_user_skill_versions_handler)
-                .post(user_skill_handlers::submit_user_skill_version_handler),
-        )
-        .route(
-            "/skills/user/{skill_name}/evaluations",
-            post(user_skill_handlers::record_user_skill_evaluation_handler),
-        )
-        .route(
-            "/skills/user/{skill_name}/activate",
-            post(user_skill_handlers::activate_user_skill_handler),
-        )
         .route(
             "/skills/{skill_name}/info",
             get(skills::get_skill_info_handler),
@@ -123,22 +129,5 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/marketplace/installed",
             get(crate::service_handlers::marketplace::list_installed_handler),
-        )
-        .route(
-            "/marketplace/credentials",
-            post(crate::service_handlers::marketplace::save_credential_handler)
-                .delete(crate::service_handlers::marketplace::delete_credential_handler),
-        )
-        .route(
-            "/marketplace/quality-report",
-            post(crate::service_handlers::marketplace::submit_quality_report_handler),
-        )
-        .route(
-            "/marketplace/stats/{skill_name}",
-            get(crate::service_handlers::marketplace::get_skill_stats_handler),
-        )
-        .route(
-            "/marketplace/search",
-            get(crate::service_handlers::marketplace::search_marketplace_handler),
         )
 }

@@ -11,17 +11,9 @@ use sqlx::Acquire;
 #[derive(Clone, Debug)]
 pub(crate) struct NoopTurnObserverWorker;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DatabaseTurnObserverWorker {
-    pub(crate) base_url: String,
-    pub(crate) master_key: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct DatabaseTurnHookDbWriter {
-    pool: Option<SharedPool>,
-    #[cfg(feature = "e2e-hooks")]
-    retained_write_hook: Option<Arc<astra_services::decisions::RetainedWriteTestHook>>,
+    memoria_port: Option<Arc<dyn astra_memoria::MemoriaPort>>,
 }
 
 #[derive(Clone, Debug)]
@@ -32,36 +24,6 @@ pub struct DatabaseTurnAuxiliaryEventWriter {
 #[derive(Clone, Debug)]
 pub struct DatabaseTraceEventWriter {
     pool: Option<SharedPool>,
-}
-
-impl DatabaseTurnHookDbWriter {
-    #[cfg(feature = "e2e-hooks")]
-    pub fn with_retained_write_test_hook(
-        mut self,
-        hook: Arc<astra_services::decisions::RetainedWriteTestHook>,
-    ) -> Self {
-        self.retained_write_hook = Some(hook);
-        self
-    }
-
-    pub fn new(_matrixone: MatrixOneSettings) -> Self {
-        Self {
-            pool: None,
-            #[cfg(feature = "e2e-hooks")]
-            retained_write_hook: None,
-        }
-    }
-    pub fn with_pool(mut self, pool: SharedPool) -> Self {
-        self.pool = Some(pool);
-        self
-    }
-
-    fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, String> {
-        self.pool
-            .as_ref()
-            .map(|p| p.get().clone())
-            .ok_or_else(|| "shared pool not configured".to_string())
-    }
 }
 
 impl DatabaseTurnAuxiliaryEventWriter {
@@ -107,13 +69,6 @@ pub(crate) struct TraceEventPersistOutcome {
 }
 
 impl TraceEventPersistOutcome {
-    pub(crate) fn accepts_projection(&self, event_id: &str) -> bool {
-        matches!(
-            self.event_outcomes.get(event_id),
-            Some(DurableCaptureOutcome::Inserted | DurableCaptureOutcome::Replayed)
-        )
-    }
-
     pub(crate) fn merge(&mut self, other: Self) {
         for (key, (delta, last_event_id)) in other.session_event_deltas {
             let entry = self.session_event_deltas.entry(key).or_default();
@@ -178,11 +133,8 @@ async fn apply_touched_session_deltas_in_tx(
 }
 
 impl DatabaseTurnObserverWorker {
-    pub fn new(base_url: String, master_key: Option<String>) -> Self {
-        Self {
-            base_url,
-            master_key,
-        }
+    pub fn new(memoria_port: Option<Arc<dyn astra_memoria::MemoriaPort>>) -> Self {
+        Self { memoria_port }
     }
 }
 
@@ -277,47 +229,6 @@ impl DatabaseTraceEventWriter {
         )
         .await
         .map_err(TraceWriteError::Persist)?;
-        Self::write_many_in_tx_after_admission(tx, events, None).await
-    }
-
-    /// Persist trace rows after the caller has already admitted their exact
-    /// owner in this same transaction. Canonical run settlement and terminal
-    /// trace repair both hold that lock before reaching this writer; repeating
-    /// session admission here only performs the same fence/status reads again.
-    ///
-    /// The owner pair is required by those callers so a future builder cannot
-    /// accidentally bypass admission for a mixed-user batch.
-    pub(crate) async fn write_many_in_admitted_tx(
-        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-        admitted_user_id: &str,
-        admitted_session_id: &str,
-        events: Vec<TraceEvent>,
-    ) -> Result<TraceEventPersistOutcome, TraceWriteError> {
-        Self::write_many_in_tx_after_admission(
-            tx,
-            events,
-            Some((admitted_user_id, admitted_session_id)),
-        )
-        .await
-    }
-
-    async fn write_many_in_tx_after_admission(
-        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-        events: Vec<TraceEvent>,
-        admitted_owner: Option<(&str, &str)>,
-    ) -> Result<TraceEventPersistOutcome, TraceWriteError> {
-        if events.is_empty() {
-            return Ok(TraceEventPersistOutcome::default());
-        }
-        if let Some((admitted_user_id, admitted_session_id)) = admitted_owner
-            && events.iter().any(|event| {
-                event.user_id != admitted_user_id || event.session_id != admitted_session_id
-            })
-        {
-            return Err(TraceWriteError::Persist(
-                "admitted trace batch contains a different owner".to_string(),
-            ));
-        }
         let mut by_session = std::collections::BTreeMap::<(String, String), Vec<TraceEvent>>::new();
         for event in events {
             by_session
@@ -356,96 +267,27 @@ impl DatabaseTraceEventWriter {
 }
 
 #[async_trait]
-impl TurnHookDbWriter for DatabaseTurnHookDbWriter {
-    async fn persist(&self, plan: TurnHookDbPersistPlan) -> Result<(), String> {
-        let Some(mut skill_selection) = plan.skill_selection else {
-            return Ok(());
-        };
-        let pool = self.get_pool()?;
-        // Resolve catalog metadata before opening the write transaction. This
-        // lookup uses the pool itself; doing it after `begin()` would hold one
-        // connection while waiting for a second connection and can deadlock a
-        // small pool (and unnecessarily consumes two leases in production).
-        let skill_versions = resolve_active_skill_versions(
-            &pool,
-            skill_selection
-                .selected_skills
-                .iter()
-                .map(String::as_str)
-                .collect(),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        if let Some(first_skill_name) = skill_selection.selected_skills.first()
-            && let Some(skill_version) = skill_versions.get(first_skill_name)
-        {
-            skill_selection.skill_version = Some(skill_version.clone());
-        }
-        let mut connection = astra_services::CancellationSafePoolConnection::acquire(&pool)
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut tx = connection
-            .begin()
-            .await
-            .map_err(|error| error.to_string())?;
-        let result = async {
-            astra_services::storage::admit_session_event_write(
-                &mut tx,
-                &skill_selection.session_id,
-                &skill_selection.user_id,
-                false,
-            )
-            .await?;
-            insert_turn_skill_selection(&mut tx, &skill_selection).await?;
-            #[cfg(feature = "e2e-hooks")]
-            if let Some(hook) = &self.retained_write_hook
-                && hook
-                    .after_insert(&skill_selection.user_id, &skill_selection.session_id)
-                    .await
-            {
-                return Err(sqlx::Error::Protocol(
-                    "injected retained write failure".into(),
-                ));
-            }
-            Ok::<(), sqlx::Error>(())
-        }
-        .await;
-        match result {
-            Ok(()) => {
-                tx.commit().await.map_err(|error| error.to_string())?;
-                connection.release();
-                Ok(())
-            }
-            Err(error) => {
-                if tx.rollback().await.is_ok() {
-                    connection.release();
-                }
-                Err(error.to_string())
-            }
-        }
-    }
-}
-
-#[async_trait]
 impl TurnObserverWorker for NoopTurnObserverWorker {
-    async fn run(&self, _request: TurnObserverRequest) -> Result<(), String> {
-        Ok(())
+    async fn run(&self, _request: TurnObserverRequest) -> Result<TurnObserverOutcome, String> {
+        Ok(TurnObserverOutcome::NotConfigured)
     }
 }
 
 #[async_trait]
 impl TurnObserverWorker for DatabaseTurnObserverWorker {
-    async fn run(&self, request: TurnObserverRequest) -> Result<(), String> {
-        let Some(master_key) = self.master_key.as_ref() else {
-            return Ok(());
-        };
+    async fn run(&self, request: TurnObserverRequest) -> Result<TurnObserverOutcome, String> {
         if request.messages.is_empty() {
-            return Ok(());
+            return Ok(TurnObserverOutcome::Empty);
         }
+        let Some(template) = self.memoria_port.as_ref() else {
+            return Ok(TurnObserverOutcome::NotConfigured);
+        };
+        let port = template.bind_owner(&request.user_id)?;
         let client = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| error.to_string())?;
         // Serialize exactly once, then retain and send that same byte buffer.
@@ -453,21 +295,34 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
         // weight behind a second serializer-owned allocation.
         let payload = encode_memory_extraction_observe_payload(&request)?;
         let queue_reservation = reserve_memory_extraction_payload(&payload);
+        // Resolve fresh write authority after preparation, just as memory tools
+        // do. A denied/revoked grant never falls back to deployment credentials.
+        let Some(transport) = port.resolve_observer_transport().await? else {
+            return Ok(TurnObserverOutcome::AccessDisabled);
+        };
         let response = client
             .post(format!(
                 "{}/v1/observe",
-                self.base_url.trim_end_matches('/')
+                transport.base_url.trim_end_matches('/')
             ))
-            .header("Authorization", format!("Bearer {master_key}"))
-            .header("X-Impersonate-User", request.user_id)
+            .header("Authorization", transport.authorization_header())
+            .header("X-User-Id", &transport.owner_user_id)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(payload)
             .send()
             .await;
         drop(queue_reservation);
-        let response = response.map_err(|error| error.to_string())?;
+        let response = response.map_err(|error| {
+            if error.is_timeout() {
+                "memoria observer request timed out".to_string()
+            } else if error.is_connect() {
+                "memoria observer connection failed".to_string()
+            } else {
+                "memoria observer request failed".to_string()
+            }
+        })?;
         if response.status().is_success() {
-            Ok(())
+            Ok(TurnObserverOutcome::Observed)
         } else {
             Err(format!(
                 "memoria observer run failed: status={}",
@@ -583,16 +438,6 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct NoopTurnHookDbWriter;
-
-#[async_trait]
-impl TurnHookDbWriter for NoopTurnHookDbWriter {
-    async fn persist(&self, _plan: TurnHookDbPersistPlan) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct NoopTurnAuxiliaryEventWriter;
 
 #[async_trait]
@@ -635,6 +480,21 @@ mod tests {
     use serde_json::json;
     use sqlx::Row;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn noop_observer_reports_not_configured() {
+        let outcome = NoopTurnObserverWorker
+            .run(TurnObserverRequest {
+                user_id: "test-owner".into(),
+                session_id: "test-session".into(),
+                messages: vec![],
+                turn_count: 0,
+                session_start: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, TurnObserverOutcome::NotConfigured);
+    }
 
     #[test]
     fn metadata_tool_name_none() {
@@ -987,107 +847,6 @@ mod tests {
             .expect("cleanup trace-tail sessions");
     }
 
-    #[tokio::test]
-    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-    async fn admitted_trace_batch_rejects_mixed_owner_without_writes() {
-        let shared = setup_live_pool_for_test().await;
-        let pool = shared.get().clone();
-        let suffix = Uuid::new_v4().to_string();
-        let first_user = format!("admitted-trace-user-a-{suffix}");
-        let first_session = format!("admitted-trace-session-a-{suffix}");
-        let second_user = format!("admitted-trace-user-b-{suffix}");
-        let second_session = format!("admitted-trace-session-b-{suffix}");
-
-        for (user_id, session_id) in [
-            (&first_user, &first_session),
-            (&second_user, &second_session),
-        ] {
-            sqlx::query(
-                "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-                 VALUES (?, ?, 'admitted-trace-owner-it', 'active', 0)",
-            )
-            .bind(session_id)
-            .bind(user_id)
-            .execute(&pool)
-            .await
-            .expect("insert admitted-trace owner session");
-        }
-
-        let mut connection = astra_services::CancellationSafePoolConnection::acquire(&pool)
-            .await
-            .expect("acquire admitted-trace transaction connection");
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .expect("begin admitted-trace transaction");
-        admit_event_owners_in_tx(
-            &mut tx,
-            std::iter::once((first_user.clone(), first_session.clone())),
-        )
-        .await
-        .expect("admit the exact trace owner");
-
-        let error = DatabaseTraceEventWriter::write_many_in_admitted_tx(
-            &mut tx,
-            &first_user,
-            &first_session,
-            vec![
-                trace_event("admitted-trace-first", &first_user, &first_session),
-                trace_event("admitted-trace-mixed", &second_user, &second_session),
-            ],
-        )
-        .await
-        .expect_err("mixed-owner admitted batch must be rejected before insert");
-        assert!(
-            error.to_string().contains("different owner"),
-            "unexpected mixed-owner error: {error}"
-        );
-        for (user_id, session_id) in [
-            (&first_user, &first_session),
-            (&second_user, &second_session),
-        ] {
-            let event_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .fetch_one(&mut *tx)
-            .await
-            .expect("count mixed-owner trace events before rollback");
-            assert_eq!(event_count, 0, "mixed-owner batch must not insert events");
-
-            let session_event_count: i64 = sqlx::query_scalar(
-                "SELECT event_count FROM agent_sessions WHERE user_id = ? AND session_id = ?",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .fetch_one(&mut *tx)
-            .await
-            .expect("read mixed-owner session event count before rollback");
-            assert_eq!(
-                session_event_count, 0,
-                "mixed-owner batch must not change session counters"
-            );
-        }
-        tx.rollback()
-            .await
-            .expect("rollback mixed-owner admitted batch");
-        connection.release();
-
-        sqlx::query(
-            "DELETE FROM agent_sessions WHERE (user_id = ? AND session_id = ?) \
-             OR (user_id = ? AND session_id = ?)",
-        )
-        .bind(&first_user)
-        .bind(&first_session)
-        .bind(&second_user)
-        .bind(&second_session)
-        .execute(&pool)
-        .await
-        .expect("cleanup admitted-trace owner sessions");
-    }
-
     /// Verify that the retained writers fail instantly when no pool is
     /// configured, rather than blocking on a 2s connect_matrixone() timeout.
     #[tokio::test]
@@ -1108,11 +867,6 @@ mod tests {
         };
 
         let start = Instant::now();
-
-        // An empty hook must succeed without even a configured pool.
-        let w = DatabaseTurnHookDbWriter::new(settings.clone());
-        let r = w.persist(TurnHookDbPersistPlan::default()).await;
-        assert!(r.is_ok());
 
         // AuxiliaryEventWriter
         let w = DatabaseTurnAuxiliaryEventWriter::new(settings.clone());

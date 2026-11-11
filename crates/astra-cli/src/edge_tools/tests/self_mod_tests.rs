@@ -301,20 +301,46 @@ async fn projection_failure_preserves_durable_receipt_and_rollback_handle() {
 #[cfg(feature = "e2e-hooks")]
 #[tokio::test]
 #[serial_test::serial]
+async fn direct_adjust_config_preserves_unknown_commit_fact() {
+    let (_tmp, _guard, exe, session, _session_id) = executor_with_persisted_session();
+    let baseline = session.read().unwrap().config.memory.retrieval_top_k;
+    let changed = (1..=20).find(|value| *value != baseline).unwrap();
+    astra_services::session_workspace::inject_workspace_commit_parent_sync_failure_once();
+    let result = exe
+        .execute_with_metadata(
+            "adjust_config",
+            &json!({"path": "memory.retrieval_top_k", "value": changed, "force": true}),
+        )
+        .await;
+    assert_eq!(
+        result.tool_result_fields.as_ref().unwrap()["execution_fact"],
+        "unknown"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&result.output).unwrap()["error"],
+        "config_commit_outcome_unknown"
+    );
+}
+
+#[cfg(feature = "e2e-hooks")]
+#[tokio::test]
+#[serial_test::serial]
 async fn post_rename_sync_unknown_projects_readback_and_records_exact_owner() {
     let (_tmp, _guard, exe, session, session_id) = executor_with_persisted_session();
     let baseline = session.read().unwrap().config.memory.retrieval_top_k;
     let changed = (1..=20).find(|value| *value != baseline).unwrap();
     astra_services::session_workspace::inject_workspace_commit_parent_sync_failure_once();
 
-    let unknown: Value = serde_json::from_str(
-        &exe.execute(
+    let result = exe.execute_with_metadata(
             "session",
             &json!({"action": "config", "path": "memory.retrieval_top_k", "value": changed, "force": true}),
         )
-        .await,
-    )
-    .unwrap();
+        .await;
+    assert_eq!(
+        result.tool_result_fields.as_ref().unwrap()["execution_fact"],
+        "unknown"
+    );
+    let unknown: Value = serde_json::from_str(&result.output).unwrap();
     assert_eq!(unknown["error"], "config_commit_outcome_unknown");
     assert_eq!(unknown["side_effects_maybe"], true);
     assert_eq!(unknown["proposed_revision"], 1);
@@ -390,87 +416,7 @@ async fn cli_rollback_rejects_aba_writer_without_overwriting_authority() {
     assert_eq!(session.read().unwrap().config.memory.retrieval_top_k, first);
 }
 
-#[tokio::test]
-async fn switching_sessions_clears_session_scoped_self_model_context() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _guard = JournalDirGuard::new(tmp.path());
-    let session = std::sync::Arc::new(std::sync::RwLock::new(
-        astra_runtime::observability::ObservabilitySession::new_simple("test-session"),
-    ));
-    let exe = ToolExecutor::new(tmp.path())
-        .with_active_session_id("context-source-session")
-        .with_observability_session(session);
-
-    let lessons = vec![astra_services::LessonHint {
-        kind: astra_services::LessonKind::PromptShape,
-        trigger_signal: "stale review context".into(),
-        action: "reload branch-specific context first".into(),
-        workload_tag: Some("code-review".into()),
-        compact: None,
-    }];
-    let feedback = astra_runtime::self_model::TurnQualityFeedback {
-        turn: 3,
-        findings: vec!["Previous session reused stale guidance".into()],
-        recommended_action: "Clear session-scoped hints on session switch.".into(),
-    };
-
-    exe.set_session_lessons(lessons);
-    exe.set_latest_turn_quality_feedback(Some(feedback));
-
-    let before = exe.build_self_model_snapshot().unwrap();
-    assert!(!before.lessons.is_empty());
-    assert!(before.turn_quality_feedback.is_some());
-
-    exe.set_active_session_id("context-dest-session");
-
-    let after = exe.build_self_model_snapshot().unwrap();
-    assert!(
-        after.lessons.is_empty(),
-        "session-scoped lessons must not bleed into another session"
-    );
-    assert!(
-        after.turn_quality_feedback.is_none(),
-        "latest turn quality feedback must not bleed into another session"
-    );
-}
-
 // ─── P4: P3 seams wired into SelfModel snapshot ─────────────────────────────
-
-#[tokio::test]
-async fn set_session_lessons_feeds_build_self_model_snapshot() {
-    // The session-bootstrap loader (P3.1) hands lessons to the ToolExecutor.
-    // `build_self_model_snapshot` must pass them through unchanged so the
-    // LLM sees prior-session advice on turn 1.
-    let (exe, _session) = executor_with_session();
-    let lessons = vec![
-        astra_services::LessonHint {
-            kind: astra_services::LessonKind::ToolAvoidance,
-            trigger_signal: "3 stalls on grep".into(),
-            action: "switch to rg".into(),
-            workload_tag: None,
-            compact: None,
-        },
-        astra_services::LessonHint {
-            kind: astra_services::LessonKind::PromptShape,
-            trigger_signal: "repeated scope drift".into(),
-            action: "restate scope before tool call".into(),
-            workload_tag: Some("code-review".into()),
-            compact: None,
-        },
-    ];
-    exe.set_session_lessons(lessons.clone());
-
-    let model = exe.build_self_model_snapshot().unwrap();
-    assert_eq!(model.lessons, lessons);
-
-    // And the renderer must surface them — confirms end-to-end wiring.
-    let rendered = model.to_system_prompt_section();
-    assert!(
-        rendered.contains("Lessons from prior sessions"),
-        "lessons must reach the prompt, got:\n{rendered}"
-    );
-    assert!(rendered.contains("switch to rg"));
-}
 
 #[tokio::test]
 async fn set_turn_quality_feedback_feeds_build_self_model_snapshot() {

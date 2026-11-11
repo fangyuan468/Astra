@@ -75,7 +75,9 @@ owns wire shapes; Astra's existing runtime owns execution and persistence.
 
 The completion line shows elapsed time, time to first token (`ttft`), primary
 model tokens, and cache usage when reported. Complete input accounting shows
-the cached-input percentage; incomplete accounting shows lower bounds such as
+the cached-input percentage in both CLI and TUI, even when output usage is
+unreported. The denominator is fresh input + cache reads + cache creation;
+output and auxiliary calls are excluded. Incomplete input accounting shows lower bounds such as
 `≥19.9k tokens · ≥17.9k cached`. Missing cache measurements are omitted, not
 reported as zero. The `≥` counts are reported lower bounds; no cache
 percentage is shown without a complete input total. Session totals remain
@@ -102,6 +104,16 @@ Scripts can still supply both explicitly:
 astra model add work-model --provider deepseek --model deepseek-v4-flash --api-key-stdin
 ```
 
+When the provider requires the Responses API, select **Responses** in model
+settings or pass `--api-format responses` to `astra model add`. The default for
+OpenAI-compatible API-key models is Chat Completions. Use the API format
+documented by your provider; credential or network failures do not cause Astra
+to guess a different format.
+For a personal Responses model, `/model` offers reasoning settings even when
+the provider has not published a complete list. Such settings are marked as
+unverified; if the provider rejects one, choose another or **Model default**.
+The default leaves the provider's reasoning setting unchanged.
+
 With `--api-key-stdin`, the alias and required provider/model arguments remain
 mandatory; only the interactive wizard offers a default alias. Keys should be
 entered at the hidden prompt or supplied via stdin, never as command arguments.
@@ -116,19 +128,101 @@ Public HTTPS endpoints do not require individual administrator registration by
 default. Operators can opt into strict host/port approval by setting
 `ASTRA_BYOK_ENDPOINT_POLICY=trusted-domains` on every Server replica and using
 `PUT /admin/llm/trusted-domains`. Both modes block private/metadata addresses,
-validate and pin DNS results, and disable redirects. Custom BYOK uses direct
-queries to the Server's configured DNS servers, not OS Fake-IP caches. Operators
-may override DNS IPs with `ASTRA_BYOK_DNS_SERVERS` and select an HTTP(S) CONNECT
-or SOCKS5 proxy with `ASTRA_BYOK_PROXY_URL`. Proxies connect to validated public
-IPs, retaining origin TLS verification; ambient proxy variables are not used.
-Direct UDP DNS can still be intercepted by a VPN/proxy. Use an explicit
-TCP-only entry such as `ASTRA_BYOK_DNS_SERVERS=tcp://10.0.0.53:53` when a
-reachable DNS server supports TCP. TCP-only entries never fall back to UDP;
-private/Fake-IP answers remain rejected. DNS failures retain resolver diagnostics
-in Server logs without exposing them in public API errors.
-These are Server settings, not options ordinary CLI users need to fill in.
+validate and pin DNS results, and disable redirects. The Server uses its normal
+system DNS and HTTPS proxy settings; proxies connect to validated public IPs
+while retaining origin TLS verification. A Server using Fake-IP DNS must be
+configured to return public addresses for model providers. These are Server
+settings, not options ordinary CLI users need to fill in.
 The default policy is `public-https`; invalid values fail closed. Upgrade the
 Server together with the CLI to provide `/me/models/validate-endpoint`.
+
+## ChatGPT subscription models
+
+For personal/non-MOI deployments, start `astra` and use `/register` or `/login`.
+Registration signs in the normal local user. A confirmed empty model catalog
+opens personal setup; `/model add` opens it again. Both `add` and `manage` appear
+in `/model ` completion and command help. Choose **Use my API key** or
+**Continue with ChatGPT**. API keys are masked, provider consent opens the system
+browser, and model selection/checking returns to the same TUI. A provider login
+without an eligible checked model is not chat-ready. No admin command is needed.
+
+`/model` selects an exact Offering and shows its source/account. `/model manage`
+reconnects/disconnects personal ChatGPT accounts, restores checked models after
+reconnection, explicitly sets defaults, and removes personal model configurations.
+For a connected ChatGPT account, **Choose models** reads its current catalog
+without another browser authorization. If that read fails, retry it from
+`/model manage`; the account remains connected. Web model settings expose the
+same action and retain a confirmed connection when model discovery fails.
+Cancellation/failure preserves the conversation and draft. Adding a model keeps
+the current usable selection and explicit default. A first sole usable model is
+selected through the existing default resolver; an unpinned fallback still uses
+the Server's existing ordering. Use **Make default** to persist a particular
+personal choice across clients/restarts. An unavailable explicit subscription
+default requires recovery or an explicit replacement; no account/billing fallback
+or automatic replay of an earlier task/tool operation is introduced.
+
+The Web model menu offers **Add or manage my models** for personal deployments,
+using the same owner-scoped model and connection services. API keys work on the
+selected supported deployment. Browser ChatGPT consent requires a local HTTP Web
+listener on `localhost` or `127.0.0.1` with a non-default port (for example,
+3536), on the browser's machine. Port 80 is not supported for browser linking. The callback uses
+`http://127.0.0.1:<Web port>/auth/callback`, including when the opener is localhost.
+For a remote/HTTPS Web deployment, link with the TUI on the browser machine;
+an arbitrary public OAuth callback is not supported. Keys/tokens stay off browser
+storage. A changed account, deployment or session requires reopening settings.
+
+For scripts, the equivalent ordinary-user CLI commands remain available.
+On a personal self-hosted Server, sign in to Astra,
+then link a ChatGPT account from a terminal with a local browser:
+
+```bash
+astra model connect chatgpt --label personal
+astra model connections
+astra model add coding --provider chatgpt --connection <connection-uuid> --model <visible-slug> --default
+astra chat --model coding
+```
+
+`astra model add` also offers a guided ChatGPT setup and lists the models
+currently visible to the chosen account. Multiple aliases/model slugs can share
+one connection; link another account to create a separate credential source.
+Adding/checking a model sends a short inference probe against that subscription.
+Linking alone does not change the default model. Existing CLI/Web model pickers
+select the same configured Offering; supported local Web and TUI linking use the same connection owner.
+
+The browser asks OpenAI for sign-in and plan-use consent. Astra Server encrypts
+renewable credentials with its existing token encryption key and can continue
+inference after this terminal closes. Use a Server you trust and HTTPS for a
+remote Server. This flow does not import the Codex CLI credential cache or
+change Astra's login identity. Native Codex collaborators remain separately
+configured.
+
+Recovery and removal:
+
+```bash
+astra model connect chatgpt --connection <connection-uuid>
+astra model probe coding
+astra model disconnect <connection-uuid>
+```
+
+A failed code exchange prints an authorization UUID; `astra model connect
+chatgpt --retry <authorization-uuid>` retains the issued client registration.
+Declined, expired or cancelled attempts require a new authorization. Reconnect
+must use the same ChatGPT identity. Disconnect disables every model using that
+connection and cancels its requests; recheck individual models to reactivate
+them after reconnecting. The result reports whether upstream revocation was
+confirmed. Inspect OpenAI's connected-app settings if it was not confirmed.
+A disconnected default produces an actionable error until you recheck it or
+explicitly choose another default. Quota errors never select a paid fallback.
+
+V1 supports text and Astra function tools through the Responses HTTP API.
+Images/audio, hosted tools, realtime/WebSocket sessions, custom endpoints and
+custom sampling controls are not exposed. Reasoning depth uses the selected
+model's declared inventory: choose Model default to preserve OpenAI's default,
+or select an available effort in `/model` (including `xhigh` when declared). Run `astra model probe coding` to refresh an existing model's
+capability snapshot. Availability and eligibility come from OpenAI; a ChatGPT
+subscription does not imply every model or effort is available.
+See [Server configuration](configuration.md#chatgpt-subscription-connections)
+for deployment and rollback requirements.
 
 ## Installation
 
@@ -190,7 +284,9 @@ astra session list [--agent-id AGENT] [--status open] [--limit 20] [--offset 0]
 astra session show <session_id> [--execution [--transcript] [--run-events]] # bounded read-only facts; optional transcript and recent run-event tails
 astra session close <session_id>
 astra session delete <session_id>
-astra session judge --model MODEL --message 'Rubric and evidence' [--timeout-seconds 120]
+astra session judge --model MODEL --message 'JudgmentRequest JSON' [--timeout-seconds 120]
+# Stream a complete request without command-line argument size limits:
+astra session judge --model MODEL --message - < judgment.json
 
 # Models
 astra model list                         # consumes the complete paginated catalog
@@ -243,7 +339,12 @@ user configuration instead. Both files use a top-level `mcpServers` object:
 without the `mcpServers` wrapper. It supports `stdio` (the default, using
 `command`, `args`, and optional `env`), `sse`, `streamable_http`, and `ws`
 (using `url`, optional `headers`, and optional `auth_token`). Use the exact
-`streamable_http` spelling in configuration; `http` is not a chat-loader alias.
+`streamable_http` spelling in configuration; `http`, `streamable-http`, and
+`websocket` are not accepted aliases.
+For `streamable_http`, a JSON response or an individual SSE event is limited to
+16 MiB, and an HTTP error body to 64 KiB. Oversized JSON or error bodies fail
+the response; an oversized SSE event terminates that stream, which may reconnect.
+If a tool request has already been sent, its execution outcome may be unknown.
 `add` writes a stdio entry. Both commands default to project scope and reject
 an existing name in that file; remove the existing entry or edit the file to
 replace it. Adding configuration does not install an executable or test access.
@@ -256,7 +357,10 @@ sorted by path. A standalone entry with `disabled: true` or a skill entry with
 can still win. Unsupported or incomplete standalone entries are skipped with
 a warning. A malformed file produces a warning and contributes no entries;
 a missing optional file is normal. Configuration changes apply to the next
-chat startup.
+chat startup. Cooperating Astra configuration writers serialize each destination
+through its stable sibling lockfile before reading and atomically replacing it;
+different destinations remain independent. External editors do not participate
+in that lock protocol.
 
 `list` and `get` show enabled configurations eligible for discovery, including
 the winning source path. They hide connection settings, including commands,
@@ -265,7 +369,19 @@ uses the same loader as chat; it describes configuration, without proving a
 connection or tool availability. In an active chat, `/mcp` shows connected
 servers and tools. The standalone `astra mcp test NAME -s project|user` and
 `astra mcp ping NAME -s project|user` explicitly connect to the selected server;
-for stdio this launches its configured command.
+for stdio this launches its configured command. Each diagnostic performs one
+top-level connection attempt using the existing transport deadlines. Both
+commands use the chat loader for the selected file and reject disabled or
+invalid definitions; they do not fall back to other scopes or skill manifests.
+A malformed typed field can invalidate the whole file, just as at chat startup.
+Chat connection recovery retains its own retry policy.
+
+The CLI agent receives stable guidance to discover these existing commands and
+use only its selected local executor. Configuration JSON and raw connection
+errors are omitted from Astra-owned command output. `test` can still print
+server-provided tool/resource data; diagnostic logs and shell history are not
+secret stores. Use protected local configuration files for credentials rather
+than placing them in inline shell arguments.
 
 ## astra admin
 
@@ -329,6 +445,23 @@ fields and quirks: supplying quirks replaces the complete stored object.
 the observation and diagnostics. An `effort_only` result allows effort selection,
 not thinking Off. An inconclusive check establishes no new capability. A matching
 prior capability may remain available while diagnostics record the latest error.
+An unsuccessful connectivity check returns a nonzero exit status and does not
+disable an existing model. A successful administrator check activates it. Model
+loading reports failed checks with a nonzero exit status while retaining any
+other models already loaded. A lost response can leave a creation outcome
+unknown; check the model list before retrying.
+
+For an administrator-managed API-key model that requires the OpenAI Responses
+API, set `inference_protocol: openai_responses` in its YAML entry and reload it
+with `astra admin model load .models.yaml --update-existing`. Set
+`thinking_protocol: responses_reasoning`, or omit `thinking_protocol` to use
+that default. Replace any existing `thinking_protocol: reasoning_effort`, which
+is incompatible with Responses. The Responses adapter currently accepts text inputs and does not accept fixed temperature or
+arbitrary request-body overrides. Other model entries retain their existing
+transport. This option applies to administrator-managed models.
+For selectable reasoning levels, declare only verified values in
+`supported_reasoning_efforts`, for example `[high, max]`. Without a declaration,
+the model check makes only the successfully observed effort selectable.
 
 Explicit CLI model selectors such as `'<name>(thinking:low)'`,
 `'<name>(thinking:medium)'` and `'<name>(thinking:high)'` select depth. A plain
@@ -341,5 +474,35 @@ level; verify the deployment's supported values before declaring its protocol.
 - CLIs share credential storage: `~/.astra/credentials.json` (tests may set `ASTRA_CREDENTIALS_DIR`)
 - `--profile` lets you isolate credentials by environment/user
 - API errors are returned with HTTP status and compact response body for easier debugging
-- Once a chat stream has started, `astra chat --json` and `--print --output-format json` also return a structured result on hard failure (exit code 3). It retains the validated root run identity, partial output and observed usage, with `success: false` and partial evidence coverage. A request rejected before Run admission has no run identity; an error does not imply successful or resumable execution.
+- Once a chat stream has started, `astra chat --json` and `--print --output-format json` also return a structured result on hard failure (exit code 3 for API failures). It retains the validated root run identity, partial output and observed usage, with `success: false` and partial evidence coverage. A request rejected before Run admission has no run identity; an error does not imply successful or resumable execution.
+- An unsupported local workspace coordination host fails before admission with exit code `1`, `error_kind: "tool_unavailable"`, `error_code: "workspace_host_unsupported"`, non-retryable metadata, and `server_admission_not_dispatched: true`. No model or tool ran. Interactive mode restores the draft and preserves recovery state. Human diagnostics remain on stderr in text, JSON, and stream-json modes. Repair the host prerequisite described in the diagnostic; changing workspace grants does not repair it.
 - Interactive mode launches the TUI (requires a TTY; use `astra chat -m` or `--print` for non-interactive invocations). There is no separate console slash frontend.
+
+In the interactive composer, a leading `/` selects a slash action. To send literal
+slash text, escape it with another slash: `//tmp/project inspect this` sends
+`/tmp/project inspect this`, and `//stop` sends `/stop` as conversation text.
+The escape also applies to queued messages and guidance for an active run.
+Returned conversation can merge with an existing conversation draft. Commands
+and shell drafts, including multiline pasted content, stay separate. Intentional
+whitespace-only drafts also remain editable. “Unsent drafts” shows retained input, which
+moves into the composer after the current draft is sent or cleared. Each draft
+requires a new submission gesture; restoration never sends it automatically.
+Navigation also preserves the draft suspended while browsing history, including
+pasted content. An unchanged recalled message remains in history; edited recall
+and distinct original drafts return for editing through the same unsent list.
+These editable drafts remain local to the running client.
+Ctrl+R also restores the latest conversation with its slash escape, so editing
+and resending `/exit` text keeps it a message. The transcript shows the original
+conversation text, without the composer escape.
+Unknown or ambiguous single-slash actions still report a command error.
+
+Older clients that always send a completion temperature must be upgraded before
+using an API-key Responses Offering.
+
+## Workspace recovery
+
+If a previous command could not be stopped reliably, check that it has stopped.
+The TUI can then confirm and retry in the current session. For a non-interactive
+session, run `astra workspace confirm-stopped` in the indicated workspace and
+resume from that workspace before retrying. Confirmation does not delete files
+or worktrees.

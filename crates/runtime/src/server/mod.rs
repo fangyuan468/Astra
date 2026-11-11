@@ -26,6 +26,7 @@ pub mod artifact_retention_sweeper;
 mod audit_handlers;
 mod auth_handlers;
 mod capability_handlers;
+mod capability_source;
 mod chat_handlers;
 mod cleanup_retry;
 pub(crate) mod context_history_artifact;
@@ -33,8 +34,8 @@ pub mod delegation;
 pub(crate) mod deployment_tool_policy;
 pub mod device_lease_sweeper;
 mod edge;
+pub(crate) use edge::edge_capacity_handler::validate_relay_origin;
 pub(crate) mod explain_analyze_artifact;
-pub mod harness;
 pub(crate) mod header_utils;
 mod http_helpers;
 mod inference_settlement_sweeper;
@@ -43,6 +44,7 @@ mod llm_trusted_domains_handlers;
 mod mcp_handlers;
 mod meta_handlers;
 pub(crate) mod model_execution_admission;
+pub(crate) mod outbound_trace;
 mod platform_handlers;
 mod preferences_handlers;
 mod provider_runtime_context;
@@ -52,8 +54,8 @@ mod reflect_handlers;
 mod request_trace;
 mod resource_handlers;
 mod router_builder;
-mod router_rollout_handlers;
 pub mod run;
+pub(crate) mod run_trace;
 mod runtime_maintenance_sweeper;
 pub(crate) mod runtime_mcp;
 pub mod runtime_tool_executor;
@@ -89,10 +91,6 @@ pub(crate) mod tool_local_transport;
 pub(crate) mod tool_model_catalog;
 mod work_branch_deletion_runtime;
 mod work_handlers;
-mod work_patch_commit_runtime;
-mod work_patch_export_runtime;
-mod work_patch_materialization_runtime;
-mod work_patch_workspace;
 
 fn external_request_descriptor(
     method: &Method,
@@ -121,7 +119,6 @@ pub(crate) mod tool_route_boundary;
 pub(crate) mod tool_route_runtime;
 pub(crate) mod tool_route_selection;
 pub(crate) mod tool_session_config;
-pub(crate) mod tool_session_history;
 pub(crate) mod tool_session_runtime;
 pub(crate) mod tool_session_state_rollback;
 pub mod tool_transport;
@@ -134,7 +131,6 @@ pub(crate) mod tool_work_plan;
 pub(crate) mod tool_work_proposal;
 pub(crate) mod tool_work_surface_events;
 pub(crate) mod tool_workspace_path_guard;
-mod user_skill_handlers;
 pub(crate) mod work_context;
 #[cfg(test)]
 pub(crate) mod work_test_support;
@@ -252,6 +248,7 @@ async fn finish_server_shutdown(
 }
 
 pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    astra_services::chatgpt::ChatgptConfig::from_env()?;
     static TRACING: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     TRACING.get_or_init(|| {
         let _ = astra_logging::init_from_env(
@@ -326,18 +323,6 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
                 bg_cancel.clone(),
             ),
         );
-        bg_handles.push(
-            work_patch_materialization_runtime::spawn_work_patch_materialization_recovery(
-                pool.clone(),
-                state.execution.run_lifecycle_service.clone(),
-                bg_cancel.clone(),
-            ),
-        );
-        bg_handles.push(work_patch_commit_runtime::spawn_work_patch_commit_recovery(
-            pool.clone(),
-            state.execution.run_lifecycle_service.clone(),
-            bg_cancel.clone(),
-        ));
         // Spawn background cleanup-debt retry task
         {
             let cleanup_store: std::sync::Arc<dyn astra_services::WorkspaceCleanupDebtStore> =
@@ -451,6 +436,28 @@ async fn http_shutdown_signal() {
 
 /// Spawn a background task that periodically cleans up expired authentication
 /// and operational data.
+async fn cleanup_until_cancelled<F: std::future::Future>(
+    cancel: &tokio_util::sync::CancellationToken,
+    cleanup: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        _ = cancel.cancelled() => None,
+        result = cleanup => Some(result),
+    }
+}
+
+fn schedule_refresh_after_sweep(
+    catching_up: &mut bool,
+    cutoff: &mut Option<chrono::NaiveDateTime>,
+    retry_at: &mut tokio::time::Instant,
+) {
+    if !*catching_up {
+        *catching_up = true;
+        *cutoff = None;
+        *retry_at = tokio::time::Instant::now();
+    }
+}
+
 fn spawn_data_cleanup(
     pool: astra_core::SharedPool,
     cancel: tokio_util::sync::CancellationToken,
@@ -463,43 +470,73 @@ fn spawn_data_cleanup(
     tokio::spawn(async move {
         let policy = RetentionPolicy::default();
         let mut interval = tokio::time::interval(cleanup_interval);
-        interval.tick().await; // skip immediate first tick
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        let mut catching_up = true;
+        let mut round_cutoff = None;
+        let jitter = u64::from(uuid::Uuid::new_v4().as_bytes()[0]) % 30;
+        let mut retry_at = tokio::time::Instant::now() + Duration::from_secs(jitter);
         loop {
             tokio::select! {
-                _ = cancel.cancelled() => {
-                    tracing::info!(
-                        target: "astra_runtime::cleanup",
-                        "data cleanup received cancellation; exiting"
-                    );
-                    break;
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    let Some(result) = cleanup_until_cancelled(
+                        &cancel, astra_services::cleanup_expired_data(pool.get(), &policy),
+                    ).await else { break; };
+                    match result {
+                        Ok(results) => {
+                            let total: u64 = results.iter().map(|r| r.rows_deleted).sum();
+                            if total > 0 {
+                                let detail = results.iter().filter(|r| r.rows_deleted > 0).map(|r| format!("{}={}", r.table, r.rows_deleted)).collect::<Vec<_>>().join(", ");
+                                tracing::info!(target: "astra_runtime::cleanup", rows_purged = total, tables = %detail, "expired data cleanup");
+                            }
+                        }
+                        Err(error) => tracing::warn!(target: "astra_runtime::cleanup", %error, "expired data cleanup failed"),
+                    }
+                    // Preserve an ongoing round's fixed cutoff. A refresh batch
+                    // may have committed even if a later table failed.
+                    schedule_refresh_after_sweep(&mut catching_up, &mut round_cutoff, &mut retry_at);
                 }
-                _ = interval.tick() => {}
-            }
-            let results = match astra_services::cleanup_expired_data(pool.get(), &policy).await {
-                Ok(results) => results,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "astra_runtime::cleanup",
-                        error = %error,
-                        "expired data cleanup failed"
-                    );
-                    continue;
+                _ = tokio::time::sleep_until(retry_at), if catching_up => {
+                    let mut deleted = 0;
+                    for _ in 0..4 {
+                        if cancel.is_cancelled() { return; }
+                        let Some(result) = cleanup_until_cancelled(
+                            &cancel, astra_services::cleanup_refresh_session_batch(pool.get(), &policy, round_cutoff),
+                        ).await else { return; };
+                        match result {
+                            Ok(batch) => {
+                                deleted += batch.deleted;
+                                match batch.status() {
+                                    astra_services::RefreshCleanupStatus::Retry => {
+                                        tracing::warn!(target: "astra_runtime::cleanup", selected = batch.selected, invalid = batch.invalid, deleted = batch.deleted, "refresh retention made incomplete progress; retrying");
+                                        round_cutoff = None;
+                                        break;
+                                    }
+                                    astra_services::RefreshCleanupStatus::Idle => {
+                                        catching_up = false;
+                                        round_cutoff = None;
+                                        break;
+                                    }
+                                    astra_services::RefreshCleanupStatus::More => {
+                                        round_cutoff = Some(batch.cutoff);
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(target: "astra_runtime::cleanup", %error, "refresh retention failed; retrying");
+                                round_cutoff = None;
+                                break;
+                            }
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    if deleted > 0 {
+                        tracing::info!(target: "astra_runtime::cleanup", rows_purged = deleted, more = catching_up, "refresh retention batch");
+                    }
+                    let jitter = u64::from(uuid::Uuid::new_v4().as_bytes()[0]) % 6;
+                    retry_at = tokio::time::Instant::now() + Duration::from_secs(30 + jitter);
                 }
-            };
-            let total: u64 = results.iter().map(|r| r.rows_deleted).sum();
-            if total > 0 {
-                let detail = results
-                    .iter()
-                    .filter(|r| r.rows_deleted > 0)
-                    .map(|r| format!("{}={}", r.table, r.rows_deleted))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                tracing::info!(
-                    target: "astra_runtime::cleanup",
-                    rows_purged = total,
-                    tables = %detail,
-                    "expired data cleanup"
-                );
             }
         }
     })
@@ -697,6 +734,60 @@ mod tests {
     };
     use tower::ServiceExt;
 
+    #[tokio::test(start_paused = true)]
+    async fn periodic_sweep_preserves_an_active_refresh_round() {
+        let fixed = chrono::Utc::now().naive_utc() - chrono::Duration::days(7);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut active = true;
+        let mut cutoff = Some(fixed);
+        let mut retry_at = deadline;
+        super::schedule_refresh_after_sweep(&mut active, &mut cutoff, &mut retry_at);
+        assert!(active);
+        assert_eq!(cutoff, Some(fixed));
+        assert_eq!(retry_at, deadline);
+
+        active = false;
+        super::schedule_refresh_after_sweep(&mut active, &mut cutoff, &mut retry_at);
+        assert!(active);
+        assert_eq!(cutoff, None);
+        assert_eq!(retry_at, tokio::time::Instant::now());
+    }
+
+    #[tokio::test]
+    async fn cleanup_cancellation_drops_an_inflight_operation() {
+        struct DropSignal(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn({
+            let cancel = cancelled.clone();
+            let dropped = dropped.clone();
+            async move {
+                super::cleanup_until_cancelled(&cancel, async move {
+                    let _signal = DropSignal(dropped);
+                    entered.send(()).unwrap();
+                    std::future::pending::<()>().await
+                })
+                .await
+            }
+        });
+        ready.await.unwrap();
+        cancelled.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
     #[derive(Default)]
     struct RecordingEdgeDispatchService {
         cleanup_calls: AtomicUsize,
@@ -705,15 +796,6 @@ mod tests {
 
     #[async_trait]
     impl EdgeDispatchService for RecordingEdgeDispatchService {
-        async fn insert_dispatch(
-            &self,
-            _identity: &EdgeDispatchIdentity,
-            _edge_agent_id: &str,
-            _payload_json: &str,
-        ) -> Result<(), String> {
-            unreachable!("insert_dispatch is not used in cleanup tests")
-        }
-
         async fn poll_pending(
             &self,
             _user_id: &str,

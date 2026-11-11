@@ -32,10 +32,7 @@ def ownership_marker(owner_run_id: str, source_sha: str, source_tag: str) -> str
         raise ReleaseBodyError("source SHA must be 40 lowercase hexadecimal characters")
     if not source_tag or any(character.isspace() for character in source_tag):
         raise ReleaseBodyError("source tag must be one non-empty token")
-    return (
-        f"{OWNER_PREFIX}run={owner_run_id} sha={source_sha} "
-        f"tag={source_tag} -->"
-    )
+    return f"{OWNER_PREFIX}run={owner_run_id} sha={source_sha} tag={source_tag} -->"
 
 
 def _release_body(release: dict, expected_tag: str) -> str:
@@ -49,21 +46,43 @@ def _release_body(release: dict, expected_tag: str) -> str:
     return body
 
 
+def capability_snapshot(repository: str, source_sha: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None:
+        raise ReleaseBodyError("repository must be an owner/name pair")
+    return (
+        "[Current capability status](https://github.com/"
+        f"{repository}/blob/{source_sha}/docs/reference/capabilities.md)"
+    )
+
+
+def verify_snapshot(body: str, snapshot: str) -> None:
+    if body.count("[Current capability status](") != 1 or body.count(snapshot) != 1:
+        raise ReleaseBodyError(
+            "release body must retain exactly one source-bound capability snapshot"
+        )
+
+
 def prepare_body(
     owner_run_id: str,
     source_sha: str,
     source_tag: str,
     existing_release: dict | None,
+    *,
+    repository: str,
 ) -> PreparedBody:
     marker = ownership_marker(owner_run_id, source_sha, source_tag)
+    snapshot = capability_snapshot(repository, source_sha)
     if existing_release is None:
-        return PreparedBody(body=f"{marker}\n", generate_release_notes=True)
+        return PreparedBody(
+            body=f"{marker}\n\n{snapshot}\n", generate_release_notes=True
+        )
 
     body = _release_body(existing_release, source_tag)
     if not body.startswith(f"{marker}\n") or body.count(OWNER_PREFIX) != 1:
         raise ReleaseBodyError(
             "the existing draft body is not owned by the immutable release run"
         )
+    verify_snapshot(body, snapshot)
     return PreparedBody(body=body, generate_release_notes=False)
 
 
@@ -74,13 +93,21 @@ def verify_body(
     release: dict,
     expected_body: str,
     generated_notes: bool,
+    *,
+    repository: str,
 ) -> None:
     marker = ownership_marker(owner_run_id, source_sha, source_tag)
     actual_body = _release_body(release, source_tag)
-    if not actual_body.startswith(f"{marker}\n") or actual_body.count(OWNER_PREFIX) != 1:
+    if (
+        not actual_body.startswith(f"{marker}\n")
+        or actual_body.count(OWNER_PREFIX) != 1
+    ):
         raise ReleaseBodyError(
             "the staged draft lost or duplicated its release-owner marker"
         )
+    verify_snapshot(actual_body, capability_snapshot(repository, source_sha))
+    if generated_notes and not actual_body.startswith(expected_body):
+        raise ReleaseBodyError("generated notes changed the canonical release preamble")
     if not generated_notes and actual_body != expected_body:
         raise ReleaseBodyError(
             "the staged draft body changed while reusing canonical release notes"
@@ -98,6 +125,7 @@ def _common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--owner-run-id", required=True)
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--source-tag", required=True)
+    parser.add_argument("--repository", required=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -113,9 +141,7 @@ def parse_args() -> argparse.Namespace:
     _common_arguments(verify)
     verify.add_argument("--release-json", required=True, type=Path)
     verify.add_argument("--expected-body", required=True, type=Path)
-    verify.add_argument(
-        "--generated-notes", required=True, choices=("true", "false")
-    )
+    verify.add_argument("--generated-notes", required=True, choices=("true", "false"))
     return parser.parse_args()
 
 
@@ -128,7 +154,11 @@ def main() -> int:
             else None
         )
         prepared = prepare_body(
-            args.owner_run_id, args.source_sha, args.source_tag, existing
+            args.owner_run_id,
+            args.source_sha,
+            args.source_tag,
+            existing,
+            repository=args.repository,
         )
         args.output.write_text(prepared.body, encoding="utf-8")
         print("true" if prepared.generate_release_notes else "false")
@@ -141,6 +171,7 @@ def main() -> int:
         _load_json(args.release_json),
         args.expected_body.read_text(encoding="utf-8"),
         args.generated_notes == "true",
+        repository=args.repository,
     )
     return 0
 

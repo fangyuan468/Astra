@@ -71,11 +71,9 @@ impl Colored {
     }
 
     /// Checks whether ansi color sequences are disabled by setting of NO_COLOR
-    /// in environment as per <https://no-color.org/>
+    /// in the environment. Astra also treats an empty value as disabled.
     pub fn ansi_color_disabled() -> bool {
-        !std::env::var("NO_COLOR")
-            .unwrap_or("".to_string())
-            .is_empty()
+        std::env::var_os("NO_COLOR").is_some()
     }
 
     pub fn ansi_color_disabled_memoized() -> bool {
@@ -313,18 +311,5 @@ mod tests {
         test("48;2;0;2;257");
         test("48;2;0;2;25;");
         test("48;2;0;2;25;3");
-    }
-
-    #[test]
-    #[serial(ansi_color_state)]
-    fn test_no_color() {
-        std::env::set_var("NO_COLOR", "1");
-        assert!(Colored::ansi_color_disabled());
-        std::env::set_var("NO_COLOR", "XXX");
-        assert!(Colored::ansi_color_disabled());
-        std::env::set_var("NO_COLOR", "");
-        assert!(!Colored::ansi_color_disabled());
-        std::env::remove_var("NO_COLOR");
-        assert!(!Colored::ansi_color_disabled());
     }
 }

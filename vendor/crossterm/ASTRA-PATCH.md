@@ -151,3 +151,13 @@ The xterm reflow journey holds a cursor reply past the actual deadline, verifies
 no overlapping query, accepts paste while the reply is outstanding, then releases
 the expired reply and verifies a fresh resize. Its history, composer, footer and
 scrollback assertions remain unchanged.
+
+## Plain styled content
+
+The existing effective color policy also controls `PrintStyledContent`: when
+disabled, it writes the original content without foreground, background,
+underline-color, attribute or reset wrappers. Presence of `NO_COLOR`, including
+an empty value, disables styling. The existing `force_color_output` override
+retains precedence. This covers Astra tool descriptions, status icons, durations,
+summaries and spinner frames without separate renderer state. Cursor commands
+and control bytes already present in content remain unchanged.

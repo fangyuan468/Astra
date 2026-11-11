@@ -299,6 +299,11 @@ mod tests {
         fn new(provider: &str, api_key: &str) -> Self {
             Self {
                 admitted: AdmittedModelExecution {
+                    responses_reasoning_history: None,
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
+                    admitted_at: std::time::Instant::now(),
                     price_snapshot: None,
                     offering_id: "judge-offering".into(),
                     source_identity: None,
@@ -311,8 +316,8 @@ mod tests {
                     provider: provider.into(),
                     cache_capability: None,
                     thinking_capability: None,
-                    reasoning_efforts: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     request_body_overrides: None,
                     context_window: None,

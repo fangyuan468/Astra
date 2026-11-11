@@ -37,33 +37,35 @@ class CleanupPressureProbeTests(unittest.TestCase):
             profile="smoke",
             database_base="astra_runtime_test_cleanup_pressure",
             queue_rows=3001,
-            csl_rows=4001,
-            prompt_rows=5001,
-            prompt_keep_rows=77,
-            prompt_fresh_rows=88,
         )
         commands = probe.build_commands(args)
         self.assertEqual([command.name for command in commands], [
             "agent_message_queue",
-            "conversation_log",
-            "prompt_retention",
         ])
         self.assertEqual(commands[0].env["ASTRA_CLEANUP_PRESSURE_QUEUE_ROWS"], "3001")
-        self.assertEqual(commands[1].env["ASTRA_CLEANUP_PRESSURE_CSL_ROWS"], "4001")
-        self.assertEqual(commands[2].env["ASTRA_CLEANUP_PRESSURE_PROMPT_ROWS"], "5001")
-        self.assertEqual(commands[2].env["ASTRA_CLEANUP_PRESSURE_PROMPT_KEEP_ROWS"], "77")
-        self.assertEqual(commands[2].env["ASTRA_CLEANUP_PRESSURE_PROMPT_FRESH_ROWS"], "88")
         for command in commands:
             self.assertIn("--nocapture", command.command)
             self.assertIn("test", command.database)
+
+    def test_summary_requires_a_completed_measurement(self) -> None:
+        args = argparse.Namespace(profile="smoke", database_base="astra_test_cleanup")
+        measurement = {"path": "queue", "rows_deleted": 5}
+        for results, expected in [
+            ([], False),
+            ([{"returncode": 0, "results": []}], False),
+            ([{"returncode": 1, "results": [measurement]}], False),
+            ([{"returncode": 0, "results": [measurement]}], True),
+        ]:
+            with self.subTest(results=results):
+                self.assertEqual(probe.build_summary(args, results)["ok"], expected)
 
     def test_build_summary_marks_any_failed_command_not_ok(self) -> None:
         args = argparse.Namespace(profile="smoke", database_base="astra_test_cleanup")
         summary = probe.build_summary(
             args,
             [
-                {"name": "a", "returncode": 0},
-                {"name": "b", "returncode": 1},
+                {"name": "a", "returncode": 0, "results": [{"path": "queue"}]},
+                {"name": "b", "returncode": 1, "results": [{"path": "queue"}]},
             ],
         )
         self.assertFalse(summary["ok"])

@@ -1,35 +1,13 @@
 //! Shared identity-fencing primitives for durable observation writes.
 //!
 //! A caller owns the persisted identity and payload schema. This module owns
-//! only deterministic hashing and the three outcomes a storage implementation
-//! may expose after an owner-scoped identity readback.
+//! deterministic hashing, insertion proofs, and the three capture outcomes.
+//! Ambiguous inserts require an owner-scoped identity readback.
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const HASH_ALGORITHM_VERSION: &str = "sha256:v1";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ObservationPayloadDomain {
-    AgentEvent,
-    ContextManifest,
-}
-
-impl ObservationPayloadDomain {
-    pub fn identity_kind(self) -> &'static str {
-        match self {
-            Self::AgentEvent => "agent_event",
-            Self::ContextManifest => "context_manifest",
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::AgentEvent => "astra.agent-event",
-            Self::ContextManifest => "astra.context-manifest",
-        }
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DurableCaptureOutcome {
@@ -39,6 +17,26 @@ pub enum DurableCaptureOutcome {
         stored_payload_hash: String,
         attempted_payload_hash: String,
     },
+}
+
+/// Prove that an INSERT IGNORE batch created every distinct, bounded event ID.
+/// A short insert, replay, collision, or potentially truncated identity still
+/// requires owner-scoped readback. Database-collation aliases cannot pass the
+/// count check when they collapse into one stored identity.
+pub fn all_agent_event_rows_were_inserted<'a>(
+    reported_rows_inserted: u64,
+    mut event_ids: impl ExactSizeIterator<Item = &'a str>,
+) -> bool {
+    if event_ids.len() == 0 || usize::try_from(reported_rows_inserted).ok() != Some(event_ids.len())
+    {
+        return false;
+    }
+    let mut identities = std::collections::HashSet::with_capacity(event_ids.len());
+    event_ids.all(|event_id| {
+        !event_id.is_empty()
+            && event_id.len() <= crate::storage::AGENT_EVENT_ID_LEN
+            && identities.insert(event_id)
+    })
 }
 
 /// Classify a row read back in the inserting transaction. Write markers must
@@ -64,7 +62,6 @@ pub fn classify_capture(
 /// A receipt contains identifiers and digests only, never observation content.
 pub struct ObservationCollisionReceipt<'a> {
     pub user_id: &'a str,
-    pub domain: ObservationPayloadDomain,
     pub identity_id: &'a str,
     pub session_id: &'a str,
     pub stored_payload_hash: &'a str,
@@ -116,7 +113,7 @@ pub async fn record_observation_collisions(
                     .push(" UNION ALL SELECT ")
                     .push_bind(receipt.user_id)
                     .push(", ")
-                    .push_bind(receipt.domain.identity_kind())
+                    .push_bind("agent_event")
                     .push(", ")
                     .push_bind(receipt.identity_id)
                     .push(", ")
@@ -135,7 +132,7 @@ pub async fn record_observation_collisions(
         query.push_values(&groups, |mut row, &(first, last, count)| {
             let receipt = &chunk[first as usize];
             row.push_bind(receipt.user_id)
-                .push_bind(receipt.domain.identity_kind())
+                .push_bind("agent_event")
                 .push_bind(receipt.identity_id)
                 .push_bind(receipt.session_id)
                 .push_bind(receipt.stored_payload_hash)
@@ -162,14 +159,11 @@ pub async fn record_observation_collisions(
 /// Arrays retain their order. Nulls and scalar values retain their JSON
 /// meaning. Length framing keeps the domain, algorithm version, and payload
 /// unambiguous if this preimage format grows in a later version.
-pub fn canonical_observation_payload_hash(
-    domain: ObservationPayloadDomain,
-    payload: &Value,
-) -> String {
+pub fn canonical_agent_event_payload_hash(payload: &Value) -> String {
     let canonical_payload = astra_core::canonical_json_string(payload);
     let mut hasher = Sha256::new();
     hash_frame(&mut hasher, HASH_ALGORITHM_VERSION.as_bytes());
-    hash_frame(&mut hasher, domain.as_str().as_bytes());
+    hash_frame(&mut hasher, b"astra.agent-event");
     hash_frame(&mut hasher, canonical_payload.as_bytes());
     format!("{HASH_ALGORITHM_VERSION}:{:x}", hasher.finalize())
 }
@@ -183,6 +177,24 @@ fn hash_frame(hasher: &mut Sha256, value: &[u8]) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn full_insert_requires_exact_count_and_distinct_bounded_identities() {
+        let prove =
+            |count, ids: &[&str]| all_agent_event_rows_were_inserted(count, ids.iter().copied());
+        assert!(prove(2, &["a", "b"]));
+        assert!(!prove(1, &["a", "b"]));
+        assert!(!prove(3, &["a", "b"]));
+        assert!(!prove(0, &[]));
+        assert!(!prove(0, &["a"]));
+        assert!(!prove(2, &["a", "a"]));
+        assert!(!prove(1, &[""]));
+        assert!(prove(1, &[&"x".repeat(crate::storage::AGENT_EVENT_ID_LEN)]));
+        assert!(!prove(
+            1,
+            &[&"x".repeat(crate::storage::AGENT_EVENT_ID_LEN + 1)]
+        ));
+    }
 
     #[test]
     fn classification_requires_both_matching_hash_and_attempt() {
@@ -211,8 +223,8 @@ mod tests {
         let right = json!({"items": [null, true], "outer": {"a": 1, "b": 2}});
 
         assert_eq!(
-            canonical_observation_payload_hash(ObservationPayloadDomain::AgentEvent, &left),
-            canonical_observation_payload_hash(ObservationPayloadDomain::AgentEvent, &right)
+            canonical_agent_event_payload_hash(&left),
+            canonical_agent_event_payload_hash(&right)
         );
     }
 
@@ -222,27 +234,14 @@ mod tests {
         let reordered = json!({"items": [1, null, 2]});
 
         assert_ne!(
-            canonical_observation_payload_hash(ObservationPayloadDomain::AgentEvent, &ordered),
-            canonical_observation_payload_hash(ObservationPayloadDomain::AgentEvent, &reordered)
-        );
-    }
-
-    #[test]
-    fn domains_separate_identical_json() {
-        let payload = json!({"id": "same", "value": 7});
-
-        assert_ne!(
-            canonical_observation_payload_hash(ObservationPayloadDomain::AgentEvent, &payload),
-            canonical_observation_payload_hash(ObservationPayloadDomain::ContextManifest, &payload)
+            canonical_agent_event_payload_hash(&ordered),
+            canonical_agent_event_payload_hash(&reordered)
         );
     }
 
     #[test]
     fn hash_has_stable_versioned_shape() {
-        let hash = canonical_observation_payload_hash(
-            ObservationPayloadDomain::AgentEvent,
-            &json!({"value": "test"}),
-        );
+        let hash = canonical_agent_event_payload_hash(&json!({"value": "test"}));
 
         assert!(hash.starts_with("sha256:v1:"));
         assert_eq!(hash.len(), "sha256:v1:".len() + 64);

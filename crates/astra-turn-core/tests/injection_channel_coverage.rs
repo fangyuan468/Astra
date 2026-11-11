@@ -17,9 +17,7 @@ use astra_turn_core::injection_tracking::{
 /// to `server_loop::dynamic_sections`, this list must grow.
 const EXPECTED_CHANNELS: &[InjectionChannel] = &[
     // Pre-wip-4 (kept):
-    InjectionChannel::RecentFailingTests,
     InjectionChannel::OutcomeBias,
-    InjectionChannel::Lessons,
     InjectionChannel::VolatilePending,
     // wip-4 additions — covering all live server_loop injections:
     InjectionChannel::MemoriaPrefetch,
@@ -54,9 +52,7 @@ fn each_channel_has_stable_tag() {
     // Tags are written into workspace.yaml and introspect output;
     // renames break cross-process history and external observers.
     let pairs: &[(InjectionChannel, &str)] = &[
-        (InjectionChannel::RecentFailingTests, "recent_failing_tests"),
         (InjectionChannel::OutcomeBias, "outcome_bias"),
-        (InjectionChannel::Lessons, "lessons"),
         (InjectionChannel::VolatilePending, "volatile_pending"),
         (InjectionChannel::MemoriaPrefetch, "memoria_prefetch"),
         (InjectionChannel::SelfAwareness, "self_awareness"),

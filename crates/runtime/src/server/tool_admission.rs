@@ -31,10 +31,36 @@ pub(crate) struct ToolOffer {
     pub authority: String,
     pub route: ToolExecutionRouteKind,
     pub readiness: CapacityProviderStatus,
+    pub resolved_descriptor: Option<astra_turn_types::ResolvedToolDescriptorRef>,
 }
 
 impl ToolOffer {
+    pub(crate) fn execution_snapshot(
+        &self,
+    ) -> super::tool_execution_binding::SelectedToolOfferSnapshot {
+        let descriptor = self.descriptor_ref();
+        super::tool_execution_binding::SelectedToolOfferSnapshot::new_with_route_digest_and_native(
+            &self.tool_name,
+            descriptor
+                .as_ref()
+                .map(|r| r.identity.provider_binding.as_str())
+                .unwrap_or(&self.provider_id),
+            self.route,
+            descriptor
+                .as_ref()
+                .map(|r| r.descriptor_version.to_string())
+                .or_else(|| Some(self.schema_digest.clone())),
+            descriptor
+                .as_ref()
+                .map(|r| r.identity.native_tool_id.as_str())
+                .unwrap_or(&self.native_tool_id),
+        )
+    }
+
     pub(crate) fn descriptor_ref(&self) -> Option<astra_turn_types::ResolvedToolDescriptorRef> {
+        if let Some(descriptor) = &self.resolved_descriptor {
+            return Some(descriptor.clone());
+        }
         use astra_turn_types::{
             NativeToolId, ProviderBindingRef, ResolvedToolDescriptorRef, ToolIdentity,
         };
@@ -97,6 +123,10 @@ pub(crate) struct ToolAdmissionContext {
     pub server_service_provider_ready: bool,
     pub control_plane_provider_ready: bool,
     pub request_scoped_mcp_provider_ready: bool,
+    /// Projection of the canonical provider policy index, not independent
+    /// permission or effect metadata.
+    pub resolved_provider_descriptors:
+        std::collections::BTreeMap<String, astra_turn_types::ResolvedToolDescriptorRef>,
     pub selected_runtime_platform: astra_runtime_env::RuntimePlatform,
     pub runtime_declared_tool_names: Option<HashSet<String>>,
     /// Schema-addressed contracts supplied by an explicitly bound runtime
@@ -121,6 +151,7 @@ impl Default for ToolAdmissionContext {
             server_service_provider_ready: true,
             control_plane_provider_ready: true,
             request_scoped_mcp_provider_ready: false,
+            resolved_provider_descriptors: Default::default(),
             selected_runtime_platform: astra_runtime_env::RuntimePlatform::Unknown,
             runtime_declared_tool_names: None,
             runtime_declared_tool_schema_digests: HashMap::new(),
@@ -316,7 +347,7 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
         }
         None
     });
-    let selected_offer = if hidden_reason == Some(ToolHiddenReason::ProviderUnavailable) {
+    let mut selected_offer = if hidden_reason == Some(ToolHiddenReason::ProviderUnavailable) {
         selected_unready_offer
     } else if matches!(
         hidden_reason,
@@ -328,6 +359,14 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
     } else {
         None
     };
+    if let Some(offer) = &mut selected_offer
+        && offer.route == ToolExecutionRouteKind::RequestScopedMcp
+    {
+        offer.resolved_descriptor = context
+            .resolved_provider_descriptors
+            .get(tool_name)
+            .cloned();
+    }
     let candidates = raw_candidates
         .into_iter()
         .map(|offer| {
@@ -715,6 +754,7 @@ fn offer_for_provider(
         authority: authority_for_offer(provider, workspace.authority).to_string(),
         route,
         readiness,
+        resolved_descriptor: None,
     }
 }
 

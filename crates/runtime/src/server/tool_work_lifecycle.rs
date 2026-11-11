@@ -102,7 +102,7 @@ async fn defer_pending_work_establishment(
             "inspect_work_plan",
         );
     }
-    let Some(pool) = executor.context_manifest_pool.clone() else {
+    let Some(pool) = executor.service_pool.clone() else {
         return ToolResult::error("canonical Work storage is unavailable".to_string());
     };
     let repository = astra_services::work::DatabaseWorkRepository::new(pool);
@@ -1017,7 +1017,7 @@ pub(super) async fn execute_start_work(
             "start_work requires the exact current turn-chain identity".to_string(),
         );
     };
-    let Some(pool) = executor.context_manifest_pool.clone() else {
+    let Some(pool) = executor.service_pool.clone() else {
         return ToolResult::error("canonical Work storage is unavailable".to_string());
     };
     let owner_id = match WorkOwnerId::parse(executor.user_id.clone()) {
@@ -1046,47 +1046,10 @@ pub(super) async fn execute_start_work(
     // changes on a bound Work go through the revision-pinned planning tools.
     // The read is only a target-selection hint for exact recovery. The
     // repository's genesis conflict/branch-binding checks remain authoritative.
-    let attached_binding = executor.work_binding.get().cloned();
-    let persisted_binding = if attached_binding.is_none() {
-        match repository
-            .load_session_plan_binding(&owner_id, &session_id)
-            .await
-        {
-            Ok(binding) => Some(binding),
-            Err(WorkRepositoryError::NotFound) => None,
-            Err(error) => {
-                return ToolResult::error(format!(
-                    "start_work could not resolve the session Work binding: {error}"
-                ));
-            }
-        }
-    } else {
-        None
+    let effective_binding = match executor.resolve_work_binding().await {
+        Ok(binding) => binding.cloned(),
+        Err(error) => return error,
     };
-    if let Some(binding) = persisted_binding.as_ref() {
-        if let Err(error) = executor.install_work_binding(WorkRuntimeBinding::new(
-            pool.clone(),
-            owner_id.clone(),
-            session_id.clone(),
-            binding.work_id.clone(),
-            binding.branch_id.clone(),
-        )) {
-            return ToolResult::error(format!(
-                "canonical Work exists but the current run could not bind its planning surface: {error}"
-            ));
-        }
-    }
-    let effective_binding = attached_binding.or_else(|| {
-        persisted_binding.as_ref().map(|binding| {
-            WorkRuntimeBinding::new(
-                pool.clone(),
-                owner_id.clone(),
-                session_id.clone(),
-                binding.work_id.clone(),
-                binding.branch_id.clone(),
-            )
-        })
-    });
     let operation_work_id = effective_binding
         .as_ref()
         .map(|binding| binding.work_id.clone())
@@ -1712,7 +1675,7 @@ async fn load_next_active_task(
             "start_work",
         ));
     };
-    if let Some(pool) = executor.context_manifest_pool.clone() {
+    if let Some(pool) = executor.service_pool.clone() {
         if let Err(error) = astra_services::work::DatabaseWorkAttemptSettlementService::new(pool)
             .reconcile_primary_attempt_carriers(
                 binding.owner_id.as_str(),
@@ -1778,7 +1741,7 @@ async fn restore_primary_attempt_from_selection(
             return Ok(None);
         }
         let pool = executor
-            .context_manifest_pool
+            .service_pool
             .clone()
             .ok_or_else(|| "canonical Work storage is unavailable".to_string())?;
         let taken_over = astra_services::work::DatabaseWorkAttemptSettlementService::new(pool)
@@ -1876,6 +1839,9 @@ pub(super) async fn execute_run_next_work_item(
             "run_next_work_item requires the exact current tool-call identity".to_string(),
         );
     };
+    if let Err(error) = executor.resolve_work_binding().await {
+        return error;
+    }
     if let Some(active) = executor.active_primary_work_attempt() {
         let (task_board_update, applied_admission_mutations) =
             match load_canonical_task_board_with_admission_mutations(executor).await {
@@ -1907,7 +1873,7 @@ pub(super) async fn execute_run_next_work_item(
         Err(error) => return error,
     };
     if matches!(selected, WorkTaskExecutionNext::Complete) {
-        let Some(pool) = executor.context_manifest_pool.clone() else {
+        let Some(pool) = executor.service_pool.clone() else {
             return ToolResult::error("canonical Work storage is unavailable".to_string());
         };
         if let Err(error) = astra_services::work::DatabaseWorkAttemptSettlementService::new(pool)
@@ -1992,7 +1958,7 @@ pub(super) async fn execute_run_next_work_item(
         Ok(attempt) => attempt,
         Err(error) => return ToolResult::error(format!("invalid Work attempt identity: {error}")),
     };
-    let Some(pool) = executor.context_manifest_pool.clone() else {
+    let Some(pool) = executor.service_pool.clone() else {
         return ToolResult::error("canonical Work storage is unavailable".to_string());
     };
     let service = astra_services::work::DatabaseWorkAttemptSettlementService::new(pool);
@@ -2073,7 +2039,7 @@ pub(super) async fn execute_settle_work_item(
                 return ToolResult::error(format!("Invalid settle_work_item input: {error}"));
             }
         };
-    let Some(pool) = executor.context_manifest_pool.clone() else {
+    let Some(pool) = executor.service_pool.clone() else {
         return ToolResult::error("canonical Work storage is unavailable".to_string());
     };
     let active = executor.active_primary_work_attempt();
@@ -2495,17 +2461,6 @@ mod tests {
         .execute(pool.get())
         .await
         .expect("active run authority");
-        sqlx::query(
-            "INSERT INTO agent_session_execution_slots
-             (user_id, session_id, run_id, acquired_at, updated_at)
-             VALUES (?, ?, ?, NOW(6), NOW(6))",
-        )
-        .bind(owner.as_str())
-        .bind(session.as_str())
-        .bind(run_id)
-        .execute(pool.get())
-        .await
-        .expect("session execution slot");
     }
 
     fn replacement_start_work_args(goal: &str) -> Value {
@@ -2567,7 +2522,7 @@ mod tests {
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             true, false,
         ));
-        executor.set_context_manifest_pool(pool);
+        executor.set_service_pool(pool);
         executor
     }
 
@@ -3176,7 +3131,7 @@ mod tests {
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             true, false,
         ));
-        executor.set_context_manifest_pool(pool.clone());
+        executor.set_service_pool(pool.clone());
         executor
             .bind_work_establishment_operation("physical-1", &request.operation_id)
             .expect("trusted recovery provenance");
@@ -3374,7 +3329,7 @@ mod tests {
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             true, false,
         ));
-        deferred_executor.set_context_manifest_pool(pool.clone());
+        deferred_executor.set_service_pool(pool.clone());
         deferred_executor
             .bind_work_establishment_defer("physical-defer", &deferred_request.operation_id)
             .expect("typed defer provenance");

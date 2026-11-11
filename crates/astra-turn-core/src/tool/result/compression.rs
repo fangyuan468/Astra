@@ -33,10 +33,10 @@ use serde_json::Value;
 /// limit.
 pub const COMPRESSION_MARKER: &str = "\n[… compressed: ";
 
-/// Default budget when callers don't supply an explicit one. Kept below
-/// `MAX_TOOL_RESULT_CHARS` so compression activates *before* hard
-/// truncation and preserves structure.
-pub const DEFAULT_COMPRESSION_BUDGET_CHARS: usize = 8_000;
+/// Default model inline budget when callers don't supply an explicit one.
+/// Callers may pass a smaller budget to compress before hard truncation.
+pub const DEFAULT_COMPRESSION_BUDGET_CHARS: usize =
+    astra_core::runtime_limits::DEFAULT_TOOL_RESULT_INLINE_CHARS;
 
 /// Head / tail line counts for line-listing compression.
 const LISTING_HEAD_LINES: usize = 20;

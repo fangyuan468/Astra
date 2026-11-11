@@ -10,6 +10,27 @@ They were not connected to provider forwarding or compaction execution. Active
 loop limits and Memoria failure handling remain with their production owners;
 this retirement does not change their admission or recovery behavior.
 
+## Request measurement and recoverable overflow
+
+Runtime and pipeline text/JSON estimates use the shared wire estimator. The
+Responses inference owner first authorizes and opens route-bound continuation
+items and applies the selected reasoning-retention policy. Replay is measured
+once instead of adding both canonical content and its private saved wrapper.
+Diagnostics separate provider-visible text, tool schemas, opaque reasoning
+bytes and transport metadata. Encoded ciphertext has an unknown token
+conversion; its rough encoded-text estimate is diagnostic and cannot alone
+justify local rejection or destructive compaction. Provider tokenization remains
+authoritative; request/body byte limits remain independent.
+
+Preparation-time and streamed context-window errors enter the same bounded
+request-loop recovery. A rewrite installs only a useful isolated candidate;
+stronger tiers may run without submitting an identical failed request. The next
+attempt rebuilds and measures the complete request, including preserved runtime
+constraints and output reserve. Savings alone do not prove fit. Exhaustion
+preserves progress and explains that the protected request must change or use a
+larger authorized model. Historical overflow counters never disable a later
+request; restored diagnostic history is not retry authority.
+
 ## Principles
 
 - Context is a scarce runtime resource.
@@ -31,18 +52,35 @@ extensible layer execution framework.
 
 A rewrite prepares one isolated candidate and installs it only after useful
 progress. Callers do not clone the result back into a temporary and then return
-another copy. The canonical commit, current retry limits, session-lifetime
-futile-compaction breaker and durable artifact-write-before-install ordering
-remain with their existing owners. Estimated savings include new boundary and
+another copy. The canonical commit, bounded request retry limits and durable
+artifact-write-before-install ordering remain with their existing owners.
+Futile-compaction counts are diagnostic; they do not disable future requests. Estimated savings include new boundary and
 metadata costs; they are not provider-reported token usage.
 
-Active runtime authority remains attached to its real human anchor and ordered
-current-turn suffix. Provider user-role tool-result envelopes do not start a new
-human turn or expire authority. Expired authority can be pruned. If required
-context alone exceeds the window, the result remains truthfully over budget;
-compaction cannot delete controls to manufacture progress. Tool-call identities,
+Automatic summary compaction is required turn-continuation work and uses the
+normal inference admission path. The latest provider input measurement informs
+the next pressure check even when locally estimated text omits opaque provider
+state. A successful summary can replace completed tool rounds within a long
+human turn, while preserving user messages, active runtime controls, and the
+latest unfinished tool continuation. Old provider continuation items leave
+with their summarized rounds; retained rounds keep their original binding.
+
+Active runtime authority and its real human anchor remain in their original
+order. Under pressure, older completed tool rounds within that same human turn
+may be compacted while active controls and their immediate dependencies remain
+intact. Provider user-role tool-result envelopes do not start a new human turn
+or expire authority; an expired control must not become active after its expiry
+witness is removed. Invalid or unanchored authority is retained conservatively.
+An incomplete tool group retains minimal evidence of the unknown result across
+canonical projection and compaction. It blocks another model request until a
+new human turn; unmatched calls and internal evidence are never sent upstream.
+If required context alone exceeds the window, the result remains truthfully
+over budget; compaction cannot delete controls to manufacture progress. Tool-call identities,
 opaque extension fields, ordered non-text blocks and artifact recovery handles
 survive every mechanical path. A no-op cannot silently normalize these fields.
+Each physical provider retry is measured again after its response and retry
+control are appended. Request-local compaction preserves that pair; if required
+input alone cannot fit, the request fails without installing a partial rewrite.
 
 Typed duplicate-output dependencies survive canonical commit and continuation
 restore. The shared validator checks unique forward invocation identity and
@@ -105,7 +143,8 @@ contract, not a guarantee of a model's semantic fidelity.
 
 Successful request-time summaries also become the loop's canonical working set
 when the summary plus bounded history saves estimated tokens. The existing
-rewrite proof and canonical WAL/terminal commit own this transition; no separate
+rewrite proof and existing Run checkpoint or terminal Context commit own this
+transition; no separate
 summary cache, memory write or checkpoint table is involved. Later pipeline and
 pre-turn pressure measurements therefore see the accepted representation plus
 newly appended history, rather than repeatedly summarizing the original input.
@@ -136,8 +175,9 @@ each call/result pair and references the retained result by call ID; it never
 merges executions or upgrades their outcome. Ambiguous IDs, structured/array
 payloads and already-compacted output are not candidates. A reference must save
 both bytes and estimated tokens. Budget truncation does not infer tool semantics
-from names or output prose. The compression trace reports this as
-`DuplicateToolOutputElimination`; it is not a semantic read-equivalence claim.
+from names or output prose. The mechanical pipeline records this as `duplicate_tool_output_elimination`
+in its existing outcome and compaction event. Savings are estimates; this is
+not a semantic read-equivalence claim.
 
 A compaction should produce:
 
@@ -177,3 +217,17 @@ rounds. Runtime focus guidance contains a bounded rule, not copied current/prior
 requests or a second `active_goal` representation. This keeps constraints intact
 without multiplying large inputs after the budget pass; telemetry owns turn and
 round identity independently of the prompt's focus instruction.
+
+## Context snapshot evidence
+
+`ContextAssemblyTrace.history` describes observed CLI admission input before
+Server-side request assembly. `null` means unobserved; an object with an empty
+`turns_retained` list and `total_tokens: 0` means observed empty input. Group
+ordinals are local input ordinals, not canonical session-turn identities.
+`total_tokens` is an estimate of that observed slice.
+
+This snapshot supplies no pre/post compaction ratio, affected-turn list or
+pipeline-stage history. Runtime compaction events, step facts and audit remain
+their owners. A positive compression-trigger flag is evidence of a trigger,
+not a reconstruction of the rewrite. Session marker lists identify turns with
+recorded markers; they do not count all compactions or prove absence.

@@ -110,6 +110,7 @@ fn canonical_turn_commits_every_cell_kind_in_order() {
             cache_creation_tokens: None,
             model_name: None,
             auxiliary_summary: None,
+            input_usage_complete: false,
             usage_partial: false,
             tools: 1,
             cumulative_tokens: Some(270),
@@ -169,6 +170,7 @@ fn canonical_turn_snapshots_full_scrollback() {
             cache_creation_tokens: None,
             model_name: None,
             auxiliary_summary: None,
+            input_usage_complete: false,
             usage_partial: false,
             tools: 1,
             cumulative_tokens: Some(240),
@@ -335,6 +337,24 @@ async fn partial_interruption_keeps_answer_once_and_renders_safe_notice_separate
     let rendered = render_history(&w, 100);
     assert_eq!(rendered.matches(assistant_text).count(), 1);
     assert!(!rendered.contains("persistent unresolved tool outcome"));
+}
+
+#[test]
+fn notice_only_interruption_renders_once_without_an_assistant_cell() {
+    let mut widget = ChatWidget::new("");
+    widget.handle_event(AppEvent::User(UserEvent::Submit("inspect the turn".into())));
+    let notice = "The model provider is temporarily rate limited. Please wait before retrying.";
+    widget.handle_event(AppEvent::wire(WireEvent::RunInterrupted(notice.into())));
+    widget.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
+
+    let kinds: Vec<_> = widget
+        .history()
+        .iter()
+        .map(|cell| cell_kind_name(cell.as_ref()))
+        .collect();
+    assert_eq!(kinds, vec!["User", "System", "TurnSummary"]);
+    assert_eq!(render_history(&widget, 200).matches(notice).count(), 1);
+    assert!(widget.active_cell().is_none());
 }
 
 // ── helpers ─────────────────────────────────────────────────────

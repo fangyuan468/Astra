@@ -11,7 +11,7 @@ use astra_turn_types::{
     JUDGMENT_SCHEMA_VERSION, JudgmentAnswer, JudgmentNoulDecision, JudgmentQuestion,
     JudgmentRequest, JudgmentResponse, JudgmentResponseProvenance, NoulCriteria, ObjectiveRelation,
     UserFeedback, UserFeedbackKind, UserFeedbackTarget, UserTurnSemantics, judgment_messages,
-    normalize_judgment_response, parse_unique_judgment_json,
+    normalize_judgment_response, parse_unique_json,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -341,8 +341,8 @@ fn decode_evidence(
     {
         return Err(malformed(raw, "noncanonical classification questions"));
     }
-    let mut wire = parse_unique_judgment_json(raw.as_bytes())
-        .map_err(|error| malformed(raw, error.to_string()))?;
+    let mut wire =
+        parse_unique_json(raw.as_bytes()).map_err(|error| malformed(raw, error.to_string()))?;
     let assessment = wire
         .as_object_mut()
         .and_then(|object| object.remove("assessment"))

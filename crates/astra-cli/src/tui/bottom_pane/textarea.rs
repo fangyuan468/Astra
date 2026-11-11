@@ -55,7 +55,7 @@ impl TextArea {
         self.text.clear();
         self.cursor_pos = 0;
         self.preferred_col = None;
-        self.paste_burst.reset();
+        self.paste_burst.reset_preserving_enter_guard();
         self.invalidate_wrap();
     }
 
@@ -63,8 +63,17 @@ impl TextArea {
         self.text = text.to_string();
         self.cursor_pos = self.text.len();
         self.preferred_col = None;
-        self.paste_burst.reset();
+        self.paste_burst.reset_preserving_enter_guard();
         self.invalidate_wrap();
+    }
+
+    pub fn take_text(&mut self) -> String {
+        if let Some(pending) = self.paste_burst.flush(Instant::now()) {
+            self.insert_str(&pending);
+        }
+        let text = std::mem::take(&mut self.text);
+        self.set_text("");
+        text
     }
 
     /// Current cursor byte offset within `text()`.
@@ -105,6 +114,20 @@ impl TextArea {
         self.paste_burst.force_due_buffer_for_test(text, now);
     }
 
+    /// Stop a stale paste Enter before submission, popup or approval routing.
+    pub fn consume_guarded_enter(&mut self) -> bool {
+        if self.paste_burst.enter_should_insert_newline(Instant::now()) {
+            // A submitted/cancelled paste has no remaining draft. Its tail must
+            // not manufacture one and block an already accepted FIFO handoff.
+            if !self.is_empty() || self.paste_burst.is_active() {
+                self.insert_char('\n');
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> TextAreaAction {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -116,9 +139,7 @@ impl TextArea {
                 TextAreaAction::Changed
             }
             KeyCode::Enter => {
-                let now = Instant::now();
-                if self.paste_burst.enter_should_insert_newline(now) {
-                    self.insert_char('\n');
+                if self.consume_guarded_enter() {
                     TextAreaAction::Changed
                 } else {
                     TextAreaAction::Submit
@@ -694,6 +715,49 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::Duration;
+
+    #[test]
+    fn guarded_enter_consumes_empty_tails_and_preserves_real_drafts() {
+        for (draft, active, expected) in [
+            ("", false, ""),
+            (" ", false, " \n"),
+            ("\n", false, "\n\n"),
+            ("recovered", false, "recovered\n"),
+            ("", true, "\n"),
+        ] {
+            let mut textarea = TextArea::new();
+            textarea.set_text(draft);
+            textarea.force_pending_paste_burst_for_test("pending", Instant::now());
+            if !active {
+                textarea.paste_burst.reset_preserving_enter_guard();
+            }
+            assert!(textarea.consume_guarded_enter());
+            assert_eq!(textarea.text(), expected);
+            assert_eq!(textarea.paste_burst_active(), active);
+        }
+        let mut textarea = TextArea::new();
+        textarea.force_pending_paste_burst_for_test("accepted", Instant::now());
+        textarea.clear();
+        assert!(textarea.consume_guarded_enter());
+        assert_eq!(textarea.text(), "");
+        textarea.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(
+            textarea.text(),
+            "\n",
+            "explicit newline remains a real draft"
+        );
+
+        // Expiration resumes the original Enter path, without sleeps.
+        let expired = Instant::now() - Duration::from_secs(1);
+        textarea.force_pending_paste_burst_for_test("past", expired);
+        textarea.paste_burst.flush(expired);
+        textarea.set_text("fresh draft");
+        assert_eq!(
+            textarea.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            TextAreaAction::Submit
+        );
+        assert_eq!(textarea.text(), "fresh draft");
+    }
 
     #[test]
     fn clear_resets_pending_paste_burst_state() {

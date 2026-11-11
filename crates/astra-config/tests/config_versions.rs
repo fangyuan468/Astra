@@ -36,6 +36,46 @@
 //! 7. **Missing id is a structured error**, not a panic.
 
 use astra_config::config_versions::{ConfigVersionStore, LocalFileStore, PutMetadata, VersionId};
+
+#[cfg(unix)]
+#[test]
+fn version_blobs_with_resolver_tokens_are_private_and_never_follow_symlinks() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let (root, store) = tmp_store();
+    let mut config = astra_config::RuntimeConfig::default();
+    config.web_fetch.doh_resolvers = vec!["https://dns.example/private-token?key=secret".into()];
+    let id = store.put(&config, PutMetadata::default()).unwrap();
+    let blob = root.path().join(format!("{}.toml", id.as_str()));
+    assert_eq!(
+        std::fs::metadata(&blob).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o644)).unwrap();
+    store.put(&config, PutMetadata::default()).unwrap();
+    assert_eq!(
+        std::fs::metadata(&blob).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    std::fs::remove_file(&blob).unwrap();
+    let target = root.path().join("other-file");
+    std::fs::write(&target, "untouched").unwrap();
+    symlink(&target, &blob).unwrap();
+    assert!(store.put(&config, PutMetadata::default()).is_err());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+    std::fs::remove_file(&blob).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::hard_link(&target, &blob).unwrap();
+    assert!(store.put(&config, PutMetadata::default()).is_err());
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    std::fs::remove_file(&blob).unwrap();
+    use std::os::unix::ffi::OsStrExt;
+    let fifo = std::ffi::CString::new(blob.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    assert!(store.put(&config, PutMetadata::default()).is_err());
+}
 use astra_config::runtime_config::RuntimeConfig;
 use fs2::FileExt;
 use std::fs::OpenOptions;
@@ -261,6 +301,31 @@ fn duplicate_put_with_different_metadata_keeps_first_blob_records_second_index_r
         sessions.contains(&"sess_A".to_string()) && sessions.contains(&"sess_B".to_string()),
         "both index rows must be present, got {sessions:?}"
     );
+}
+
+#[test]
+fn concurrent_puts_publish_one_complete_blob_and_all_index_rows() {
+    let (dir, store) = tmp_store();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+    let mut threads = Vec::new();
+    for _ in 0..6 {
+        let barrier = barrier.clone();
+        let root = dir.path().to_path_buf();
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            LocalFileStore::new(root)
+                .put(&RuntimeConfig::default(), PutMetadata::default())
+                .unwrap()
+        }));
+    }
+    let ids: Vec<_> = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert!(ids.iter().all(|id| id == &ids[0]));
+    assert_eq!(store.list().unwrap().len(), 6);
+    let body = store.get_toml(&ids[0]).unwrap().unwrap();
+    assert!(toml::from_str::<RuntimeConfig>(&body).is_ok());
 }
 
 #[test]

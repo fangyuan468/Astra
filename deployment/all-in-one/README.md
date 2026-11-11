@@ -36,8 +36,9 @@ exists, it offers an explicit update, a separate installation with independent
 containers, data, logs, and ports, or a no-change exit. It then tests the
 embedding endpoint, credentials, model, and dimension, reuses or repairs
 services, and verifies a memory round trip. Administrator/model setup is
-optional: the recommended path launches `astra admin setup`, while skipping it
-finishes the stack and prints a resumable command. The summary distinguishes
+optional: the recommended personal path opens `astra` for `/register` or `/login`
+and `/model`. Deployment/shared model administration remains an explicit separate
+choice; skipping setup finishes the stack and prints a resumable TUI command. The summary distinguishes
 `Stack ready` from `Chat ready`. Startup failures offer repair/retry,
 stop-and-preserve, and leave-for-inspection choices. API keys are hidden and
 the local `.env` is owner-only. The API address is saved before the optional
@@ -57,8 +58,9 @@ MEMORIA_EMBEDDING_PROVIDER=mock make stack-start
 ```
 
 Mock embeddings replace only semantic-memory embedding calls. They do not
-provide the agent's LLM; `astra admin setup` still needs a hosted model or an
-OpenAI-compatible local endpoint. Because model inference is server-side, a
+provide the agent's LLM. Use `/model` in the TUI to configure your own API key or
+ChatGPT account, or select an authorized deployment model. Shared deployment
+models can still be configured through `astra admin setup`. Because model inference is server-side, a
 model running on the Docker host is reached as
 `http://host.docker.internal:<port>`, not `localhost`.
 
@@ -134,7 +136,20 @@ ASTRA_EDGE_WORKSPACE_DIR=/path/to/repo make stack-up-server-edge
 
 With the default self-hosted configuration, `astra login` prompts for the local Astra username and password. The example pins Memoria 0.5.2 and explicitly sets `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`. Astra uses the configured `MEMORIA_MASTER_KEY` through the non-admin `Memoria-Owner` scheme only for active local password accounts with no scoped binding or retained Memoria identity. Existing scoped owners and `none` / `read_only` consent remain authoritative; disconnect and account deactivation deny already-created runtime consumers. The Server's implicit default is still disabled, and hosted/browser-login deployments must leave the flag disabled.
 
-Existing `.env` files are not overwritten by `stack-env`. If upgrading from the older Memoria pin, back up the database, update `MEMORIA_IMAGE` to the compatible digest in `.env.example`, set `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`, and run `make stack-up` to recreate affected containers. `make stack-setup` offers this change with confirmation and preserves explicit opt-outs and custom images. Updating only the image leaves access disabled (403); enabling only the flag with an old image fails authentication (401).
+Memoria 0.5.2 does not provide the idempotent write endpoint required for durable session-memory extraction and finalization. Configure `MEMORIA_IMAGE` to a verified build containing [Memoria #310](https://github.com/matrixorigin/Memoria/pull/310) to enable those background operations. The older image fails closed; it is not safe to replace the idempotent write with an ordinary write.
+
+Until an official image containing that fix is published, a local Docker build
+can be used (verified on Apple Silicon):
+
+```bash
+docker build -t astra-memoria:cb38fec --file memoria/Dockerfile \
+  'https://github.com/matrixorigin/Memoria.git#cb38fec1cf15a3be30f8afccff31c0506bbe41d5'
+```
+
+Set `MEMORIA_IMAGE=astra-memoria:cb38fec` in `deployment/all-in-one/.env`, then
+run `make stack-up` to start the updated service.
+
+Existing `.env` files are not overwritten by `stack-env`. If upgrading from an image that predates owner-scoped authentication, back up the database, set `MEMORIA_IMAGE` to a verified compatible image and `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`, then run `make stack-up` to recreate affected containers. `make stack-setup` preserves explicit opt-outs and custom images. Updating only the image leaves access disabled (403); enabling only the flag with an old image fails authentication (401). The default image also requires the idempotent-write upgrade described above for session-memory maintenance.
 
 `stack-up-server-edge` starts the same compose stack and then launches a local
 host `astra-edge` process connected to `/edge/ws`. The edge process reads the
@@ -147,6 +162,20 @@ visibility behavior:
 ```bash
 make test-runtime-profiles
 ```
+
+## Personal accounts and models
+
+`make stack-env` prepares the existing encryption key; ChatGPT connections need
+no extra enabling or installation configuration. Repeat runs retain existing
+values and explicit operator overrides. Retain the encryption key when upgrading
+or restoring; it also supplies the default ChatGPT installation identity. Retain
+`ASTRA_CHATGPT_HOST_ID` too if explicitly configured.
+Start `astra`, register or sign in, then use `/model` to configure your own source.
+An administrator's personal connection is still personal; `astra admin model ...`
+is the separate path for deployment-shared models. MOI/UC deployments retain their
+existing managed model and billing policy.
+
+See [personal setup and local Web boundaries](../../docs/reference/cli-commands.md#chatgpt-subscription-models).
 
 ## Admin Accounts
 

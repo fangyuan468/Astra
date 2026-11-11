@@ -12,6 +12,7 @@ pub use context_history_artifact::{
 pub use skill_catalog_identity::SkillCatalogIdentity;
 
 mod agent_communication;
+pub mod agent_tool_contract;
 mod agent_transcript_evidence;
 mod agent_transcript_location;
 mod artifact_publication;
@@ -22,8 +23,12 @@ pub use judgment::{
     JudgmentNoulDecision, JudgmentQuestion, JudgmentRequest, JudgmentResponse,
     JudgmentResponseProvenance, NormalizedJudgmentResponse, NoulCriteria, judgment_messages,
     judgment_request_from_messages, normalize_judgment_response,
-    output_budget_exceeds_completion_cap, parse_unique_judgment_json,
+    output_budget_exceeds_completion_cap,
 };
+mod strict_json;
+pub use strict_json::parse_unique_json;
+mod canonical_transcript;
+pub use canonical_transcript::{transcript_content_hash, transcript_payload_identity};
 mod canonical_token_usage;
 mod canonical_tool_pairing;
 pub use canonical_token_usage::CanonicalTokenUsage;
@@ -45,6 +50,7 @@ mod explain_analyze_projection;
 mod explain_wire;
 pub use explain_wire::decode_explain_analyze_wire;
 mod inference;
+pub mod interruption;
 mod memory_ranking;
 mod memory_structure;
 mod permission_mode;
@@ -70,6 +76,7 @@ pub mod task_resolution;
 pub mod token_estimate;
 mod tool_idempotency;
 mod tool_invocation;
+pub mod tool_ledger_receipt;
 mod turn_provenance;
 mod user_intent;
 mod verification_frontier;
@@ -86,10 +93,8 @@ pub use completion_settlement::{
     ForegroundFanoutPagination, RuntimeSuccessfulToolCompletion,
 };
 pub use context_identity::{
-    ContextIdentityError, LLM_ARTIFACT_EVIDENCE_CONTRACT_VERSION,
-    LLM_ARTIFACT_EVIDENCE_MAX_ENTRIES, LlmArtifactEvidenceEntryV1, LlmArtifactEvidenceManifestV1,
-    NormalizedPromptCacheUsage, PROMPT_CACHE_IDENTITY_CONTRACT_VERSION, PromptCacheIdentityV1,
-    PromptCacheInvalidationReason,
+    ContextIdentityError, NormalizedPromptCacheUsage, PROMPT_CACHE_IDENTITY_CONTRACT_VERSION,
+    PromptCacheIdentityV1, PromptCacheInvalidationReason,
 };
 pub use context_window::{ContextWindowUsage, ContextWindowUsageSource, RequestTokenUsage};
 pub use deferred_tool::DeferredToolActivation;
@@ -97,8 +102,7 @@ pub use delegation_model_admission::{
     DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY, DelegationCatalogResolutionFailure,
     DelegationIntentRequirement, DelegationIntentRequirements, DelegationModelAdmission,
     DelegationModelAdmissionOutcome, DelegationModelInstructionSource,
-    DelegationModelSlotConstraint, DelegationReasoningEffort, DelegationReasoningRequirement,
-    DelegationRequirementPropagation, DelegationRequirementStrength,
+    DelegationModelSlotConstraint, DelegationRequirementPropagation, DelegationRequirementStrength,
     DelegationUserRequirementSource, MAX_MODEL_ADMISSION_SLOTS,
 };
 pub use explain_analyze::{
@@ -122,8 +126,8 @@ pub use explain_analyze_projection::{
 };
 pub use inference::{
     AutoModelStrategy, CLIENT_DIRECT_EXECUTION_FIELDS, InferenceInvocationScope, InferencePurpose,
-    ModelSelection, ModelSelector, RequestedModelPolicy, RequestedModelPolicyError,
-    client_direct_execution_field, resolve_requested_model_selection,
+    ModelSelection, ModelSelector, ReasoningEffort, ReasoningRequirement, RequestedModelPolicy,
+    RequestedModelPolicyError, client_direct_execution_field, resolve_requested_model_selection,
     resolve_requested_model_selector,
 };
 pub use memory_ranking::{
@@ -162,7 +166,7 @@ pub use provider_contract::{
     ResolvedSemanticCacheBaseline, ResolvedToolDescriptor, ResolvedToolDescriptorDraft,
     ResolvedToolDescriptorRef, ResolvedToolEffect, ResolvedToolIdempotency, ResolvedToolSemantics,
     STABLE_TOOL_ALIAS_METADATA_KEY, STABLE_TOOL_ALIAS_SCHEMA_KEY, StableToolAlias, ToolIdentity,
-    project_native_collaborator_observation,
+    executable_schema, project_native_collaborator_observation,
 };
 pub use recovery_point::{
     RECOVERY_POINT_MANIFEST_SCHEMA_VERSION, RecoveryPointArtifactReferenceV1,
@@ -184,7 +188,7 @@ pub use resume::{
 pub use runtime_scaffolding::{
     APPEND_ONLY_RUNTIME_AUTHORITY_POLICY, APPEND_ONLY_RUNTIME_AUTHORITY_POLICY_FIELD,
     ParsedRuntimeAuthorityFrame, RUNTIME_MESSAGE_PROVENANCE_FIELD, RuntimeAuthorityFrameError,
-    RuntimeAuthorityLifetime, RuntimeMessageDelivery,
+    RuntimeAuthorityLifetime, RuntimeMessageDelivery, active_append_only_authority_mask,
     active_append_only_authority_protected_suffix_start, append_only_runtime_authority_is_active,
     has_append_only_runtime_authority_policy, is_human_user_message, is_runtime_owned_message,
     is_runtime_owned_provenance, mark_append_only_required_context,
@@ -222,8 +226,9 @@ pub use session_cursor::{
 };
 pub use session_fork::{
     ForkBasisDimensionV1, ForkDimensionDispositionV1, ForkDimensionEvidenceV1,
-    ForkExcludedAuthorityV1, SESSION_FORK_MANIFEST_SCHEMA_VERSION, SessionForkActivationV1,
-    SessionForkManifestV1, SessionForkStateV1, SessionForkValidationError, SharedManifestPrefixV1,
+    ForkExcludedAuthorityV1, ProviderRunOwner, SESSION_FORK_MANIFEST_SCHEMA_VERSION,
+    SessionForkActivationV1, SessionForkManifestV1, SessionForkStateV1, SessionForkValidationError,
+    SharedManifestPrefixV1,
 };
 pub use session_handoff::{
     HandoffOperationWatermarksV1, HandoffRiskEvidenceV1, MANIFEST_DELTA_SCHEMA_VERSION,
@@ -253,9 +258,11 @@ pub use tool_invocation::{
     canonical_public_arguments_hash, canonical_public_tool_arguments,
 };
 pub use turn_provenance::{
-    MODEL_ITEM_ID_FIELD, TURN_MESSAGE_PROVENANCE_FIELD, TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
+    MODEL_ITEM_ID_FIELD, MODEL_REPLAY_ORIGIN_FIELD, ModelReplayOrigin,
+    TURN_MESSAGE_PROVENANCE_FIELD, TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
     TurnMessageProvenanceError, TurnMessageProvenanceV1, clear_turn_message_provenance,
-    mark_model_message, mark_turn_message, model_item_id, turn_message_provenance,
+    mark_model_message, mark_model_replay_origin, mark_turn_message, model_item_id,
+    model_replay_origin, turn_message_provenance,
 };
 pub use user_intent::{
     AssessmentConfidence, FeedbackResponseReference, FeedbackResponseRelation, ObjectiveRelation,
@@ -265,13 +272,12 @@ pub use user_intent::{
     mark_user_turn_semantics, user_turn_semantics,
 };
 pub use verification_frontier::{
-    BoundVerificationFrontier, BoundWorkspaceObservation, VerificationEvidence,
-    VerificationHandoff, VerificationUnavailable, WorkspaceMutationSource,
-    WorkspaceObservationProof,
+    BoundVerificationFrontier, VerificationEvidence, VerificationHandoff, VerificationUnavailable,
 };
 
-pub mod permission_control;
-pub use permission_control::{
+pub mod run_settings;
+pub use run_settings::{
+    RunModelOutcome, RunModelOutcomeKind, RunModelRequest, RunModelSelection, RunModelSnapshot,
     RunPermissionModeApplied, RunPermissionModeRequest, RunPermissionModeSelection,
     RunPermissionModeSnapshot,
 };

@@ -236,3 +236,12 @@ if grep -Fqi "astra-suite" <<< "$installer_output"; then
     echo "installer still resolves assets through astra-suite" >&2
     exit 1
 fi
+
+# Selected-source validation must reject a pre-reference source before building.
+mkdir -p "${fixture_root}/pre-reference"
+if "${repo_root}/scripts/validate-release-version.sh" 0.1.0 \
+    --root "${fixture_root}/pre-reference" >"${fixture_root}/missing-reference.log" 2>&1; then
+    echo "release preflight accepted a source without a capability snapshot" >&2
+    exit 1
+fi
+grep -Fq "selected release source has no capability reference" "${fixture_root}/missing-reference.log"

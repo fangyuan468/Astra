@@ -17,6 +17,9 @@ export const PATH_CHAT_STREAM = "/chat/stream";
 
 export const PATH_MODELS = "/models";
 export const PATH_MODEL_ACCESS = "/model-access";
+/** Model catalog response format; keep aligned with astra-server-types. */
+export const ASTRA_MODEL_CATALOG_VERSION_HEADER = "x-astra-model-catalog-version";
+export const ASTRA_MODEL_CATALOG_VERSION = "3";
 export const PATH_AGENT_BINDINGS = "/agent-bindings";
 
 export const PATH_MEMORY_STORE = "/memory/store";
@@ -258,83 +261,6 @@ export function workBranchExecutionSwitchRetryPath(
   return `${workBranchExecutionSwitchPath(workId, branchId, operationId)}/retry`;
 }
 
-export function workBranchPatchArtifactPath(
-  workId: string,
-  branchId: string,
-  patchArtifactId: string,
-): string {
-  if (
-    patchArtifactId === "." ||
-    patchArtifactId === ".." ||
-    patchArtifactId.length === 0 ||
-    Array.from(patchArtifactId).length > 64 ||
-    !/^[A-Za-z0-9._-]+$/u.test(patchArtifactId)
-  ) {
-    throw new TypeError("patchArtifactId is not a canonical Work resource identity");
-  }
-  return `${workBranchPath(workId, branchId)}/patch-artifacts/${encodeURIComponent(patchArtifactId)}`;
-}
-
-export function workBranchPatchArtifactsPath(
-  workId: string,
-  branchId: string,
-): string {
-  return `${workBranchPath(workId, branchId)}/patch-artifacts`;
-}
-
-export function workBranchPatchArtifactContentPath(
-  workId: string,
-  branchId: string,
-  patchArtifactId: string,
-): string {
-  return `${workBranchPatchArtifactPath(workId, branchId, patchArtifactId)}/content`;
-}
-
-export function workPatchMaterializationsPath(
-  workId: string,
-  branchId: string,
-): string {
-  return `${workBranchPath(workId, branchId)}/patch-materializations`;
-}
-
-export function workPatchMaterializationPath(
-  workId: string,
-  branchId: string,
-  operationId: string,
-): string {
-  if (
-    operationId === "." ||
-    operationId === ".." ||
-    operationId.length === 0 ||
-    Array.from(operationId).length > 64 ||
-    !/^[A-Za-z0-9._-]+$/u.test(operationId)
-  ) {
-    throw new TypeError("operationId is not a canonical Work resource identity");
-  }
-  return `${workPatchMaterializationsPath(workId, branchId)}/${encodeURIComponent(operationId)}`;
-}
-
-export function workPatchCommitsPath(workId: string, branchId: string): string {
-  return `${workBranchPath(workId, branchId)}/patch-commits`;
-}
-
-export function workPatchCommitPath(
-  workId: string,
-  branchId: string,
-  operationId: string,
-): string {
-  if (
-    operationId === "." ||
-    operationId === ".." ||
-    operationId.length === 0 ||
-    Array.from(operationId).length > 64 ||
-    !/^[A-Za-z0-9._-]+$/u.test(operationId)
-  ) {
-    throw new TypeError("operationId is not a canonical Work resource identity");
-  }
-  return `${workPatchCommitsPath(workId, branchId)}/${encodeURIComponent(operationId)}`;
-}
-
 export function workBranchTranscriptPath(workId: string, branchId: string): string {
   return `${workBranchPath(workId, branchId)}/transcript`;
 }
@@ -567,9 +493,7 @@ export function chatRunProjectionPath(runId: string): string {
   return `/chat/runs/${encodeURIComponent(runId)}/projection`;
 }
 
-export function chatRunProjectionRepairPath(runId: string): string {
-  return `/chat/runs/${encodeURIComponent(runId)}/projection/repair`;
-}
+
 
 export function chatRunInputPath(runId: string): string {
   return `/chat/runs/${encodeURIComponent(runId)}/input`;

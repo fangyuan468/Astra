@@ -115,18 +115,23 @@ bounded diagnostic data in report details, never interpreted as a valid score.
 Truncated, filtered, or unknown completion endings are rejected even if their
 text contains a score. External `--judger-cmd` process timeout behavior is unchanged.
 
-Live quality judging uses a bounded projection of the durable tool
-journal. It preserves canonical run, turn, round, batch, and parallel metadata
-when present; missing identity stays unknown and cannot prove batching. It
-reserves room for call identities and statuses before sharing the
-remaining budget across arguments and results, so a large early response does
-not hide later verification. Truncated fields report their original and omitted
-character counts; if even the call identities exceed the budget, the envelope
-reports omitted calls. The projection fits the final judge prompt's existing
-budget. Raw reports and deterministic checks retain the original evidence.
-An inconclusive quality judgment caused by omitted evidence is not proof that
-the agent's claimed result is false, and a passing exit code is not a substitute
-for inspecting quality failures.
+Live quality judging receives complete invocation-scoped tool documents from
+its authorized trace, including identities, dispositions, arguments, results
+and Work receipts. Rejected and suppressed requests stay non-executions.
+Child-result judging additionally retains the existing Server custody gates.
+Tool evidence and ordered user/assistant exchanges are structured input, not
+stderr excerpts. The harness does not truncate or repack them to obtain a
+verdict: built-in requests use the existing governed Server admission boundary,
+while an external command rejects a complete serialized envelope above 64 KiB
+before spawning. Stderr remains bounded diagnostic text. Inconclusive judgments
+and input-limit failures stay unavailable; they are never converted to passes.
+
+An owned archived invocation can be replayed without another model call using
+`ASTRA_TEST_JUDGER_REPLAY=/path/to/fixture.json cargo test -p astra-test-harness
+recorded_action_documents_reach_actual_judgment_request -- --ignored`.
+The private fixture contains `outcome`, machine `stream_capture` identity and
+`session` trace; the check compares every complete tool document with the actual
+judgment request. Store captured fixtures outside tracked source.
 
 Harness cleanup cancels only the exact server-issued Session observed by its
 CLI invocation. `astra session cancel` waits up to 10 seconds for the Server's
@@ -144,6 +149,13 @@ non-passing interrupted result. The case watchdog also covers stdout/stderr
 and machine-event drain after the CLI process exits; a descendant holding a
 pipe open cannot turn an incomplete capture into a passing result or leave the
 harness waiting without a bound.
+
+Execution preflight failures retain only categorical `final_state` and
+`interruption_kind` alongside the existing safe stage and error identifiers.
+These facts require a strictly parsed CLI terminal matching the process exit;
+unknown interruption labels, protocol failures and older sidecars produce null
+fields. An interrupted preflight remains a failed gate, with zero cases run.
+The report never includes provider text, interruption reasons or raw envelopes.
 
 Live agent cases require exit 0 by default. A negative test can explicitly
 expect a nonzero terminal code using `exit_code`, together with the expected
@@ -182,13 +194,23 @@ edges too before claiming the entire combined graph is acyclic.
 
 `journal_work_replacement_lifecycle` checks exact initial, cancelled, added, and
 delivered item counts using canonical Work and branch identities. It allows any
-unexecuted initial item to be cancelled, requires fresh addition identities, and
+initial item without a delivered outcome to be cancelled, requires fresh addition identities, and
 checks that the remaining initial items and additions each have a delivered
 settlement. Replays of the same execution do not count twice. Its optional
 `cancellation_after_deliveries` minimum requires causal evidence that the target
-remained unstarted until the preceding deliveries; a late snapshot alone is not
+remained active until the preceding deliveries; a late snapshot alone is not
 proof of deferred cancellation. Natural requests with unspecified cancellation
-targets and requests for an explicit deferred replacement use separate cases.
+targets and requests for an explicit deferred replacement use separate cases. Cancellation permits execution under an earlier active revision;
+accepted retirement receipts must fence later execution even before another
+complete board arrives. Use `require_cancel_before_execution` when the user
+requires the item never to start. Use `require_board_before_execution` to reject
+unbound pre-reads and require successful evidence under the delivered assignment.
+Parallel batch position alone does not prove cancellation/execution ordering.
+
+The offline `multi_agent_binding_http_e2e` journeys exercise sessionless runtime
+execution, real model/skill HTTP, and canonical SSE projection. They do not
+exercise inbound HTTP authentication or persistent Session creation/admission;
+those boundaries require the real database consumer journey below.
 
 ## MOI consumer compatibility with a fresh Astra database
 
@@ -254,6 +276,66 @@ before reusing the session. It checks:
 Scripted providers have a finite response inventory: duplicate inference or an
 unexpected call fails the test rather than receiving a generic mock response.
 
+The same fresh-database journey also exercises the additive reasoning-level
+contract in `moi_fresh_astra/reasoning.rs`, pinned separately to Matrixflow
+`2403ed2b49e450146465a09a931515c4b772d8f6`. That producer freezes the selected
+catalog model's supported efforts into
+`capability_descriptors.model_gateway.metadata.reasoning_control`, independently
+of the requested `context.thinking`. The historical consumer baseline above is
+unchanged. This module reuses its independent HMAC signer and SSE parser, without
+using Astra request types or fetching a moving MOI branch. It checks:
+
+- `low`, `medium`, `high`, and `max` arrive unchanged in the actual model request
+  and each turn completes on the same persisted session;
+- a subsequent ordinary turn omits `reasoning_effort` rather than retaining the
+  preceding explicit level;
+- an undeclared effort, missing capability, or malformed declaration is rejected
+  before run allocation or model I/O, with stable SSE error classification;
+- a valid turn still completes on that session after the rejected requests,
+  without duplicate inference.
+
+The additive `moi_fresh_astra/forks.rs` contract uses the same independent
+signer and real router, with its own `astra_test_moi_fork_<uuid>` database.
+It exercises signed prepare, continuation activation, and exact committed
+root-run cursor lookup, then continues the parent, two siblings, and a nested
+fork through ordinary chat. Signature path and replay controls use the supported
+cursor route; legacy list/read/writer-activation routes retain their
+existing authentication rather than admitting request-signed provider tokens.
+The finite model inventory checks the actual inherited input and excludes later
+parent or sibling turns. Activation replay must preserve a continued child's
+head; activation alone grants no writer lease and makes no inference call.
+Negative controls cover signature/body/path tampering, nonce replay, workspace
+scope isolation, idempotency conflicts, non-root runs, incomplete projection,
+and unavailable historical roots. The earlier consumer baseline is unchanged.
+The same fork journey deletes its middle Session, then its ancestor, and proves
+the descendant can still materialize and continue from the exact pinned history
+after bounded cleanup. Deleted Sessions retain no live head or execution state.
+Deleting the final descendant releases fork metadata, pins and manifest rows,
+including the node-local payloads stored by the current canonical owner.
+
+`moi_fresh_astra/fork_auth_compat.rs` checks that real runtime and Edge user
+tokens retain the existing prepare and writer-activation contract at a
+canonical head before Server projection. These legacy credentials cannot use
+the new provider cursor or continuation-activation controls. A custom
+request-only provider authenticator without mechanism evidence cannot bypass
+scope or retry legacy authentication. The canonical verifier also proves the
+legacy/HMAC mechanism distinction and single nonce consumption.
+
+MOI's new provider fork integration uses request-bound HMAC authentication.
+Those principals own Sessions under `provider_authorized:<provider>:<subject>`;
+legacy MOI user tokens use the separate `external_authorized:moi:<subject>`
+owner namespace and retain their existing subject-owned Session contract.
+Legacy credentials cannot read or control a request-signed provider's fork.
+This integration does not change legacy APIs into workspace-scoped APIs.
+
+New request-signed provider Sessions and forks enforce scope at common Run
+admission and access. Existing ordinary Sessions without a scope binding retain
+their previous chat behavior, but cannot serve as a source for a new provider
+fork. A later Run never claims that Session's historical scope. A malformed
+binding or an existing fork manifest cannot use the ordinary-session fallback.
+The fresh-database fixtures do not establish an existing-database migration or
+repair older ordinary Sessions' pre-existing scope behavior.
+
 Buffered and live consumers share the pinned MOI SSE framing rules, including
 LF/CRLF, multiline data, EOF frames and stopping at `[DONE]`. Negative controls
 reject an early `[DONE]` even when a terminal follows it. MCP and Skill callbacks
@@ -280,6 +362,26 @@ No Memoria process is needed. The test creates and drops only its own
 behind; CI disposes of the entire isolated dependency stack. The dedicated
 feature keeps this test out of generic offline/online lanes, avoiding duplicate
 full-stack execution.
+
+## Candidate CLI and Edge integration
+
+The shared CLI CI job exercises the current CLI and standalone Edge against a
+fresh production Server backed by disposable MatrixOne and Memoria. The driver
+uses an isolated HOME, a synthetic account and a controlled model provider. It
+checks model discovery, ordinary chat, approval and denial, write readback,
+cancellation with and without committed history, same-session resume, and an
+Edge WebSocket tool invocation. Missing clients or failed scenarios fail the job.
+The separate MOI consumer compatibility gate is unchanged.
+
+The PR integration report records binary hashes, Server source, scenario results,
+and bounded, redacted error categories, without credentials or raw transcripts.
+It uses debug clients and a Server with test features, while release images use
+release builds with default features disabled.
+Public and IDC candidate-image smoke jobs separately verify image identity,
+health, and a Memoria round trip; they do not run the CLI or Edge journeys above.
+In particular, the PR integration does not prove the behavior of an independently
+selected IDC source or of the final release binaries. Deployment uses a fresh
+database and local state and does not promise compatibility with older clients.
 
 ## Where Tests Live
 
@@ -348,20 +450,35 @@ npm ci --ignore-scripts --prefix scripts/tui-reflow
 ASTRA_TEST_BINARY="$PWD/target/debug/astra" npm test --prefix scripts/tui-reflow
 ```
 
-CI runs the default terminal reader, `use-dev-tty` reader, and reflow binary in
-three parallel jobs on each of Linux and macOS. Separate builds keep dev-tty
-feature unification out of the default-reader checks. The existing
-`Test: terminal PTY (ubuntu-latest)` and `Test: terminal PTY (macos-15)` required
-checks aggregate the full terminal matrix; a failed, cancelled, or unexpectedly
-skipped shard cannot pass either gate. Unaffected changes skip the heavy jobs.
-Push runs populate the terminal dependency cache once per OS and the separate
-macOS workspace-coordination cache. The Rust terminal-reader PTY tests also
+CI runs the default terminal reader, `use-dev-tty` reader and all eight
+production-binary reflow journeys in three parallel Linux jobs. Linux also runs
+the complete vendored units with both reader feature sets. One Mac bundle runs
+the existing default CLI PTY/Bash suite, native workspace coordination/Clippy,
+and the single Mio simultaneous-readiness regression on Darwin's kqueue.
+The same dispatcher selects this platform-native inventory on Darwin and the
+full inventory on Linux. Mac does not prepare Node or build the production CLI
+and alternate-feature CLI graphs just to repeat the portable integration matrix.
+
+The existing Mac-named terminal/vendor check names are compatibility gates for
+this platform split: they require passing native Mac results and passing Linux
+terminal/vendor matrices, and their summaries state what ran on each OS. Failed,
+cancelled or unexpectedly skipped required work cannot pass. This intentionally
+removes macOS production-binary reflow and dev-tty cross-product coverage; Linux
+cannot prove those exact Darwin combinations. Default Mac PTY tests retain real
+SIGINT/terminal restoration, input and resize/cursor behavior. Unaffected changes
+skip heavy jobs. IDC failure never allocates paid fallback; producer stamps must
+match the current run and SHA, with a valid producer attempt no later than the
+current attempt. Failed-only reruns can reuse a same-version Mac success after
+Linux recovery. Node/reflow-only changes run Linux coverage and skip Mac; mixed
+native or unknown changes retain Mac coverage. Pushes populate the terminal
+cache once per OS.
+The Rust terminal-reader PTY tests also
 verify that a resize cursor query preserves keyboard/paste input and times out
 when the terminal does not answer.
 
 ## Live MatrixOne system E2E
 
-CI runs four independent online jobs: `core-runtime`, `core-turn-core`,
+CI runs three independent online jobs: `core-runtime`,
 `core-services`, and `integration`. Each runner starts its own MatrixOne and
 Memoria stack and keeps `ASTRA_TEST_DB_IT_TEST_THREADS=1`. The core shards use
 distinct database suffixes as well. This parallelizes package builds and test
@@ -369,14 +486,47 @@ execution without increasing contention on a shared database. The required
 `Test: online (core)` check aggregates all selected online jobs; the integration
 job retains `Test: online (integration)`.
 
+The integration lane also runs the real Next/browser-session database test. It
+installs the Node version pinned in `.nvmrc`, builds the local SDK and Web from
+that job's checkout, and installs Playwright's Chromium headless shell. The real
+browser checks recovery from an unreadable session, retry and explicit sign-in.
+Web, SDK and Node-version changes select this lane as
+well as their ordinary static checks; the other online lanes do not install Node.
+Before running the integration lane, `make test-online` without a lane, or
+`make test-ignored-integration` on a clean local checkout, run:
+
+```bash
+nvm use
+npm --prefix packages/sdk ci --ignore-scripts
+npm --prefix packages/sdk run build
+npm --prefix web ci
+npm --prefix web run build
+(cd web && npm exec -- playwright install --with-deps chromium --only-shell)
+```
+
+Missing Web build artifacts fail the test; they do not silently skip coverage.
+
 `make test-online` still runs the complete suite, and `ASTRA_ONLINE_LANE=core`
-still runs all three core groups. To reproduce a CI shard, choose
-`ASTRA_ONLINE_LANE=core-runtime`, `core-turn-core`, `core-services`, or
+still runs both core groups. To reproduce a CI shard, choose
+`ASTRA_ONLINE_LANE=core-runtime`, `core-services`, or
 `integration` and run `make test-online NEXTEST_ONLINE_PROFILE=strict-online-ci`
 with `ASTRA_TEST_DB_IT_TEST_THREADS=1`. Parallel CI isolation comes from separate
 service stacks; distinct database names alone do not remove shared-host load.
 All existing test selections, features, exclusions, and per-test deadlines are
 retained.
+
+The integration lane includes `pool_shutdown_db_it`. It forwards a real MySQL
+handshake and query, withholds only the returned connection's health-check ping,
+and verifies that public `SharedPool::close()` completes and the client socket
+closes without a ping response. A second case withholds a queued transaction
+rollback, then verifies rollback and key-lock release using an independent
+connection. Run these cases against the explicitly configured
+disposable MatrixOne instance with:
+
+```bash
+ASTRA_TEST_DB_IT=1 cargo nextest run -p astra-runtime --test pool_shutdown_db_it \
+  --profile strict-online-ci --run-ignored only
+```
 
 Memoria identity/credential fixtures require `ASTRA_TEST_DB_IT=1` and an
 explicit `ASTRA_TEST_DATABASE` matching the effective database name. The normal
@@ -395,7 +545,6 @@ as a passing test. No production credentials are needed in fork CI.
 The key-free BYOK network smoke is also explicit:
 
 ```bash
-ASTRA_BYOK_DNS_SERVERS=tcp://223.5.5.5 \
 ASTRA_TEST_BYOK_MODELS_URL=https://api.moonshot.cn/v1/models \
 CARGO_INCREMENTAL=0 cargo test --locked -p astra-services \
   --features external-contract-tests --test byok_live_network -- --ignored
@@ -406,14 +555,12 @@ not successful model inference.
 
 The provider-wire regression uses a strict loopback HTTP fixture and a disposable
 MatrixOne database, without real provider keys. Create the designated database
-first and supply its `MATRIXONE_*` connection settings. Choose an unused loopback
-port for the fixture:
+first and supply its `MATRIXONE_*` connection settings. The fixture binds an
+available loopback port:
 
 ```bash
 ASTRA_TEST_DB_IT=1 ASTRA_DATABASE_PREFIX= \
 ASTRA_DATABASE=astra_test_probe_local ASTRA_TEST_DATABASE=astra_test_probe_local \
-ASTRA_ALLOW_INSECURE_DEFAULTS=1 \
-ASTRA_BYOK_DEEPSEEK_BASE_URL=http://127.0.0.1:18994 \
 CARGO_INCREMENTAL=0 cargo test --locked -p astra-services \
   --features external-contract-tests --test user_model_probe_db_it -- --ignored
 ```
@@ -449,6 +596,15 @@ users or sessions. The Phase-0 production baseline journeys have additional
 exclusive-run configuration; see their dedicated instructions before enabling
 them.
 
+The slow-fanout root-cancellation journey uses the fixture-owned Session, so
+`ctx.close()` drains run/finalizer work before deleting its data. It must not
+delete another Session before that drain. All cancelled-child replay responses
+share one 10-second deadline and retain the 1 MiB body limit. Its
+`root_cancel_phase` markers record only phase names and elapsed time, allowing a
+CI timeout to distinguish setup, provider entry, cancellation, replay and
+teardown without publishing identities or payloads. The suite's 60-second
+per-test limit and cancellation/late-output assertions remain in force.
+
 Requires the same environment as `astra-server`: `MATRIXONE_*`,
 `ASTRA_JWT_SECRET`, `ASTRA_TOKEN_ENCRYPTION_KEY`, Memoria, and embedding
 settings parsed by `astra_core::AppSettings::from_env`. Use a local `.env` if
@@ -457,6 +613,43 @@ set **`ASTRA_DATABASE_PREFIX`** (effective DB = prefix + `ASTRA_DATABASE`).
 Optionally set **`ASTRA_AUTO_CREATE_DATABASE=1`** so the first
 `ensure_core_schema` (server or online tests) runs `CREATE DATABASE IF NOT
 EXISTS` for that effective name (bootstrap catalog defaults to `mysql`).
+
+### Ordinary-chat SQL budget
+
+`chat_sql_budget::ordinary_chat_and_readonly_rounds_have_bounded_total_sql`
+uses the same isolated MatrixOne setup and scripted loopback provider as the
+system HTTP journeys. Run this test by exact name in its own process because
+it owns the global SQL tracing subscriber:
+
+```bash
+MEMORIA_SELF_HOSTED_MASTER_ACCESS=1 \
+cargo test -p astra-runtime --features e2e-hooks --test chat_sql_budget \
+  ordinary_chat_and_readonly_rounds_have_bounded_total_sql -- --ignored --exact --nocapture
+```
+
+The 20-statement limit measures each request on an initialized server pool,
+including transactions, periodic control reads and the real observer's SQL.
+Pool initialization happens before capture; no statements are filtered out
+inside the measured interval. Warm-context setup consumes its complete SSE
+response and waits for observer completion before the next request starts;
+it must not use shutdown drain, which closes admission for that next request.
+Capture ends only after
+both the measured run and its observer finish: the detached observer is not
+owned by `drain_background_runs`. The authorized probe requires the exact expected
+number of both `scheduled` dispatches and `success` outcomes. An extra scheduled
+observer fails even if it is still pending when the expected successes finish.
+Errors, dropped work, missing completions, and skipped
+outcomes (`not_configured`, `access_disabled`, `empty`) fail the probe even when
+successful observations are also present. Disabled access is covered separately;
+it cannot satisfy this HTTP-path SQL measurement.
+The readonly-round comparison accounts for exact periodic control reads and
+at most one account/session authentication snapshot when its 30-second cache
+expires. Those statements still count toward the raw 20-statement limit;
+repeated authentication snapshots or any other extra readonly-round SQL fail.
+The HTTP fixture binds both the Memoria URL and its master credential to the
+strict local mock. Enabling self-hosted access exercises the authenticated
+observer request, including its authority queries; a run with access disabled
+does not validate that HTTP path. Wrong credentials still fail authentication.
 
 ### Durable provider concurrency and cancellation
 
@@ -486,22 +679,18 @@ and latency measurements.
 
 ### Sustained ingestion and shared-pool pressure
 
-The collision-receipt and canonical-WAL tests separate database contracts from
-full-scale diagnostics. The normal collision contract still processes 1,024
-distinct conflicting payloads through the bounded batch writer, plus concurrent
-single-receipt checks. The normal WAL contract runs 32 rounds with the same
-retry ownership, stale-parent rollback, linear payload, recovery, and retirement
-assertions. To retain the original 1,024 **independent transactions contending
-on one identity** and 300-round WAL workload, opt in explicitly:
+The collision-receipt test separates the normal database contract from scale
+diagnostics. Its normal workload processes 1,024 distinct conflicting payloads
+through the bounded batch writer, plus concurrent single-receipt checks. To run
+1,024 independent transactions contending on one identity, opt in explicitly:
 
 ```bash
 # Use a dedicated test database and credentials from your environment/.env.
 ASTRA_TEST_DB_IT=1 ASTRA_TEST_STORAGE_SCALE=1 \
-cargo nextest run -p astra-services \
-  --test observation_capture_db_it --test inference_execution_db_it \
+cargo nextest run -p astra-services --test observation_capture_db_it \
   --run-ignored all --profile strict-online-ci --test-threads 1 \
   --success-output immediate \
-  -E 'test(collision_receipts_bound_distinct_hashes_and_isolate_owners) | test(canonical_transition_wal_is_linear_and_recoverable_across_many_rounds)'
+  -E 'test(collision_receipts_bound_distinct_hashes_and_isolate_owners)'
 ```
 
 The scale mode retains the same 60-second online hard deadline and fails on timeout;
@@ -653,9 +842,9 @@ Repeat for `kimi-k3`. The first check verifies observable enabled/disabled
 behavior; the second uses the actual streaming summary transport and Work
 decision parser with a test persistence implementation, without starting an
 Astra Server. Its elapsed time is invocation duration, not user-visible TTFT.
-Neither replaces the MatrixOne-backed persistence fixture above. Configure
-`ASTRA_BYOK_DNS_SERVERS` only when required by the local network; do not disable
-the BYOK public-endpoint policy to run these checks.
+Neither replaces the MatrixOne-backed persistence fixture above. Configure the
+Server's system DNS if needed; do not disable the BYOK public-endpoint policy
+to run these checks.
 
 ```bash
 # 1. Smallest relevant target while iterating
@@ -690,6 +879,31 @@ The database tests cover canonical-context handoff recovery, shared fencing and
 lease takeover. Runtime tests exercise authenticated exit/close/status HTTP
 routes and partial-stage retry after lost receipts. CLI tests cover distinct
 Astra/Memoria owners and unsuccessful queue acknowledgments without purge.
+
+## Real Memoria observer authentication smoke
+
+`memoria_observer_live` checks the production observer worker against a real
+Memoria with owner-scoped authentication support (#250 or later) and its database.
+Use only a dedicated local test service. Supply `ASTRA_TEST_MEMORIA_OBSERVER_URL`
+(a loopback HTTP origin) and `ASTRA_TEST_MEMORIA_OBSERVER_KEY` privately through
+the test process environment; do not put credentials in command arguments or
+commit them. The test creates unique synthetic owners and retains their test
+memories. It rejects remote origins and redirects.
+
+```bash
+ASTRA_TEST_MEMORIA_OBSERVER_LIVE=1 cargo test -p astra-runtime \
+  --features live-provider-tests --test memoria_observer_live \
+  live_memoria_owner_observe -- --ignored --exact --nocapture
+```
+
+The feature, ignored-test selection and explicit opt-in are all required, so
+ordinary offline and database CI lanes cannot enable it via inherited credentials.
+It verifies that the legacy impersonation header fails with 400, the production
+self-hosted observer succeeds with `X-User-Id`, the target owner's session contains
+stored memories, and a second owner's view of the same session is empty. This is
+an observer authentication/storage check, not MOI identity or prompt recall E2E.
+The deterministic `turn_observer_authority` target remains the offline contract
+suite; it does not substitute for the real-backend smoke.
 
 ## What "done" Means
 

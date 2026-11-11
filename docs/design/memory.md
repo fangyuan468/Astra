@@ -50,21 +50,27 @@ The design does not require one physical backend. Vector, fulltext, graph, tabul
 
 ## Credential authority and admission
 
-Per-turn extraction and remote session-end maintenance are Server-owned. CLI
+Extraction and remote session-end maintenance are Server-owned and run at
+explicit Session close/finalize boundaries. Ordinary model rounds neither recall nor refresh long-term memory, and do not
+load the current-session memory snapshot. Explicit memory tools and HTTP recall
+remain available. This removes implicit credential resolution and remote reads
+from every model preparation; users request memory when the task needs it. CLI
 exit hands off through `POST /sessions/{session_id}/memory/finalize` using the
 selected profile's fresh access token; it preserves the resumable Session and
 never falls back to a client-side purge if the handoff fails. Explicit session
 close enqueues the same maintenance within the canonical close transaction.
 Direct/in-process providers continue to use the same governance algorithm.
 Without a bound memory provider and session identity, CLI exit skips maintenance.
-The CLI memory inference adapter remains available for lesson relevance checks;
-it does not introduce a second extraction service or lesson synthesizer.
+CLI turn entry does not retrieve, select, dismiss, inject or checkpoint automatic
+cross-session lessons. Explicit Memory remains available, including explicitly
+requested lesson-category memories. Session close/finalize retains the single
+Server-owned governance path.
 
-The Server composes one per-user memory authority policy. Prompt recall, background extraction, explicit `memory` tools, HTTP memory routes and session-end governance must use that same policy.
+The Server composes one per-user memory authority policy. Explicit `memory` tools, HTTP memory routes, compaction and session-end governance must use that same policy.
 
 Hosted or browser-login deployments use the application-scoped credential resolver owned by authentication. Each operation resolves the current owner binding and generation; no master-key fallback is inferred by a generic pool builder.
 
-- Missing binding or `none`: normal disabled state. Prompt recall reports `NotAttempted` and does not contact Memoria.
+- Missing binding or `none`: normal disabled state. Optional memory operations report `NotAttempted` and do not contact Memoria.
 - `read_only`: recall is allowed; write-oriented extraction, reflection and session-end cleanup are not admitted.
 - `read_write`: read and write operations are allowed. Transport checks remain in place to catch revocation or changes after admission.
 
@@ -72,15 +78,45 @@ Consent denials in explicit tools and HTTP routes point to Memoria Settings → 
 
 Trusted self-hosted deployments may explicitly enable `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1` with `MEMORIA_MASTER_KEY` and no `MEMORIA_WEB_URL`. A persisted scoped binding always wins, preserving its owner namespace and consent. Only an active local password account with no scoped binding and no retained Memoria identity may select the owner-bound master port. Disconnect, account deactivation/deletion and lookup errors fail closed, including for runtime ports created before the lifecycle change. These data requests authenticate with Memoria's owner-scoped master scheme, which validates the deployment secret but removes administrator authority before routing to memory handlers. Every request projects the authenticated Astra user as the Memoria owner; an unbound or incompatible backend fails closed. Memoria must contain the `Memoria-Owner` support introduced by `matrixorigin/Memoria#250` (not present in v0.5.1).
 
+Turn observation uses the same composition-owned `MemoriaPort` template as
+prompt recall and session memory. Each queued observation binds the authenticated
+Astra owner, checks write admission, and resolves fresh write transport before
+sending `/v1/observe`. The transport supplies the Memoria owner and authentication
+scheme, with exactly one `X-User-Id` header; the worker must not derive them from
+the request user ID or fall back to a deployment master key. Denied/read-only access skips observation; authority
+lookup failures and grants revoked after admission fail closed.
+
+Transport resolution performs fresh authority lookup without allocating an HTTP
+client. HTTP memory operations construct their client from the resolved transport;
+the observer keeps its own 10-second connect / 30-second request timeout and
+no-redirect policy. Admission and the fresh send-time authority check remain
+separate.
+
+Observer run metrics distinguish `success` (backend accepted the request), `not_configured`
+(no authority template), `access_disabled` (write admission denied), `empty`, and
+`error`; success alone does not prove recall or prompt injection. Existing
+success-rate dashboards must exclude skipped outcomes from attempted-request
+denominators: use `success / (success + error)` and display skipped outcomes
+separately. The bundled dashboard already displays each outcome as a separate
+rate series and has no success-ratio alert.
+
+Setting a deployment master key alone no longer enables the observer. Self-hosted
+local-account fallback additionally requires `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`
+and the existing eligible-account checks. If `memoria_credentials()` supplies no
+authority template, observation reports `not_configured`; it does not use the
+master key directly.
+Provider request authentication does not itself grant memory access. A provider
+without a canonical memory binding remains disabled until an explicit identity
+and memory-authority integration is established.
+
 The background coordinator may launch a lightweight admission task, but it checks consent before loading snapshots, resolving an LLM, generating memory, or scheduling persistence. See [authentication](authentication.md) for issuer, credential replacement and retention.
 
 MOI native UC uses the same resolver and consumers with an explicitly enabled
 product-owned authority, not the local-password fallback or a second Memoria
 login. Current UC status and canonical issuer mapping are checked for every
 operation. Its bounded owner namespace and server-only credential are described
-in [MOI native login](../guides/moi-native-login.md#built-in-memory). Automatic
-prompt recall budgets both authorization and retrieval together; one successful
-session-start lane remains usable if the other lane times out.
+in [MOI native login](../guides/moi-native-login.md#built-in-memory). Ordinary
+model rounds do not initiate memory operations, even when this authority is enabled.
 
 Optional reads report admission through the existing `MemoriaPort` read
 operation, with one fresh authority resolution per operation and no discarded
@@ -105,14 +141,19 @@ validates every row against the attested Memoria owner. UC and personal Memoria
 namespaces need not equal `/auth/me.user_id`; an absent, malformed or mismatched
 attestation fails closed. No owner or grant cache is shared between operations.
 
-Fresh schema contract `2026-10-16-v103` includes `agent_session_memory_work`,
-the durable journal for the existing extraction and governance algorithms. Normal turn finalization performs a one-second bounded
-handoff of authenticated canonical extraction input before terminal completion;
-expensive inference and Memoria work remain background operations. A missed
-handoff is recovered from immutable canonical context using the existing Session
-context coordinator. Server's post-loop settlement remains its sole extraction
-dispatch point; deferring dispatch does not skip the bounded pre-terminal input
-publication. Destructive stages verify the canonical completed-turn
+Fresh schema contract `2026-10-16-v104` includes `agent_session_memory_work`,
+the durable journal for extraction and governance. Ordinary turn completion
+stores conversation input only through the canonical Context coordinator: it
+does not clone the transcript into a memory job, run extraction, or create a
+second post-loop settlement worker. Close/finalize enqueues one durable task;
+the existing recovery driver materializes the latest committed Context head
+and freezes input only when that task executes. This intentionally trades
+per-turn long-term-memory freshness for fewer writes and model calls. Runtime-only
+per-turn facts are not checkpointed separately for memory; extraction derives
+content from the committed conversation and turn coordinate. No in-process
+snapshot or per-turn handoff is required for recovery.
+
+Destructive stages verify the canonical completed-turn
 watermark and wait for execution settlement. If freshness cannot be verified or
 materialization fails, working memory is retained.
 
@@ -158,21 +199,21 @@ Completion flags and the status report remain available after retirement.
 This bounds payload generations, not total retained sessions or arbitrary input
 bytes. Permanently failing work remains recoverable and can retain large inputs;
 Session deletion owns physical removal. More worker pods can process independent
-sessions, but the shared due index and the separate global admission gate remain
+sessions, but the shared due index and database pool remain
 database capacity limits; this is not a claim of unlimited horizontal throughput.
 
 CLI exit targets its idle generation; a follow-up turn invalidates that old
 maintenance request. Explicit close settles all already-admitted extraction and
 rejects writes after the closed generation is consolidated. The close transaction
-creates the journal even when the first turn's bounded handoff never published a
-row, allowing restart recovery to discover canonical input. A previously completed
-CLI-exit generation cannot complete an explicit close while the existing Session
-execution slot is occupied or canonical writer/reservation authority remains live.
-Terminal Run persistence releases the slot before canonical context commit; slot
-absence alone does not prove settlement. Close invalidates the old maintenance
-plan under the same fence and retains pending work for the admitted turn's late
-handoff or canonical recovery. Destructive checkpoints wait for both execution
-and canonical authority to settle, using database time for authority expiry.
+creates its journal without requiring a per-turn snapshot, allowing restart recovery to discover canonical input. A previously completed
+CLI-exit generation cannot complete an explicit close while actual Run execution,
+a live owner lease, unresolved effect custody or explicit Controller authority
+remains. The atomic Run terminal/context commit retires its exact execution
+owner; there is no earlier derived-slot release to interpret as settlement.
+Close invalidates the old maintenance plan under the same canonical Session/Run
+fences and retains pending work for the admitted turn's late handoff or canonical
+recovery. Destructive checkpoints wait for execution and actual authority to
+settle, using database time for authority expiry.
 Repeated close or exit requests on an idle, completed generation retain journal
 progress instead of creating duplicate archives.
 `GET /sessions/{session_id}/memory/status` exposes pending work, the settled turn,
@@ -199,27 +240,11 @@ Memoria erasure. Memoria retention and explicit memory deletion still govern the
 remote records. Successful consolidation is tracked durably per generation,
 rather than relying on a process-local 15-minute debounce timer.
 
-Session-start recall applies
-each profile/episode cap only after typed prompt admission, so invalid or
-inactive rows cannot displace valid evidence already returned by the backend.
-
-The bounded admitted authority-resolution counts are message recall 2 → 1,
-session-start recall 3 → 2, snapshot loading 2 → 1, and applicable compaction
-2 → 1. Independent session-start lanes deliberately resolve twice even when
-disabled (previously one shared preflight), with zero backend requests. No
-grant/client cache is shared between lanes or operations. These are source-level
-operation counts, not predictions for whole-chat SQL totals.
-
-Automatic prompt recall does not reuse candidates across primary-model request
-preparations solely because the turn number and user message are unchanged.
-Each preparation uses the existing current-authority admission and bounded
-retrieval path; denial, lookup failure or timeout must not restore candidates
-from an earlier preparation. Within one preparation, context-budget assembly and physical
-provider retries may reuse its local retrieval result without starting another
-retrieval. This avoids an unversioned cross-request cache; it does not promise atomic authorization
-between an in-flight retrieval and the eventual model dispatch. Any future
-asynchronous candidate selector must address that boundary explicitly before
-retaining or reusing authorized snapshots.
+The interactive Server no longer runs session-start or semantic prompt prefetch.
+The shared memory-read helpers remain available to explicit memory workflows;
+current credential and owner checks belong to each actual operation. Compaction
+may still return memory produced by that explicit context-maintenance boundary.
+Web session switching and archiving do not imply memory finalization.
 
 ## Learning boundary
 

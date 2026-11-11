@@ -3,22 +3,6 @@
 use crate::path::{canonicalize_parent_and_append, normalize_path};
 use std::path::{Path, PathBuf};
 
-fn unique_path_variants(path: &Path) -> Vec<PathBuf> {
-    let mut variants = vec![normalize_path(path)];
-    if let Ok(canonical) = path.canonicalize()
-        && !variants.iter().any(|existing| existing == &canonical)
-    {
-        variants.push(canonical);
-    } else if let Ok(canonical_parent) = canonicalize_parent_and_append(path)
-        && !variants
-            .iter()
-            .any(|existing| existing == &canonical_parent)
-    {
-        variants.push(canonical_parent);
-    }
-    variants
-}
-
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.iter().any(|existing| existing == &path) {
         paths.push(path);
@@ -414,6 +398,18 @@ impl SandboxPolicy {
         }
     }
 
+    /// Paths added beyond the defaults for this isolation mode.
+    pub fn non_default_allowed_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        let defaults = match self.isolation {
+            IsolationLevel::Permissive => Vec::new(),
+            IsolationLevel::Standard => Self::for_project(&self.project_root).allowed_paths,
+            IsolationLevel::Strict => Self::strict(&self.project_root).allowed_paths,
+        };
+        self.allowed_paths
+            .iter()
+            .filter(move |path| !defaults.contains(path))
+    }
+
     /// Create a policy based on the skill's trust tier.
     ///
     /// Maps trust tiers to isolation levels:
@@ -450,16 +446,22 @@ impl SandboxPolicy {
         if self.isolation == IsolationLevel::Permissive {
             return true;
         }
-        let path_variants = unique_path_variants(path);
-        let prefix_matches = |prefix: &Path| {
-            let prefix_variants = unique_path_variants(prefix);
-            path_variants.iter().any(|candidate| {
-                prefix_variants
-                    .iter()
-                    .any(|allowed| candidate.starts_with(allowed))
+        canonicalize_parent_and_append(path)
+            .is_ok_and(|resolved| self.is_resolved_path_allowed(&resolved))
+    }
+
+    pub(crate) fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
+        self.is_within_project_root(resolved)
+            || self.allowed_paths.iter().any(|prefix| {
+                canonicalize_parent_and_append(prefix)
+                    .is_ok_and(|prefix| resolved.starts_with(prefix))
             })
-        };
-        prefix_matches(&self.project_root) || self.allowed_paths.iter().any(|ap| prefix_matches(ap))
+    }
+
+    /// Additional absolute grants cannot authorize relative workspace escapes.
+    pub(crate) fn is_within_project_root(&self, resolved: &Path) -> bool {
+        canonicalize_parent_and_append(&self.project_root)
+            .is_ok_and(|root| resolved.starts_with(root))
     }
 
     /// Check if an environment variable should be passed to child process.

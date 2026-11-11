@@ -62,7 +62,7 @@ struct GenesisPublicModel {
     #[serde(rename = "type")]
     model_type: String,
     #[serde(default)]
-    reasoning_efforts: Vec<String>,
+    reasoning_efforts: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -76,7 +76,6 @@ pub(super) struct GenesisCatalog {
     pub items: Vec<ModelListItem>,
     pub default_offering_id: Option<String>,
     source_models: HashMap<String, (String, String)>,
-    reasoning_efforts: HashMap<String, Vec<String>>,
     api_key: String,
 }
 
@@ -180,17 +179,26 @@ impl DatabaseModelService {
                     }) else {
                         continue;
                     };
-                    // The existing picker offers low/high/max together, so
-                    // advertise it only when all three are declared.
+                    let efforts: Vec<_> = model
+                        .reasoning_efforts
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .filter(|effort| {
+                            matches!(effort.as_str(), "low" | "medium" | "high" | "max")
+                        })
+                        .cloned()
+                        .collect();
+                    // Catalog v2 cannot carry the inventory and its picker
+                    // offers low/high/max together. Do not advertise a
+                    // partial set to those clients.
                     if ["low", "high", "max"]
                         .iter()
-                        .all(|level| model.reasoning_efforts.iter().any(|value| value == level))
+                        .all(|level| efforts.iter().any(|effort| effort == level))
                     {
                         item.thinking_capability = Some(ThinkingCapability::EffortOnly);
                         item.thinking_protocol = Some(ThinkingProtocol::ReasoningEffort);
-                        catalog
-                            .reasoning_efforts
-                            .insert(item.offering_id.clone(), model.reasoning_efforts.clone());
+                        item.supported_reasoning_efforts = Some(efforts);
                     }
                 }
             }
@@ -363,6 +371,7 @@ impl DatabaseModelService {
                 let id = offering_id(&provider.settings.issuer, subject, &model.id);
                 source_models.insert(id.clone(), (model.id, model.model_type));
                 items.push(ModelListItem {
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     offering_id: id,
                     access_id: "genesis".into(),
@@ -391,7 +400,6 @@ impl DatabaseModelService {
                     items,
                     default_offering_id,
                     source_models,
-                    reasoning_efforts: HashMap::new(),
                     api_key: pat.api_key,
                 });
             }
@@ -428,6 +436,11 @@ impl DatabaseModelService {
             })?;
         let provider = self.uc_provider.as_ref().ok_or_else(unavailable)?;
         Ok(AdmittedModelExecution {
+            responses_reasoning_history: None,
+            inference_protocol: None,
+            response_scope: None,
+            subscription: None,
+            admitted_at: std::time::Instant::now(),
             price_snapshot: None,
             offering_id: item.offering_id.clone(),
             source_identity: Some(crate::models::ResolvedModelSourceIdentity {
@@ -443,9 +456,9 @@ impl DatabaseModelService {
             provider: "openai".into(),
             cache_capability: None,
             thinking_capability: item.thinking_capability,
-            reasoning_efforts: catalog.reasoning_efforts.get(&item.offering_id).cloned(),
             fixed_temperature: None,
             thinking_protocol: item.thinking_protocol,
+            supported_reasoning_efforts: item.supported_reasoning_efforts.clone(),
             request_body_overrides: None,
             context_window: Some(item.context_window as u32),
             max_completion_tokens: item.max_completion_tokens.map(|v| v as u32),
@@ -590,14 +603,26 @@ mod tests {
                 .iter()
                 .all(|item| item.thinking_capability.is_none())
         );
-        *state.reasoning_efforts.lock().unwrap() = Some(serde_json::json!(["low", "high"]));
-        let partial = service.genesis_catalog("account-A").await.unwrap();
+        *state.reasoning_efforts.lock().unwrap() = Some(serde_json::Value::Null);
+        let null = service.genesis_catalog("account-A").await.unwrap();
         assert!(
-            partial
+            null.items
+                .iter()
+                .all(|item| item.thinking_capability.is_none())
+        );
+        *state.reasoning_efforts.lock().unwrap() = Some(serde_json::json!(["unsupported"]));
+        let unknown = service.genesis_catalog("account-A").await.unwrap();
+        assert!(
+            unknown
                 .items
                 .iter()
                 .all(|item| item.thinking_capability.is_none())
         );
+        *state.reasoning_efforts.lock().unwrap() = Some(serde_json::json!(["low", "high"]));
+        let partial = service.genesis_catalog("account-A").await.unwrap();
+        assert!(partial.items.iter().all(|item| {
+            item.thinking_capability.is_none() && item.supported_reasoning_efforts.is_none()
+        }));
         *state.reasoning_efforts.lock().unwrap() = Some(serde_json::json!(["low", "high", "max"]));
         let catalog = service.genesis_catalog("account-A").await.unwrap();
         let item = &catalog.items[0];
@@ -613,7 +638,7 @@ mod tests {
             .admit_genesis_from_catalog(&catalog, &item.offering_id)
             .unwrap();
         assert_eq!(
-            execution.reasoning_efforts,
+            execution.supported_reasoning_efforts,
             Some(vec!["low".into(), "high".into(), "max".into()])
         );
         assert_eq!(execution.thinking_capability, item.thinking_capability);
@@ -642,7 +667,7 @@ mod tests {
             assert_eq!(catalog.items.len(), 1);
             assert_eq!(catalog.items[0].name, "genesis-model-1");
             assert!(catalog.items[0].thinking_capability.is_none());
-            assert!(catalog.reasoning_efforts.is_empty());
+            assert!(catalog.items[0].supported_reasoning_efforts.is_none());
         }
     }
 
@@ -654,7 +679,12 @@ mod tests {
         let started = std::time::Instant::now();
         let catalog = service.genesis_catalog("account-A").await.unwrap();
         assert_eq!(catalog.items.len(), 2);
-        assert!(catalog.reasoning_efforts.is_empty());
+        assert!(
+            catalog
+                .items
+                .iter()
+                .all(|item| item.supported_reasoning_efforts.is_none())
+        );
         assert!(started.elapsed() < std::time::Duration::from_secs(8));
     }
 

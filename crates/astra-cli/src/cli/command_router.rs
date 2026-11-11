@@ -5,6 +5,7 @@ use crate::cli::arg_render::{
 use crate::cli::auth_flow::{clear_profile_auth, do_login, do_memoria_login_with_key, do_register};
 use crate::cli::cli_config::cli_args::{
     AuditCmd, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd, SkillCmd,
+    WorkspaceCmd,
 };
 use crate::cli::cli_config::cli_utils;
 use crate::cli::cli_config::cli_utils::{
@@ -38,14 +39,13 @@ use crate::cli::slash::slash_bug::handle_bug_command;
 use crate::cli::slash::slash_debug::handle_debug_command;
 use crate::cli::slash::slash_memory::handle_memory_domain_command;
 use crate::cli::slash::{slash_agent, slash_telemetry};
-use crate::cli::stream::streaming_types::{
-    StreamResult, stream_result_from_resumable_turn_failure,
-};
+use crate::cli::stream::streaming_types::StreamResult;
 use crate::cli::workspace_inspection::{handle_grep_command, handle_review_command};
 use crate::cli::{diff_presenter, journal_diff, journal_digest, journal_tree, theme};
 use astra_thin_client::paths;
 use clap::CommandFactory;
 use crossterm::{style::Stylize, terminal};
+use std::io::IsTerminal;
 use std::io::Read;
 
 /// A wall deadline has already stopped useful new work.  The rest of its
@@ -64,6 +64,43 @@ const WALL_DEADLINE_TERMINAL_RESERVE: std::time::Duration = std::time::Duration:
 /// request admission. This is deducted in addition to the terminal reserve so
 /// the Server never receives a rounded-up execution slice.
 const WALL_BUDGET_REQUEST_SAFETY_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Keep both signal observations alive while joining the same cleanup future.
+/// A first interrupt during cleanup establishes the existing request deadline;
+/// a second interrupt vetoes recovery without abandoning owned cleanup work.
+async fn settle_one_shot_cleanup_observing_interrupt(
+    cleanup: impl std::future::Future<Output = Result<(), String>>,
+    phase: &str,
+    first_interrupt: &mut (impl std::future::Future<Output = std::io::Result<()>> + Unpin),
+    second_interrupt: &mut (impl std::future::Future<Output = std::io::Result<()>> + Unpin),
+    user_interrupted: &mut bool,
+    second_interrupted: &mut bool,
+    terminal_deadline: &mut Option<tokio::time::Instant>,
+) -> Result<(), String> {
+    tokio::pin!(cleanup);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut *first_interrupt, if !*user_interrupted => {
+                *user_interrupted = true;
+                let signal_deadline = tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(10);
+                *terminal_deadline = Some(terminal_deadline.map_or(signal_deadline,
+                    |deadline| deadline.min(signal_deadline)));
+            }
+            _ = &mut *second_interrupt, if *user_interrupted && !*second_interrupted => {
+                *second_interrupted = true;
+            }
+            result = &mut cleanup => return result,
+            _ = async {
+                match *terminal_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => return Err(format!("request interruption {phase} did not settle")),
+        }
+    }
+}
 
 async fn settle_one_shot_stream_event_writer(
     writer: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
@@ -176,6 +213,7 @@ async fn capture_session_execution(
             "session_id": session_id,
             "owner": owner,
             "run_tree": tree,
+            "run_tree_note": "Tool-call totals are persisted aggregates and may lag while a run is active.",
             "reflection": reflection,
         });
         if include_run_events {
@@ -917,7 +955,23 @@ fn one_shot_completion_warning(sr: &StreamResult, exit_code: ExitCode) -> Option
         Some(format!("Session persistence degraded: {error}"))
     } else if sr.local_continuation_omitted {
         Some("Local conversation content omitted by privacy policy; this turn cannot be recovered or automatically resumed locally.".into())
+    } else if !sr.server_terminal_authoritative
+        && exit_code != ExitCode::Success
+        && astra_turn_core::evaluation::has_unresolved_tool_result_delivery_failure(
+            &sr.tool_call_records,
+        )
+    {
+        Some("A tool result could not be saved or delivered. Check what completed before continuing; do not repeat an action just to recover its output.".into())
     } else if exit_code == ExitCode::Partial {
+        if let Some(message) = sr
+            .interruption
+            .as_ref()
+            .and_then(|interruption| interruption.get("user_message"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+        {
+            return Some(message.to_string());
+        }
         Some(match sr.interruption_kind.as_deref() {
             Some(kind) => format!(
                 "Turn finished partially ({kind}). Inspect partial output before continuing."
@@ -1360,6 +1414,12 @@ mod token_refresh_error_tests {
                 assert_eq!(capture["transcript"]["items"][1]["item_seq"], 2);
                 assert_eq!(capture["owner"]["api_origin"], api.api_origin());
                 assert_eq!(capture["run_tree"]["session_id"], "session");
+                assert!(
+                    capture["run_tree_note"]
+                        .as_str()
+                        .unwrap()
+                        .contains("may lag")
+                );
                 assert_eq!(capture["reflection"]["schema_version"], 2);
             }
             server.verify().await;
@@ -1387,7 +1447,7 @@ mod token_refresh_error_tests {
                     "/chat/runs/root/projection",
                     serde_json::json!({
                         "run_id":projection_run, "session_id":projection_session,
-                        "run_event_high_watermark":7, "projection_event_idx":7,
+                        "run_event_high_watermark":7,
                         "recent_events":[{"index":7,"type":"run_finished"}],
                     }),
                     u64::from(!truncated),
@@ -1790,9 +1850,9 @@ async fn execute_cli_command_impl(
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 agent_spawner: None,
                 root_agent_id: None,
-                bg_task_commands: None,
+                background_tasks: None,
                 bg_task_list_cache: None,
-                bash_detach_slot: None,
+                foreground_wait_control: None,
                 stream_event_tx: None,
                 stream_json_emitter: None,
                 #[cfg(feature = "harness")]
@@ -1906,7 +1966,18 @@ async fn execute_cli_command_impl(
                     .magenta()
                     .bold()
             );
-            if args.username.is_some() || args.password.is_some() {
+            if args.device_code {
+                if profile.is_some() {
+                    return Err(
+                        "Device code sign-in requires MOI UC login without --profile".into(),
+                    );
+                }
+                let method = crate::cli::auth_flow::discover_login_method(api, None).await?;
+                let crate::cli::auth_flow::LoginMethod::Uc(discovery) = method else {
+                    return Err("This server does not support MOI device code sign-in".into());
+                };
+                crate::cli::auth_flow::uc::login_device_code(api, discovery).await?;
+            } else if args.username.is_some() || args.password.is_some() {
                 let username = prompt_or("Username", args.username)?;
                 let password = prompt_password_masked("Password", args.password)?;
                 do_login(api, profile.as_deref(), &username, &password).await?;
@@ -2163,6 +2234,14 @@ async fn execute_cli_command_impl(
         }
 
         Some(Command::Chat(args)) => {
+            // Poll before admission: Tokio installs the process signal handler on
+            // first poll, and the pending future retains an interrupt during setup.
+            let interrupt = tokio::signal::ctrl_c();
+            tokio::pin!(interrupt);
+            if let std::task::Poll::Ready(result) = futures_util::poll!(&mut interrupt) {
+                result.map_err(|error| error.to_string())?;
+                return interrupted_before_chat_admission(args.json);
+            }
             let mut chat_context = cli_context.clone();
             if let Some(model) = args.model.as_deref() {
                 chat_context.select_model(Some(model));
@@ -2195,13 +2274,40 @@ async fn execute_cli_command_impl(
                 }
             }
 
+            // Setup cannot admit a model run. Keep it interruptible as well,
+            // including authentication/catalog waits before the stream exists.
+            macro_rules! setup_await {
+                ($future:expr) => {
+                    tokio::select! {
+                        biased;
+                        signal = &mut interrupt => {
+                            signal.map_err(|error| error.to_string())?;
+                            return interrupted_before_chat_admission(args.json);
+                        }
+                        result = $future => result,
+                    }
+                };
+            }
+
             // Determine message source: --stdin, -m, or start REPL
             let message = if args.stdin {
-                let mut buf = String::new();
-                std::io::stdin()
-                    .read_to_string(&mut buf)
-                    .map_err(|e| format!("Could not read input from stdin: {e}"))?;
-                let msg = buf.trim().to_string();
+                // An ordinary detached reader lets cancellation terminate this
+                // process even while the pipe's writer stays open. Tokio stdin
+                // and spawn_blocking would keep runtime shutdown waiting on the
+                // uncancellable OS read after the signal branch returned.
+                let (input_tx, input_rx) = tokio::sync::oneshot::channel();
+                std::thread::Builder::new()
+                    .name("astra-chat-stdin".to_string())
+                    .spawn(move || {
+                        let mut input = String::new();
+                        let result = std::io::stdin().read_to_string(&mut input).map(|_| input);
+                        let _ = input_tx.send(result);
+                    })
+                    .map_err(|error| format!("Could not start stdin reader: {error}"))?;
+                let input = setup_await!(input_rx)
+                    .map_err(|error| format!("Could not receive input from stdin: {error}"))?
+                    .map_err(|error| format!("Could not read input from stdin: {error}"))?;
+                let msg = input.trim().to_string();
                 if msg.is_empty() {
                     return Err(
                         "message cannot be empty (stdin was empty or whitespace-only)".to_string(),
@@ -2237,16 +2343,19 @@ async fn execute_cli_command_impl(
             };
 
             let token = if let Some(deadline) = one_shot_terminal_deadline {
-                tokio::time::timeout_at(
+                setup_await!(tokio::time::timeout_at(
                     deadline,
                     fresh_access_token_or_error(api, profile.as_deref()),
-                )
-                .await
+                ))
                 .map_err(|_| "request wall deadline expired during authentication".to_string())??
             } else {
-                fresh_access_token_or_error(api, profile.as_deref()).await?
+                setup_await!(fresh_access_token_or_error(api, profile.as_deref()))?
             };
-            register_one_shot_edge(api, &token, one_shot_terminal_deadline).await?;
+            setup_await!(register_one_shot_edge(
+                api,
+                &token,
+                one_shot_terminal_deadline
+            ))?;
             let explicit_session_id = args.session_id.clone();
             let session_routing_future = resolve_one_shot_session_routing(
                 api,
@@ -2258,27 +2367,24 @@ async fn execute_cli_command_impl(
                 !args.no_resume,
             );
             let mut session_routing = if let Some(deadline) = one_shot_terminal_deadline {
-                tokio::time::timeout_at(deadline, session_routing_future)
-                    .await
-                    .map_err(|_| {
-                        "request wall deadline expired during session routing".to_string()
-                    })??
+                setup_await!(tokio::time::timeout_at(deadline, session_routing_future)).map_err(
+                    |_| "request wall deadline expired during session routing".to_string(),
+                )??
             } else {
-                session_routing_future.await?
+                setup_await!(session_routing_future)?
             };
             // A headless turn normally lets /chat/stream create its session
             // lazily. Native capacity must be advertised before the parent
             // model is admitted, so use the existing session creation owner
-            // when a supported local collaborator is available. Environments
-            // without one keep the ordinary lazy path.
+            // only when native collaborators were explicitly selected. Ordinary
+            // turns do not probe external runtimes or pre-create a Session.
             let mut created_session_for_native = false;
-            if session_routing.server_session_id.is_none()
-                && !crate::edge_tools::native_codex::native_provider_executable_snapshot()
-                    .is_empty()
-            {
-                let session_id =
+            let native_collaborators_requested =
+                crate::cli::edge_lifecycle::native_delivery::native_collaborators_requested()?;
+            if session_routing.server_session_id.is_none() && native_collaborators_requested {
+                let session_id = setup_await!(
                     crate::cli::slash::slash_state::create_server_session_identity(api, &token)
-                        .await?;
+                )?;
                 session_routing.server_session_id = Some(session_id.clone());
                 session_routing.history_source_session_id = Some(session_id);
                 created_session_for_native = true;
@@ -2299,14 +2405,14 @@ async fn execute_cli_command_impl(
                     !args.no_resume,
                 );
                 session_routing = if let Some(deadline) = one_shot_terminal_deadline {
-                    tokio::time::timeout_at(deadline, refresh_future)
-                        .await
-                        .map_err(|_| {
+                    setup_await!(tokio::time::timeout_at(deadline, refresh_future)).map_err(
+                        |_| {
                             "request wall deadline expired while refreshing admitted session"
                                 .to_string()
-                        })??
+                        },
+                    )??
                 } else {
-                    refresh_future.await?
+                    setup_await!(refresh_future)?
                 };
                 if session_routing.server_session_id.as_deref() != Some(session_id) {
                     return Err("session routing changed after execution admission".to_string());
@@ -2328,13 +2434,11 @@ async fn execute_cli_command_impl(
                 global_model.as_deref(),
             );
             let resolved_model = if let Some(deadline) = one_shot_terminal_deadline {
-                tokio::time::timeout_at(deadline, model_future)
-                    .await
-                    .map_err(|_| {
-                        "request wall deadline expired during model resolution".to_string()
-                    })??
+                setup_await!(tokio::time::timeout_at(deadline, model_future)).map_err(|_| {
+                    "request wall deadline expired during model resolution".to_string()
+                })??
             } else {
-                model_future.await?
+                setup_await!(model_future)?
             };
             let effective_model = resolved_model.model;
             let effective_offering_id = resolved_model.offering_id;
@@ -2355,7 +2459,7 @@ async fn execute_cli_command_impl(
                     session_routing.continuation_turn_inputs()?
                 };
             let is_tty = terminal::size().is_ok();
-            let _pipeline = create_pipeline_modules(api, profile.as_deref()).await;
+            let _pipeline = setup_await!(create_pipeline_modules(api, profile.as_deref()));
             let mut pm = {
                 let project_root = std::env::current_dir().unwrap_or_default();
                 PermissionManager::with_load_policy(
@@ -2364,6 +2468,15 @@ async fn execute_cli_command_impl(
                     &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
                 )
             };
+            // One-shot chat owns shell tasks for this turn only. The same
+            // registry is shared by every tool callback until shutdown.
+            let mut background_tasks =
+                crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+                    astra_runtime_env::local_state_root()
+                        .join("bg_tasks")
+                        .join("one-shot"),
+                );
+            let mut native_executor = None;
             let mut native_delivery = if let (Some(session_id), Some(account_id)) =
                 (session_id.as_deref(), cli_utils::cli_account_id())
             {
@@ -2374,19 +2487,27 @@ async fn execute_cli_command_impl(
                 // being reused by this process.
                 pm.bind_permission_attachment(session_id, 1);
                 let project_root = std::env::current_dir().unwrap_or_default();
-                let executor = crate::edge_tools::ToolExecutor::new(project_root)
-                    .with_active_session_id(session_id.to_owned())
-                    .with_cloud(api.api_origin(), token.to_owned());
-                crate::cli::edge_lifecycle::native_delivery::start_headless_native_delivery(
-                    api,
-                    &token,
-                    account_id,
-                    session_id,
-                    std::sync::Arc::new(executor),
-                    pm.subscribe_permission_policy(),
-                    one_shot_terminal_deadline,
-                )
-                .await
+                let executor = std::sync::Arc::new(
+                    crate::edge_tools::ToolExecutor::new(project_root)
+                        .with_active_session_id(session_id.to_owned())
+                        .with_cloud(api.api_origin(), token.to_owned()),
+                );
+                native_executor = Some(executor.clone());
+                setup_await!(
+                    crate::cli::edge_lifecycle::native_delivery::start_headless_native_delivery(
+                        api,
+                        &token,
+                        account_id,
+                        session_id,
+                        executor,
+                        pm.subscribe_permission_policy(),
+                        one_shot_terminal_deadline,
+                    )
+                )?
+            } else if native_collaborators_requested {
+                return Err(
+                    "selected native collaborators require an authenticated Session owner".into(),
+                );
             } else {
                 None
             };
@@ -2424,12 +2545,13 @@ async fn execute_cli_command_impl(
             #[cfg(feature = "harness")]
             let harness_sink = astra_harness::InMemorySnapshotSink::arc();
 
-            let auth_owner = crate::cli::session::session_runtime::capture_admitted_auth_owner(
-                api,
-                profile.as_deref(),
-                &token,
-            )
-            .await;
+            let auth_owner = setup_await!(
+                crate::cli::session::session_runtime::capture_admitted_auth_owner(
+                    api,
+                    profile.as_deref(),
+                    &token,
+                )
+            );
 
             let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
                 mcp_manager: Some(_pipeline.mcp_manager.clone()),
@@ -2448,9 +2570,9 @@ async fn execute_cli_command_impl(
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 agent_spawner: None,
                 root_agent_id: None,
-                bg_task_commands: None,
+                background_tasks: Some(background_tasks.clone()),
                 bg_task_list_cache: None,
-                bash_detach_slot: None,
+                foreground_wait_control: None,
                 stream_event_tx,
                 stream_json_emitter: None,
                 #[cfg(feature = "harness")]
@@ -2459,14 +2581,13 @@ async fn execute_cli_command_impl(
                 #[cfg(feature = "harness")]
                 benchmark_profile: args.benchmark_profile,
             };
-            let wall_deadline_cancel_token = args
-                .max_wall_time_seconds
-                .map(|_| std::sync::Arc::new(tokio_util::sync::CancellationToken::new()));
-            let wall_deadline_incremental_state = args.max_wall_time_seconds.map(|_| {
-                std::sync::Arc::new(
-                    astra_turn_core::turn_event_sink::IncrementalTurnState::default(),
-                )
-            });
+            let wall_deadline_cancel_token = Some(std::sync::Arc::new(
+                tokio_util::sync::CancellationToken::new(),
+            ));
+            let wall_deadline_incremental_state = Some(std::sync::Arc::new(
+                astra_turn_core::turn_event_sink::IncrementalTurnState::default(),
+            ));
+            let executor_observer = crate::cli::chat_stream::CliExecutorObserver::default();
             let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
                 pre_loaded_messages: continuation_messages.take(),
                 deferred_tool_activations,
@@ -2475,16 +2596,24 @@ async fn execute_cli_command_impl(
                 turn_index: Some(session_routing.next_server_turn_index()),
                 cancel_token: wall_deadline_cancel_token.clone(),
                 incremental_state: wall_deadline_incremental_state.clone(),
+                executor_observer: Some(executor_observer.clone()),
                 request_session_execution_lease: Some(request_session_execution_lease.clone()),
                 ..Default::default()
             };
             let turn_start = std::time::Instant::now();
-            let terminal_deadline = one_shot_terminal_deadline;
+            let mut terminal_deadline = one_shot_terminal_deadline;
             let execution_deadline =
                 terminal_deadline.map(|deadline| deadline - WALL_DEADLINE_TERMINAL_RESERVE);
             let mut wall_deadline_reached = false;
+            let mut user_interrupted = false;
             let mut wall_deadline_root_settled = false;
             let mut wall_deadline_server_terminal_settled = false;
+            let mut cancelled_context_observation = None;
+            // First polled after the initial interruption, then retained through
+            // every settlement phase. Never poll again after it completes.
+            let second_interrupt = tokio::signal::ctrl_c();
+            tokio::pin!(second_interrupt);
+            let mut second_interrupted = false;
             let turn_result = {
                 let turn_future = crate::cli::turn::execute_basic_cli_turn(
                     &chat_ctx,
@@ -2494,11 +2623,28 @@ async fn execute_cli_command_impl(
                     turn_options,
                 );
                 tokio::pin!(turn_future);
-                if let Some(deadline) = execution_deadline {
-                    tokio::select! {
-                        result = &mut turn_future => result,
-                        _ = tokio::time::sleep_until(deadline) => {
-                            wall_deadline_reached = true;
+                tokio::select! {
+                        biased;
+                        interrupted = async {
+                            tokio::select! {
+                                result = &mut interrupt => {
+                                    result.map_err(|error| error.to_string())?;
+                                    Ok::<_, String>(true)
+                                }
+                                _ = async {
+                                    match execution_deadline {
+                                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                                        None => std::future::pending().await,
+                                    }
+                                } => Ok(false),
+                            }
+                        } => {
+                            user_interrupted = interrupted?;
+                            wall_deadline_reached = !user_interrupted;
+                            if user_interrupted {
+                                let signal_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                                terminal_deadline = Some(terminal_deadline.map_or(signal_deadline, |deadline| deadline.min(signal_deadline)));
+                            }
                             if let Some(cancel_token) = wall_deadline_cancel_token.as_ref() {
                                 cancel_token.cancel();
                             }
@@ -2507,119 +2653,320 @@ async fn execute_cli_command_impl(
                                 .map(|state| state.snapshot())
                                 .unwrap_or_default();
                             async {
-                                let run_id = snapshot.run_id.clone().ok_or_else(|| crate::TurnFailure {
-                                    error: "request wall deadline reached before an authoritative run id was observed".to_string(),
-                                    partial: Default::default(),
-                                })?;
-                                let terminal = terminal_deadline.expect("deadline pair is constructed together");
+                                let Some(run_id) = snapshot.run_id.clone() else {
+                                    return crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
+                                        "request interrupted before an authoritative run id was observed; remote execution settlement is unverified",
+                                        wall_deadline_incremental_state.as_ref().expect("one-shot state").clone(),
+                                    );
+                                };
+                                let terminal = terminal_deadline.expect("interrupt establishes terminal deadline");
                                 let terminal_settle_deadline = terminal
                                     .checked_sub(WALL_DEADLINE_SERVER_TERMINAL_SETTLE_MARGIN)
                                     .unwrap_or(terminal);
                                 let cancel_deadline = terminal_settle_deadline;
-                                crate::cli::turn::turn_facade::cancel_exact_run_until_settled_with_deadline(
+                                let cancel = crate::cli::turn::turn_facade::cancel_exact_run_until_settled_with_deadline(
                                     api, &token, &run_id, chat_ctx.auth_owner.as_ref(), cancel_deadline,
-                                ).await.map_err(|error| crate::TurnFailure {
-                                    error,
-                                    partial: Default::default(),
-                                })?;
+                                );
+                                let context_observation = match tokio::select! {
+                                    biased;
+                                    _ = &mut second_interrupt => {
+                                        second_interrupted = true;
+                                        Err("user_interrupted (second Ctrl+C); remote execution settlement is unverified".to_string())
+                                    }
+                                    result = cancel => result,
+                                } {
+                                    Ok(observation) => observation,
+                                    Err(error) => return crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
+                                        &error, wall_deadline_incremental_state.as_ref().expect("one-shot state").clone(),
+                                    ),
+                                };
+                                cancelled_context_observation = Some(context_observation);
+                                request_session_execution_lease.mark_remote_execution_settled();
                                 wall_deadline_server_terminal_settled = true;
                                 let drain_budget = terminal
                                     .saturating_duration_since(tokio::time::Instant::now())
                                     .min(std::time::Duration::from_secs(20));
-                                match tokio::time::timeout(
-                                    drain_budget,
-                                    &mut turn_future,
-                                )
-                                .await
-                                {
-                                    Ok(result) => {
+                                let drained = tokio::select! {
+                                    biased;
+                                    _ = &mut second_interrupt => {
+                                        second_interrupted = true;
+                                        None
+                                    }
+                                    result = tokio::time::timeout(drain_budget, &mut turn_future) => result.ok(),
+                                };
+                                match drained {
+                                    Some(result) => {
                                         wall_deadline_root_settled = true;
+                                        if let Err(failure) = &result {
+                                            cancelled_context_observation = Some(
+                                                merge_cancelled_context_for_run(context_observation, &run_id, failure),
+                                            );
+                                        }
                                         match result {
                                             Ok(result) => Ok(result),
-                                            Err(_) => Ok(stream_result_from_incremental_snapshot(
+                                            Err(_) if !user_interrupted => Ok(stream_result_from_incremental_snapshot(
                                                 wall_deadline_incremental_state
                                                     .as_ref()
                                                     .map(|state| state.snapshot())
                                                     .unwrap_or(snapshot),
                                             )),
+                                            Err(failure) => Err(failure),
                                         }
                                     }
-                                    Err(_) => Err(crate::TurnFailure {
-                                        error: format!("request wall deadline root drain timed out for run {run_id}"),
-                                        partial: Default::default(),
-                                    }),
+                                    None => crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
+                                        &format!("request interruption root drain did not settle for run {run_id}"),
+                                        wall_deadline_incremental_state.as_ref().expect("one-shot state").clone(),
+                                    ),
                                 }
                             }.await
                         }
-                    }
-                } else {
-                    turn_future.as_mut().await
+                        result = &mut turn_future => result,
                 }
             };
+            // An additional cleanup failure is a negative veto, independent
+            // of the original error class and exact Server cancellation proof.
+            let mut interruption_cleanup_settled = true;
+            let mut turn_result =
+                if (user_interrupted || wall_deadline_reached) && !wall_deadline_root_settled {
+                    if !wall_deadline_server_terminal_settled {
+                        request_session_execution_lease.retain_unsettled_owner_until_process_exit();
+                    }
+                    apply_one_shot_cleanup_result(
+                        turn_result,
+                        Err("request interrupted without root execution settlement".to_string()),
+                        wall_deadline_incremental_state
+                            .as_ref()
+                            .expect("one-shot state"),
+                        &mut interruption_cleanup_settled,
+                    )
+                } else {
+                    turn_result
+                };
 
+            let interrupted_before_cleanup = user_interrupted;
             if let Some(handle) = native_delivery.take() {
-                handle.shutdown().await;
+                let shutdown = settle_one_shot_cleanup_observing_interrupt(
+                    async {
+                        handle.shutdown().await;
+                        Ok(())
+                    },
+                    "native delivery shutdown",
+                    &mut interrupt,
+                    &mut second_interrupt,
+                    &mut user_interrupted,
+                    &mut second_interrupted,
+                    &mut terminal_deadline,
+                )
+                .await;
+                if shutdown.is_err() {
+                    request_session_execution_lease.retain_unsettled_owner_until_process_exit();
+                }
+                turn_result = apply_one_shot_cleanup_result(
+                    turn_result,
+                    shutdown,
+                    wall_deadline_incremental_state
+                        .as_ref()
+                        .expect("one-shot state"),
+                    &mut interruption_cleanup_settled,
+                );
             }
 
-            // Flush the completed Server stream before publishing the result.
-            drop(chat_ctx);
-            settle_one_shot_stream_event_writer(stream_event_writer, terminal_deadline).await?;
+            let mut shell_settlement_confirmed = false;
+            let shell_shutdown = settle_one_shot_cleanup_observing_interrupt(
+                async {
+                    let report = background_tasks.kill_all_and_wait(std::time::Duration::from_secs(2)).await;
+                    let unsettled = report.unsettled.len().saturating_add(report.evicted_unsettled);
+                    let unknown = report.unknown.len();
+                    shell_settlement_confirmed = unsettled == 0 && unknown == 0;
+                    if !shell_settlement_confirmed {
+                        Err(format!("one-shot shell shutdown could not confirm execution outcomes or cleanup: {unsettled} unsettled, {unknown} unobserved unknown"))
+                    } else if !report.requested.is_empty() {
+                        Err(format!("one-shot turn ended with {} shell task(s) still running; cancellation was requested during shutdown", report.requested.len()))
+                    } else {
+                        Ok(())
+                    }
+                },
+                "shell task shutdown",
+                &mut interrupt,
+                &mut second_interrupt,
+                &mut user_interrupted,
+                &mut second_interrupted,
+                &mut terminal_deadline,
+            ).await;
+            if !shell_settlement_confirmed {
+                request_session_execution_lease.retain_unsettled_owner_until_process_exit();
+            }
+            turn_result = apply_one_shot_cleanup_result(
+                turn_result,
+                shell_shutdown,
+                wall_deadline_incremental_state
+                    .as_ref()
+                    .expect("one-shot state"),
+                &mut interruption_cleanup_settled,
+            );
 
+            // Flush the completed stream before publishing. Retain the abort
+            // authority outside the join future in case a late signal bounds
+            // a writer that started without a wall deadline.
+            drop(chat_ctx);
+            let writer_abort = stream_event_writer
+                .as_ref()
+                .map(|writer| writer.abort_handle());
+            let writer_settlement = settle_one_shot_cleanup_observing_interrupt(
+                settle_one_shot_stream_event_writer(stream_event_writer, terminal_deadline),
+                "stream-event writer",
+                &mut interrupt,
+                &mut second_interrupt,
+                &mut user_interrupted,
+                &mut second_interrupted,
+                &mut terminal_deadline,
+            )
+            .await;
+            if writer_settlement.is_err()
+                && let Some(writer) = writer_abort
+            {
+                writer.abort();
+            }
+            turn_result = apply_one_shot_cleanup_result(
+                turn_result,
+                writer_settlement,
+                wall_deadline_incremental_state
+                    .as_ref()
+                    .expect("one-shot state"),
+                &mut interruption_cleanup_settled,
+            );
+            if !user_interrupted && futures_util::poll!(&mut interrupt).is_ready() {
+                user_interrupted = true;
+            }
+            if !interrupted_before_cleanup && user_interrupted {
+                wall_deadline_cancel_token
+                    .as_ref()
+                    .expect("one-shot token")
+                    .cancel();
+                request_session_execution_lease.retain_unsettled_owner_until_process_exit();
+                turn_result = apply_one_shot_cleanup_result(
+                    turn_result,
+                    Err(
+                        "user_interrupted during final cleanup; execution settlement is unverified"
+                            .into(),
+                    ),
+                    wall_deadline_incremental_state
+                        .as_ref()
+                        .expect("one-shot state"),
+                    &mut interruption_cleanup_settled,
+                );
+            }
+
+            if user_interrupted {
+                if !second_interrupted && futures_util::poll!(&mut second_interrupt).is_ready() {
+                    second_interrupted = true;
+                }
+                if second_interrupted {
+                    turn_result = apply_one_shot_cleanup_result(
+                        turn_result,
+                        Err(
+                            "user_interrupted (second Ctrl+C); partial recovery is disabled".into(),
+                        ),
+                        wall_deadline_incremental_state
+                            .as_ref()
+                            .expect("one-shot state"),
+                        &mut interruption_cleanup_settled,
+                    );
+                }
+                // Native shutdown joins callbacks and their local scope cleanup.
+                // Only now can its sticky ownership barrier veto partial recovery.
+                turn_result = settle_one_shot_user_interrupt_result(
+                    turn_result,
+                    executor_observer.get().map(|executor| executor.as_ref()),
+                    native_executor.as_deref(),
+                    interruption_cleanup_settled
+                        && wall_deadline_root_settled
+                        && wall_deadline_server_terminal_settled
+                        && request_session_execution_lease.failure().is_none(),
+                    wall_deadline_incremental_state
+                        .as_ref()
+                        .expect("one-shot state"),
+                );
+            }
+
+            if let Some(observation) = cancelled_context_observation
+                && let Err(failure) = &mut turn_result
+            {
+                failure.partial.cancel_context_not_saved = Some(observation);
+            }
             let mut sr = match turn_result {
                 Ok(sr) => sr,
-                Err(e) if crate::cli::turn::turn_facade::is_settled_stdout_closure(&e) => {
+                Err(e)
+                    if one_shot_stdout_closure_is_settled(
+                        &e,
+                        user_interrupted,
+                        interruption_cleanup_settled,
+                        executor_observer.get().map(|executor| executor.as_ref()),
+                        native_executor.as_deref(),
+                    ) =>
+                {
                     return Ok(ExitCode::Success);
                 }
                 Err(e) => {
-                    if let Some(mut sr) = stream_result_from_resumable_turn_failure(&e) {
-                        let exit_code = finalize_one_shot_stream_result_with_request_lease(
-                            profile.as_deref(),
-                            effective_model.as_deref(),
-                            &message,
-                            &mut sr,
-                            turn_start,
-                            request_session_execution_lease.as_ref(),
-                        );
-
-                        if args.json {
-                            let mut json_output = final_json_output(&sr, exit_code);
-                            if let Some(obj) = json_output.as_object_mut() {
-                                obj.insert("ttft_ms".to_string(), serde_json::json!(sr.ttft_ms));
-                                obj.insert(
-                                    "context_ms".to_string(),
-                                    serde_json::json!(sr.context_ms),
-                                );
-                            }
-                            write_headless_stdout_line(
-                                &serde_json::to_string_pretty(&json_output).unwrap_or_default(),
-                            )?;
-                            return Ok(exit_code);
-                        }
-                        if quiet {
-                            write_headless_stdout_line(&sr.full_text)?;
-                        }
-                        print_one_shot_completion_warning(&sr, exit_code, args.json);
-                        return Ok(exit_code);
+                    let failure_exit = hard_failure_exit_code(&e);
+                    if (quiet || !std::io::stdout().is_terminal())
+                        && !args.json
+                        && !e.partial.partial_text.is_empty()
+                    {
+                        write_headless_stdout_line(&e.partial.partial_text)?;
                     }
+                    eprintln!(
+                        "{}",
+                        crate::cli::turn::turn_failure_reporting::turn_failure_diagnostic(&e)
+                    );
                     if args.json {
-                        let error = e.error.clone();
+                        let mut output = hard_failure_json_output(e);
+                        if let Some(observation) = cancelled_context_observation {
+                            output["context_not_saved"] = serde_json::json!(observation);
+                        }
                         write_headless_stdout_line(
-                            &serde_json::to_string_pretty(&hard_failure_json_output(e))
+                            &serde_json::to_string_pretty(&output)
                                 .map_err(|error| error.to_string())?,
                         )?;
-                        return Err(error);
+                        return Ok(failure_exit);
                     }
-                    return Err(e.error);
+                    return Ok(failure_exit);
                 }
             };
-            if wall_deadline_reached {
+            if wall_deadline_reached || user_interrupted {
                 if !wall_deadline_root_settled {
                     return Err(
                         "request wall deadline ended without root execution settlement".to_string(),
                     );
                 }
+                let had_partial_text = !sr.full_text.trim().is_empty();
                 apply_wall_deadline_interruption(&mut sr, wall_deadline_server_terminal_settled);
-                retain_wall_deadline_partial_canonical_messages(&mut sr, &message);
+                if user_interrupted {
+                    sr.interruption = Some(serde_json::json!({
+                        "kind": "execution_incomplete",
+                        "reason": "user_interrupted",
+                        "resumable": true,
+                    }));
+                    if !had_partial_text {
+                        sr.full_text = "Execution interrupted by the user.".to_string();
+                    }
+                }
+                if let Some(observation) = cancelled_context_observation {
+                    if let Some(interruption) = sr
+                        .interruption
+                        .as_mut()
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        interruption
+                            .insert("context_not_saved".into(), serde_json::json!(observation));
+                    }
+                    if let Some(notice) =
+                        crate::cli::turn::turn_cancellation::cancelled_context_notice(observation)
+                    {
+                        eprintln!("{notice}");
+                    }
+                }
+                retain_interrupted_partial_canonical_messages(&mut sr, &message);
             }
 
             let exit_code = finalize_one_shot_stream_result_with_request_lease(
@@ -2654,16 +3001,44 @@ async fn execute_cli_command_impl(
             Ok(exit_code)
         }
 
-        Some(Command::Session(SessionCmd::Judge(args))) => {
-            if args.message.trim().is_empty() {
-                return Err("judgment message must not be empty".to_string());
+        Some(Command::Workspace(WorkspaceCmd::ConfirmStopped)) => {
+            if !std::io::stdin().is_terminal() {
+                return Err("Confirm workspace recovery from an interactive terminal.".into());
             }
+            let root = std::env::current_dir().map_err(|error| error.to_string())?;
+            let recovery = astra_tools::workspace_observation::begin_workspace_recovery(&root)
+                .await
+                .map_err(|error| format!("Workspace recovery failed: {error}"))?;
+            eprintln!("Workspace: {}", root.display());
+            let confirmed = inquire::Confirm::new(
+                "Have all local and connected commands that may still use this workspace stopped?",
+            )
+            .with_default(false)
+            .prompt()
+            .map_err(|error| format!("Could not confirm workspace recovery: {error}"))?;
+            if !confirmed {
+                eprintln!("Workspace recovery cancelled.");
+                return Ok(ExitCode::Success);
+            }
+            recovery
+                .confirm()
+                .await
+                .map_err(|error| format!("Workspace recovery failed: {error}"))?;
+            eprintln!(
+                "Workspace confirmed. Restart any running Astra sessions from this workspace before retrying the rollback."
+            );
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Session(SessionCmd::Judge(args))) => {
+            let message =
+                crate::cli::session_judge::read_message(args.message, std::io::stdin().lock())?;
             let token = fresh_access_token_or_error(&api, profile.as_deref()).await?;
             let result = crate::cli::session_judge::execute_for_model(
                 &api,
                 &token,
                 &args.model,
-                &args.message,
+                &message,
                 args.timeout_seconds,
             )
             .await?;
@@ -2841,6 +3216,34 @@ async fn execute_cli_command_impl(
             Ok(ExitCode::Success)
         }
 
+        Some(Command::Model(ModelCmd::Connect(args))) => {
+            let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
+            let value =
+                crate::cli::model_connections::connect(api, &token, args, profile.as_deref())
+                    .await?;
+            print_json_or_raw(&value.to_string());
+            Ok(ExitCode::Success)
+        }
+        Some(Command::Model(ModelCmd::Connections)) => {
+            let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
+            let body = api
+                .get_bearer_path_query_text(&token, crate::cli::model_connections::CONNECTIONS, &[])
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(ExitCode::Success)
+        }
+        Some(Command::Model(ModelCmd::Disconnect { connection_id })) => {
+            let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
+            let path =
+                crate::cli::model_connections::connection_path(&connection_id, "disconnect")?;
+            let body = api
+                .post_bearer_path_empty_text(&token, &path)
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(ExitCode::Success)
+        }
         Some(Command::Model(ModelCmd::List)) => {
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = session_runtime::load_server_model_catalog_json(
@@ -2858,7 +3261,7 @@ async fn execute_cli_command_impl(
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let interactive =
                 !args.api_key_stdin && std::io::IsTerminal::is_terminal(&std::io::stdin());
-            let wizard = args.provider.is_none() || args.model.is_none() || args.name.is_none();
+            let mut wizard = args.provider.is_none() || args.model.is_none() || args.name.is_none();
             let required_text =
                 |value: Option<String>, label: &str, flag: &str| -> Result<String, String> {
                     let value = match value {
@@ -2873,18 +3276,57 @@ async fn execute_cli_command_impl(
                     }
                     Ok(value.trim().to_string())
                 };
-            let provider = match args.provider {
+            let provider = match args.provider.clone() {
                 Some(provider) => provider,
                 None if interactive => {
                     let label = inquire::Select::new(
                         "Model provider:",
-                        vec!["OpenAI", "Anthropic", "DeepSeek", "OpenAI-compatible"],
+                        vec![
+                            "OpenAI",
+                            "Anthropic",
+                            "DeepSeek",
+                            "OpenAI-compatible",
+                            "ChatGPT subscription",
+                        ],
                     )
                     .prompt()
                     .map_err(|e| e.to_string())?;
-                    label.to_ascii_lowercase()
+                    if label == "ChatGPT subscription" {
+                        "chatgpt".into()
+                    } else {
+                        label.to_ascii_lowercase()
+                    }
                 }
                 None => return Err("--provider is required in non-interactive mode".into()),
+            };
+            let subscription = provider == "chatgpt";
+            if subscription && (args.api_key_stdin || args.base_url.is_some()) {
+                return Err(
+                    "ChatGPT models use a linked connection and fixed OpenAI endpoint".into(),
+                );
+            }
+            if !subscription && args.connection_id.is_some() {
+                return Err("--connection is only valid for --provider chatgpt".into());
+            }
+            wizard |= subscription && args.connection_id.is_none();
+            let connection = if subscription {
+                Some(
+                    crate::cli::model_connections::select_connection(
+                        api,
+                        &token,
+                        args.connection_id,
+                        interactive,
+                        profile.as_deref(),
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            let token = if subscription {
+                fresh_access_token_or_error(api, profile.as_deref()).await?
+            } else {
+                token
             };
             let base_url = if provider == "openai-compatible" {
                 Some(required_text(
@@ -2908,6 +3350,16 @@ async fn execute_cli_command_impl(
                 .map_err(map_thin_err)?;
             }
             let model = match args.model {
+                None if interactive && subscription => Some(
+                    crate::cli::model_connections::select_model(
+                        api,
+                        &token,
+                        connection
+                            .as_deref()
+                            .expect("subscription connection selected"),
+                    )
+                    .await?,
+                ),
                 None if interactive => Some(
                     personal_model_id_prompt()
                         .prompt()
@@ -2938,13 +3390,15 @@ async fn execute_cli_command_impl(
             }
             let is_default = if wizard && interactive && !args.default {
                 inquire::Confirm::new("Use this as your default model?")
-                    .with_default(true)
+                    .with_default(!subscription)
                     .prompt()
                     .map_err(|e| e.to_string())?
             } else {
                 args.default
             };
-            let api_key = if args.api_key_stdin {
+            let api_key = if subscription {
+                String::new()
+            } else if args.api_key_stdin {
                 read_model_api_key_from_stdin()?
             } else {
                 prompt_password_masked(
@@ -2952,7 +3406,7 @@ async fn execute_cli_command_impl(
                     None,
                 )?
             };
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "name": name,
                 "provider": provider,
                 "model": model,
@@ -2961,11 +3415,27 @@ async fn execute_cli_command_impl(
                 "context_window": context_window,
                 "is_default": is_default,
             });
+            if let Some(format) = args.api_format {
+                payload["inference_protocol"] = serde_json::json!(match format.as_str() {
+                    "responses" => "openai_responses",
+                    _ => "openai_compatible",
+                });
+            }
+            if let Some(connection) = connection {
+                payload["connection_id"] = serde_json::json!(connection);
+            }
             let body = api
                 .post_bearer_path_json_text(&token, paths::ME_MODELS, &payload)
                 .await
-                .map_err(map_thin_err)?;
-            print_json_or_raw(&body);
+                .map_err(crate::cli::cli_config::cli_utils::model_creation_error)?;
+            if interactive {
+                stdout_println!(
+                    "{} Personal model '{name}' added; provider check passed.",
+                    theme::icon_ok()
+                );
+            } else {
+                print_json_or_raw(&body);
+            }
             Ok(ExitCode::Success)
         }
 
@@ -3210,6 +3680,152 @@ async fn execute_cli_command_impl(
 /// that field to avoid treating those as tool failures — a grep that
 /// finds nothing or a diff that reports differences is a successful tool
 /// execution, not an error the agent needs to recover from.
+fn interrupted_before_chat_admission(json: bool) -> Result<ExitCode, String> {
+    if json {
+        write_headless_stdout_line(
+            &hard_failure_json_output(crate::TurnFailure {
+                error: "user_interrupted before chat stream admission".to_string(),
+                partial: Default::default(),
+            })
+            .to_string(),
+        )?;
+    }
+    Ok(ExitCode::ApiError)
+}
+
+fn one_shot_local_ownership_unsettled(
+    executor: Option<&crate::edge_tools::ToolExecutor>,
+    native_executor: Option<&crate::edge_tools::ToolExecutor>,
+) -> bool {
+    executor.into_iter().chain(native_executor).any(|executor| {
+        astra_tools::workspace_observation::workspace_ownership_is_unsettled(
+            &executor.effective_project_root(),
+        ) == Some(true)
+    })
+}
+
+pub(crate) fn one_shot_stdout_closure_is_settled(
+    failure: &crate::TurnFailure,
+    user_interrupted: bool,
+    cleanup_settled: bool,
+    executor: Option<&crate::edge_tools::ToolExecutor>,
+    native_executor: Option<&crate::edge_tools::ToolExecutor>,
+) -> bool {
+    cleanup_settled
+        && crate::cli::turn::turn_facade::is_settled_stdout_closure(failure)
+        && (!user_interrupted || !one_shot_local_ownership_unsettled(executor, native_executor))
+}
+
+#[allow(clippy::result_large_err)]
+fn apply_one_shot_cleanup_result(
+    result: Result<StreamResult, crate::TurnFailure>,
+    cleanup: Result<(), String>,
+    incremental_state: &astra_turn_core::turn_event_sink::IncrementalTurnState,
+    cleanup_settled: &mut bool,
+) -> Result<StreamResult, crate::TurnFailure> {
+    match cleanup {
+        Ok(()) => result,
+        Err(reason) => {
+            *cleanup_settled = false;
+            retain_one_shot_interruption_failure(result, &reason, incremental_state)
+        }
+    }
+}
+
+fn retain_one_shot_observed_partial(
+    failure: &mut crate::TurnFailure,
+    incremental_state: &astra_turn_core::turn_event_sink::IncrementalTurnState,
+) {
+    // Physical-stream failure may precede terminal text ingestion. Keep only
+    // already-observed request evidence, without changing failure authority.
+    if failure.partial.partial_text.is_empty() {
+        failure.partial.partial_text = incremental_state.snapshot().partial_text;
+    }
+}
+
+/// Preserve an existing failure and all of its typed evidence. Cleanup causes
+/// are additive; only a result without a failure needs a new failure envelope.
+#[allow(clippy::result_large_err)]
+fn retain_one_shot_interruption_failure(
+    result: Result<StreamResult, crate::TurnFailure>,
+    reason: &str,
+    incremental_state: &astra_turn_core::turn_event_sink::IncrementalTurnState,
+) -> Result<StreamResult, crate::TurnFailure> {
+    let had_failure = result.is_err();
+    let mut failure = match result {
+        Err(failure) => failure,
+        Ok(sr) => {
+            let tool_outcomes = sr.canonical_tool_outcomes();
+            crate::TurnFailure {
+                error: reason.to_string(),
+                partial: crate::PartialTurnData {
+                    qualified_usage: sr.qualified_usage,
+                    session_id: sr.session_id,
+                    run_id: sr.run_id,
+                    partial_text: sr.full_text,
+                    prompt_tokens: sr.prompt_tokens,
+                    completion_tokens: sr.completion_tokens,
+                    cache_read_tokens: sr.cache_read_tokens,
+                    cache_creation_tokens: sr.cache_creation_tokens,
+                    usage_attribution: sr.usage_attribution,
+                    tool_calls_count: sr.tool_calls_count,
+                    tool_call_records: sr.tool_call_records,
+                    tools_used: sr.tools_used,
+                    stall_events: sr.stall_events,
+                    verdict_events: sr.verdict_events,
+                    last_heavy_checkpoint: sr.last_heavy_checkpoint,
+                    llm_rounds: sr.llm_rounds,
+                    token_usage_coverage: sr.token_usage_coverage,
+                    tool_outcomes,
+                    applied_user_intents: sr.applied_user_intents,
+                    run_transcript_messages: sr.run_transcript_messages,
+                    interruption: sr.interruption,
+                    ..Default::default()
+                },
+            }
+        }
+    };
+    failure.partial.failed_run_terminal = None;
+    retain_one_shot_observed_partial(&mut failure, incremental_state);
+    if had_failure {
+        if !failure.error.is_empty() {
+            failure.error.push_str("; ");
+        }
+        failure.error.push_str(reason);
+    }
+    Err(failure)
+}
+
+/// Called only after native delivery shutdown; a settled Server run cannot
+/// discharge the executor's independent, canonical local ownership barrier.
+#[allow(clippy::result_large_err)]
+pub(crate) fn settle_one_shot_user_interrupt_result(
+    result: Result<StreamResult, crate::TurnFailure>,
+    executor: Option<&crate::edge_tools::ToolExecutor>,
+    native_executor: Option<&crate::edge_tools::ToolExecutor>,
+    recover_clean_cancel: bool,
+    incremental_state: &astra_turn_core::turn_event_sink::IncrementalTurnState,
+) -> Result<StreamResult, crate::TurnFailure> {
+    let result = result.map_err(|mut failure| {
+        retain_one_shot_observed_partial(&mut failure, incremental_state);
+        failure
+    });
+    let local_unsettled = one_shot_local_ownership_unsettled(executor, native_executor);
+    if local_unsettled {
+        return retain_one_shot_interruption_failure(
+            result,
+            "workspace_ownership_unsettled; local execution settlement is unverified",
+            incremental_state,
+        );
+    }
+    match result {
+        Err(failure) if recover_clean_cancel && failure.is_clean_local_cancel() => Ok(
+            stream_result_from_incremental_snapshot(incremental_state.snapshot()),
+        ),
+        result => result,
+    }
+}
+
 fn apply_wall_deadline_interruption(sr: &mut StreamResult, server_terminal_verified: bool) {
     sr.final_state = "interrupted".to_string();
     sr.interruption_kind = Some("execution_incomplete".to_string());
@@ -3242,10 +3858,6 @@ fn retain_interrupted_partial_canonical_messages(sr: &mut StreamResult, user_mes
     ];
 }
 
-fn retain_wall_deadline_partial_canonical_messages(sr: &mut StreamResult, user_message: &str) {
-    retain_interrupted_partial_canonical_messages(sr, user_message);
-}
-
 fn stream_result_from_incremental_snapshot(
     snapshot: astra_turn_core::turn_event_sink::TurnIncrementalSnapshot,
 ) -> StreamResult {
@@ -3276,6 +3888,9 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
             != astra_services::session_journal::ToolCallDisposition::Executed
         {
             return false;
+        }
+        if record.execution_ok.is_some() && !record.ok {
+            return true;
         }
         match record.exit_semantics.as_deref().and_then(|tag| {
             serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(
@@ -3312,6 +3927,18 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
     if sr.final_state == "interrupted" {
         return ExitCode::Partial;
     }
+    // The shared loop's completed response follows its tool-result feedback.
+    // An earlier failed call remains audit evidence, not an exit-code veto.
+    if sr.final_state == "completed" && !sr.full_text.trim().is_empty() {
+        return ExitCode::Success;
+    }
+    if !sr.server_terminal_authoritative
+        && astra_turn_core::evaluation::has_unresolved_tool_result_delivery_failure(
+            &sr.tool_call_records,
+        )
+    {
+        return ExitCode::ToolFailure;
+    }
     if !sr.server_terminal_authoritative
         && sr.tool_call_records.iter().any(&is_error)
         && sr.tool_call_records.last().is_none_or(|record| {
@@ -3329,8 +3956,8 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
 
 /// Classify the user-visible terminal contract without turning advisory
 /// evidence into another execution/retry authority. A natural-language stop
-/// can still be useful output, but an active exact-argument failure or
-/// rejection means Astra cannot honestly label the result verified.
+/// can still be useful output. Historical tool failures remain diagnostics;
+/// lifecycle and explicit verification own the terminal disposition.
 fn completion_disposition(sr: &StreamResult, exit_code: ExitCode) -> &'static str {
     if exit_code != ExitCode::Success {
         return if sr.final_state == "interrupted" {
@@ -3345,17 +3972,7 @@ fn completion_disposition(sr: &StreamResult, exit_code: ExitCode) -> &'static st
     if sr.server_terminal_authoritative {
         return "completed";
     }
-    let unresolved = !astra_turn_core::evaluation::active_terminal_execution_failure_operation_keys(
-        &sr.tool_call_records,
-    )
-    .is_empty()
-        || !astra_turn_core::evaluation::active_rejected_operation_keys(&sr.tool_call_records)
-            .is_empty();
-    if unresolved {
-        "responded_unverified"
-    } else {
-        "completed"
-    }
+    "completed"
 }
 
 fn error_kind_for_exit_code(exit_code: ExitCode) -> Option<&'static str> {
@@ -3387,15 +4004,39 @@ fn final_json_output(sr: &StreamResult, exit_code: ExitCode) -> serde_json::Valu
     final_json_output_with_context(sr, exit_code, trace_id, request_id)
 }
 
+fn hard_failure_exit_code(failure: &crate::TurnFailure) -> ExitCode {
+    if failure.partial.server_admission_not_dispatched
+        && failure.partial.failure_kind == Some(astra_core::ErrorKind::ToolUnavailable)
+    {
+        ExitCode::ToolFailure
+    } else {
+        ExitCode::ApiError
+    }
+}
+
 /// Project observed failure facts without committing a successful turn or
 /// inferring a durable terminal from a transport error. Run identity comes
 /// only from the physical stream's validated root binding.
 fn hard_failure_json_output(failure: crate::TurnFailure) -> serde_json::Value {
+    let exit_code = hard_failure_exit_code(&failure);
+    let mut diagnostic = failure.error.clone();
+    crate::cli::turn::turn_failure_reporting::append_cancelled_context_notice(
+        &mut diagnostic,
+        failure.partial.cancel_context_not_saved,
+    );
     let partial = failure.partial;
+    let authoritative_failed = partial.failed_run_terminal.is_some()
+        && !partial.remote_cancel_required
+        && !partial.callback_client_detached
+        && !partial.admission_rejected
+        && partial.output_transport_failure.is_none();
+    let model_item_id = partial.partial_text_model_item_id.clone();
     let classes = partial
         .tool_outcomes
         .as_ref()
-        .filter(|outcomes| outcomes.is_consistent())
+        .filter(|outcomes| {
+            outcomes.is_consistent() && outcomes.requested == partial.tool_calls_count
+        })
         .map(|outcomes| {
             serde_json::json!({
                 "succeeded": outcomes.succeeded,
@@ -3414,21 +4055,60 @@ fn hard_failure_json_output(failure: crate::TurnFailure) -> serde_json::Value {
         completion_tokens: partial.completion_tokens,
         cache_read_tokens: partial.cache_read_tokens,
         cache_creation_tokens: partial.cache_creation_tokens,
+        qualified_usage: partial.qualified_usage,
+        usage_attribution: partial.usage_attribution,
         token_usage_coverage: partial.token_usage_coverage,
         llm_rounds: partial.llm_rounds,
         tool_calls_count: partial.tool_calls_count,
         tools_used: partial.tools_used,
         final_state: "failed".to_string(),
-        server_terminal_unverified: true,
+        server_terminal_authoritative: authoritative_failed,
+        server_terminal_unverified: !authoritative_failed,
         tool_record_coverage_partial: true,
         ..Default::default()
     };
-    let mut output = final_json_output(&result, ExitCode::ApiError);
+    let mut output = final_json_output(&result, exit_code);
+    if partial.server_admission_not_dispatched {
+        output["server_admission_not_dispatched"] = serde_json::json!(true);
+        if let Some(kind) = partial.failure_kind {
+            output["error_kind"] = serde_json::json!(kind.as_str());
+        }
+    }
+    if let Some(model_item_id) = model_item_id {
+        output["model_item_id"] = serde_json::json!(model_item_id);
+    }
     output["tool_result_class_counts"] = classes;
-    output["error"] = serde_json::json!(failure.error);
+    output["error"] = serde_json::json!(diagnostic);
     output["error_code"] = serde_json::json!(partial.error_code);
     output["error_metadata"] = serde_json::json!(partial.error_metadata);
+    if let Some(observation) = partial.cancel_context_not_saved {
+        output["context_not_saved"] = serde_json::json!(observation);
+    }
     output
+}
+
+fn merge_cancelled_context_observations(first: Option<bool>, second: Option<bool>) -> Option<bool> {
+    match (first, second) {
+        (Some(a), Some(b)) if a != b => None,
+        (Some(value), _) | (_, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn merge_cancelled_context_for_run(
+    outer: Option<bool>,
+    run_id: &str,
+    failure: &crate::TurnFailure,
+) -> Option<bool> {
+    if failure.partial.run_id.as_deref() != Some(run_id) {
+        return None;
+    }
+    failure
+        .partial
+        .cancel_context_not_saved
+        .map_or(outer, |inner| {
+            merge_cancelled_context_observations(outer, inner)
+        })
 }
 
 fn final_stream_json_result(sr: &StreamResult, exit_code: ExitCode) -> serde_json::Value {
@@ -3451,10 +4131,18 @@ fn final_json_output_with_context(
         sr.cache_creation_tokens,
     )
     .total_input_tokens();
-    let tool_result_class_counts = serde_json::to_value(sr.tool_ledger_aggregate.result_classes)
-        .expect("fixed tool result-class aggregate must serialize");
+    let tool_result_class_counts = if !sr
+        .tool_ledger_aggregate
+        .is_complete_for(sr.tool_calls_count)
+        || (sr.server_terminal_unverified && sr.tool_record_coverage_partial)
+    {
+        serde_json::json!({})
+    } else {
+        serde_json::to_value(sr.tool_ledger_aggregate.result_classes)
+            .expect("fixed tool result-class aggregate must serialize")
+    };
     let disposition = completion_disposition(sr, exit_code);
-    serde_json::json!({
+    let mut output = serde_json::json!({
         "trace_id": trace_id,
         "request_id": request_id,
         "run_id": sr.run_id,
@@ -3462,6 +4150,9 @@ fn final_json_output_with_context(
         "text": sr.full_text,
         "final_state": sr.final_state,
         "interruption_kind": sr.interruption_kind,
+        "interruption_reason": sr.interruption.as_ref()
+            .and_then(|interruption| interruption.get("reason"))
+            .and_then(serde_json::Value::as_str),
         "server_terminal_unverified": sr.server_terminal_unverified,
         "server_terminal_authoritative": sr.server_terminal_authoritative,
         "tool_record_coverage": if sr.tool_record_coverage_partial {
@@ -3478,6 +4169,7 @@ fn final_json_output_with_context(
             "creation_tokens": sr.cache_creation_tokens,
         },
         "completion_tokens": sr.completion_tokens,
+        "qualified_usage": sr.qualified_usage.map(astra_turn_types::CanonicalTokenUsage::to_json),
         "token_usage_coverage": {
             "scope": "logical_provider_calls",
             "attempts": sr.token_usage_coverage.attempts,
@@ -3490,11 +4182,20 @@ fn final_json_output_with_context(
         "tools_used": sr.tools_used,
         "local_continuation": if sr.local_continuation_omitted { Some("omitted_by_policy") } else { None },
         "persistence_error": sr.session_persistence_error,
+        "warning": one_shot_completion_warning(sr, exit_code),
         "exit_code": i32::from(exit_code),
         "success": exit_code == ExitCode::Success && disposition == "completed",
         "completion_disposition": disposition,
         "error_kind": error_kind_for_exit_code(exit_code),
-    })
+    });
+    if let Some(observation) = sr
+        .interruption
+        .as_ref()
+        .and_then(|value| value.get("context_not_saved"))
+    {
+        output["context_not_saved"] = observation.clone();
+    }
+    output
 }
 
 // All one-shot entrypoints bypass interactive startup but advertise a native
@@ -3643,9 +4344,9 @@ pub(crate) async fn run_print_mode(
         unified_skill_registry: astra_runtime::skills::default_unified_registry(),
         agent_spawner: None,
         root_agent_id: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         stream_event_tx: None,
         stream_json_emitter: stream_json_emitter.clone(),
         #[cfg(feature = "harness")]
@@ -3677,8 +4378,15 @@ pub(crate) async fn run_print_mode(
             return Ok(ExitCode::Success);
         }
         Err(e) => {
+            let failure_exit = hard_failure_exit_code(&e);
+            if output_format == "text" && !e.partial.partial_text.is_empty() {
+                write_headless_stdout(e.partial.partial_text.as_bytes())?;
+            }
+            eprintln!(
+                "{}",
+                crate::cli::turn::turn_failure_reporting::turn_failure_diagnostic(&e)
+            );
             if output_format == "json" || stream_json_emitter.is_some() {
-                let error = e.error.clone();
                 let mut output = hard_failure_json_output(e);
                 if let Some(emitter) = stream_json_emitter.as_ref() {
                     let result_session_id = output["session_id"].as_str().map(str::to_string);
@@ -3693,9 +4401,9 @@ pub(crate) async fn run_print_mode(
                             .map_err(|error| error.to_string())?,
                     )?;
                 }
-                return Err(error);
+                return Ok(failure_exit);
             }
-            return Err(e.error);
+            return Ok(failure_exit);
         }
     };
 
@@ -3948,8 +4656,804 @@ mod exit_code_tests {
     };
     use crate::cli::stream::streaming_types::VerdictEvent;
 
+    #[test]
+    fn local_host_failure_json_and_process_exit_share_classification() {
+        let failure = crate::TurnFailure {
+            error: "Local workspace execution requires an administrator to repair /tmp".into(),
+            partial: crate::PartialTurnData {
+                failure_kind: Some(astra_core::ErrorKind::ToolUnavailable),
+                error_code: Some(astra_tools::TOOL_ERROR_KIND_WORKSPACE_HOST_UNSUPPORTED.into()),
+                error_metadata: Some(serde_json::json!({"retryable":false})),
+                server_admission_not_dispatched: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            super::hard_failure_exit_code(&failure),
+            ExitCode::ToolFailure
+        );
+        let output = super::hard_failure_json_output(failure);
+        assert_eq!(output["exit_code"], 1);
+        assert_eq!(output["error_kind"], "tool_unavailable");
+        assert_eq!(output["error_code"], "workspace_host_unsupported");
+        assert_eq!(output["server_admission_not_dispatched"], true);
+        assert_eq!(output["success"], false);
+        assert!(output["run_id"].is_null());
+        assert_eq!(output["prompt_tokens"], 0);
+        assert_eq!(output["tool_calls_count"], 0);
+    }
+
     fn empty_stream_result() -> StreamResult {
         StreamResult::default()
+    }
+
+    #[test]
+    fn user_interrupt_local_fence_rejects_drained_ok_and_preserves_partial_json() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = crate::edge_tools::ToolExecutor::new(root.path());
+        assert!(
+            astra_tools::workspace_observation::mark_workspace_observation_unsettled(root.path())
+        );
+        let result = StreamResult {
+            session_id: Some("session".into()),
+            run_id: Some("run".into()),
+            full_text: "observed prefix".into(),
+            prompt_tokens: 17,
+            llm_rounds: Some(2),
+            server_terminal_authoritative: true,
+            run_transcript_messages: vec![
+                serde_json::json!({"role": "assistant", "content": "observed prefix"}),
+            ],
+            ..Default::default()
+        };
+        let failure = super::settle_one_shot_user_interrupt_result(
+            Ok(result),
+            Some(&executor),
+            None,
+            true,
+            &Default::default(),
+        )
+        .unwrap_err();
+        assert_eq!(failure.partial.llm_rounds, Some(2));
+        assert_eq!(failure.partial.run_transcript_messages.len(), 1);
+        let json = super::hard_failure_json_output(failure);
+        assert_eq!(json["session_id"], "session");
+        assert_eq!(json["run_id"], "run");
+        assert_eq!(json["text"], "observed prefix");
+        assert_eq!(json["prompt_tokens"], 17);
+        assert_eq!(json["success"], false);
+        assert_eq!(json["server_terminal_unverified"], true);
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("workspace_ownership_unsettled"));
+        assert!(error.contains("local execution settlement is unverified"));
+    }
+
+    #[test]
+    fn user_interrupt_local_fence_preserves_clean_cancel_and_hard_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = crate::edge_tools::ToolExecutor::new(root.path());
+        assert!(
+            astra_tools::workspace_observation::mark_workspace_observation_unsettled(root.path())
+        );
+        for kind in [
+            astra_core::ErrorKind::Cancelled,
+            astra_core::ErrorKind::ContractViolation,
+        ] {
+            let failure = crate::TurnFailure {
+                error: "original failure".into(),
+                partial: crate::PartialTurnData {
+                    failure_kind: Some(kind),
+                    partial_text: "retained partial".into(),
+                    error_code: (kind != astra_core::ErrorKind::Cancelled)
+                        .then(|| "original_code".into()),
+                    prompt_tokens: 23,
+                    ..Default::default()
+                },
+            };
+            let expected_code = failure.partial.error_code.clone();
+            let failure = super::settle_one_shot_user_interrupt_result(
+                Err(failure),
+                Some(&executor),
+                None,
+                true,
+                &Default::default(),
+            )
+            .unwrap_err();
+            assert!(
+                failure
+                    .error
+                    .starts_with("original failure; workspace_ownership_unsettled")
+            );
+            assert_eq!(failure.partial.failure_kind, Some(kind));
+            assert_eq!(failure.partial.error_code, expected_code);
+            assert_eq!(failure.partial.partial_text, "retained partial");
+            assert_eq!(failure.partial.prompt_tokens, 23);
+        }
+    }
+
+    #[test]
+    fn user_interrupt_local_fence_recovers_observed_prefix_without_promoting_cancel() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = crate::edge_tools::ToolExecutor::new(root.path());
+        assert!(
+            astra_tools::workspace_observation::mark_workspace_observation_unsettled(root.path())
+        );
+        let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+        state.replace_text("observed prefix before text_done");
+        let failure = crate::TurnFailure {
+            error: "original cancellation".into(),
+            partial: crate::PartialTurnData {
+                failure_kind: Some(astra_core::ErrorKind::Cancelled),
+                prompt_tokens: 9,
+                ..Default::default()
+            },
+        };
+        let failure = super::settle_one_shot_user_interrupt_result(
+            Err(failure),
+            Some(&executor),
+            None,
+            true,
+            &state,
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.partial.failure_kind,
+            Some(astra_core::ErrorKind::Cancelled)
+        );
+        assert_eq!(failure.partial.prompt_tokens, 9);
+        assert!(
+            failure
+                .error
+                .starts_with("original cancellation; workspace_ownership_unsettled")
+        );
+        let json = super::hard_failure_json_output(failure);
+        assert_eq!(json["text"], "observed prefix before text_done");
+        assert_eq!(json["exit_code"], 3);
+        assert_eq!(json["final_state"], "failed");
+        assert_eq!(json["server_terminal_unverified"], true);
+        assert_eq!(json["success"], false);
+    }
+
+    #[test]
+    fn user_interrupt_local_fence_keeps_existing_hard_error_prefix_and_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = crate::edge_tools::ToolExecutor::new(root.path());
+        assert!(
+            astra_tools::workspace_observation::mark_workspace_observation_unsettled(root.path())
+        );
+        let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+        state.replace_text("incremental prefix must not replace retained text");
+        let metadata = serde_json::json!({"source": "synthetic binding failure"});
+        let failure = crate::TurnFailure {
+            error: "original contract violation".into(),
+            partial: crate::PartialTurnData {
+                failure_kind: Some(astra_core::ErrorKind::ContractViolation),
+                error_code: Some("original_code".into()),
+                error_metadata: Some(metadata.clone()),
+                partial_text: "original canonical partial".into(),
+                ..Default::default()
+            },
+        };
+        let failure = super::settle_one_shot_user_interrupt_result(
+            Err(failure),
+            Some(&executor),
+            None,
+            true,
+            &state,
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.partial.failure_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
+        );
+        assert!(
+            failure
+                .error
+                .starts_with("original contract violation; workspace_ownership_unsettled")
+        );
+        let json = super::hard_failure_json_output(failure);
+        assert_eq!(json["text"], "original canonical partial");
+        assert_eq!(json["error_code"], "original_code");
+        assert_eq!(json["error_metadata"], metadata);
+        assert_eq!(json["exit_code"], 3);
+        assert_eq!(json["server_terminal_unverified"], true);
+    }
+
+    #[test]
+    fn user_interrupt_without_local_fence_retains_existing_partial_contract() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = crate::edge_tools::ToolExecutor::new(root.path());
+        for executor in [None, Some(&executor)] {
+            let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+            let failure = crate::TurnFailure {
+                error: "cancelled".into(),
+                partial: crate::PartialTurnData {
+                    failure_kind: Some(astra_core::ErrorKind::Cancelled),
+                    ..Default::default()
+                },
+            };
+            let mut recovered = super::settle_one_shot_user_interrupt_result(
+                Err(failure),
+                executor,
+                None,
+                true,
+                &state,
+            )
+            .unwrap();
+            super::apply_wall_deadline_interruption(&mut recovered, true);
+            assert_eq!(super::compute_exit_code(&recovered), ExitCode::Partial);
+            assert!(!recovered.server_terminal_unverified);
+            let unchanged = super::settle_one_shot_user_interrupt_result(
+                Ok(StreamResult {
+                    full_text: "unchanged".into(),
+                    ..Default::default()
+                }),
+                executor,
+                None,
+                true,
+                &state,
+            )
+            .unwrap();
+            assert_eq!(unchanged.full_text, "unchanged");
+            for kind in [
+                astra_core::ErrorKind::Cancelled,
+                astra_core::ErrorKind::ContractViolation,
+            ] {
+                let failure = crate::TurnFailure {
+                    error: "unsettled or hard failure".into(),
+                    partial: crate::PartialTurnData {
+                        failure_kind: Some(kind),
+                        ..Default::default()
+                    },
+                };
+                assert!(
+                    super::settle_one_shot_user_interrupt_result(
+                        Err(failure),
+                        executor,
+                        None,
+                        kind != astra_core::ErrorKind::Cancelled,
+                        &state,
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn user_interrupt_unfenced_hard_failure_retains_observed_prefix_without_promotion() {
+        let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+        state.replace_text("observed partial");
+        let metadata = serde_json::json!({"source": "original contract failure"});
+        for original_text in ["", "original retained partial"] {
+            let failure = crate::TurnFailure {
+                error: "original contract violation".into(),
+                partial: crate::PartialTurnData {
+                    failure_kind: Some(astra_core::ErrorKind::ContractViolation),
+                    error_code: Some("original_code".into()),
+                    error_metadata: Some(metadata.clone()),
+                    partial_text: original_text.into(),
+                    prompt_tokens: 11,
+                    ..Default::default()
+                },
+            };
+            // No local fence or secondary cleanup error: the hard failure
+            // still owns the terminal while its visible prefix survives.
+            let failure = super::settle_one_shot_user_interrupt_result(
+                Err(failure),
+                None,
+                None,
+                true,
+                &state,
+            )
+            .unwrap_err();
+            assert_eq!(failure.error, "original contract violation");
+            assert_eq!(
+                failure.partial.failure_kind,
+                Some(astra_core::ErrorKind::ContractViolation)
+            );
+            let json = super::hard_failure_json_output(failure);
+            assert_eq!(
+                json["text"],
+                if original_text.is_empty() {
+                    "observed partial"
+                } else {
+                    original_text
+                }
+            );
+            assert_eq!(json["error_code"], "original_code");
+            assert_eq!(json["error_metadata"], metadata);
+            assert_eq!(json["prompt_tokens"], 11);
+            assert_eq!(json["exit_code"], 3);
+            assert_eq!(json["final_state"], "failed");
+            assert_eq!(json["server_terminal_unverified"], true);
+            assert_eq!(json["success"], false);
+        }
+    }
+
+    fn one_shot_cleanup_test_failure(kind: astra_core::ErrorKind) -> crate::TurnFailure {
+        crate::TurnFailure {
+            error: "original turn failure".into(),
+            partial: crate::PartialTurnData {
+                failure_kind: Some(kind),
+                error_code: (kind == astra_core::ErrorKind::ContractViolation)
+                    .then(|| "original_code".into()),
+                error_metadata: Some(serde_json::json!({"source": "original failure"})),
+                partial_text: "original failure prefix".into(),
+                prompt_tokens: 11,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn assert_one_shot_cleanup_stays_failed(
+        result: Result<StreamResult, crate::TurnFailure>,
+        cleanup_settled: bool,
+        kind: Option<astra_core::ErrorKind>,
+        state: &astra_turn_core::turn_event_sink::IncrementalTurnState,
+        causes: &[&str],
+    ) {
+        assert!(!cleanup_settled);
+        // This is the same recovery gate used after the production cleanup
+        // boundaries, even when the prior kind was a clean cancellation.
+        let failure = super::settle_one_shot_user_interrupt_result(
+            result,
+            None,
+            None,
+            cleanup_settled,
+            state,
+        )
+        .unwrap_err();
+        assert_eq!(failure.partial.failure_kind, kind);
+        for cause in causes {
+            assert!(failure.error.contains(cause), "{}", failure.error);
+        }
+        let json = super::hard_failure_json_output(failure);
+        assert_eq!(json["exit_code"], 3);
+        assert_eq!(json["final_state"], "failed");
+        assert_eq!(json["server_terminal_unverified"], true);
+        assert_eq!(json["success"], false);
+        if kind.is_some() {
+            assert!(
+                json["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("original turn failure;")
+            );
+            assert_eq!(json["text"], "original failure prefix");
+            assert_eq!(json["prompt_tokens"], 11);
+            assert_eq!(
+                json["error_metadata"],
+                serde_json::json!({"source": "original failure"})
+            );
+            if kind == Some(astra_core::ErrorKind::ContractViolation) {
+                assert_eq!(json["error_code"], "original_code");
+            } else {
+                assert!(json["error_code"].is_null());
+            }
+        } else {
+            assert_eq!(json["text"], "observed result prefix");
+            assert_eq!(json["prompt_tokens"], 7);
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupts_survive_successful_native_and_writer_cleanup() {
+        async fn signal(receiver: tokio::sync::oneshot::Receiver<()>) -> std::io::Result<()> {
+            receiver.await.unwrap();
+            Ok(())
+        }
+        for first_signal in [false, true] {
+            for event_writer in [false, true] {
+                for kind in [
+                    None,
+                    Some(astra_core::ErrorKind::Cancelled),
+                    Some(astra_core::ErrorKind::ContractViolation),
+                ] {
+                    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+                    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
+                    let (_unsent, pending_rx) = tokio::sync::oneshot::channel();
+                    let (first_rx, second_rx) = if first_signal {
+                        (signal_rx, pending_rx)
+                    } else {
+                        (pending_rx, signal_rx)
+                    };
+                    let first = signal(first_rx);
+                    let second = signal(second_rx);
+                    tokio::pin!(first, second);
+                    let cleanup_started = started.clone();
+                    let cleanup_finished = finished.clone();
+                    let work = async move {
+                        cleanup_started.notify_one();
+                        release_rx.await.unwrap();
+                        cleanup_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                    };
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let cleanup = async {
+                        if event_writer {
+                            let writer = tokio::spawn(async move {
+                                work.await;
+                                Ok(())
+                            });
+                            super::settle_one_shot_stream_event_writer(Some(writer), Some(deadline))
+                                .await
+                        } else {
+                            work.await;
+                            Ok(())
+                        }
+                    };
+                    let mut interrupted = false;
+                    let mut user_interrupted = !first_signal;
+                    let mut deadline = Some(deadline);
+                    let observe = super::settle_one_shot_cleanup_observing_interrupt(
+                        cleanup,
+                        if event_writer {
+                            "stream-event writer"
+                        } else {
+                            "native delivery shutdown"
+                        },
+                        &mut first,
+                        &mut second,
+                        &mut user_interrupted,
+                        &mut interrupted,
+                        &mut deadline,
+                    );
+                    let signal = async {
+                        started.notified().await;
+                        signal_tx.send(()).unwrap();
+                        release_tx.send(()).unwrap();
+                    };
+                    let (cleanup, ()) = tokio::join!(observe, signal);
+                    cleanup.unwrap();
+                    assert!(
+                        user_interrupted,
+                        "the late signal survives successful cleanup"
+                    );
+                    assert_eq!(interrupted, !first_signal);
+                    assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+                    // The next phase must join without polling the completed signal.
+                    super::settle_one_shot_cleanup_observing_interrupt(
+                        std::future::ready(Ok(())),
+                        "later cleanup",
+                        &mut first,
+                        &mut second,
+                        &mut user_interrupted,
+                        &mut interrupted,
+                        &mut deadline,
+                    )
+                    .await
+                    .unwrap();
+                    let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+                    let result = match kind {
+                        Some(kind) => Err(one_shot_cleanup_test_failure(kind)),
+                        None => Ok(StreamResult {
+                            full_text: "observed result prefix".into(),
+                            prompt_tokens: 7,
+                            ..Default::default()
+                        }),
+                    };
+                    let mut cleanup_settled = true;
+                    let cause = if first_signal {
+                        "user_interrupted during final cleanup"
+                    } else {
+                        "second Ctrl+C"
+                    };
+                    let result = super::apply_one_shot_cleanup_result(
+                        result,
+                        Err(cause.into()),
+                        &state,
+                        &mut cleanup_settled,
+                    );
+                    assert_one_shot_cleanup_stays_failed(
+                        result,
+                        cleanup_settled,
+                        kind,
+                        &state,
+                        &[cause],
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_interrupt_during_cleanup_bounds_the_original_wait() {
+        let started = tokio::time::Instant::now();
+        let first = std::future::ready(Ok::<(), std::io::Error>(()));
+        let second = std::future::pending::<std::io::Result<()>>();
+        tokio::pin!(first, second);
+        let mut user_interrupted = false;
+        let mut second_interrupted = false;
+        let mut deadline = None;
+        let failure = super::settle_one_shot_cleanup_observing_interrupt(
+            std::future::pending(),
+            "native delivery shutdown",
+            &mut first,
+            &mut second,
+            &mut user_interrupted,
+            &mut second_interrupted,
+            &mut deadline,
+        )
+        .await
+        .unwrap_err();
+        assert!(user_interrupted);
+        assert!(!second_interrupted);
+        assert_eq!(deadline, Some(started + std::time::Duration::from_secs(10)));
+        assert_eq!(tokio::time::Instant::now(), deadline.unwrap());
+        assert!(failure.contains("native delivery shutdown did not settle"));
+        // A completed cleanup is still a fact even when the budget is spent.
+        super::settle_one_shot_cleanup_observing_interrupt(
+            std::future::ready(Ok(())),
+            "already joined writer",
+            &mut first,
+            &mut second,
+            &mut user_interrupted,
+            &mut second_interrupted,
+            &mut deadline,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_shot_native_shutdown_timeout_preserves_prior_failure_and_cleanup_veto() {
+        for kind in [
+            None,
+            Some(astra_core::ErrorKind::Cancelled),
+            Some(astra_core::ErrorKind::ContractViolation),
+        ] {
+            let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+            state.replace_text("incremental prefix cannot replace existing text");
+            let input = match kind {
+                None => Ok(StreamResult {
+                    full_text: "observed result prefix".into(),
+                    prompt_tokens: 7,
+                    ..Default::default()
+                }),
+                Some(kind) => Err(one_shot_cleanup_test_failure(kind)),
+            };
+            if kind == Some(astra_core::ErrorKind::Cancelled) {
+                assert!(input.as_ref().unwrap_err().is_clean_local_cancel());
+            }
+            let first = std::future::pending::<std::io::Result<()>>();
+            let second = std::future::pending::<std::io::Result<()>>();
+            tokio::pin!(first, second);
+            let mut user_interrupted = true;
+            let mut second_interrupted = false;
+            let mut deadline =
+                Some(tokio::time::Instant::now() + std::time::Duration::from_secs(5));
+            let shutdown = super::settle_one_shot_cleanup_observing_interrupt(
+                std::future::pending(),
+                "native delivery shutdown",
+                &mut first,
+                &mut second,
+                &mut user_interrupted,
+                &mut second_interrupted,
+                &mut deadline,
+            )
+            .await;
+            let mut cleanup_settled = true;
+            let result =
+                super::apply_one_shot_cleanup_result(input, shutdown, &state, &mut cleanup_settled);
+            // A later successful cleanup cannot erase the earlier timeout veto.
+            let result =
+                super::apply_one_shot_cleanup_result(result, Ok(()), &state, &mut cleanup_settled);
+            let writer = tokio::spawn(async {
+                Err::<(), _>(std::io::Error::from_raw_os_error(libc::ENOSPC))
+            });
+            let writer_result =
+                super::settle_one_shot_stream_event_writer(Some(writer), None).await;
+            let result = super::apply_one_shot_cleanup_result(
+                result,
+                writer_result,
+                &state,
+                &mut cleanup_settled,
+            );
+            assert_one_shot_cleanup_stays_failed(
+                result,
+                cleanup_settled,
+                kind,
+                &state,
+                &[
+                    "native delivery shutdown did not settle",
+                    "stream-event file write failed",
+                ],
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn one_shot_event_writer_failure_preserves_prior_failure_and_cleanup_veto() {
+        for kind in [
+            None,
+            Some(astra_core::ErrorKind::Cancelled),
+            Some(astra_core::ErrorKind::ContractViolation),
+        ] {
+            let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+            let writer = tokio::spawn(async {
+                Err::<(), _>(std::io::Error::from_raw_os_error(libc::ENOSPC))
+            });
+            let writer_result =
+                super::settle_one_shot_stream_event_writer(Some(writer), None).await;
+            let mut cleanup_settled = true;
+            let input = match kind {
+                None => Ok(StreamResult {
+                    full_text: "observed result prefix".into(),
+                    prompt_tokens: 7,
+                    ..Default::default()
+                }),
+                Some(kind) => Err(one_shot_cleanup_test_failure(kind)),
+            };
+            let result = super::apply_one_shot_cleanup_result(
+                input,
+                writer_result,
+                &state,
+                &mut cleanup_settled,
+            );
+            assert_one_shot_cleanup_stays_failed(
+                result,
+                cleanup_settled,
+                kind,
+                &state,
+                &["stream-event file write failed"],
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn one_shot_cleanup_failure_prevents_settled_stdout_success() {
+        let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+        state.replace_text("observed prefix");
+        let failure = crate::TurnFailure {
+            error: "stdout closed".into(),
+            partial: crate::PartialTurnData {
+                output_transport_failure: Some(
+                    crate::cli::stream::streaming_types::OutputTransportFailure::Closed,
+                ),
+                ..Default::default()
+            },
+        };
+        assert!(super::one_shot_stdout_closure_is_settled(
+            &failure, true, true, None, None
+        ));
+        let writer =
+            tokio::spawn(async { Err::<(), _>(std::io::Error::from_raw_os_error(libc::ENOSPC)) });
+        let writer_result = super::settle_one_shot_stream_event_writer(Some(writer), None).await;
+        let mut cleanup_settled = true;
+        let failure = super::apply_one_shot_cleanup_result(
+            Err(failure),
+            writer_result,
+            &state,
+            &mut cleanup_settled,
+        )
+        .unwrap_err();
+        assert!(!super::one_shot_stdout_closure_is_settled(
+            &failure,
+            true,
+            cleanup_settled,
+            None,
+            None
+        ));
+        assert_eq!(failure.partial.partial_text, "observed prefix");
+        assert!(
+            failure
+                .error
+                .starts_with("stdout closed; stream-event file write failed")
+        );
+    }
+
+    fn accepted_failed_run() -> crate::TurnFailure {
+        crate::TurnFailure {
+            error: "provider stream stopped".into(),
+            partial: crate::PartialTurnData {
+                run_id: Some("failed-root".into()),
+                failure_kind: Some(astra_core::ErrorKind::StreamTransport),
+                failed_run_terminal: Some(astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminal {
+                    run_id: "failed-root".into(), owner_generation: Some(4),
+                    status: astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminalStatus::Failed,
+                    error: Some("provider stream stopped".into()),
+                    error_kind: Some(astra_core::ErrorKind::StreamTransport),
+                    interruption: None,
+                }),
+                partial_text: "  real partial bytes\n".into(),
+                partial_text_model_item_id: Some("partial-model-item".into()),
+                qualified_usage: Some(astra_turn_types::CanonicalTokenUsage::new(Some(17), None, None, Some(3)).unwrap()),
+                prompt_tokens: 17, completion_tokens: 3,
+                interruption: Some(serde_json::json!({"kind":"stream_transport","resumable":true})),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn failed_terminal_stays_failed_with_observed_identity_and_unknown_usage_lanes() {
+        let failure = accepted_failed_run();
+        assert!(!failure.is_clean_local_cancel());
+        let json = super::hard_failure_json_output(failure);
+        assert_eq!(json["final_state"], "failed");
+        assert_eq!(json["exit_code"], 3);
+        assert_eq!(json["success"], false);
+        assert_eq!(json["server_terminal_authoritative"], true);
+        assert_eq!(json["server_terminal_unverified"], false);
+        assert_eq!(json["text"], "  real partial bytes\n");
+        assert_eq!(json["model_item_id"], "partial-model-item");
+        assert_eq!(
+            json["qualified_usage"],
+            serde_json::json!({"input_tokens":17,"output_tokens":3})
+        );
+        assert!(json["llm_rounds"].is_null());
+        assert!(json["local_continuation"].is_null());
+    }
+
+    #[test]
+    fn failed_remote_run_does_not_invent_tool_result_classes() {
+        for (count, outcomes) in [
+            (0, None),
+            (1, None),
+            (4, None),
+            (4, Some(Default::default())),
+        ] {
+            let mut failure = accepted_failed_run();
+            failure.partial.tool_calls_count = count;
+            failure.partial.tool_outcomes = outcomes;
+            let json = super::hard_failure_json_output(failure);
+            assert_eq!(json["tool_calls_count"], count);
+            assert_eq!(json["tool_result_class_counts"], serde_json::json!({}));
+        }
+    }
+
+    #[test]
+    fn local_failure_owner_revokes_failed_terminal_projection_without_losing_observations() {
+        let mut settled = true;
+        let failure = super::apply_one_shot_cleanup_result(
+            Err(accepted_failed_run()),
+            Err("local output writer failed".into()),
+            &Default::default(),
+            &mut settled,
+        )
+        .unwrap_err();
+        assert!(!settled);
+        assert!(failure.partial.failed_run_terminal.is_none());
+        let json = super::hard_failure_json_output(failure);
+        assert_eq!(json["server_terminal_authoritative"], false);
+        assert_eq!(json["server_terminal_unverified"], true);
+        assert_eq!(json["text"], "  real partial bytes\n");
+        assert_eq!(json["model_item_id"], "partial-model-item");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("local output writer failed")
+        );
+    }
+
+    #[test]
+    fn one_shot_root_drain_failure_preserves_original_partial_classification() {
+        let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+        let kind = Some(astra_core::ErrorKind::ContractViolation);
+        let interruption = serde_json::json!({
+            "kind": "execution_incomplete", "resumable": true, "reason": "original reason",
+        });
+        let mut prior = one_shot_cleanup_test_failure(astra_core::ErrorKind::ContractViolation);
+        prior.partial.interruption = Some(interruption.clone());
+        let mut cleanup_settled = true;
+        let result = super::apply_one_shot_cleanup_result(
+            Err(prior),
+            Err("request interrupted without root execution settlement".into()),
+            &state,
+            &mut cleanup_settled,
+        );
+        let failure = result.unwrap_err();
+        assert_eq!(failure.partial.interruption, Some(interruption));
+        assert_one_shot_cleanup_stays_failed(
+            Err(failure),
+            cleanup_settled,
+            kind,
+            &state,
+            &["request interrupted without root execution settlement"],
+        );
     }
 
     #[test]
@@ -4176,6 +5680,83 @@ mod exit_code_tests {
                 ..Default::default()
             });
         assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
+    }
+
+    #[test]
+    fn exit_code_reports_delivery_failure_after_successful_command() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "bash".to_string(),
+                ok: false,
+                execution_ok: Some(true),
+                exit_semantics: Some("success".to_string()),
+                ..Default::default()
+            });
+        assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
+    }
+
+    #[test]
+    fn completed_model_response_is_not_overridden_by_an_earlier_delivery_failure() {
+        let mut sr = empty_stream_result();
+        sr.full_text = "I verified the output.".into();
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "write_file".into(),
+                ok: false,
+                execution_ok: Some(true),
+                ..Default::default()
+            });
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+        assert_eq!(
+            super::one_shot_completion_warning(&sr, ExitCode::Success),
+            None
+        );
+
+        sr.final_state = "interrupted".into();
+        assert_eq!(compute_exit_code(&sr), ExitCode::Partial);
+    }
+
+    #[test]
+    fn read_delivery_failure_does_not_block_an_alternative_observation() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "read_file".into(),
+                ok: false,
+                execution_ok: Some(true),
+                args_full: Some(r#"{"path":"one.txt"}"#.into()),
+                ..Default::default()
+            });
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "read_file".into(),
+                ok: true,
+                args_full: Some(r#"{"path":"two.txt"}"#.into()),
+                ..Default::default()
+            });
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+        assert_eq!(
+            super::one_shot_completion_warning(&sr, ExitCode::Success),
+            None
+        );
+
+        // A lost mutation outcome cannot be recovered by an unrelated read.
+        sr.tool_call_records[0].name = "write_file".into();
+        assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
+        assert!(
+            super::one_shot_completion_warning(&sr, ExitCode::ToolFailure)
+                .unwrap()
+                .contains("result could not be saved or delivered")
+        );
+
+        // The server's terminal state supersedes stale local tool records.
+        sr.server_terminal_authoritative = true;
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+        assert_eq!(
+            super::one_shot_completion_warning(&sr, ExitCode::Success),
+            None
+        );
     }
 
     fn tool_call_record(
@@ -4449,7 +6030,59 @@ mod exit_code_tests {
 
 #[cfg(test)]
 mod final_json_output_tests {
-    use super::{ExitCode, StreamResult, final_json_output_with_context, final_stream_json_result};
+    use super::{
+        ExitCode, StreamResult, final_json_output_with_context, final_stream_json_result,
+        hard_failure_json_output,
+    };
+
+    #[test]
+    fn interrupted_json_preserves_context_save_observation() {
+        for observed in [Some(true), Some(false), None] {
+            let mut result = StreamResult::default();
+            result.interruption = Some(serde_json::json!({"context_not_saved": observed}));
+            let output = final_json_output_with_context(&result, ExitCode::Partial, None, None);
+            assert_eq!(output["context_not_saved"], serde_json::json!(observed));
+        }
+    }
+
+    #[test]
+    fn failed_json_preserves_context_save_observation() {
+        for observed in [Some(true), Some(false), None] {
+            let output = hard_failure_json_output(crate::TurnFailure {
+                error: "cancelled during cleanup".into(),
+                partial: crate::PartialTurnData {
+                    cancel_context_not_saved: Some(observed),
+                    ..Default::default()
+                },
+            });
+            assert_eq!(output["context_not_saved"], serde_json::json!(observed));
+        }
+    }
+
+    #[test]
+    fn stronger_cancelled_context_observation_wins_but_conflicts_are_unknown() {
+        use super::merge_cancelled_context_observations as merge;
+        assert_eq!(merge(None, Some(true)), Some(true));
+        assert_eq!(merge(Some(false), None), Some(false));
+        assert_eq!(merge(Some(true), Some(false)), None);
+        assert_eq!(merge(None, None), None);
+        let failure = crate::TurnFailure {
+            error: "cancelled".into(),
+            partial: crate::PartialTurnData {
+                run_id: Some("root".into()),
+                cancel_context_not_saved: Some(Some(true)),
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            super::merge_cancelled_context_for_run(None, "root", &failure),
+            Some(true)
+        );
+        assert_eq!(
+            super::merge_cancelled_context_for_run(None, "child", &failure),
+            None
+        );
+    }
 
     fn stream_result_for_json() -> StreamResult {
         StreamResult {
@@ -4501,6 +6134,7 @@ mod final_json_output_tests {
         assert_eq!(output["text"], "hello");
         assert_eq!(output["final_state"], "completed");
         assert!(output["interruption_kind"].is_null());
+        assert!(output["interruption_reason"].is_null());
         assert_eq!(
             output["tool_result_class_counts"],
             serde_json::json!({
@@ -4543,6 +6177,7 @@ mod final_json_output_tests {
             "text",
             "final_state",
             "interruption_kind",
+            "interruption_reason",
             "tool_result_class_counts",
             "prompt_tokens",
             "fresh_prompt_tokens",
@@ -4611,6 +6246,31 @@ mod final_json_output_tests {
     }
 
     #[test]
+    fn final_json_does_not_invent_zero_classes_for_missing_remote_accounting() {
+        let mut sr = stream_result_for_json();
+        sr.tool_calls_count = 4;
+        sr.tool_ledger_aggregate = Default::default();
+        sr.server_terminal_authoritative = true;
+        sr.server_terminal_unverified = true;
+        sr.tool_record_coverage_partial = true;
+        let output = final_json_output_with_context(&sr, ExitCode::Partial, None, None);
+        assert_eq!(output["tool_calls_count"], 4);
+        assert_eq!(output["tool_result_class_counts"], serde_json::json!({}));
+        sr.tool_calls_count = 0;
+        sr.server_terminal_unverified = false;
+        sr.tool_ledger_aggregate.consistent = false;
+        let unknown = final_json_output_with_context(&sr, ExitCode::Partial, None, None);
+        assert_eq!(unknown["tool_result_class_counts"], serde_json::json!({}));
+        assert!(sr.canonical_tool_outcomes().is_none());
+        sr.tool_ledger_aggregate =
+            astra_turn_types::tool_ledger_receipt::ToolLedgerReceipt::empty("run", 1)
+                .canonical_aggregate();
+        let measured = final_json_output_with_context(&sr, ExitCode::Partial, None, None);
+        assert_eq!(measured["tool_result_class_counts"]["failed"], 0);
+        assert_eq!(sr.canonical_tool_outcomes().unwrap().requested, 0);
+    }
+
+    #[test]
     fn execution_incomplete_receipt_can_never_serialize_as_success() {
         let mut sr = stream_result_for_json();
         sr.final_state = "interrupted".into();
@@ -4627,6 +6287,10 @@ mod final_json_output_tests {
 
         assert_eq!(output["final_state"], "interrupted");
         assert_eq!(output["completion_disposition"], "interrupted");
+        assert_eq!(
+            output["interruption_reason"],
+            "remote_tool_receipt_unresolved"
+        );
         assert_eq!(output["success"], false);
         assert_eq!(output["exit_code"], 5);
     }
@@ -4662,7 +6326,7 @@ mod final_json_output_tests {
     }
 
     #[test]
-    fn final_json_output_marks_active_exact_failure_as_unverified() {
+    fn final_json_output_keeps_historical_failure_separate_from_completion() {
         let mut sr = stream_result_for_json();
         sr.tool_call_records
             .push(astra_services::session_journal::ToolCallRecord {
@@ -4675,9 +6339,13 @@ mod final_json_output_tests {
             });
         let output = final_json_output_with_context(&sr, ExitCode::Success, None, None);
 
-        assert_eq!(output["completion_disposition"], "responded_unverified");
-        assert_eq!(output["success"], false);
+        assert_eq!(output["completion_disposition"], "completed");
+        assert_eq!(output["success"], true);
         assert_eq!(output["exit_code"], 0);
+        assert!(
+            !sr.tool_call_records[0].ok,
+            "failure remains diagnostic evidence"
+        );
     }
 
     #[test]
@@ -4800,7 +6468,7 @@ mod one_shot_persistence_tests {
     use super::{
         ExitCode, HeadlessCanonicalCommitStatus, StreamResult, apply_wall_deadline_interruption,
         finalize_one_shot_stream_result, finalize_one_shot_stream_result_with_request_lease,
-        persist_headless_session_state, retain_wall_deadline_partial_canonical_messages,
+        persist_headless_session_state, retain_interrupted_partial_canonical_messages,
         stream_result_from_incremental_snapshot,
     };
 
@@ -5295,7 +6963,7 @@ mod one_shot_persistence_tests {
             },
         );
         apply_wall_deadline_interruption(&mut result, false);
-        retain_wall_deadline_partial_canonical_messages(&mut result, "perform bounded work");
+        retain_interrupted_partial_canonical_messages(&mut result, "perform bounded work");
 
         let exit_code = finalize_one_shot_stream_result_with_request_lease(
             None,
@@ -5537,6 +7205,7 @@ mod one_shot_persistence_tests {
             qualified_usage: None,
             session_id: Some(sid.clone()),
             run_id: None,
+            cancel_context_not_saved: None,
             session_persistence_error: None,
             local_continuation_omitted: false,
             full_text: "answer".into(),
@@ -5672,6 +7341,7 @@ mod one_shot_persistence_tests {
             qualified_usage: None,
             session_id: Some(sid.clone()),
             run_id: None,
+            cancel_context_not_saved: None,
             session_persistence_error: None,
             local_continuation_omitted: false,
             full_text: "answer".into(),

@@ -553,9 +553,9 @@ fn planning_section() -> &'static str {
      5. **Preserve sole evidence**: checksum ≠ backup; use the current tool schema or its explicit selection protocol for any source-artifact contract; make the boundary observable before observe → transform → validate.\n\
      6. **Never batch writes**: write_file/str_replace/bash/worktree execute sequentially.\n\
      7. **Build/test only AFTER your writes**; not for exploration/review/Q&A.\n\
-     8. **Converge on evidence**: once targeted reads establish the affected set, and the task requires and authorizes a change, make the smallest safe mutation; for read-only work, summarize or change approach when reads add no new evidence.\n\
+     8. **Converge on evidence**: once targeted reads establish scope, make the smallest authorized change; for read-only work, summarize or change approach when reads add no evidence.\n\
      9. **Acceptance**: preserve quantifiers/positions; don't infer order; test named items independently; no partial claims; derive checks from each requirement and its negation; assert required effects and forbidden effects across relevant boundary partitions, plus one proportionate adversarial probe. Existence, compilation, or import is structural evidence only; exercise every explicitly required component. A smoke test proves only its exact assertions; contradictory output is a failure.\n\
-     10. **Reproducible external facts**: exact results derived from versioned datasets require an identified revision and toolchain. Honor lockfiles; never silently treat a floating latest dependency as reproducible. Record the effective versions/revisions or state the missing boundary.\n\
+     10. **Reproducible external facts**: exact versioned-data results need an identified revision and toolchain. Honor lockfiles; never treat floating latest as reproducible. Record versions/revisions or the missing boundary.\n\
      11. **Executable acceptance**: run the complete unmodified harness for the user-named workflow from a fresh process after the final mutation. Smoke checks do not prove the composed workflow. Fix and rerun failures or report incomplete; claim pre-existing/unrelated only with an equivalent before-change baseline or explicit exemption. Cover queued/cancelled/error paths; check artifact derivation and the official measurement. Cancellation must finish within a bound, stop later queued work, and clean up owned resources. Reviews retain boundary evidence and disclose unverified scope. Self-authored checks are provisional; keep the task open until every acceptance predicate agrees.\n\
      12. **Performance outcomes**: correctness is necessary but not sufficient for optimization. Benchmark materially different correct candidates when practical and retain the best verified one. Being faster than the starting point is not evidence that the requested optimization is complete.\n"
 }
@@ -587,6 +587,7 @@ fn coding_discipline_section() -> &'static str {
 fn turn_discipline_section() -> &'static str {
     "\n## Turn Discipline\n\
      - Announce substantial progress only when compatible with the requested output format.\n\
+     - When the user speaks during work, respond promptly when appropriate and continue unless redirected or stopped.\n\
      - **Summarize changes and verification only when requested format permits**; do not append a summary to a constrained answer.\n\
      - **Finish within constraints**: report blocked work truthfully; chosen restrictions are not missing permission. Do not reopen them or request another turn unless asked. Ask only necessary, permitted questions. Required safety/approval still applies. Stop after the requested answer.\n\
      - **No externalized reasoning**: keep deliberation in <think>.\n"
@@ -682,15 +683,15 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
     }
     if agent_visible {
         body.push_str(
-            "         - Delegation: when the user asks for a child using defaults or a known selector and all required arguments fit the visible schema, the first native call is `agent(action=\"spawn\", ...)`. Omit `requested_model_policy` for profile/parent defaults. Use it for an Astra Offering override, or use the exact provider tool/model from the current provider directory. Use `model_catalog` only for unknown Astra Offerings; never inspect config/credentials, run provider CLIs, or substitute. Task text is not a control.\n",
+            "         - Delegation: when the user asks for a child using defaults or a known selector and all required arguments fit the visible schema, the first native call is `agent(action=\"spawn\", ...)`. Omit `requested_model_policy` for profile/parent defaults. Use it for an Astra Offering override, or use the exact provider tool/model from the current provider directory. Use `model_catalog` only for unknown Astra Offerings; never inspect credentials or silently substitute a requested provider/model. Task text is not a control.\n",
         );
         body.push_str(
-            "         - After spawn, do independent requested work, then await child results; no polling or shell sleep. Use `agent(send_message, message_type=question)` only for an active mailbox; answer with the incoming `request_id`. Continue a completed provider collaborator with spawn+exact collaborator_id, never another identity. Ask once on typed model selection; never guess or present an unstarted child as failure. Final prose is not a coordination message; running is not failure.\n",
+            "         - After spawn, do independent requested work, then observe or wait for child results. Use `agent(send_message, message_type=question)` only for an active mailbox; answer with the incoming `request_id`. Continue a completed provider collaborator with spawn+exact collaborator_id, never another identity. Ask once on typed model selection; never guess or present an unstarted child as failure. Final prose is not a coordination message; running is not failure.\n",
         );
     }
     if tool_visible(tool_names, "bash") {
         body.push_str(
-            "         - `tools[]` limits structured calls, not executables available through `bash`. For provider collaborators, use the directory's exact structured tool/model; never inspect config/credentials or invoke a provider CLI through `bash`. Other named services without structured capability permit one bounded non-secret CLI/API probe; otherwise disclose evidence.\n",
+            "         - `tools[]` limits structured calls, not executables available through `bash`. Explicitly requested local programs (including provider CLIs) may use admitted CLI/User Runner Bash even with an empty provider directory. Prefer suitable adapters; preserve requested provider/model, sandbox, credentials, network and approvals.\n",
         );
     }
     body.push_str(&tool_precedence_section(tool_names));
@@ -967,7 +968,7 @@ fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool 
     astra_turn_types::is_runtime_owned_message(message)
 }
 
-/// Give the model a bounded execution horizon while there is still enough
+/// Give the model an explicit round limit while there is still enough
 /// authority to change course. The runtime already records this fact in
 /// telemetry, but telemetry is not model context. Keeping the reminder in the
 /// volatile tail preserves the stable prompt-cache prefix.
@@ -976,12 +977,11 @@ fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool 
 /// authority and it does not infer anything from the task text. Settlement
 /// windows carry their own stricter typed instruction and therefore suppress
 /// this reminder at the call site.
-pub fn execution_slice_guidance(
+pub fn execution_round_limit_guidance(
     remaining_after_current: usize,
-    slice_round_limit: usize,
-    may_receive_adaptive_renewal: bool,
+    hard_round_limit: usize,
 ) -> String {
-    if slice_round_limit == 0 {
+    if hard_round_limit == 0 {
         return String::new();
     }
 
@@ -996,23 +996,21 @@ pub fn execution_slice_guidance(
     // whole budget on every round. A quarter-slice reminder is useful for
     // small caller budgets; the cap avoids eight-plus rounds of repeated
     // guidance on large runs.
-    let reminder_threshold = slice_round_limit.div_ceil(4).clamp(2, 8);
+    let reminder_threshold = hard_round_limit.div_ceil(4).clamp(2, 8);
     if available_boundaries > reminder_threshold {
         return String::new();
     }
 
-    let instruction = if may_receive_adaptive_renewal {
-        "This is an adaptive capacity checkpoint, not a task-completion boundary. Renewal is not evidence of progress or unfinished work and does not expand the user request. Continue only for an unmet authorized objective; if the requested work is complete, return the result now. Base completion claims on actual execution evidence, not the requested outcome, and explicitly label unresolved gaps."
-    } else if available_boundaries == 1 {
+    let instruction = if available_boundaries == 1 {
         "This is the final model boundary. Do not call any tool or begin another check. Return the best truthful result from retained evidence now, explicitly labeling unresolved gaps."
     } else if available_boundaries == 2 {
-        "The current execution slice is nearly complete. Make at most one smallest decisive acceptance check only when essential, then use the final boundary for truthful settlement; do not begin a broad new investigation."
+        "The configured round limit is nearly reached. Make at most one smallest decisive acceptance check only when essential, then use the final boundary for truthful settlement; do not begin a broad new investigation."
     } else {
-        "The current execution slice is approaching review. Close the active objective: combine compatible work, prefer decisive acceptance evidence, and do not assume another slice will be granted."
+        "The configured round limit is approaching. Close the active objective: combine compatible work, prefer decisive acceptance evidence, and do not assume additional rounds will be granted."
     };
     format!(
-        "<execution-slice>\n{{\"available_model_boundaries_including_current\":{available_boundaries},\"slice_round_limit\":{slice_round_limit},\"authority\":\"advisory_only\",\"instruction\":{}}}\n</execution-slice>",
-        serde_json::to_string(instruction).expect("static execution-slice instruction serializes")
+        "<execution-round-limit>\n{{\"available_model_boundaries_including_current\":{available_boundaries},\"hard_round_limit\":{hard_round_limit},\"authority\":\"advisory_only\",\"instruction\":{}}}\n</execution-round-limit>",
+        serde_json::to_string(instruction).expect("static execution-limit instruction serializes")
     )
 }
 
@@ -1250,7 +1248,7 @@ mod tests {
     fn exploration_converges_on_evidence_without_fixed_call_caps() {
         let p = static_sections_for_test(None).planning_protocol.text;
         assert!(p.contains("Converge on evidence"));
-        assert!(p.contains("targeted reads establish the affected set"));
+        assert!(p.contains("targeted reads establish scope"));
         assert!(!p.contains("do one useful pass, then stop"));
         assert!(!p.contains("≤2 dir listings"));
     }
@@ -1315,7 +1313,7 @@ mod tests {
             agent_with_discovery
                 .contains("Use the visible `agent` schema directly for its permitted actions")
         );
-        assert!(agent_surface.contains("then await child results"));
+        assert!(agent_surface.contains("then observe or wait for child results"));
         assert!(agent_surface.contains("do independent requested work"));
         assert!(
             agent_with_discovery
@@ -1326,7 +1324,7 @@ mod tests {
         assert!(
             agent_surface.contains("exact provider tool/model from the current provider directory")
         );
-        assert!(agent_surface.contains("never inspect config/credentials"));
+        assert!(agent_surface.contains("never inspect credentials"));
         assert!(!agent_surface.contains("settle_work_item"));
         let fanout_surface = tool_conditional_section(&["agent_fanout"]);
         assert!(!fanout_surface.contains("call visible `agent` spawn directly"));
@@ -1453,7 +1451,9 @@ mod tests {
         assert!(
             !turn_discipline_section().contains("before your first tool call, write ONE sentence")
         );
-        assert!(tool_conditional_section(&["bash"]).contains("bounded non-secret CLI/API probe"));
+        assert!(
+            tool_conditional_section(&["bash"]).contains("Explicitly requested local programs")
+        );
     }
 
     #[test]
@@ -1478,11 +1478,9 @@ mod tests {
         ));
         assert!(contains("every explicitly required component"));
         assert!(contains("smoke test proves only its exact assertions"));
-        assert!(contains("exact results derived from versioned datasets"));
-        assert!(contains(
-            "never silently treat a floating latest dependency"
-        ));
-        assert!(contains("Record the effective versions/revisions"));
+        assert!(contains("exact versioned-data results"));
+        assert!(contains("never treat floating latest as reproducible"));
+        assert!(contains("Record versions/revisions"));
         assert!(contains("Smoke checks do not prove the composed workflow"));
         assert!(contains(
             "equivalent before-change baseline or explicit exemption"
@@ -1527,11 +1525,9 @@ mod tests {
         assert!(prompt.contains("Task text is not a control"));
         assert!(prompt.contains("Omit `requested_model_policy` for profile/parent defaults"));
         assert!(prompt.contains("exact provider tool/model from the current provider directory"));
-        assert!(
-            prompt.contains(
-                "never inspect config/credentials or invoke a provider CLI through `bash`"
-            )
-        );
+        assert!(prompt.contains(
+            "never inspect credentials or silently substitute a requested provider/model"
+        ));
         assert!(prompt.contains("the first native call is `agent(action=\"spawn\", ...)`"));
         assert!(prompt.contains("when the user asks for a child"));
         assert!(prompt.contains("Launch before child-specific checks"));
@@ -1729,38 +1725,24 @@ mod tests {
     }
 
     #[test]
-    fn execution_slice_guidance_is_bounded_and_advisory() {
-        assert!(execution_slice_guidance(8, 40, false).is_empty());
+    fn explicit_round_limit_guidance_is_bounded_and_advisory() {
+        assert!(execution_round_limit_guidance(8, 40).is_empty());
 
-        let approaching = execution_slice_guidance(7, 40, false);
-        assert!(approaching.contains("<execution-slice>"));
+        let approaching = execution_round_limit_guidance(7, 40);
+        assert!(approaching.contains("<execution-round-limit>"));
         assert!(approaching.contains("\"available_model_boundaries_including_current\":8"));
         assert!(approaching.contains("\"authority\":\"advisory_only\""));
         assert!(approaching.contains("decisive acceptance evidence"));
 
-        let critical = execution_slice_guidance(1, 40, false);
+        let critical = execution_round_limit_guidance(1, 40);
         assert!(critical.contains("at most one smallest decisive acceptance check"));
         assert!(critical.contains("final boundary for truthful settlement"));
 
-        let final_boundary = execution_slice_guidance(0, 40, false);
+        let final_boundary = execution_round_limit_guidance(0, 40);
         assert!(final_boundary.contains("\"available_model_boundaries_including_current\":1"));
         assert!(final_boundary.contains("Do not call any tool"));
         assert!(final_boundary.contains("Return the best truthful result"));
-        assert!(execution_slice_guidance(0, 0, false).is_empty());
-
-        let renewable_checkpoint = execution_slice_guidance(0, 40, true);
-        assert!(renewable_checkpoint.contains("adaptive capacity checkpoint"));
-        assert!(renewable_checkpoint.contains("not evidence of progress or unfinished work"));
-        assert!(renewable_checkpoint.contains("does not expand the user request"));
-        assert!(renewable_checkpoint.contains("actual execution evidence"));
-        assert!(!renewable_checkpoint.contains("recent typed progress supports it"));
-        assert!(!renewable_checkpoint.contains("Do not call any tool"));
-        for remaining in [1, 7] {
-            let renewable = execution_slice_guidance(remaining, 40, true);
-            assert!(renewable.contains("not evidence of progress or unfinished work"));
-            assert!(!renewable.contains("final boundary for truthful settlement"));
-            assert!(!renewable.contains("Close the active objective"));
-        }
+        assert!(execution_round_limit_guidance(0, 0).is_empty());
     }
 
     #[test]
@@ -1774,7 +1756,7 @@ mod tests {
         );
         let guidance = tool_conditional_section(&["bash", "glob", "grep", "read_file"]);
         assert!(guidance.contains("not executables available through `bash`"));
-        assert!(guidance.contains("bounded non-secret CLI/API probe"));
+        assert!(guidance.contains("Explicitly requested local programs"));
         assert!(!guidance.contains("run_build_test"));
         assert!(!tool_conditional_section(&["git"]).contains("Git Workflow"));
         let tokens: u32 = sections

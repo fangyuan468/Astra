@@ -117,7 +117,7 @@ fn execution_limits_survive_resident_and_deferred_projection() {
     let resident = ToolSurface::build(canonical.clone(), &ToolSurfaceConfig::default(), &[]);
     let resident_schemas = resident.always_load_schemas();
     for (name, paths) in [
-        ("bash", vec!["/properties/mode"]),
+        ("bash", vec!["/properties/timeout", "/properties/workdir"]),
         (
             "agent",
             vec!["/properties/max_output_tokens", "/properties/message_type"],
@@ -146,14 +146,19 @@ fn execution_limits_survive_resident_and_deferred_projection() {
             assert!(native.is_some(), "{name} must be resident");
         }
         for path in paths {
-            let expected = original["function"]["parameters"].pointer(path).unwrap()
-                ["x-astra-discovery-summary"].as_str().expect("producer-owned execution limit");
+            let property = original["function"]["parameters"].pointer(path).unwrap();
             for parameters in std::iter::once(&selected["matches"][0]["parameters"])
                 .chain(native.map(|s| &s["function"]["parameters"]))
             {
+                let projected = parameters.pointer(path).unwrap();
                 assert_eq!(
-                    parameters.pointer(path).unwrap()["description"].as_str(),
-                    Some(expected)
+                    without_descriptions(projected.clone()),
+                    without_descriptions(property.clone()),
+                    "{name} {path} must retain its execution constraints"
+                );
+                assert_eq!(
+                    projected["description"].as_str(),
+                    property["x-astra-discovery-summary"].as_str()
                 );
             }
         }
@@ -211,6 +216,73 @@ fn default_always_load_surface_has_a_fixed_schema_budget() {
 }
 
 #[test]
+fn resident_bash_command_guidance_survives_projection() {
+    let mut canonical = catalog_schemas();
+    astra_tools::schemas::hide_shell_task_controls(&mut canonical);
+    let canonical_bash = canonical
+        .iter()
+        .find(|schema| tool_schema_name(schema) == Some("bash"))
+        .expect("canonical Bash schema");
+    let canonical_command = &canonical_bash["function"]["parameters"]["properties"]["command"];
+    let guidance = astra_tools::schemas::BASH_COMMAND_GUIDANCE;
+    assert_eq!(canonical_command["description"], guidance);
+
+    let resident =
+        ToolSurface::build(canonical, &ToolSurfaceConfig::default(), &[]).always_load_schemas();
+    let resident_bash = resident
+        .iter()
+        .find(|schema| tool_schema_name(schema) == Some("bash"))
+        .expect("resident Bash schema");
+    let description = resident_bash["function"]["description"]
+        .as_str()
+        .expect("model-visible Bash command guidance");
+    assert_eq!(description, guidance);
+    assert!(description.contains("$()/backticks"));
+    assert!(description.starts_with("No $()/backticks"));
+    assert!(description.contains("literal write paths"));
+    assert!(description.contains("Loops via python3"));
+    assert!(
+        resident_bash["function"]["parameters"]["properties"]["command"]["description"].is_null()
+    );
+}
+
+#[test]
+fn resident_bash_exposes_interactive_controls_only_when_provider_supplies_them() {
+    for enabled in [false, true] {
+        let mut catalog = catalog_schemas();
+        if !enabled {
+            astra_tools::schemas::hide_shell_task_controls(&mut catalog);
+        }
+        let surface = ToolSurface::build(catalog, &ToolSurfaceConfig::default(), &[]);
+        let bash = surface
+            .always_load_schemas()
+            .into_iter()
+            .find(|schema| tool_schema_name(schema) == Some("bash"))
+            .unwrap();
+        let fields = bash
+            .pointer("/function/parameters/properties")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(fields.contains_key("stdin"), enabled);
+        assert_eq!(fields.contains_key("yield_time_ms"), enabled);
+        let args = serde_json::json!({"command":"cat","stdin":true,"yield_time_ms":0});
+        assert_eq!(
+            astra_tools::schemas::validate_tool_arguments_against_schema("bash", &args, &bash)
+                .is_ok(),
+            enabled
+        );
+        assert_eq!(
+            bash["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("task_input"),
+            enabled
+        );
+    }
+}
+
+#[test]
 fn models_discovery_is_easy_from_resident_and_selected_model_catalog() {
     let schemas = catalog_schemas();
     let surface = ToolSurface::build(schemas.clone(), &ToolSurfaceConfig::default(), &[]);
@@ -238,6 +310,7 @@ fn models_discovery_is_easy_from_resident_and_selected_model_catalog() {
     assert!(params.get("catalog").is_none());
     for arguments in [
         json!({"facet":"overview"}),
+        json!({"facet":"overview", "depth":"diagnostic", "horizon":"recent"}),
         json!({"explain":{"target":"previous"}}),
         json!({"artifact":"artifact://session/tool-result/example","offset":0,"max_bytes":1024}),
     ] {
@@ -445,9 +518,15 @@ fn resident_work_lifecycle_schemas_preserve_the_canonical_contract() {
         full_start.pointer(prerequisite_path),
         "resident input must explain how to declare dependencies, not only name the field"
     );
-    assert!(description.contains("One Work graph"));
-    assert!(description.contains("no repeat start"));
-    assert!(description.contains("revision-pinned proposal"));
+    assert_eq!(
+        description,
+        full_start["function"]["parameters"]["x-astra-discovery-summary"]
+            .as_str()
+            .unwrap()
+    );
+    assert!(description.contains("before exploration"));
+    assert!(description.contains("one start"));
+    assert!(description.contains("initial_task directly"));
     astra_tools::schemas::validate_tool_arguments_against_schema(
         "start_work",
         &json!({
@@ -494,8 +573,10 @@ fn resident_settlement_schema_accepts_typed_direct_input_and_rejects_stale_shape
 
 #[test]
 fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
+    let mut catalog = catalog_schemas();
+    astra_tools::schemas::hide_shell_task_controls(&mut catalog);
     let surface = ToolSurface::build(
-        catalog_schemas(),
+        catalog,
         &ToolSurfaceConfig {
             pinned_tools: vec!["memory".into()],
         },
@@ -505,9 +586,12 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     let agent_description = find(&resident, "agent")["function"]["description"]
         .as_str()
         .expect("resident agent description");
-    assert!(agent_description.contains("Wait"));
-    assert!(agent_description.contains("No substitution"));
+    assert!(agent_description.contains("Auto results"));
     assert!(agent_description.starts_with(astra_tools::agent_parent_scope_guidance!()));
+    assert_eq!(
+        find(&resident, "agent")["function"]["parameters"]["properties"]["description"]["description"],
+        "Short task label."
+    );
     let full = catalog_schemas();
     let policy =
         &find(&full, "agent")["function"]["parameters"]["properties"]["requested_model_policy"];
@@ -518,8 +602,8 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         "resident projection must retain model-control semantics"
     );
     let summary = policy["x-astra-discovery-summary"].as_str().unwrap();
-    assert!(summary.contains("Not task/output text"));
-    assert!(summary.contains("inherit unless user picks execution model"));
+    assert!(summary.contains("User model override"));
+    assert!(summary.contains("omit to inherit"));
     let reasoning = &find(&full, "agent")["function"]["parameters"]["properties"]["reasoning"];
     assert_eq!(
         find(&resident, "agent")["function"]["parameters"]["properties"]["reasoning"]["description"],
@@ -529,7 +613,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         reasoning["x-astra-discovery-summary"]
             .as_str()
             .unwrap()
-            .contains("Omit outside user-requested scope")
+            .contains("User scope only")
     );
     assert_eq!(
         find(&resident, "agent")["function"]["parameters"]["properties"]["prompt"]["description"],
@@ -565,7 +649,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
             .keys()
             .map(String::as_str)
             .collect::<std::collections::BTreeSet<_>>(),
-        ["command", "force", "mode", "timeout", "workdir"]
+        ["command", "force", "timeout", "workdir"]
             .into_iter()
             .collect(),
         "ordinary resident Bash must retain its exact foreground call shape"
@@ -604,9 +688,8 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         .as_str()
         .unwrap();
     for constraint in [
-        "Omit for read-only",
-        "task/general-purpose",
-        "shell or mutation",
+        "Default:inherit parent authority",
+        "explore/code-review:read-only",
     ] {
         assert!(profile.contains(constraint), "{profile}");
     }
@@ -614,7 +697,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         agent["function"]["description"]
             .as_str()
             .unwrap()
-            .contains("launch≠done")
+            .contains("Auto results")
     );
     astra_tools::schemas::validate_tool_arguments_against_schema(
         "agent", &json!({"action":"spawn", "description":"Independent task", "prompt":"Return the requested result"}), agent,
@@ -724,7 +807,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         .as_str()
         .expect("resident child brief guidance");
     assert!(child_brief.contains("Exact output"));
-    assert!(child_brief.contains("parent uses model/status receipts"));
+    assert!(child_brief.contains("parent") && child_brief.contains("model/status receipts"));
     assert!(
         full_agent["function"]["parameters"]["properties"]
             .get("requested_model_policy")
@@ -801,6 +884,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
 #[test]
 fn edge_managed_bash_projection_preserves_service_lifecycle_contract() {
     let mut edge_catalog = astra_tools::schemas::all_tool_schemas();
+    astra_tools::schemas::hide_shell_task_controls(&mut edge_catalog);
     astra_tools::schemas::enable_managed_background_bash_schema(&mut edge_catalog);
     let surface = ToolSurface::build(edge_catalog, &ToolSurfaceConfig::default(), &[]);
     let bash = surface
@@ -826,7 +910,6 @@ fn edge_managed_bash_projection_preserves_service_lifecycle_contract() {
             "background_ttl",
             "command",
             "force",
-            "mode",
             "ready_check",
             "run_in_background",
             "timeout",
@@ -872,26 +955,46 @@ fn resident_projection_rejects_advanced_fields_while_canonical_schema_accepts_th
     }
 
     let agent = find(&resident, "agent");
-    assert_eq!(
-        agent["function"]["parameters"]["x-astra-per-action-allowed"]["wait"],
-        json!(["action", "timeout_ms"])
+    let canonical_agent = find(&full, "agent");
+    assert!(
+        agent["function"]["parameters"]["x-astra-per-action-allowed"]
+            .get("wait")
+            .is_some()
+    );
+    assert!(
+        agent["function"]["parameters"]["properties"]
+            .get("timeout_ms")
+            .is_some()
     );
     for arguments in [
-        json!({"action": "wait"}),
-        json!({"action": "wait", "timeout_ms": 1}),
+        json!({"action":"wait"}),
+        json!({"action":"wait", "timeout_ms":1}),
     ] {
-        astra_tools::schemas::validate_tool_arguments_against_schema("agent", &arguments, agent)
-            .expect("resident wait accepts its canonical observation shape");
+        for schema in [agent, canonical_agent] {
+            astra_tools::schemas::validate_tool_arguments_against_schema(
+                "agent", &arguments, schema,
+            )
+            .expect("ordinary wait is directly callable without schema discovery");
+        }
     }
+    let selected = astra_tools::tool_search::tool_selection_contract(canonical_agent).unwrap();
     assert!(
-        astra_tools::schemas::validate_tool_arguments_against_schema(
-            "agent",
-            &json!({"action": "wait", "agent_id": "other-child"}),
-            agent,
-        )
-        .is_err(),
-        "resident wait must not accept fields belonging to other actions"
+        selected["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("wait"))
     );
+    for schema in [agent, canonical_agent] {
+        assert!(
+            astra_tools::schemas::validate_tool_arguments_against_schema(
+                "agent",
+                &json!({"action":"wait", "agent_id":"other-child"}),
+                schema,
+            )
+            .is_err(),
+            "selection cannot turn current-run observation into a targeted child wait"
+        );
+    }
 
     let advanced_memory = json!({
         "action": "remember",

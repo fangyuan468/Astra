@@ -210,3 +210,19 @@ fn slash_and_mention_are_mutually_exclusive() {
     assert!(bp.slash_menu_is_open());
     assert!(!bp.mention_menu_is_open());
 }
+
+#[test]
+fn restored_conversation_refreshes_mention_range_without_losing_content() {
+    let mut bp = fresh();
+    type_string(&mut bp, "inspect @src");
+    assert!(bp.mention_menu_is_open());
+    bp.restore_into_composer("//returned");
+    assert!(
+        !bp.mention_menu_is_open(),
+        "cursor moved beyond the old mention"
+    );
+    let BottomPaneAction::SubmitInput(text) = bp.handle_key(special(KeyCode::Enter)) else {
+        panic!("recovered conversation must submit in full");
+    };
+    assert_eq!(text, "inspect @src\n\n/returned");
+}

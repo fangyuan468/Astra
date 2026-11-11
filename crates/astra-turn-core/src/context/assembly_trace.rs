@@ -1,13 +1,12 @@
 //! Context Assembly Trace — deep observability into turn context composition.
 //!
-//! Records exactly what goes into each LLM request:
+//! Records available observations of request context:
 //! - System prompt breakdown (base, skills, environment, memories)
-//! - Conversation history selection (retained, compressed, dropped)
+//! - Optional CLI admission input history (before Server request assembly)
 //! - Memory retrieval (queries, candidates, selections)
 //! - tool surface (scoring, filtering, final set)
 //!
 //! This enables answering questions like:
-//! - "Why did the agent lose focus?" → compression dropped critical context
 //! - "Which memories were effective?" → see relevance scores + selection
 //! - "Where are my tokens going?" → detailed breakdown by component
 
@@ -48,8 +47,9 @@ pub struct ContextAssemblyTrace {
     /// Breakdown of system prompt components.
     pub system_prompt: SystemPromptBreakdown,
 
-    /// History selection and compression decisions.
-    pub history: HistorySelectionTrace,
+    /// Optional observed CLI admission input, before Server request assembly.
+    #[serde(default)]
+    pub history: Option<HistorySelectionTrace>,
 
     /// Memory retrieval trace.
     pub memory: MemoryRetrievalTrace,
@@ -59,9 +59,6 @@ pub struct ContextAssemblyTrace {
 
     /// Final token budget and allocation.
     pub token_budget: TokenBudgetTrace,
-
-    /// Optional: why certain decisions were made.
-    pub explanations: Vec<DecisionExplanation>,
 }
 
 impl ContextAssemblyTrace {
@@ -87,11 +84,10 @@ impl Default for ContextAssemblyTrace {
             session_id: String::new(),
             request_identity: None,
             system_prompt: SystemPromptBreakdown::default(),
-            history: HistorySelectionTrace::default(),
+            history: None,
             memory: MemoryRetrievalTrace::default(),
             tools: ToolSurfaceTrace::default(),
             token_budget: TokenBudgetTrace::default(),
-            explanations: Vec::new(),
         }
     }
 }
@@ -212,34 +208,20 @@ pub struct MemoryInjection {
 
 // ─── History Selection Trace ─────────────────────────────────────────────────
 
-/// Trace of conversation history selection and compression.
+/// CLI admission input history, before Server-side request assembly.
+/// Absence is distinct from an explicitly observed empty input. This snapshot
+/// does not identify canonical session turns or describe compaction outcomes.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HistorySelectionTrace {
-    /// Total turns available in the conversation.
-    pub total_turns_available: u32,
-    /// Turns that were retained in full.
     pub turns_retained: Vec<TurnRetention>,
-    /// Turns that were compressed.
-    pub turns_compressed: Vec<TurnCompression>,
-    /// Turns that were completely dropped.
-    pub turns_dropped: Vec<u32>,
-    /// Pipeline-level compaction work that cannot truthfully be attributed to
-    /// one exact conversation turn. This is deliberately distinct from
-    /// `turns_compressed`: a layer such as duplicate-read elimination may
-    /// free tokens without compressing a whole turn.
-    #[serde(default)]
-    pub compression_stages: Vec<CompressionStage>,
-    /// Overall compression ratio achieved.
-    pub compression_ratio: f64,
-    /// Tokens before compression.
-    pub tokens_before: u32,
-    /// Tokens after compression.
-    pub tokens_after: u32,
+    /// Estimated tokens in the observed input groups.
+    pub total_tokens: u32,
 }
 
 /// A turn that was retained in the history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnRetention {
+    /// Local input group ordinal, not a canonical session-turn identity.
     pub turn_index: u32,
     pub role: String,
     pub tokens: u32,
@@ -251,41 +233,6 @@ pub struct TurnRetention {
     /// separate UI transcript.
     #[serde(default)]
     pub content_preview: String,
-}
-
-/// A turn that was compressed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurnCompression {
-    pub turn_index: u32,
-    pub role: String,
-    pub original_tokens: u32,
-    pub compressed_tokens: u32,
-    pub compression_method: CompressionMethod,
-    /// What information was lost (for explainability).
-    pub information_lost: Vec<String>,
-}
-
-/// An observed context-compaction stage with no fabricated turn identity.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompressionStage {
-    pub stage: String,
-    pub method: CompressionMethod,
-    pub tokens_freed: u32,
-}
-
-/// Method used to compress a turn.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CompressionMethod {
-    /// Tool result truncation.
-    ToolResultTruncation,
-    /// Byte-identical tool output elimination.
-    DuplicateToolOutputElimination,
-    /// LLM-based summarization.
-    LlmSummarization,
-    /// Tiered compaction.
-    TieredCompaction,
-    /// Emergency reactive compression.
-    ReactiveCompact,
 }
 
 // ─── Memory Retrieval Trace ──────────────────────────────────────────────────
@@ -416,38 +363,6 @@ pub struct TokenBudgetTrace {
     pub compression_triggered: bool,
 }
 
-// ─── Decision Explanations ───────────────────────────────────────────────────
-
-/// Explanation of a context assembly decision.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DecisionExplanation {
-    pub decision_type: DecisionType,
-    pub reasoning: String,
-    pub alternatives_considered: Vec<Alternative>,
-    pub confidence: f64,
-}
-
-/// Type of decision being explained.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DecisionType {
-    /// Tool surface decision.
-    ToolSurface { visible_tools: Vec<String> },
-    /// History compression decision.
-    HistoryCompression { turns_affected: Vec<u32> },
-    /// Memory retrieval decision.
-    MemoryRetrieval { memories: Vec<String> },
-    /// Strategy choice decision.
-    StrategyChoice { strategy: String },
-}
-
-/// An alternative that was considered.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Alternative {
-    pub description: String,
-    pub score: f64,
-    pub why_not_chosen: String,
-}
-
 // ─── Trace Builder ───────────────────────────────────────────────────────────
 
 /// Builder for constructing a ContextAssemblyTrace incrementally.
@@ -479,7 +394,7 @@ impl ContextAssemblyTraceBuilder {
     }
 
     pub fn with_history(mut self, history: HistorySelectionTrace) -> Self {
-        self.trace.history = history;
+        self.trace.history = Some(history);
         self
     }
 
@@ -495,11 +410,6 @@ impl ContextAssemblyTraceBuilder {
 
     pub fn with_token_budget(mut self, budget: TokenBudgetTrace) -> Self {
         self.trace.token_budget = budget;
-        self
-    }
-
-    pub fn add_explanation(mut self, explanation: DecisionExplanation) -> Self {
-        self.trace.explanations.push(explanation);
         self
     }
 
@@ -521,7 +431,6 @@ pub struct TraceAggregation {
     pub avg_tool_schema_tokens: f64,
     /// Compression statistics.
     pub compression_trigger_rate: f64,
-    pub avg_compression_ratio: f64,
     /// Memory effectiveness.
     pub avg_memories_selected: f64,
     pub avg_memory_relevance: f64,
@@ -564,11 +473,6 @@ impl TraceAggregation {
                 .sum::<f64>()
                 / n,
             compression_trigger_rate: compression_triggered_count / n,
-            avg_compression_ratio: traces
-                .iter()
-                .map(|t| t.history.compression_ratio)
-                .sum::<f64>()
-                / n,
             avg_memories_selected: traces
                 .iter()
                 .map(|t| t.memory.memories_selected.len() as f64)
@@ -596,51 +500,6 @@ impl TraceAggregation {
                 .sum::<f64>()
                 / n,
         }
-    }
-}
-
-// ─── Integration with Context Compression ────────────────────────────────────
-
-/// Build HistorySelectionTrace from compression pipeline results.
-///
-/// This function converts the compression pipeline's internal metrics into
-/// the telemetry trace format for observability.
-pub fn build_history_trace_from_compression(
-    initial_messages: usize,
-    _final_messages: usize,
-    initial_tokens: u32,
-    final_tokens: u32,
-    layer_results: &[(String, CompressionMethod, u32)], // (layer_name, method, tokens_freed)
-) -> HistorySelectionTrace {
-    let mut compression_stages = Vec::new();
-
-    for (layer_name, method, tokens_freed) in layer_results {
-        if *tokens_freed > 0 {
-            compression_stages.push(CompressionStage {
-                stage: layer_name.clone(),
-                method: method.clone(),
-                tokens_freed: *tokens_freed,
-            });
-        }
-    }
-
-    let compression_ratio = if initial_tokens > 0 {
-        final_tokens as f64 / initial_tokens as f64
-    } else {
-        1.0
-    };
-
-    HistorySelectionTrace {
-        total_turns_available: initial_messages as u32,
-        // This input only knows pipeline aggregate counts. Do not invent
-        // per-turn retention, compression, or dropping identities from it.
-        turns_retained: Vec::new(),
-        turns_compressed: Vec::new(),
-        turns_dropped: Vec::new(),
-        compression_stages,
-        compression_ratio,
-        tokens_before: initial_tokens,
-        tokens_after: final_tokens,
     }
 }
 
@@ -931,39 +790,6 @@ mod tests {
         assert_eq!(trace.deferred_available, 4);
         assert_eq!(trace.deferred_omitted_tools, vec!["github".to_string()]);
         assert_eq!(trace.visible_tools[1].tokens, 250);
-    }
-
-    #[test]
-    fn aggregate_compression_records_stages_without_inventing_turn_identity() {
-        let trace = build_history_trace_from_compression(
-            12,
-            7,
-            20_000,
-            12_000,
-            &[
-                (
-                    "duplicate tool output elimination".to_string(),
-                    CompressionMethod::DuplicateToolOutputElimination,
-                    3_000,
-                ),
-                (
-                    "no-op layer".to_string(),
-                    CompressionMethod::ToolResultTruncation,
-                    0,
-                ),
-            ],
-        );
-
-        assert_eq!(trace.total_turns_available, 12);
-        assert!(trace.turns_retained.is_empty());
-        assert!(trace.turns_compressed.is_empty());
-        assert!(trace.turns_dropped.is_empty());
-        assert_eq!(trace.compression_stages.len(), 1);
-        assert_eq!(
-            trace.compression_stages[0].stage,
-            "duplicate tool output elimination"
-        );
-        assert_eq!(trace.compression_stages[0].tokens_freed, 3_000);
     }
 
     #[test]

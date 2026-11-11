@@ -67,20 +67,9 @@ pub struct ContextTraceMemorySignal {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextTraceHistorySignal {
-    #[serde(default)]
-    pub total_turns_available: u32,
-    #[serde(default)]
-    pub retained_turns: usize,
-    #[serde(default)]
-    pub compressed_turns: usize,
-    #[serde(default)]
-    pub dropped_turns: usize,
-    #[serde(default)]
-    pub compression_ratio: f64,
-    #[serde(default)]
-    pub tokens_before: u32,
-    #[serde(default)]
-    pub tokens_after: u32,
+    /// Observed CLI admission input groups, not canonical session turns.
+    pub retained_groups: usize,
+    pub total_tokens: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -128,8 +117,6 @@ pub struct ContextTraceSignal {
     pub budget: Option<ContextTraceBudgetSignal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<ContextTraceTimingSignal>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub explanations: Vec<String>,
 }
 
 impl ContextTraceSignal {
@@ -174,18 +161,11 @@ impl ContextTraceSignal {
                 ));
             }
         }
-        if let Some(history) = self.history.as_ref()
-            && history.compressed_turns > 0
-        {
-            if history.compression_ratio > 0.0 {
-                parts.push(format!(
-                    "history: {} compressed (ratio {ratio:.2})",
-                    history.compressed_turns,
-                    ratio = history.compression_ratio
-                ));
-            } else {
-                parts.push(format!("history: {} compressed", history.compressed_turns));
-            }
+        if let Some(history) = self.history.as_ref() {
+            parts.push(format!(
+                "admission history: {} groups (~{} tokens)",
+                history.retained_groups, history.total_tokens
+            ));
         }
         if let Some(budget) = self.budget.as_ref()
             && (budget.max_tokens > 0 || budget.total_used > 0)
@@ -198,14 +178,7 @@ impl ContextTraceSignal {
         {
             parts.push(format!("time: {}ms", timing.total_ms));
         }
-        if let Some(explanation) = self.explanations.first() {
-            let preview: String = explanation.chars().take(96).collect();
-            if explanation.chars().count() > 96 {
-                parts.push(format!("note: {preview}..."));
-            } else {
-                parts.push(format!("note: {preview}"));
-            }
-        }
+
         parts.join(" | ")
     }
 }
@@ -266,6 +239,20 @@ pub struct BackgroundLocalAgentTaskProjection {
     pub fanout: Option<BackgroundLocalAgentFanoutProjection>,
 }
 
+/// Local checkout selection, or an explicit unknown after local metadata loss.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SelectedWorktree {
+    Selected {
+        path: PathBuf,
+        branch: String,
+        original_root: PathBuf,
+        original_head_commit: Option<String>,
+        git_identity: String,
+    },
+    Unknown,
+}
+
 /// Session workspace metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceMetadata {
@@ -282,6 +269,9 @@ pub struct WorkspaceMetadata {
     /// Git HEAD commit at session start.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_head: Option<String>,
+    /// Local checkout selection, restored when this session is resumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_worktree: Option<SelectedWorktree>,
     /// Concrete LLM model override used to start the session.
     ///
     /// `None` means the runtime used the server/API default. Symbolic values
@@ -464,6 +454,7 @@ impl WorkspaceMetadata {
             git_root,
             git_branch,
             git_head,
+            selected_worktree: None,
             model: astra_core::model_override::normalize_model_override(Some(model))
                 .map(str::to_string),
             permission_mode: None,
@@ -507,6 +498,7 @@ impl WorkspaceMetadata {
             git_root: None,
             git_branch: git_branch.map(|s| s.to_string()),
             git_head: None,
+            selected_worktree: None,
             model: astra_core::model_override::normalize_model_override(Some(model))
                 .map(str::to_string),
             permission_mode: None,
@@ -581,7 +573,9 @@ pub fn to_remote_artifact_record(
     metadata: &WorkspaceMetadata,
     user_id: &str,
 ) -> Result<SessionArtifactJsonRecord, serde_json::Error> {
-    let metadata = canonical_workspace_metadata(metadata);
+    let mut metadata = canonical_workspace_metadata(metadata);
+    // A selected checkout belongs to the local execution boundary.
+    metadata.selected_worktree = None;
     Ok(SessionArtifactJsonRecord {
         artifact_id: WORKSPACE_METADATA_PROJECTION_ID.to_string(),
         session_id: metadata.session_id.clone(),
@@ -613,8 +607,11 @@ pub async fn persist_remote_workspace(
 }
 
 pub fn read_workspace(session_id: &str) -> std::io::Result<WorkspaceMetadata> {
-    let path = workspace_file_path(session_id)?;
-    let metadata = std::fs::metadata(&path)?;
+    read_workspace_at_path(session_id, &workspace_file_path(session_id)?)
+}
+
+fn read_workspace_at_path(session_id: &str, path: &Path) -> std::io::Result<WorkspaceMetadata> {
+    let metadata = std::fs::metadata(path)?;
     const MAX_WORKSPACE_YAML_SIZE: u64 = 1024 * 1024; // 1 MB
     if metadata.len() > MAX_WORKSPACE_YAML_SIZE {
         return Err(std::io::Error::new(
@@ -626,7 +623,7 @@ pub fn read_workspace(session_id: &str) -> std::io::Result<WorkspaceMetadata> {
             ),
         ));
     }
-    let content = std::fs::read_to_string(&path)?;
+    let content = std::fs::read_to_string(path)?;
     let metadata: WorkspaceMetadata = serde_yaml_ng::from_str(&content)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     validate_workspace_identity(session_id, &metadata)?;
@@ -641,6 +638,10 @@ pub fn write_workspace(metadata: &WorkspaceMetadata) -> std::io::Result<()> {
     let _lock = lock_workspace(&dir)?;
     let mut candidate = metadata.clone();
     if let Some(current) = read_workspace_optional(&metadata.session_id)? {
+        // Worktree selection is changed atomically by its owner. A stale
+        // whole-session snapshot must not overwrite that selection.
+        candidate.selected_worktree = current.selected_worktree;
+        candidate.cwd = current.cwd;
         candidate.tuned_config_json = current.tuned_config_json;
         candidate.config_mutation_revision = current.config_mutation_revision;
         candidate.projection_revision = current.projection_revision;
@@ -659,21 +660,40 @@ pub fn update_workspace(
     initialize: impl FnOnce() -> WorkspaceMetadata,
     update: impl FnOnce(&mut WorkspaceMetadata),
 ) -> std::io::Result<()> {
-    let dir = validated_workspace_dir(session_id)?;
+    update_workspace_for_owner(
+        &crate::OwnerScope::local_user(),
+        session_id,
+        initialize,
+        update,
+    )
+}
+
+/// Apply the same atomic workspace update in an explicitly captured owner scope.
+pub fn update_workspace_for_owner(
+    owner_scope: &crate::OwnerScope,
+    session_id: &str,
+    initialize: impl FnOnce() -> WorkspaceMetadata,
+    update: impl FnOnce(&mut WorkspaceMetadata),
+) -> std::io::Result<()> {
+    let dir = crate::local_session_artifact_store()
+        .session_dir_for_owner(owner_scope, session_id)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     std::fs::create_dir_all(&dir)?;
     sync_parent_dir(&dir)?;
     let _lock = lock_workspace(&dir)?;
-    let (mut metadata, existing_config) = match read_workspace_optional(session_id)? {
-        Some(metadata) => {
-            let config = (
-                metadata.tuned_config_json.clone(),
-                metadata.config_mutation_revision,
-                metadata.projection_revision,
-            );
-            (metadata, Some(config))
-        }
-        None => (initialize(), None),
-    };
+    let (mut metadata, existing_config) =
+        match read_workspace_at_path(session_id, &dir.join("workspace.yaml")) {
+            Ok(metadata) => {
+                let config = (
+                    metadata.tuned_config_json.clone(),
+                    metadata.config_mutation_revision,
+                    metadata.projection_revision,
+                );
+                (metadata, Some(config))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (initialize(), None),
+            Err(error) => return Err(error),
+        };
     validate_workspace_identity(session_id, &metadata)?;
     update(&mut metadata);
     if let Some((tuned_config_json, revision, projection_revision)) = existing_config {
@@ -1308,6 +1328,56 @@ fn extract_last_compact_summary(session_id: &str) -> std::io::Result<Option<Stri
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[serial_test::serial]
+    fn explicit_owner_workspace_update_reads_and_writes_only_the_captured_namespace() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let _guard = crate::session_journal::JournalDirGuard::new(root.path());
+        let sid = "workspace-explicit-owner-update";
+        let owner = crate::OwnerScope::user("captured-workspace-owner").unwrap();
+        assert_ne!(owner, crate::OwnerScope::local_user());
+        update_workspace_for_owner(
+            &owner,
+            sid,
+            || WorkspaceMetadata::new(sid, "default"),
+            |workspace| {
+                workspace.turn_count = 3;
+                workspace.summary = Some("captured owner evidence".into());
+            },
+        )
+        .unwrap();
+        update_workspace(
+            sid,
+            || WorkspaceMetadata::new(sid, "default"),
+            |workspace| workspace.turn_count = 20,
+        )
+        .unwrap();
+        update_workspace_for_owner(
+            &owner,
+            sid,
+            || panic!("existing captured workspace must be read"),
+            |workspace| {
+                assert_eq!(workspace.turn_count, 3);
+                workspace.turn_count = 4;
+                workspace.discovered_skills.push("captured-skill".into());
+            },
+        )
+        .unwrap();
+        assert_eq!(read_workspace(sid).unwrap().turn_count, 20);
+        let path = crate::local_session_artifact_store()
+            .session_dir_for_owner(&owner, sid)
+            .unwrap()
+            .join("workspace.yaml");
+        let captured = read_workspace_at_path(sid, &path).unwrap();
+        assert_eq!(captured.turn_count, 4);
+        assert_eq!(captured.summary.as_deref(), Some("captured owner evidence"));
+        assert_eq!(
+            captured.discovered_skills,
+            vec!["captured-skill".to_string()]
+        );
+    }
+
     use super::*;
     use crate::session_journal::{JournalDirGuard, ProcessJournalDirGuard};
     use async_trait::async_trait;
@@ -1332,8 +1402,6 @@ mod tests {
             retention_policy: Some("default".into()),
             retention_until: None,
             status: Some("active".into()),
-            referenced_by_manifest_count: 0,
-            referenced_by_state_items_count: 0,
             referenced_by_citation_count: 0,
             referenced_by_durable_count: 0,
             created_at: Some("2026-04-25T14:00:00Z".into()),
@@ -1531,6 +1599,32 @@ mod tests {
     }
 
     #[test]
+    fn selected_worktree_is_local_and_survives_stale_workspace_updates() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let initial = WorkspaceMetadata::with_context("selected-worktree", "model", "/repo", None);
+        write_workspace(&initial).unwrap();
+        let selected = SelectedWorktree::Selected {
+            path: PathBuf::from("/local/checkout"),
+            branch: "feature".into(),
+            original_root: PathBuf::from("/repo"),
+            original_head_commit: Some("abc".into()),
+            git_identity: "fixture".into(),
+        };
+        update_workspace(
+            &initial.session_id,
+            || unreachable!(),
+            |metadata| metadata.selected_worktree = Some(selected.clone()),
+        )
+        .unwrap();
+        write_workspace(&initial).unwrap();
+        let current = read_workspace(&initial.session_id).unwrap();
+        assert_eq!(current.selected_worktree, Some(selected));
+        let remote = to_remote_artifact_record(&current, "user").unwrap();
+        assert!(remote.content.get("selected_worktree").is_none());
+    }
+
+    #[test]
     fn workspace_remote_artifact_record_uses_workspace_kind() {
         let mut ws = WorkspaceMetadata::with_context("sess-1", "gpt-4", "/home/user", Some("main"));
         ws.record_turn(100, 50, 0, 0);
@@ -1596,13 +1690,8 @@ mod tests {
                 latency_ms: 9,
             }),
             history: Some(ContextTraceHistorySignal {
-                total_turns_available: 10,
-                retained_turns: 5,
-                compressed_turns: 3,
-                dropped_turns: 2,
-                compression_ratio: 0.58,
-                tokens_before: 900,
-                tokens_after: 522,
+                retained_groups: 5,
+                total_tokens: 522,
             }),
             budget: Some(ContextTraceBudgetSignal {
                 max_tokens: 20_000,
@@ -1618,7 +1707,6 @@ mod tests {
                 tool_execution_ms: 330,
                 total_ms: 1600,
             }),
-            explanations: vec!["Kept LSP because symbol-aware navigation was required.".into()],
         });
 
         let yaml = serde_yaml_ng::to_string(&ws).unwrap();
@@ -1656,7 +1744,6 @@ mod tests {
             history: None,
             budget: None,
             timing: None,
-            explanations: Vec::new(),
         });
 
         write_workspace(&ws).unwrap();
@@ -1754,7 +1841,6 @@ mod tests {
             history: None,
             budget: None,
             timing: None,
-            explanations: Vec::new(),
         };
 
         assert!(trace.preview().contains("tools[latest_round]: lsp"));

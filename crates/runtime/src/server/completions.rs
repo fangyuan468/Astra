@@ -54,10 +54,11 @@ fn provider_admission_http_error(
             "model_provider_admission_rejected",
         ),
     };
-    crate::error_response_coded(
+    crate::error_response_coded_with_metadata(
         status,
         "LLM provider admission rejected this request",
         error_code,
+        serde_json::json!({"error_kind": error.kind}),
     )
 }
 
@@ -217,6 +218,8 @@ pub(super) async fn completions_handler(
     // Use the same provider capacity policy as agent turns. This gate runs
     // before durable admission and provider I/O, so a rejected request cannot
     // reserve lifecycle state or consume provider capacity.
+    let requested_temperature = request.temperature;
+    let default_temperature = request.temperature_or_default();
     let mut messages = request.messages;
     crate::turn::llm::client::strip_empty_assistant_tool_calls(&mut messages);
     let admission_estimated_tokens = completion_admission_estimated_tokens(&messages, max_tokens);
@@ -225,6 +228,7 @@ pub(super) async fn completions_handler(
         &admitted.provider,
         &admitted.model_name,
         admission_estimated_tokens,
+        crate::turn::llm::client::LlmCancel::None,
     )
     .await
     .map_err(provider_admission_http_error)?;
@@ -250,6 +254,7 @@ pub(super) async fn completions_handler(
                     .unwrap_or(&admitted.model_name),
             )
         }),
+        admitted.supported_reasoning_efforts.as_deref(),
     );
     let parsed = durable_ledger
         .execute_nonstream(
@@ -262,7 +267,13 @@ pub(super) async fn completions_handler(
                 cache_capability: None,
                 route: crate::turn::llm::client::LlmExecutionRoute::from_admitted(&admitted),
                 max_output_tokens: Some(max_tokens as usize),
-                temperature: Some(request.temperature),
+                temperature: if admitted.inference_protocol
+                    == Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses)
+                {
+                    requested_temperature
+                } else {
+                    Some(default_temperature)
+                },
                 thinking: &thinking,
             },
             provider_timeout,
@@ -310,18 +321,21 @@ fn provider_request_http_error(
 ) -> (StatusCode, Json<ErrorResponse>) {
     let detail = crate::turn::llm::client::redact_provider_secrets(&error.message);
     let detail = astra_text_utils::str_preview::truncate_str(&detail, 500);
-    let (status, code) = if error.kind == astra_core::ErrorKind::PaymentRequired {
-        (
+    let (status, code) = match error.kind {
+        astra_core::ErrorKind::PaymentRequired => (
             StatusCode::PAYMENT_REQUIRED,
             "model_provider_payment_required",
-        )
-    } else {
-        (StatusCode::BAD_GATEWAY, "model_provider_request_failed")
+        ),
+        astra_core::ErrorKind::InvalidRequest => {
+            (StatusCode::BAD_REQUEST, "model_provider_request_invalid")
+        }
+        _ => (StatusCode::BAD_GATEWAY, "model_provider_request_failed"),
     };
-    crate::error_response_coded(
+    crate::error_response_coded_with_metadata(
         status,
         format!("Upstream LLM request failed ({}): {detail}", error.kind),
         code,
+        serde_json::json!({"error_kind": error.kind}),
     )
 }
 
@@ -334,10 +348,11 @@ fn inference_ledger_http_error(
     if crate::turn::llm::durable::inference_scope_rejection(&error)
         == Some(astra_services::InferenceScopeRejection::Unavailable)
     {
-        return crate::error_response_coded(
+        return crate::error_response_coded_with_metadata(
             StatusCode::BAD_REQUEST,
             "The requested inference scope is unavailable",
             "invalid_inference_scope",
+            serde_json::json!({"error_kind": astra_core::ErrorKind::InvalidRequest}),
         );
     }
     let (status, error_code) = match error.kind {
@@ -353,10 +368,11 @@ fn inference_ledger_http_error(
             "inference_ledger_unavailable",
         ),
     };
-    crate::error_response_coded(
+    crate::error_response_coded_with_metadata(
         status,
         "Durable inference admission or settlement failed",
         error_code,
+        serde_json::json!({"error_kind": error.kind}),
     )
 }
 
@@ -408,6 +424,43 @@ mod tests {
     use axum::http::{HeaderValue, header::AUTHORIZATION};
     use serde_json::json;
     use std::sync::Arc;
+
+    #[test]
+    fn completion_failures_preserve_typed_causes_in_http_metadata() {
+        use astra_core::{ClassifiedError, ErrorKind};
+        for kind in [
+            ErrorKind::ProviderDeadline,
+            ErrorKind::RateLimit,
+            ErrorKind::PaymentRequired,
+            ErrorKind::DatabaseError,
+            ErrorKind::ContractViolation,
+        ] {
+            for map in [
+                provider_request_http_error,
+                provider_admission_http_error,
+                inference_ledger_http_error,
+            ] {
+                let (_, body) = map(ClassifiedError::new(kind, "private-provider-sentinel"));
+                assert_eq!(body.metadata, Some(json!({"error_kind":kind})));
+            }
+        }
+        assert_eq!(
+            provider_request_http_error(ClassifiedError::new(
+                ErrorKind::InvalidRequest,
+                "unsupported settings"
+            ))
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            provider_request_http_error(ClassifiedError::new(
+                ErrorKind::PaymentRequired,
+                "payment required"
+            ))
+            .0,
+            StatusCode::PAYMENT_REQUIRED
+        );
+    }
 
     #[test]
     fn inference_scope_http_mapping_uses_typed_cause_not_diagnostic_text() {
@@ -511,6 +564,10 @@ mod tests {
             Ok(ResolvedModelOffering {
                 offering_id,
                 model: ResolvedActiveLlmModel {
+                    responses_reasoning_history: None,
+                    inference_protocol: None,
+                    response_scope_key: None,
+                    supported_reasoning_efforts: None,
                     price_snapshot: None,
                     model_name: "catalog-display-model".into(),
                     wire_model_name: Some("provider-wire-model".into()),
@@ -576,7 +633,7 @@ mod tests {
             }),
             messages: vec![json!({"role": "user", "content": "extract"})],
             max_tokens: 64,
-            temperature: 0.0,
+            temperature: Some(0.0),
             timeout_ms: 120_000,
         }
     }
@@ -627,7 +684,8 @@ mod tests {
             astra_turn_types::InferencePurpose::VerificationJudge
         );
         assert_eq!(req.max_tokens, 512);
-        assert!((req.temperature - 0.1).abs() < f64::EPSILON);
+        assert_eq!(req.temperature, None);
+        assert!((req.temperature_or_default() - 0.1).abs() < f64::EPSILON);
         assert!(req.model_selection.is_none());
     }
 

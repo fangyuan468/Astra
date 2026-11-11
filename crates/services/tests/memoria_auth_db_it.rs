@@ -15,7 +15,7 @@ use serde_json::json;
 use sha2::Digest;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use uuid::Uuid;
 
@@ -29,6 +29,8 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
     let key_id = Uuid::new_v4().to_string();
     let revoked = Arc::new(AtomicBool::new(false));
     let flag = revoked.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let request_calls = calls.clone();
     let whoami = json!({"user_id":owner, "key_id":key_id, "is_active":true, "is_master":false,
         "scope":{"type":"personal","id":owner},"api_version":"1",
         "capabilities":["api_key_scopes","memory_filters_v1"],"granted_scopes":["identity:read"]});
@@ -37,7 +39,9 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
         get(move || {
             let flag = flag.clone();
             let body = whoami.clone();
+            let request_calls = request_calls.clone();
             async move {
+                request_calls.fetch_add(1, Ordering::SeqCst);
                 (
                     if flag.load(Ordering::SeqCst) {
                         StatusCode::UNAUTHORIZED
@@ -93,7 +97,15 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
         .execute(pool)
         .await
         .unwrap();
-    let inactive = auth.current_principal(&headers).await.unwrap_err();
+    auth.current_principal(&headers)
+        .await
+        .expect("the ordinary identity snapshot is bounded, not instantly revoked across replicas");
+    let inactive = auth
+        .clone()
+        .with_pool(shared.clone())
+        .current_principal(&headers)
+        .await
+        .unwrap_err();
     assert_eq!(inactive.0, StatusCode::UNAUTHORIZED);
     assert_eq!(inactive.1.0.detail, "User is inactive");
     sqlx::query("UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE user_id = ?")
@@ -101,7 +113,12 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
         .execute(pool)
         .await
         .unwrap();
-    let expired = auth.current_principal(&headers).await.unwrap_err();
+    let expired = auth
+        .clone()
+        .with_pool(shared.clone())
+        .current_principal(&headers)
+        .await
+        .unwrap_err();
     assert_eq!(expired.0, StatusCode::UNAUTHORIZED);
     assert_eq!(
         expired.1.0.detail, "Session expired or revoked",
@@ -150,9 +167,17 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
         .unwrap();
         if kind == "refresh" {
             use sha2::{Digest, Sha256};
-            sqlx::query("INSERT INTO auth_refresh_tokens (token_id,user_id,session_id,token_hash,expires_at,is_revoked) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 1 DAY), 0)")
-                .bind(Uuid::new_v4().to_string()).bind(&tokens.user_id).bind(claims["sid"].as_str().unwrap())
-                .bind(format!("{:x}", Sha256::digest(legacy.as_bytes()))).execute(pool).await.unwrap();
+            let updated = sqlx::query(
+                "UPDATE auth_refresh_tokens SET token_hash = ? WHERE session_id = ? AND user_id = ?",
+            )
+            .bind(format!("{:x}", Sha256::digest(legacy.as_bytes())))
+            .bind(claims["sid"].as_str().unwrap())
+            .bind(&tokens.user_id)
+            .execute(pool)
+            .await
+            .unwrap();
+            assert_eq!(updated.rows_affected(), 1);
+            let before = calls.load(Ordering::SeqCst);
             assert_eq!(
                 auth.refresh(AuthRefreshRequestData {
                     refresh_token: legacy
@@ -161,6 +186,10 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
                 .unwrap_err()
                 .0,
                 StatusCode::UNAUTHORIZED
+            );
+            assert!(
+                calls.load(Ordering::SeqCst) > before,
+                "legacy refresh must reach provider verification"
             );
         } else {
             headers.insert(
@@ -240,11 +269,13 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
             "auth_external_identities" => "astra_user_id",
             _ => "user_id",
         };
-        sqlx::query(&format!("DELETE FROM {table} WHERE {column} = ?"))
-            .bind(&tokens.user_id)
-            .execute(pool)
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE {column} = ?"
+        )))
+        .bind(&tokens.user_id)
+        .execute(pool)
+        .await
+        .unwrap();
     }
     server.abort();
 }
@@ -374,7 +405,12 @@ async fn memoria_issuer_atomicity_concurrent_binding_and_disconnect() {
     .await
     .unwrap();
     assert_eq!(
-        auth.current_user(&headers).await.unwrap_err().0,
+        auth.clone()
+            .with_pool(shared.clone())
+            .current_user(&headers)
+            .await
+            .unwrap_err()
+            .0,
         StatusCode::UNAUTHORIZED
     );
     sqlx::query("INSERT INTO auth_external_identities (provider_id, external_subject, astra_user_id) VALUES (?, ?, ?)")
@@ -454,12 +490,13 @@ async fn memoria_issuer_atomicity_concurrent_binding_and_disconnect() {
         ("auth_tokens", "scope_user_id"),
         ("auth_refresh_tokens", "user_id"),
     ] {
-        let rows: i64 =
-            sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?"))
-                .bind(&failed_user)
-                .fetch_one(shared.get())
-                .await
-                .unwrap();
+        let rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE {column} = ?"
+        )))
+        .bind(&failed_user)
+        .fetch_one(shared.get())
+        .await
+        .unwrap();
         assert_eq!(rows, 0, "failed login left rows in {table}");
     }
 

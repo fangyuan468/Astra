@@ -16,8 +16,8 @@ use std::collections::HashSet;
 
 use crate::cli::session::session_state::ContinuationAnchor;
 use astra_turn_core::context_assembly_trace::{
-    ContextAssemblyTrace, DecisionExplanation, DecisionType, MemoryInjection, MemoryRejection,
-    MemorySelection, RejectionReason, SkillInjection, VisibleTool,
+    ContextAssemblyTrace, MemoryInjection, MemoryRejection, MemorySelection, RejectionReason,
+    SkillInjection, VisibleTool,
 };
 
 use ratatui::style::Color;
@@ -43,64 +43,21 @@ pub(crate) struct ContextBreakdown {
     pub memory_focus: MemoryFocus,
     pub prompt_signals: Vec<SignalItem>,
     pub session_summary: Option<SessionSummary>,
-    pub decisions: Vec<DecisionItem>,
     pub compaction: CompactionSummary,
 }
 
-/// Compaction stats sourced from two places:
-///   • `ContextAssemblyTrace.history` — last turn's compression
-///     method + pre/post tokens + information_lost.
-///   • `ObservabilitySession.compressed_turns` — every turn this
-///     session that fired compaction, for the big-picture story.
-/// Collapsed view shows aggregate counts; expansion walks per-event
-/// detail; drill shows full `information_lost` + summary text.
+/// Positive compaction observations owned by the runtime and session.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct CompactionSummary {
-    /// `true` when the most recent turn triggered compaction.
     pub triggered_this_turn: bool,
-    /// All turns in the session that fired compaction.  Includes
-    /// older events beyond just this turn.
+    /// Turns with at least one recorded marker, not a count of rewrites.
     pub compressed_turns: Vec<u32>,
-    /// Exact per-turn compaction detail, only when a producer recorded a
-    /// real turn identity.
-    pub events: Vec<CompactionEventItem>,
-    /// Pipeline-level work that freed context without a meaningful individual
-    /// turn identity (for example duplicate-read elimination).
-    pub stages: Vec<CompactionStageItem>,
-    /// Aggregate token shape (last turn only).
-    pub tokens_before: u32,
-    pub tokens_after: u32,
 }
 
 impl CompactionSummary {
     pub fn is_empty(&self) -> bool {
-        !self.triggered_this_turn
-            && self.compressed_turns.is_empty()
-            && self.events.is_empty()
-            && self.stages.is_empty()
+        !self.triggered_this_turn && self.compressed_turns.is_empty()
     }
-
-    pub fn tokens_saved(&self) -> u32 {
-        self.tokens_before.saturating_sub(self.tokens_after)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct CompactionEventItem {
-    pub turn_index: u32,
-    pub role: String,
-    pub method: String,
-    pub original_tokens: u32,
-    pub compressed_tokens: u32,
-    /// Human-readable bullets describing what was lost.
-    pub information_lost: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct CompactionStageItem {
-    pub stage: String,
-    pub method: String,
-    pub tokens_freed: u32,
 }
 
 /// Extra detail for the Memory section.  Populated directly from
@@ -378,58 +335,29 @@ pub(crate) fn summarize_session_read_activity(
     summary
 }
 
-/// One decision lifted from `ContextAssemblyTrace::explanations`.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct DecisionItem {
-    pub label: String,
-    pub reasoning: String,
-    pub confidence: f64,
-    pub alternatives: Vec<AlternativeItem>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct AlternativeItem {
-    pub description: String,
-    pub score: f64,
-    pub why_not_chosen: String,
-}
-
-/// Aggregate summary of the history slice the context carried into
-/// the most recent turn.  The view renders this as a labelled
-/// section so the user can see how aggressively the compactor is
-/// trimming their backlog. `turns` carries per-turn details that
-/// the expanded view surfaces.
+/// Observed CLI admission input, or explicitly labelled local display evidence.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct HistorySummary {
-    pub total_turns: u32,
-    pub retained: u32,
-    pub compressed: u32,
-    pub dropped: u32,
-    pub tokens_before: u32,
-    pub tokens_after: u32,
-    pub compression_ratio: f64,
+    pub total_tokens: u32,
     pub turns: Vec<TurnDetail>,
-    pub dropped_indices: Vec<u32>,
-    /// Whether item text came from the exact prompt-history trace or is a
-    /// local visible-conversation fallback. The UI must never present the
-    /// latter as proof of what entered the model prompt.
     pub evidence_source: HistoryEvidenceSource,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum HistoryEvidenceSource {
     #[default]
-    PromptTrace,
+    Unavailable,
+    AdmissionInput,
     LocalVisibleConversation,
 }
 
 impl HistorySummary {
     pub fn is_empty(&self) -> bool {
-        self.total_turns == 0
-            && self.retained == 0
-            && self.compressed == 0
-            && self.dropped == 0
-            && self.tokens_before == 0
+        match self.evidence_source {
+            HistoryEvidenceSource::Unavailable => true,
+            HistoryEvidenceSource::AdmissionInput => false,
+            HistoryEvidenceSource::LocalVisibleConversation => self.turns.is_empty(),
+        }
     }
 }
 
@@ -442,6 +370,7 @@ pub(crate) enum CategoryKind {
     Memory,
     History,
     UserMessage,
+    Unattributed,
 }
 
 impl CategoryKind {
@@ -452,6 +381,7 @@ impl CategoryKind {
             Self::Memory => "Memory",
             Self::History => "History",
             Self::UserMessage => "Current turn",
+            Self::Unattributed => "Unattributed",
         }
     }
 
@@ -463,6 +393,7 @@ impl CategoryKind {
             Self::Memory => theme.quote,
             Self::History => theme.warn,
             Self::UserMessage => theme.success,
+            Self::Unattributed => theme.warn,
         }
     }
 }
@@ -506,9 +437,6 @@ pub(crate) struct TurnDetail {
     pub role: String,
     pub tokens: u32,
     pub has_tool_calls: bool,
-    /// `None` when this turn was retained; `Some(method)` when
-    /// compressed with that method.
-    pub compressed_from: Option<(u32, String)>,
     /// Short content preview taken from the turn body (first
     /// non-blank line). Empty when the caller didn't attach
     /// transcript text.
@@ -545,7 +473,6 @@ pub(crate) enum Section {
     Memory,
     History,
     Compaction,
-    Decisions,
 }
 
 impl Section {
@@ -559,7 +486,6 @@ impl Section {
             Section::Memory,
             Section::History,
             Section::Compaction,
-            Section::Decisions,
         ]
     }
 
@@ -573,7 +499,6 @@ impl Section {
             Section::Memory => "Memory · /memory",
             Section::History => "History · conversation turns",
             Section::Compaction => "Compaction · context trimming",
-            Section::Decisions => "Decisions · why did it pick this",
         }
     }
 
@@ -603,9 +528,8 @@ impl ContextBreakdown {
             Section::Tools => !self.tools.is_empty(),
             Section::Skills => !self.skills.is_empty(),
             Section::Memory => !self.memories.is_empty() || !self.memory_focus.is_empty(),
-            Section::History => !self.history.is_empty(),
+            Section::History => !self.history.is_empty() || self.limit > 0,
             Section::Compaction => !self.compaction.is_empty(),
-            Section::Decisions => !self.decisions.is_empty(),
         }
     }
 
@@ -646,14 +570,14 @@ impl PressureBand {
 }
 
 /// Auxiliary data the caller supplies alongside a trace. The
-/// trace carries its own exact prompt-history previews; this snapshot carries
+/// trace carries observed CLI admission input previews; this snapshot carries
 /// local evidence that the trace cannot own (visible conversation when no
 /// trace exists, cwd + git branch for Environment, etc). All fields are
 /// optional so callers can opt in incrementally.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ContextSnapshot<'a> {
     /// Local conversation visible in the current TUI session. This is a
-    /// fallback when an exact prompt-composition trace is unavailable; its
+    /// fallback when admission input history is unavailable; its
     /// ordinal intentionally is not treated as a trace turn identity.
     pub visible_conversation: Vec<VisibleConversationItem>,
     /// Current model identifier (for the System-prompt Persona row).
@@ -707,7 +631,7 @@ impl ContextBreakdown {
             memory_focus: MemoryFocus::default(),
             prompt_signals: Vec::new(),
             session_summary: None,
-            decisions: Vec::new(),
+
             compaction: CompactionSummary::default(),
         }
     }
@@ -726,12 +650,10 @@ impl ContextBreakdown {
                 role: item.role.clone(),
                 tokens: 0,
                 has_tool_calls: false,
-                compressed_from: None,
                 preview: item.preview.clone(),
                 body: item.body.clone(),
             })
             .collect::<Vec<_>>();
-        let retained = turns.len() as u32;
         let skills = snap
             .selected_skills
             .iter()
@@ -755,21 +677,14 @@ impl ContextBreakdown {
             skills,
             system_sections: Vec::new(),
             history: HistorySummary {
-                total_turns: retained,
-                retained,
-                compressed: 0,
-                dropped: 0,
-                tokens_before: 0,
-                tokens_after: 0,
-                compression_ratio: 0.0,
+                total_tokens: 0,
                 turns,
-                dropped_indices: Vec::new(),
                 evidence_source: HistoryEvidenceSource::LocalVisibleConversation,
             },
             memory_focus: MemoryFocus::default(),
             prompt_signals: Vec::new(),
             session_summary: snap.session.clone(),
-            decisions: Vec::new(),
+
             compaction: CompactionSummary {
                 compressed_turns: snap.compressed_turns.clone(),
                 ..Default::default()
@@ -791,7 +706,7 @@ impl ContextBreakdown {
     }
 
     /// Build from a trace plus auxiliary local evidence. The trace's history
-    /// preview remains authoritative for prompt contents; the snapshot adds
+    /// preview describes admission input; the snapshot adds
     /// environment, skill and session facts without attempting an ordinal
     /// join to local transcript cells.
     pub fn from_trace_with(trace: &ContextAssemblyTrace, snap: &ContextSnapshot<'_>) -> Self {
@@ -811,7 +726,8 @@ impl ContextBreakdown {
             (CategoryKind::History, budget.history_tokens),
             (CategoryKind::UserMessage, budget.user_message_tokens),
         ];
-        let categories: Vec<Category> = raw
+        let attributed: u64 = raw.iter().map(|(_, tokens)| u64::from(*tokens)).sum();
+        let mut categories: Vec<Category> = raw
             .into_iter()
             .filter(|(_, t)| *t > 0)
             .map(|(kind, tokens)| Category {
@@ -820,6 +736,17 @@ impl ContextBreakdown {
                 pct_of_limit: pct(tokens),
             })
             .collect();
+
+        // Provider-reported usage can exceed the estimated category breakdown.
+        // Keep that occupied context explicit instead of presenting it as free.
+        let unattributed = u64::from(budget.total_used).saturating_sub(attributed) as u32;
+        if unattributed > 0 {
+            categories.push(Category {
+                kind: CategoryKind::Unattributed,
+                tokens: unattributed,
+                pct_of_limit: pct(unattributed),
+            });
+        }
 
         let free_space_tokens = limit.saturating_sub(budget.total_used);
 
@@ -896,54 +823,29 @@ impl ContextBreakdown {
         // for Persona, user-rules path for User preferences.
         let system_sections = build_system_sections(trace, snap);
 
-        // History summary: counts + pre/post-compression token shape.
-        // Rendered as a dedicated section so users can see how much
-        // of their backlog survived the compactor this turn.
-        let h = &trace.history;
-        let mut turns: Vec<TurnDetail> =
-            Vec::with_capacity(h.turns_retained.len() + h.turns_compressed.len());
-        for r in &h.turns_retained {
-            turns.push(TurnDetail {
-                index: r.turn_index,
-                role: r.role.clone(),
-                tokens: r.tokens,
-                has_tool_calls: r.has_tool_calls,
-                compressed_from: None,
-                preview: r.content_preview.clone(),
-                body: String::new(),
-            });
-        }
-        for c in &h.turns_compressed {
-            turns.push(TurnDetail {
-                index: c.turn_index,
-                role: c.role.clone(),
-                tokens: c.compressed_tokens,
-                has_tool_calls: false,
-                compressed_from: Some((c.original_tokens, format!("{:?}", c.compression_method))),
-                preview: String::new(),
-                body: String::new(),
-            });
-        }
-        // Sort ascending by turn index so the expanded view reads
-        // chronologically — matches how scrollback is ordered.
-        turns.sort_by_key(|t| t.index);
-
-        let history = HistorySummary {
-            total_turns: h.total_turns_available,
-            retained: h.turns_retained.len() as u32,
-            compressed: h.turns_compressed.len() as u32,
-            dropped: h.turns_dropped.len() as u32,
-            tokens_before: h.tokens_before,
-            tokens_after: h.tokens_after,
-            compression_ratio: h.compression_ratio,
-            turns,
-            dropped_indices: h.turns_dropped.clone(),
-            evidence_source: HistoryEvidenceSource::PromptTrace,
-        };
+        let history = trace
+            .history
+            .as_ref()
+            .map(|history| HistorySummary {
+                total_tokens: history.total_tokens,
+                turns: history
+                    .turns_retained
+                    .iter()
+                    .map(|turn| TurnDetail {
+                        index: turn.turn_index,
+                        role: turn.role.clone(),
+                        tokens: turn.tokens,
+                        has_tool_calls: turn.has_tool_calls,
+                        preview: turn.content_preview.clone(),
+                        body: String::new(),
+                    })
+                    .collect(),
+                evidence_source: HistoryEvidenceSource::AdmissionInput,
+            })
+            .unwrap_or_default();
 
         let memory_focus = build_memory_focus(trace);
         let prompt_signals = build_prompt_signals(trace);
-        let decisions = build_decisions(trace);
         let session_summary = snap.session.clone();
         let compaction = build_compaction_summary(trace, snap);
 
@@ -962,7 +864,6 @@ impl ContextBreakdown {
             memory_focus,
             prompt_signals,
             session_summary,
-            decisions,
             compaction,
         }
     }
@@ -997,35 +898,9 @@ fn build_compaction_summary(
     trace: &ContextAssemblyTrace,
     snap: &ContextSnapshot<'_>,
 ) -> CompactionSummary {
-    let h = &trace.history;
-    let events: Vec<CompactionEventItem> = h
-        .turns_compressed
-        .iter()
-        .map(|c| CompactionEventItem {
-            turn_index: c.turn_index,
-            role: c.role.clone(),
-            method: format!("{:?}", c.compression_method),
-            original_tokens: c.original_tokens,
-            compressed_tokens: c.compressed_tokens,
-            information_lost: c.information_lost.clone(),
-        })
-        .collect();
-    let stages = h
-        .compression_stages
-        .iter()
-        .map(|stage| CompactionStageItem {
-            stage: stage.stage.clone(),
-            method: format!("{:?}", stage.method),
-            tokens_freed: stage.tokens_freed,
-        })
-        .collect();
     CompactionSummary {
         triggered_this_turn: trace.token_budget.compression_triggered,
         compressed_turns: snap.compressed_turns.clone(),
-        events,
-        stages,
-        tokens_before: h.tokens_before,
-        tokens_after: h.tokens_after,
     }
 }
 
@@ -1151,42 +1026,6 @@ fn build_prompt_signals(trace: &ContextAssemblyTrace) -> Vec<SignalItem> {
     .into_iter()
     .flatten()
     .collect()
-}
-
-fn build_decisions(trace: &ContextAssemblyTrace) -> Vec<DecisionItem> {
-    trace
-        .explanations
-        .iter()
-        .map(|d: &DecisionExplanation| DecisionItem {
-            label: render_decision_label(&d.decision_type),
-            reasoning: d.reasoning.clone(),
-            confidence: d.confidence,
-            alternatives: d
-                .alternatives_considered
-                .iter()
-                .map(|a| AlternativeItem {
-                    description: a.description.clone(),
-                    score: a.score,
-                    why_not_chosen: a.why_not_chosen.clone(),
-                })
-                .collect(),
-        })
-        .collect()
-}
-
-fn render_decision_label(t: &DecisionType) -> String {
-    match t {
-        DecisionType::ToolSurface { visible_tools } => {
-            format!("Tool surface ({})", visible_tools.join(", "))
-        }
-        DecisionType::HistoryCompression { turns_affected } => {
-            format!("History compression ({} turns)", turns_affected.len())
-        }
-        DecisionType::MemoryRetrieval { memories } => {
-            format!("Memory retrieval ({} memories)", memories.len())
-        }
-        DecisionType::StrategyChoice { strategy } => format!("Strategy choice ({strategy})"),
-    }
 }
 
 fn build_system_sections(

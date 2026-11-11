@@ -164,6 +164,9 @@ pub enum Criterion {
         /// assertions and intentionally remains optional for parallel work.
         #[serde(default)]
         require_settled: bool,
+        /// Optional predicates and shared values for the same ordered witness.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        steps: Vec<ExecutionSequenceStep>,
     },
     /// Count direct children in the complete authoritative run tree.
     ExecutionChildCount { min: u32, max: u32 },
@@ -454,11 +457,24 @@ pub enum Criterion {
         producer: String,
         producer_document: JournalToolDocument,
         producer_path: String,
+        /// Optionally extract one JSON scalar from a textual producer value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        producer_capture: Option<String>,
         producer_filters: Vec<JournalJsonPredicate>,
         consumer: String,
         consumer_document: JournalToolDocument,
         consumer_paths: Vec<String>,
+        /// Optionally extract a complete string value from the destination.
+        /// When present, captured producer and consumer values compare as
+        /// strings, preserving their exact bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        consumer_capture: Option<String>,
         consumer_filters: Vec<JournalJsonPredicate>,
+        /// Require every call to this consumer in the captured run to use
+        /// the same value from exactly one prior producer. At least one
+        /// successful consumer must also satisfy `consumer_filters`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        all_consumers: bool,
         /// Optional visible-turn separation required between the producer
         /// and consumer. When set, both calls must carry a typed turn field;
         /// missing turn evidence fails closed instead of guessing from event
@@ -566,6 +582,12 @@ pub enum Criterion {
         /// tool execution, including one whose execution result is an error.
         #[serde(default)]
         require_added_before_execution: bool,
+        /// User explicitly requires retirement before any execution.
+        #[serde(default)]
+        require_cancel_before_execution: bool,
+        /// Task execution must follow a server-issued Work assignment.
+        #[serde(default)]
+        require_board_before_execution: bool,
     },
 
     /// Proves a successful canonical graph patch was committed after Work was
@@ -795,6 +817,27 @@ pub enum JournalToolDocument {
     RuntimeMetadata,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionSequenceStep {
+    #[serde(default)]
+    pub ok: Option<bool>,
+    #[serde(default)]
+    pub predicates: Vec<JournalJsonPredicate>,
+    #[serde(default)]
+    pub bindings: Vec<ExecutionSequenceBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionSequenceBinding {
+    pub name: String,
+    pub document: JournalToolDocument,
+    pub path: String,
+    #[serde(default)]
+    pub capture: Option<String>,
+}
+
 /// One structural predicate applied to the same durable tool call that
 /// participates in a value-flow relation.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -864,6 +907,108 @@ impl JournalJsonPredicate {
             _ => false,
         }
     }
+
+    fn mismatch(&self, value: Option<&serde_json::Value>) -> serde_json::Value {
+        // Diagnostics must not publish tool arguments, results, or unknown keys.
+        // Paths come only from the declared predicate and expected structure.
+        if self.path.len() > 512 {
+            return serde_json::json!({"reason":"truncated", "limit":"path"});
+        }
+        if let Some(expected) = &self.equals {
+            first_json_mismatch(expected, value, &self.path, 0, &mut 64)
+                .expect("only mismatching predicates request diagnostics")
+        } else {
+            serde_json::json!({
+                "path":self.path,
+                "reason": match value {
+                    None => "missing",
+                    Some(serde_json::Value::String(_)) => "substring_absent",
+                    _ => "type_mismatch",
+                },
+                "expected_type":"string", "actual_type":json_kind(value),
+            })
+        }
+    }
+}
+
+fn json_kind(value: Option<&serde_json::Value>) -> &'static str {
+    use serde_json::Value;
+    match value {
+        None => "missing",
+        Some(Value::Null) => "null",
+        Some(Value::Bool(_)) => "boolean",
+        Some(Value::Number(_)) => "number",
+        Some(Value::String(_)) => "string",
+        Some(Value::Array(_)) => "array",
+        Some(Value::Object(_)) => "object",
+    }
+}
+
+fn first_json_mismatch(
+    expected: &serde_json::Value,
+    actual: Option<&serde_json::Value>,
+    path: &str,
+    depth: usize,
+    remaining: &mut usize,
+) -> Option<serde_json::Value> {
+    use serde_json::{Value, json};
+    if path.len() > 512 || depth > 8 || *remaining == 0 {
+        return Some(json!({"reason":"truncated", "limit":"structure"}));
+    }
+    *remaining -= 1;
+    let detail = |reason| {
+        json!({"path":path, "reason":reason,
+        "expected_type":json_kind(Some(expected)), "actual_type":json_kind(actual)})
+    };
+    let Some(actual) = actual else {
+        return Some(detail("missing"));
+    };
+    if json_kind(Some(expected)) != json_kind(Some(actual)) {
+        return Some(detail("type_mismatch"));
+    }
+    match (expected, actual) {
+        (Value::Object(expected), Value::Object(actual)) => {
+            for (key, expected) in expected {
+                if key.len() > 512 {
+                    return Some(json!({"reason":"truncated", "limit":"path"}));
+                }
+                let escaped = key.replace('~', "~0").replace('/', "~1");
+                let child_path = format!("{path}/{escaped}");
+                if let Some(detail) = first_json_mismatch(
+                    expected,
+                    actual.get(key),
+                    &child_path,
+                    depth + 1,
+                    remaining,
+                ) {
+                    return Some(detail);
+                }
+            }
+            (actual.len() > expected.len()).then(|| {
+                json!({"path":path,
+                "reason":"unexpected_members", "count":actual.len() - expected.len()})
+            })
+        }
+        (Value::Array(expected), Value::Array(actual)) => {
+            if expected.len() != actual.len() {
+                return Some(json!({"path":path, "reason":"array_length_mismatch",
+                    "expected_length":expected.len(), "actual_length":actual.len()}));
+            }
+            for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                if let Some(detail) = first_json_mismatch(
+                    expected,
+                    Some(actual),
+                    &format!("{path}/{index}"),
+                    depth + 1,
+                    remaining,
+                ) {
+                    return Some(detail);
+                }
+            }
+            None
+        }
+        _ => (actual != expected).then(|| detail("scalar_mismatch")),
+    }
 }
 
 /// How severe a criterion failure is.
@@ -901,6 +1046,33 @@ pub struct CriterionResult {
     /// For Judger only: the score the judger returned.
     #[serde(default)]
     pub score: Option<f64>,
+}
+
+// Numeric evidence produced by the same evaluator that decides the verdict.
+// Never carry tool names, JSON paths/values, commands, or response text here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum JournalDiagnostic {
+    JournalCount {
+        min: u32,
+        max: u32,
+        actual: u32,
+        considered: u32,
+        outcome_matches: u32,
+        missing: u32,
+        type_mismatch: u32,
+        value_mismatch: u32,
+    },
+    JournalRatio {
+        min: f64,
+        min_calls: u32,
+        allowed_failures: u32,
+        terminal: u32,
+        succeeded: u32,
+        failed: u32,
+        pending: u32,
+        adjusted_terminal: u32,
+    },
 }
 
 fn default_severity() -> CriterionSeverity {
@@ -984,25 +1156,34 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
 }
 
 /// Share the same structured proof with classification, including composites.
-pub(crate) fn execution_verification_unavailable(
-    result: &CriterionResult,
-    outcome: &RunOutcome,
-) -> bool {
+pub(crate) fn execution_verification_unavailable(result: &CriterionResult) -> bool {
     match &result.criterion {
         Criterion::ExecutionToolCount { .. }
         | Criterion::ExecutionToolSequence { .. }
         | Criterion::ExecutionChildCount { .. }
-        | Criterion::ExecutionChildResultsAdopted { .. } => {
-            execution_contract_proof(&result.criterion, outcome).is_err()
-        }
+        | Criterion::ExecutionChildResultsAdopted { .. }
+        | Criterion::JournalToolValueFlowBound {
+            all_consumers: true,
+            ..
+        } => result
+            .full_detail
+            .as_deref()
+            .and_then(|detail| serde_json::from_str::<serde_json::Value>(detail).ok())
+            .is_some_and(|proof| {
+                proof["kind"] == "unavailable"
+                    || (proof["kind"] == "child_adoption" && proof["status"] == "unavailable")
+            }),
         Criterion::AnyOf { .. } | Criterion::AllOf { .. } => result
             .full_detail
             .as_deref()
-            .and_then(|value| serde_json::from_str::<Vec<CriterionResult>>(value).ok())
-            .is_some_and(|nested| {
-                nested.iter().any(|evaluated| {
-                    !evaluated.passed && execution_verification_unavailable(evaluated, outcome)
-                })
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .is_some_and(|proof| {
+                proof["kind"] == "unavailable"
+                    || serde_json::from_value::<Vec<CriterionResult>>(proof).is_ok_and(|nested| {
+                        nested.iter().any(|evaluated| {
+                            !evaluated.passed && execution_verification_unavailable(evaluated)
+                        })
+                    })
             }),
         _ => false,
     }
@@ -1037,9 +1218,159 @@ impl ExecutionProofUnavailable {
 
 /// The verdict and its public numeric evidence come from the same proof. Never
 /// include tool arguments, result strings, predicate values or provider errors.
+fn bound_execution_sequence(
+    calls: &[crate::execution_capture::ExecutionToolCall<'_>],
+    root: &str,
+    tools: &[String],
+    steps: &[ExecutionSequenceStep],
+    last_ok: Option<bool>,
+) -> Result<(bool, serde_json::Value), &'static str> {
+    if tools.is_empty() || tools.len() != steps.len() || tools.len() > 64 {
+        return Err("invalid sequence steps");
+    }
+    #[derive(Clone, PartialEq)]
+    struct Witness {
+        next: usize,
+        round: Option<(u32, u32)>,
+        values: std::collections::HashMap<String, serde_json::Value>,
+    }
+    let captures = steps
+        .iter()
+        .map(|step| {
+            step.bindings
+                .iter()
+                .map(|binding| binding.capture.as_deref().map(Regex::new).transpose())
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "invalid sequence capture")?;
+    let mut calls = calls
+        .iter()
+        .filter(|call| call.run_id.as_deref() == Some(root))
+        .collect::<Vec<_>>();
+    if calls.iter().any(|call| call.round.is_none()) {
+        return Err("tool ordering requires exact producer rounds");
+    }
+    if calls.iter().any(|call| call.turn.is_some()) && calls.iter().any(|call| call.turn.is_none())
+    {
+        return Err("tool ordering requires consistent turn identity");
+    }
+    calls.sort_by_key(|call| (call.turn.unwrap_or(0), call.round));
+    let mut states = vec![Witness {
+        next: 0,
+        round: None,
+        values: Default::default(),
+    }];
+    for call in calls {
+        let round = (call.turn.unwrap_or(0), call.round.expect("round validated"));
+        let raw_result = call
+            .result
+            .is_none()
+            .then(|| serde_json::Value::String(call.raw_result().to_owned()));
+        let existing = states.len();
+        for index in 0..existing {
+            let state = &states[index];
+            let step = &steps[state.next];
+            if call.name != tools[state.next]
+                || state.round.is_some_and(|previous| round <= previous)
+                || step.ok.is_some_and(|expected| call.ok != Some(expected))
+                || (state.next + 1 == tools.len()
+                    && last_ok.is_some_and(|expected| call.ok != Some(expected)))
+            {
+                continue;
+            }
+            let document = |kind: JournalToolDocument, path: &str| -> Option<&serde_json::Value> {
+                match kind {
+                    JournalToolDocument::Arguments => call.arguments.as_ref()?.pointer(path),
+                    JournalToolDocument::Result if path.is_empty() && call.result.is_none() => {
+                        raw_result.as_ref()
+                    }
+                    JournalToolDocument::Result => call.result.as_ref()?.pointer(path),
+                    _ => None,
+                }
+            };
+            if !step
+                .predicates
+                .iter()
+                .all(|predicate| predicate.matches(document(predicate.document, &predicate.path)))
+            {
+                continue;
+            }
+            let mut next = state.clone();
+            let mut matched = true;
+            for (binding, capture) in step.bindings.iter().zip(&captures[state.next]) {
+                let value = document(binding.document, &binding.path).and_then(|value| {
+                    if let Some(capture) = capture {
+                        let text = value.as_str()?;
+                        if text.len() > 65_536 {
+                            return None;
+                        }
+                        return capture
+                            .captures(text)?
+                            .get(1)
+                            .map(|value| serde_json::Value::String(value.as_str().to_owned()));
+                    }
+                    match value {
+                        serde_json::Value::String(text) if text.len() <= 1024 => {
+                            Some(value.clone())
+                        }
+                        serde_json::Value::Number(_)
+                        | serde_json::Value::Bool(_)
+                        | serde_json::Value::Null => Some(value.clone()),
+                        _ => None,
+                    }
+                });
+                let Some(value) =
+                    value.filter(|value| value.as_str().is_none_or(|text| text.len() <= 1024))
+                else {
+                    matched = false;
+                    break;
+                };
+                match next.values.get(&binding.name) {
+                    Some(previous) if previous != &value => {
+                        matched = false;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => {
+                        next.values.insert(binding.name.clone(), value);
+                    }
+                }
+            }
+            if !matched {
+                continue;
+            }
+            next.next += 1;
+            next.round = Some(round);
+            if next.next == tools.len() {
+                return Ok((
+                    true,
+                    serde_json::json!({"kind":"sequence", "matched":tools.len(), "expected":tools.len()}),
+                ));
+            }
+            // For identical bindings an earlier round dominates a later one.
+            if !states
+                .iter()
+                .any(|state| state.next == next.next && state.values == next.values)
+            {
+                if states.len() >= 1024 {
+                    return Err("sequence witness limit exceeded");
+                }
+                states.push(next);
+            }
+        }
+    }
+    let matched = states.iter().map(|state| state.next).max().unwrap_or(0);
+    Ok((
+        false,
+        serde_json::json!({"kind":"sequence", "matched":matched, "expected":tools.len()}),
+    ))
+}
+
 pub(crate) fn execution_contract_proof(
     c: &Criterion,
     outcome: &RunOutcome,
+    session: Option<&SessionCapture>,
 ) -> Result<(bool, serde_json::Value), ExecutionProofUnavailable> {
     let stream = outcome
         .stream_capture
@@ -1062,7 +1393,7 @@ pub(crate) fn execution_contract_proof(
         fanout_group,
     } = c
     {
-        return match capture.verify_children(root, children, fanout_group.as_ref()) {
+        return match capture.verify_children(root, children, fanout_group.as_ref(), session) {
             Ok(_) => Ok((
                 true,
                 serde_json::json!({
@@ -1074,12 +1405,16 @@ pub(crate) fn execution_contract_proof(
                     detail,
                     child_reason: Some(failure.reason),
                 }),
-                None => Ok((
-                    false,
-                    serde_json::json!({
+                None => {
+                    let mut diagnostic = serde_json::json!({
                         "kind":"child_adoption", "status":"contradicted", "reason":failure.reason
-                    }),
-                )),
+                    });
+                    if let Some(mutation) = failure.mutation {
+                        diagnostic["mutation"] =
+                            serde_json::to_value(mutation).expect("closed diagnostic");
+                    }
+                    Ok((false, diagnostic))
+                }
             },
         };
     }
@@ -1092,7 +1427,7 @@ pub(crate) fn execution_contract_proof(
             serde_json::json!({"kind":"count", "min":min, "max":max, "actual":count}),
         ));
     }
-    let calls = capture.tools(root)?;
+    let calls = capture.tools(root, session)?;
     match c {
         Criterion::ExecutionToolCount {
             name,
@@ -1109,10 +1444,9 @@ pub(crate) fn execution_contract_proof(
                         .into(),
                 );
             }
-            for call in calls
-                .iter()
-                .filter(|call| call.name == name && (!root_only || call.run_id == root))
-            {
+            for call in calls.iter().filter(|call| {
+                call.name == *name && (!root_only || call.run_id.as_deref() == Some(root))
+            }) {
                 if ok.is_some() && call.ok.is_none() {
                     return Err("requested tool outcome not captured".into());
                 }
@@ -1134,13 +1468,14 @@ pub(crate) fn execution_contract_proof(
             let mut outcome_matches = 0;
             let mut error_matches = 0;
             let mut predicate_matches = vec![0usize; predicates.len()];
+            let mut predicate_mismatches = vec![None; predicates.len()];
             let mut observed_outcomes: Vec<serde_json::Value> = Vec::new();
             let mut outcome_bytes = 0;
             let mut outcomes_omitted = 0usize;
             let count = calls
                 .iter()
                 .filter(|call| {
-                    if call.name != name || (*root_only && call.run_id != root) {
+                    if call.name != *name || (*root_only && call.run_id.as_deref() != Some(root)) {
                         return false;
                     }
                     considered += 1;
@@ -1165,7 +1500,7 @@ pub(crate) fn execution_contract_proof(
                     }
                     outcome_matches += 1;
                     let error_match = error_contains.as_ref().is_none_or(|needle| {
-                        call.ok == Some(false) && call.raw_result.contains(needle)
+                        call.ok == Some(false) && call.raw_result().contains(needle)
                     });
                     error_matches += usize::from(error_match);
                     let mut all_match = error_match;
@@ -1178,11 +1513,29 @@ pub(crate) fn execution_contract_proof(
                         let matched = predicate
                             .matches(document.and_then(|value| value.pointer(&predicate.path)));
                         predicate_matches[index] += usize::from(matched);
+                        if !matched && predicate_mismatches[index].is_none() {
+                            predicate_mismatches[index] = Some(predicate.mismatch(
+                                document.and_then(|value| value.pointer(&predicate.path)),
+                            ));
+                        }
                         all_match &= matched;
                     }
                     all_match
                 })
                 .count() as u32;
+            let predicate_mismatches: Vec<_> = predicate_mismatches
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, first_mismatch)| {
+                    first_mismatch.map(|first_mismatch| {
+                        serde_json::json!({
+                            "predicate_index":index,
+                            "failure_count":outcome_matches - predicate_matches[index],
+                            "first_mismatch":first_mismatch,
+                        })
+                    })
+                })
+                .collect();
             Ok((
                 count >= *min && count <= *max,
                 serde_json::json!({
@@ -1190,6 +1543,7 @@ pub(crate) fn execution_contract_proof(
                     "considered":considered, "expected_ok":ok, "outcome_matches":outcome_matches,
                     "error_matches":error_contains.as_ref().map(|_| error_matches),
                     "predicate_matches":predicate_matches,
+                    "predicate_mismatches":predicate_mismatches,
                     "observed_outcomes":observed_outcomes, "outcomes_omitted":outcomes_omitted,
                 }),
             ))
@@ -1197,39 +1551,58 @@ pub(crate) fn execution_contract_proof(
         Criterion::ExecutionToolSequence {
             tools,
             last_ok,
-            require_settled,
+            require_settled: _,
+            steps,
         } => {
-            // Match an ordered subsequence of terminal receipts, rather than
-            // merely proving that every name exists somewhere in the run.
-            // Using the receipt order makes a recovery check cross the actual
-            // failed boundary instead of only the request emission boundary.
-            let mut calls: Vec<_> = calls.iter().filter(|call| call.run_id == root).collect();
-            calls.sort_by_key(|call| call.terminal_seq);
+            if !steps.is_empty() {
+                return bound_execution_sequence(&calls, root, tools, steps, *last_ok)
+                    .map_err(Into::into);
+            }
+            // A provider round completes before the next one is requested.
+            // Slots within one round do not establish execution order.
+            let mut calls: Vec<_> = calls
+                .iter()
+                .filter(|call| call.run_id.as_deref() == Some(root))
+                .collect();
+            if calls.iter().any(|call| call.round.is_none()) {
+                return Err("tool ordering requires exact producer rounds".into());
+            }
+            calls.sort_by_key(|call| call.round);
             let mut calls = calls.into_iter();
+            let mut previous_round = None;
             let mut last_call = None;
-            let mut previous_terminal_seq = None;
             for (position, name) in tools.iter().enumerate() {
                 let final_call = position + 1 == tools.len();
+                let mut ambiguous = false;
                 last_call = calls.find(|call| {
-                    call.name == name
-                        && (!*require_settled
-                            || previous_terminal_seq
-                                .is_none_or(|terminal_seq| call.request_seq > terminal_seq))
-                        && (!final_call || last_ok.is_none_or(|expected| call.ok == Some(expected)))
+                    if call.name != *name
+                        || (final_call && last_ok.is_some_and(|expected| call.ok != Some(expected)))
+                    {
+                        return false;
+                    }
+                    if previous_round.is_some_and(|round| call.round <= Some(round)) {
+                        ambiguous = true;
+                        return false;
+                    }
+                    true
                 });
                 if last_call.is_none() {
+                    if ambiguous {
+                        return Err("same-round tool order is unavailable".into());
+                    }
                     return Ok((
                         false,
                         serde_json::json!({"kind":"sequence", "matched":position, "expected":tools.len()}),
                     ));
                 }
-                previous_terminal_seq = last_call.map(|call| call.terminal_seq);
+                previous_round = last_call.and_then(|call| call.round);
             }
             Ok((
                 last_ok.is_none_or(|expected| last_call.and_then(|call| call.ok) == Some(expected)),
                 serde_json::json!({"kind":"sequence", "matched":tools.len(), "expected":tools.len()}),
             ))
         }
+
         _ => unreachable!(),
     }
 }
@@ -1483,57 +1856,6 @@ pub fn requires_session_capture(criteria: &[Criterion]) -> bool {
     criteria.iter().any(criterion_requires_session_capture)
 }
 
-/// Whether a criterion tree explicitly checks the post-loop memory
-/// subsystem.  A health assertion for a different future subsystem must not
-/// suppress the Memoria gate on a memory case.
-pub fn requires_memoria_subsystem_health(criteria: &[Criterion]) -> bool {
-    criteria.iter().any(|criterion| match criterion {
-        Criterion::SessionSubsystemHealthy { settled_subsystem } => settled_subsystem
-            .as_deref()
-            .is_none_or(|subsystem| subsystem == "post_loop_memory"),
-        Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
-            requires_memoria_subsystem_health(criteria)
-        }
-        _ => false,
-    })
-}
-
-/// Whether a criterion tree contains a Memoria health assertion on every
-/// successful path at the current list level.  `AnyOf` is deliberately
-/// conservative: a sibling branch can bypass its health assertion, so the
-/// runner keeps the injected hard gate in that case.
-pub fn has_unconditional_memoria_subsystem_health(criteria: &[Criterion]) -> bool {
-    criteria.iter().any(|criterion| match criterion {
-        // An omitted settlement target only validates the capture that is
-        // already available. It must not suppress the runner-injected
-        // post-loop barrier, because asynchronous memory work may still
-        // publish an error after that first capture.
-        Criterion::SessionSubsystemHealthy {
-            settled_subsystem: Some(subsystem),
-        } => subsystem == "post_loop_memory",
-        Criterion::AllOf { criteria } => has_unconditional_memoria_subsystem_health(criteria),
-        Criterion::AnyOf { .. } => false,
-        _ => false,
-    })
-}
-
-/// Return the explicit settlement target from an unconditional Memoria health
-/// assertion. `AnyOf` is excluded because a successful branch can bypass the
-/// health assertion; `AllOf` preserves the requirement for nested criteria.
-pub fn unconditional_memoria_settled_subsystem(criteria: &[Criterion]) -> Option<String> {
-    criteria.iter().find_map(|criterion| match criterion {
-        Criterion::SessionSubsystemHealthy { settled_subsystem }
-            if settled_subsystem
-                .as_deref()
-                .is_none_or(|subsystem| subsystem == "post_loop_memory") =>
-        {
-            settled_subsystem.clone()
-        }
-        Criterion::AllOf { criteria } => unconditional_memoria_settled_subsystem(criteria),
-        _ => None,
-    })
-}
-
 /// Return the explicit settlement target from any unconditional subsystem
 /// health assertion. This retains the runner-wide health mode's historical
 /// support for future subsystem names while keeping `AnyOf` fail-closed.
@@ -1570,6 +1892,9 @@ pub fn requires_durable_run_binding(criteria: &[Criterion]) -> bool {
 fn criterion_requires_session_capture(c: &Criterion) -> bool {
     match c {
         Criterion::SessionEventCount { .. }
+        | Criterion::ExecutionToolCount { .. }
+        | Criterion::ExecutionToolSequence { .. }
+        | Criterion::ExecutionChildResultsAdopted { .. }
         | Criterion::SessionChildResultAdopted { .. }
         | Criterion::JournalTurnEvaluationSignalCount { .. }
         | Criterion::JournalTurnEvaluationSuccess { .. }
@@ -1600,12 +1925,26 @@ fn criterion_requires_session_capture(c: &Criterion) -> bool {
     }
 }
 
+pub(crate) fn requires_judger_evidence(criteria: &[Criterion]) -> bool {
+    criteria.iter().any(|criterion| match criterion {
+        Criterion::Judger { .. } | Criterion::HardJudger { .. } => true,
+        Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
+            requires_judger_evidence(criteria)
+        }
+        _ => false,
+    })
+}
+
 pub(crate) fn requires_execution_capture(criteria: &[Criterion]) -> bool {
     criteria.iter().any(|criterion| match criterion {
         Criterion::ExecutionChildResultsAdopted { .. }
         | Criterion::ExecutionToolCount { .. }
         | Criterion::ExecutionToolSequence { .. }
-        | Criterion::ExecutionChildCount { .. } => true,
+        | Criterion::ExecutionChildCount { .. }
+        | Criterion::JournalToolValueFlowBound {
+            all_consumers: true,
+            ..
+        } => true,
         Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
             requires_execution_capture(criteria)
         }
@@ -1613,9 +1952,21 @@ pub(crate) fn requires_execution_capture(criteria: &[Criterion]) -> bool {
     })
 }
 
+fn requires_complete_journal_value_flow(criterion: &Criterion) -> bool {
+    match criterion {
+        Criterion::JournalToolValueFlowBound {
+            all_consumers: true,
+            ..
+        } => true,
+        Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
+            criteria.iter().any(requires_complete_journal_value_flow)
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn requires_execution_transcript(criteria: &[Criterion]) -> bool {
     criteria.iter().any(|criterion| match criterion {
-        Criterion::ExecutionToolCount { .. } | Criterion::ExecutionToolSequence { .. } => true,
         Criterion::ExecutionChildResultsAdopted { .. } => true,
         Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
             requires_execution_transcript(criteria)
@@ -1658,6 +2009,69 @@ fn is_flow_scalar(value: &serde_json::Value) -> bool {
         serde_json::Value::Null | serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
             false
         }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+fn bounded_flow_producer_value(
+    call: &crate::session_capture::JournalToolCall,
+    document: JournalToolDocument,
+    path: &str,
+    capture: Option<&regex::Regex>,
+    capture_requested: bool,
+    preserve_capture_string: bool,
+) -> Option<serde_json::Value> {
+    let value = if document == JournalToolDocument::RunId {
+        path.is_empty()
+            .then(|| call.run_id.clone().map(serde_json::Value::String))
+            .flatten()
+    } else {
+        journal_tool_document(call, document)
+            .and_then(|value| value.pointer(path))
+            .cloned()
+    }?;
+    let value = if capture_requested {
+        let captured = capture?
+            .captures(value.as_str()?)?
+            .get(1)?
+            .as_str()
+            .to_owned();
+        if preserve_capture_string {
+            serde_json::Value::String(captured)
+        } else {
+            serde_json::from_str(&captured).unwrap_or(serde_json::Value::String(captured))
+        }
+    } else {
+        value
+    };
+    is_flow_scalar(&value).then_some(value)
+}
+
+fn bounded_flow_destination_matches(
+    source: &serde_json::Value,
+    destination: &serde_json::Value,
+    capture: Option<&regex::Regex>,
+    capture_requested: bool,
+    exact: bool,
+) -> bool {
+    if capture_requested {
+        return source
+            .as_str()
+            .zip(destination.as_str())
+            .is_some_and(|(source, text)| {
+                capture
+                    .and_then(|regex| regex.captures(text))
+                    .and_then(|captures| captures.get(1))
+                    .is_some_and(|matched| matched.as_str() == source)
+            });
+    }
+    if exact {
+        source == destination
+    } else {
+        value_flows_into(source, destination)
     }
 }
 
@@ -2536,7 +2950,8 @@ fn evaluate_one_with_primary_cache(
             severity: criterion_severity(c),
             passed: false,
             detail: incomplete,
-            full_detail: None,
+            full_detail: requires_complete_journal_value_flow(c)
+                .then(|| serde_json::json!({"kind":"unavailable"}).to_string()),
             score: Some(0.0),
         };
     }
@@ -2585,17 +3000,16 @@ fn evaluate_one_with_primary_cache(
             }
         }
         Criterion::ToolResultClassCount { class, min, max } => {
-            let count = outcome
-                .tool_result_class_counts
-                .get(class)
-                .copied()
-                .unwrap_or(0);
-            let pass = count >= *min && count <= *max;
+            let count = outcome.tool_result_class_counts.get(class).copied();
+            let pass = count.is_some_and(|count| count >= *min && count <= *max);
             CriterionResult {
                 criterion: c.clone(),
                 severity: criterion_severity(c),
                 passed: pass,
-                detail: format!("tool_result_class_count[{class}]={count}, expected {min}..={max}"),
+                detail: format!(
+                    "tool_result_class_count[{class}]={}, expected {min}..={max}",
+                    count.map_or_else(|| "unknown".to_string(), |count| count.to_string())
+                ),
                 full_detail: None,
                 score: None,
             }
@@ -2612,11 +3026,7 @@ fn evaluate_one_with_primary_cache(
             }
         }
         Criterion::ToolsCountBetween { min, max } => {
-            // The terminal envelope and step-event archive cover the same
-            // inclusive execution but have independent capture paths. A
-            // short/partial step-event archive must never override a larger
-            // terminal count and accidentally certify an upper bound.
-            let n = outcome.total_tool_calls.max(outcome.tool_calls_count);
+            let n = outcome.observed_tool_calls();
             let pass = n >= *min && n <= *max;
             CriterionResult {
                 criterion: c.clone(),
@@ -3027,7 +3437,7 @@ fn evaluate_one_with_primary_cache(
         | Criterion::ExecutionToolSequence { .. }
         | Criterion::ExecutionChildCount { .. }
         | Criterion::ExecutionChildResultsAdopted { .. } => {
-            let proof = execution_contract_proof(c, outcome);
+            let proof = execution_contract_proof(c, outcome, session);
             CriterionResult {
                 criterion: c.clone(),
                 severity: CriterionSeverity::Hard,
@@ -3038,7 +3448,10 @@ fn evaluate_one_with_primary_cache(
                     }
                     Err(reason) => format!("Server verification unavailable: {reason}"),
                 },
-                full_detail: None,
+                full_detail: proof
+                    .as_ref()
+                    .err()
+                    .map(|reason| reason.diagnostic().to_string()),
                 score: None,
             }
         }
@@ -3389,22 +3802,43 @@ fn evaluate_one_with_primary_cache(
                     score: None,
                 };
             }
+            let mut considered = 0;
+            let mut outcome_matches = 0;
+            let mut missing = 0;
+            let mut type_mismatch = 0;
+            let mut value_mismatch = 0;
             let count = calls
                 .iter()
                 .filter(|call| {
                     if *root_only && call.run_id.as_deref() != outcome.run_id.as_deref() {
                         return false;
                     }
-                    if call.name != *name || ok.is_some_and(|expected| call.ok != Some(expected)) {
+                    if call.name != *name {
                         return false;
                     }
+                    considered += 1;
+                    if ok.is_some_and(|expected| call.ok != Some(expected)) {
+                        return false;
+                    }
+                    outcome_matches += 1;
                     let (Some(document), Some(path), Some(equals)) =
                         (document, path.as_deref(), equals)
                     else {
                         return true;
                     };
-                    let value = journal_tool_document(call, *document);
-                    value.and_then(|value| value.pointer(path)) == Some(equals)
+                    let actual = journal_tool_document(call, *document)
+                        .and_then(|value| value.pointer(path));
+                    match actual {
+                        None => missing += 1,
+                        Some(value) if value == equals => return true,
+                        Some(value)
+                            if std::mem::discriminant(value) != std::mem::discriminant(equals) =>
+                        {
+                            type_mismatch += 1;
+                        }
+                        Some(_) => value_mismatch += 1,
+                    }
+                    false
                 })
                 .count() as u32;
             let passed = count >= *min && count <= *max;
@@ -3423,7 +3857,19 @@ fn evaluate_one_with_primary_cache(
                     "journal tool {name}{outcome_filter}{predicate}{} full-call count={count}, expected {min}..={max}",
                     if *root_only { " root-only" } else { "" }
                 ),
-                full_detail: None,
+                full_detail: Some(
+                    serde_json::to_string(&JournalDiagnostic::JournalCount {
+                        min: *min,
+                        max: *max,
+                        actual: count,
+                        considered,
+                        outcome_matches,
+                        missing,
+                        type_mismatch,
+                        value_mismatch,
+                    })
+                    .expect("numeric journal count diagnostic"),
+                ),
                 score: None,
             }
         }
@@ -3431,11 +3877,7 @@ fn evaluate_one_with_primary_cache(
             let Some(session) = session else {
                 return missing_required_session(c, "journal_tool_outcome_count");
             };
-            let count = session
-                .journal_tool_calls()
-                .iter()
-                .filter(|call| call.name == *name && call.ok == Some(*ok))
-                .count() as u32;
+            let count = session.journal_tool_outcome_count(name, *ok) as u32;
             let passed = count >= *min && count <= *max;
             CriterionResult {
                 criterion: c.clone(),
@@ -3483,7 +3925,19 @@ fn evaluate_one_with_primary_cache(
                     adjusted_ratio = adjusted_ratio * 100.0,
                     min = min * 100.0,
                 ),
-                full_detail: None,
+                full_detail: Some(
+                    serde_json::to_string(&JournalDiagnostic::JournalRatio {
+                        min: *min,
+                        min_calls: *min_calls,
+                        allowed_failures: *allowed_failures,
+                        terminal,
+                        succeeded,
+                        failed: failures,
+                        pending: calls.len() as u32 - terminal,
+                        adjusted_terminal,
+                    })
+                    .expect("numeric journal ratio diagnostic"),
+                ),
                 score: None,
             }
         }
@@ -3972,6 +4426,8 @@ fn evaluate_one_with_primary_cache(
             added_execution_after_initial_deliveries,
             require_added_at_start,
             require_added_before_execution,
+            require_cancel_before_execution,
+            require_board_before_execution,
         } => {
             let Some(session) = session else {
                 return missing_required_session(c, "journal_work_replacement_lifecycle");
@@ -3988,6 +4444,8 @@ fn evaluate_one_with_primary_cache(
                         *added_execution_after_initial_deliveries,
                     require_added_at_start: *require_added_at_start,
                     require_added_before_execution: *require_added_before_execution,
+                    require_cancel_before_execution: *require_cancel_before_execution,
+                    require_board_before_execution: *require_board_before_execution,
                 },
             );
             CriterionResult {
@@ -4437,18 +4895,169 @@ fn evaluate_one_with_primary_cache(
             producer,
             producer_document,
             producer_path,
+            producer_capture,
             producer_filters,
             consumer,
             consumer_document,
             consumer_paths,
+            consumer_capture,
             consumer_filters,
+            all_consumers,
             min_turns_after_producer,
             max_turns_after_producer,
             ..
         } => {
             let Some(session) = session else {
-                return missing_required_session(c, "journal_tool_value_flow_bound");
+                let mut result = missing_required_session(c, "journal_tool_value_flow_bound");
+                if *all_consumers {
+                    result.full_detail =
+                        Some(serde_json::json!({"kind":"unavailable"}).to_string());
+                }
+                return result;
             };
+            let capture = producer_capture
+                .as_deref()
+                .and_then(|pattern| regex::Regex::new(pattern).ok());
+            let destination_capture = consumer_capture
+                .as_deref()
+                .and_then(|pattern| regex::Regex::new(pattern).ok());
+            if *all_consumers {
+                #[derive(Clone, Copy)]
+                enum Failure {
+                    Unavailable,
+                    Contradicted,
+                }
+                let verified = (|| {
+                    let stream = outcome
+                        .stream_capture
+                        .as_ref()
+                        .ok_or(Failure::Unavailable)?;
+                    if !stream.identity_verified {
+                        return Err(Failure::Unavailable);
+                    }
+                    let root = outcome.run_id.as_deref().ok_or(Failure::Unavailable)?;
+                    let execution = stream.execution.as_ref().ok_or(Failure::Unavailable)?;
+                    let calls = execution
+                        .tools(root, Some(session))
+                        .map_err(|_| Failure::Unavailable)?;
+                    let identities: std::collections::HashSet<_> = calls
+                        .iter()
+                        .filter_map(|call| Some((call.run_id.clone()?, call.call_id.clone()?)))
+                        .collect();
+                    if identities.len() != calls.len()
+                        || session
+                            .journal_tool_calls()
+                            .iter()
+                            .filter(|call| call.name == *producer || call.name == *consumer)
+                            .any(|call| {
+                                call.run_id.as_ref().zip(call.call_id.as_ref()).is_none_or(
+                                    |(run, id)| !identities.contains(&(run.clone(), id.clone())),
+                                )
+                            })
+                    {
+                        return Err(Failure::Unavailable);
+                    }
+                    let mut produced = None;
+                    let mut consumers = Vec::new();
+                    for execution_call in calls {
+                        let mut call = (*execution_call).clone();
+                        if call.result.is_none() {
+                            call.result = Some(serde_json::Value::String(
+                                execution_call.raw_result().to_owned(),
+                            ));
+                        }
+                        if call.name == *producer
+                            && call_matches_predicates(&call, producer_filters)
+                        {
+                            if call.ok.is_none() {
+                                return Err(Failure::Unavailable);
+                            }
+                            if call.ok != Some(true) || produced.is_some() {
+                                return Err(Failure::Contradicted);
+                            }
+                            if *producer_document != JournalToolDocument::RunId
+                                && journal_tool_document(&call, *producer_document).is_none()
+                            {
+                                return Err(Failure::Unavailable);
+                            }
+                            produced = Some((
+                                bounded_flow_producer_value(
+                                    &call,
+                                    *producer_document,
+                                    producer_path,
+                                    capture.as_ref(),
+                                    producer_capture.is_some(),
+                                    consumer_capture.is_some(),
+                                )
+                                .ok_or(Failure::Contradicted)?,
+                                call.run_id.clone().ok_or(Failure::Unavailable)?,
+                                (
+                                    call.turn.ok_or(Failure::Unavailable)?,
+                                    call.round.ok_or(Failure::Unavailable)?,
+                                ),
+                            ));
+                        }
+                        if call.name == *consumer {
+                            consumers.push(call);
+                        }
+                    }
+                    let (value, run_id, producer_position) =
+                        produced.ok_or(Failure::Contradicted)?;
+                    let mut successful = false;
+                    for call in consumers {
+                        let consumer_run = call.run_id.as_deref().ok_or(Failure::Unavailable)?;
+                        let consumer_position = (
+                            call.turn.ok_or(Failure::Unavailable)?,
+                            call.round.ok_or(Failure::Unavailable)?,
+                        );
+                        if call.ok.is_none() {
+                            return Err(Failure::Unavailable);
+                        }
+                        if consumer_run != run_id || consumer_position <= producer_position {
+                            return Err(Failure::Contradicted);
+                        }
+                        let document = journal_tool_document(&call, *consumer_document)
+                            .ok_or(Failure::Unavailable)?;
+                        if !consumer_paths.iter().any(|path| {
+                            flow_destinations_at_path(document, path).into_iter().any(
+                                |destination| {
+                                    bounded_flow_destination_matches(
+                                        &value,
+                                        destination,
+                                        destination_capture.as_ref(),
+                                        consumer_capture.is_some(),
+                                        true,
+                                    )
+                                },
+                            )
+                        }) {
+                            return Err(Failure::Contradicted);
+                        }
+                        successful |= call.ok == Some(true)
+                            && call_matches_predicates(&call, consumer_filters);
+                    }
+                    if successful {
+                        Ok(())
+                    } else {
+                        Err(Failure::Contradicted)
+                    }
+                })();
+                return CriterionResult {
+                    criterion: c.clone(),
+                    severity: criterion_severity(c),
+                    passed: verified.is_ok(),
+                    detail: if verified.is_ok() {
+                        format!("all {consumer} calls used one prior {producer} value")
+                    } else if matches!(verified, Err(Failure::Unavailable)) {
+                        "complete execution evidence unavailable".into()
+                    } else {
+                        format!("same-run {producer} -> {consumer} value flow contradicted")
+                    },
+                    full_detail: matches!(verified, Err(Failure::Unavailable))
+                        .then(|| serde_json::json!({"kind":"unavailable"}).to_string()),
+                    score: None,
+                };
+            }
             let mut produced = Vec::<(serde_json::Value, Option<u32>)>::new();
             let mut matched = None;
             for call in session.journal_tool_calls() {
@@ -4475,9 +5084,17 @@ fn evaluate_one_with_primary_cache(
                             };
                             turn_separation_ok
                                 && consumer_paths.iter().any(|path| {
-                                    flow_destinations_at_path(document, path)
-                                        .into_iter()
-                                        .any(|destination| value_flows_into(value, destination))
+                                    flow_destinations_at_path(document, path).into_iter().any(
+                                        |destination| {
+                                            bounded_flow_destination_matches(
+                                                value,
+                                                destination,
+                                                destination_capture.as_ref(),
+                                                consumer_capture.is_some(),
+                                                false,
+                                            )
+                                        },
+                                    )
                                 })
                         })
                     });
@@ -4486,23 +5103,18 @@ fn evaluate_one_with_primary_cache(
                         break;
                     }
                 }
-                if call.name == *producer && call_matches_predicates(&call, producer_filters) {
-                    let producer_value = if *producer_document == JournalToolDocument::RunId {
-                        (producer_path.is_empty())
-                            .then(|| {
-                                call.run_id
-                                    .as_deref()
-                                    .map(|run_id| serde_json::Value::String(run_id.to_owned()))
-                            })
-                            .flatten()
-                    } else {
-                        journal_tool_document(&call, *producer_document)
-                            .and_then(|document| document.pointer(producer_path))
-                            .cloned()
-                    };
-                    if let Some(value) = producer_value.filter(is_flow_scalar) {
-                        produced.push((value, call.turn));
-                    }
+                if call.name == *producer
+                    && call_matches_predicates(&call, producer_filters)
+                    && let Some(value) = bounded_flow_producer_value(
+                        &call,
+                        *producer_document,
+                        producer_path,
+                        capture.as_ref(),
+                        producer_capture.is_some(),
+                        consumer_capture.is_some(),
+                    )
+                {
+                    produced.push((value, call.turn));
                 }
             }
             let passed = matched.is_some();
@@ -4517,9 +5129,11 @@ fn evaluate_one_with_primary_cache(
                     || format!(
                         "bounded journal consumer {consumer} {consumer_document:?} paths {consumer_paths:?} did not use a scalar emitted by prior producer {producer}{turn_detail}"
                     ),
-                    |value| format!(
-                        "bounded journal consumer {consumer} used prior producer {producer} value {value}{turn_detail}"
-                    ),
+                    |value| if producer_capture.is_some() {
+                        format!("bounded journal consumer {consumer} used a captured scalar from {producer}{turn_detail}")
+                    } else {
+                        format!("bounded journal consumer {consumer} used prior producer {producer} value {value}{turn_detail}")
+                    },
                 ),
                 full_detail: None,
                 score: None,
@@ -5197,6 +5811,104 @@ fn assess_cache_read_nonregression(
     })
 }
 
+/// Safe evidence retained at grading time: the aggregate outcome deliberately
+/// drops physical captures, so the progress observer cannot reconstruct this.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CacheScopeDiagnostic {
+    scope: PromptCacheReuseScope,
+    observations: Option<usize>,
+    // Decimal u128 avoids truncating the sum of provider-owned u64 counters.
+    post_cold_cache_read_tokens: Option<String>,
+    executions: Vec<CacheScopeExecutionDiagnostic>,
+    executions_omitted: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CacheScopeExecutionDiagnostic {
+    capture: CacheScopeCaptureStatus,
+    run_matches: Option<bool>,
+    session_matches: Option<bool>,
+    scope_count: Option<usize>,
+    cache_read_tokens: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CacheScopeCaptureStatus {
+    Missing,
+    IdentityUnverified,
+    CaptureDiagnostic,
+    SnapshotPending,
+    StreamGap,
+    Verified,
+}
+
+impl CacheScopeDiagnostic {
+    pub(crate) fn safe_value(&self) -> serde_json::Result<serde_json::Value> {
+        if self
+            .post_cold_cache_read_tokens
+            .as_ref()
+            .is_some_and(|value| {
+                value.parse::<u128>().is_err() || value.bytes().any(|b| !b.is_ascii_digit())
+            })
+        {
+            return Err(serde::de::Error::custom("invalid cache read sum"));
+        }
+        serde_json::to_value(self)
+    }
+
+    fn capture(
+        scope: PromptCacheReuseScope,
+        executions: &[&RunOutcome],
+        observed: Option<(usize, u128)>,
+    ) -> String {
+        let session = executions.first().and_then(|o| o.session_id.as_deref());
+        let evidence = executions
+            .iter()
+            .take(16)
+            .map(|execution| {
+                let capture = execution.explain_capture.as_ref();
+                let graph = capture.and_then(|capture| capture.canonical_graph());
+                let status = match capture {
+                    None => CacheScopeCaptureStatus::Missing,
+                    Some(c) if !c.identity_verified => CacheScopeCaptureStatus::IdentityUnverified,
+                    Some(c) if !c.diagnostics.is_empty() => {
+                        CacheScopeCaptureStatus::CaptureDiagnostic
+                    }
+                    Some(c) if c.snapshot_pending => CacheScopeCaptureStatus::SnapshotPending,
+                    Some(c) if c.gap_unrecovered => CacheScopeCaptureStatus::StreamGap,
+                    Some(_) => CacheScopeCaptureStatus::Verified,
+                };
+                CacheScopeExecutionDiagnostic {
+                    capture: status,
+                    run_matches: capture.map(|c| {
+                        c.events
+                            .iter()
+                            .all(|event| execution.run_id.as_deref() == Some(event.run_id.as_str()))
+                    }),
+                    session_matches: session
+                        .filter(|id| !id.is_empty())
+                        .map(|id| execution.session_id.as_deref() == Some(id)),
+                    scope_count: graph.as_ref().map(|g| g.execution_scope_coverage().len()),
+                    cache_read_tokens: graph
+                        .as_ref()
+                        .and_then(|g| g.primary_prompt_cache_read_tokens()),
+                }
+            })
+            .collect();
+        serde_json::to_string(&Self {
+            scope,
+            observations: observed.map(|(count, _)| count),
+            post_cold_cache_read_tokens: observed.map(|(_, reads)| reads.to_string()),
+            executions: evidence,
+            executions_omitted: executions.len().saturating_sub(16),
+        })
+        .expect("bounded numeric cache diagnostic serializes")
+    }
+}
+
 fn evaluate_prompt_cache_reuse_scope(
     criterion: &Criterion,
     scope: PromptCacheReuseScope,
@@ -5212,7 +5924,7 @@ fn evaluate_prompt_cache_reuse_scope(
             severity: criterion_severity(criterion),
             passed: false,
             detail: "required prompt-cache scope: evidence unavailable: incomplete, conflicting, or unordered primary execution coverage".into(),
-            full_detail: None,
+            full_detail: Some(CacheScopeDiagnostic::capture(scope, executions, None)),
             score: None,
         };
     };
@@ -5220,7 +5932,12 @@ fn evaluate_prompt_cache_reuse_scope(
         let witness = groups
             .iter()
             .map(|requests| {
-                let reads: u128 = requests.iter().skip(1).map(|read| u128::from(*read)).sum();
+                let reads: u128 = requests
+                    .iter()
+                    .skip(1)
+                    .flatten()
+                    .map(|read| u128::from(*read))
+                    .sum();
                 (requests.len(), reads)
             })
             .max_by_key(|(count, reads)| (*count >= 2 && *reads > 0, *reads, *count))
@@ -5230,6 +5947,7 @@ fn evaluate_prompt_cache_reuse_scope(
         let reads: u128 = groups
             .iter()
             .skip(1)
+            .flatten()
             .flatten()
             .map(|read| u128::from(*read))
             .sum();
@@ -5241,9 +5959,13 @@ fn evaluate_prompt_cache_reuse_scope(
         passed: observations >= 2 && reuse_reads > 0,
         detail: format!(
             "required prompt-cache scope={boundary}: observations={observations}, \
-             post-cold cache_read_tokens={reuse_reads}, expected >=2 observations and read>0"
+             post-cold cache_read_tokens={reuse_reads} (known reads only), expected >=2 observations and read>0"
         ),
-        full_detail: None,
+        full_detail: Some(CacheScopeDiagnostic::capture(
+            scope,
+            executions,
+            Some((observations, reuse_reads)),
+        )),
         score: None,
     }
 }
@@ -5317,7 +6039,7 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             }
             Ok(())
         }
-        Criterion::ExecutionToolSequence { tools, .. } => {
+        Criterion::ExecutionToolSequence { tools, steps, .. } => {
             if tools.is_empty()
                 || tools.len() > 64
                 || tools
@@ -5325,6 +6047,59 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
                     .any(|name| name.trim().is_empty() || name.len() > 128)
             {
                 return Err("ExecutionToolSequence requires 1..=64 bounded tool names".into());
+            }
+            if !steps.is_empty() && steps.len() != tools.len() {
+                return Err("ExecutionToolSequence steps must match the tool count".into());
+            }
+            let mut names = std::collections::HashSet::new();
+            for step in steps {
+                if step.predicates.len() > 16 || step.bindings.len() > 16 {
+                    return Err(
+                        "ExecutionToolSequence step exceeds the predicate or binding limit".into(),
+                    );
+                }
+                for predicate in &step.predicates {
+                    predicate.validate()?;
+                    if !matches!(
+                        predicate.document,
+                        JournalToolDocument::Arguments | JournalToolDocument::Result
+                    ) {
+                        return Err(
+                            "ExecutionToolSequence accepts arguments or result documents".into(),
+                        );
+                    }
+                    validate_json_pointer("ExecutionToolSequence predicate", &predicate.path)?;
+                }
+                for binding in &step.bindings {
+                    if binding.name.is_empty()
+                        || binding.name.len() > 64
+                        || !binding
+                            .name
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                        || !matches!(
+                            binding.document,
+                            JournalToolDocument::Arguments | JournalToolDocument::Result
+                        )
+                    {
+                        return Err(
+                            "ExecutionToolSequence binding name or document is invalid".into()
+                        );
+                    }
+                    names.insert(&binding.name);
+                    if names.len() > 32 {
+                        return Err("ExecutionToolSequence exceeds the binding limit".into());
+                    }
+                    validate_json_pointer("ExecutionToolSequence binding", &binding.path)?;
+                    if let Some(pattern) = &binding.capture
+                        && (pattern.len() > 512
+                            || Regex::new(pattern).map_or(true, |regex| regex.captures_len() != 2))
+                    {
+                        return Err(
+                            "ExecutionToolSequence capture requires one bounded regex group".into(),
+                        );
+                    }
+                }
             }
             Ok(())
         }
@@ -5637,10 +6412,14 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             producer,
             producer_document,
             producer_path,
+            producer_capture,
             producer_filters,
             consumer,
+            consumer_document,
             consumer_paths,
+            consumer_capture,
             consumer_filters,
+            all_consumers,
             min_turns_after_producer,
             max_turns_after_producer,
             ..
@@ -5653,11 +6432,19 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
                     "JournalToolValueFlowBound producer and consumer must not be empty".into(),
                 );
             }
-            if producer_filters.is_empty() || consumer_filters.is_empty() {
+            if producer_filters.is_empty() || (!*all_consumers && consumer_filters.is_empty()) {
                 return Err(
                     "JournalToolValueFlowBound producer_filters and consumer_filters must not be empty"
                         .into(),
                 );
+            }
+            if *all_consumers
+                && (producer == consumer
+                    || *consumer_document == JournalToolDocument::RunId
+                    || min_turns_after_producer.is_some()
+                    || max_turns_after_producer.is_some())
+            {
+                return Err("all_consumers requires distinct tools, a consumer document, and no visible-turn bounds".into());
             }
             if consumer_paths.is_empty() || consumer_paths.iter().any(String::is_empty) {
                 return Err(
@@ -5665,25 +6452,51 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
                         .into(),
                 );
             }
-            let filter_paths = producer_filters
-                .iter()
-                .map(|predicate| (&predicate.path, "producer_filters.path"))
-                .chain(
-                    consumer_filters
-                        .iter()
-                        .map(|predicate| (&predicate.path, "consumer_filters.path")),
-                );
+            if let Some(pattern) = producer_capture {
+                if pattern.is_empty()
+                    || pattern.len() > 512
+                    || *producer_document == JournalToolDocument::RunId
+                {
+                    return Err(
+                        "producer_capture requires at most 512 bytes on a text document".into(),
+                    );
+                }
+                let regex =
+                    regex::Regex::new(pattern).map_err(|_| "invalid producer_capture regex")?;
+                if regex.captures_len() != 2 {
+                    return Err("producer_capture requires exactly one capture group".into());
+                }
+            }
+            if let Some(pattern) = consumer_capture {
+                if pattern.is_empty()
+                    || pattern.len() > 512
+                    || *consumer_document == JournalToolDocument::RunId
+                {
+                    return Err(
+                        "consumer_capture requires at most 512 bytes on a text document".into(),
+                    );
+                }
+                let regex =
+                    regex::Regex::new(pattern).map_err(|_| "invalid consumer_capture regex")?;
+                if regex.captures_len() != 2 {
+                    return Err("consumer_capture requires exactly one capture group".into());
+                }
+            }
             for (path, label) in std::iter::once((producer_path, "producer_path"))
                 .chain(consumer_paths.iter().map(|path| (path, "consumer_paths")))
-                .chain(filter_paths)
             {
-                if (path.is_empty() && *producer_document != JournalToolDocument::RunId)
+                if (path.is_empty()
+                    && *producer_document != JournalToolDocument::RunId
+                    && producer_capture.is_none())
                     || (!path.is_empty() && !path.starts_with('/'))
                 {
                     return Err(format!(
                         "JournalToolValueFlowBound.{label} must be an RFC 6901 JSON pointer; got {path:?}"
                     ));
                 }
+            }
+            for predicate in producer_filters.iter().chain(consumer_filters) {
+                validate_json_pointer("JournalToolValueFlowBound filter", &predicate.path)?;
             }
             if max_turns_after_producer
                 .zip(*min_turns_after_producer)
@@ -5970,8 +6783,14 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             Ok(())
         }
         Criterion::ToolResultClassCount { class, min, max } => {
-            if class.trim().is_empty() {
-                return Err("ToolResultClassCount.class must not be empty".into());
+            if serde_json::to_value(
+                astra_turn_types::tool_ledger_receipt::ToolLedgerResultClassCounts::default(),
+            )
+            .map_err(|error| error.to_string())?
+            .get(class)
+            .is_none()
+            {
+                return Err(format!("unknown canonical tool result class: {class}"));
             }
             if min > max {
                 return Err(format!("ToolResultClassCount: min ({min}) > max ({max})"));
@@ -6103,6 +6922,91 @@ pub fn validate_criteria(criteria: &[Criterion]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn predicate_mismatch_distinguishes_structure_without_values() {
+        use serde_json::json;
+        for (expected, actual, reason, path) in [
+            (json!(null), None, "missing", "/value"),
+            (json!({}), Some(json!(null)), "type_mismatch", "/value"),
+            (
+                json!([1]),
+                Some(json!([])),
+                "array_length_mismatch",
+                "/value",
+            ),
+            (json!([1]), Some(json!([2])), "scalar_mismatch", "/value/0"),
+            (
+                json!({"a/b~":true}),
+                Some(json!({"a/b~":false})),
+                "scalar_mismatch",
+                "/value/a~1b~0",
+            ),
+            (
+                json!({}),
+                Some(json!({"private-sentinel":"private-sentinel"})),
+                "unexpected_members",
+                "/value",
+            ),
+        ] {
+            let predicate = super::JournalJsonPredicate {
+                document: super::JournalToolDocument::Arguments,
+                path: "/value".into(),
+                equals: Some(expected),
+                contains: None,
+            };
+            assert!(!predicate.matches(actual.as_ref()));
+            let detail = predicate.mismatch(actual.as_ref());
+            assert_eq!(detail["reason"], reason);
+            assert_eq!(detail["path"], path);
+            assert!(!detail.to_string().contains("private-sentinel"));
+        }
+        let predicate = super::JournalJsonPredicate {
+            document: super::JournalToolDocument::Arguments,
+            path: "/value".into(),
+            equals: None,
+            contains: Some("required".into()),
+        };
+        let detail = predicate.mismatch(Some(&json!("private-sentinel")));
+        assert_eq!(detail["reason"], "substring_absent");
+        assert!(!detail.to_string().contains("private-sentinel"));
+    }
+
+    #[test]
+    fn predicate_mismatch_truncates_deep_wide_and_long_paths() {
+        use serde_json::{Value, json};
+        let mut deep = json!("expected");
+        let mut actual = json!("private-sentinel");
+        for _ in 0..10 {
+            deep = json!({"nested":deep});
+            actual = json!({"nested":actual});
+        }
+        let wide: serde_json::Map<_, _> =
+            (0..80).map(|i| (format!("key{i:03}"), json!(i))).collect();
+        let mut wide_actual = wide.clone();
+        wide_actual.insert("key079".into(), json!("private-sentinel"));
+        for (expected, actual, path) in [
+            (deep, actual, "/value".into()),
+            (
+                Value::Object(wide),
+                Value::Object(wide_actual),
+                "/value".into(),
+            ),
+            (json!(true), json!(false), format!("/{}", "x".repeat(512))),
+            (json!({("x".repeat(4096)):true}), json!({}), "/value".into()),
+        ] {
+            let predicate = super::JournalJsonPredicate {
+                document: super::JournalToolDocument::Arguments,
+                path,
+                equals: Some(expected),
+                contains: None,
+            };
+            assert!(!predicate.matches(Some(&actual)));
+            let detail = predicate.mismatch(Some(&actual));
+            assert_eq!(detail["reason"], "truncated");
+            assert!(detail.to_string().len() < 100);
+        }
+    }
+
+    #[test]
     fn document_predicates_preserve_null_and_only_match_string_contains() {
         let null: super::JournalJsonPredicate =
             serde_json::from_str(r#"{"document":"arguments","path":"/value","equals":null}"#)
@@ -6117,6 +7021,7 @@ mod tests {
         for operators in [
             r#""#,
             r#", "equals":null,"contains":"x""#,
+            r#", "equals":null,"exists":true"#,
             r#", "contains":"""#,
             r#", "contains":42"#,
             r#", "equals":null,"contains":null"#,
@@ -6157,6 +7062,8 @@ mod tests {
 
     fn outcome_with_tools(tools: &[&str]) -> RunOutcome {
         RunOutcome {
+            error_code: None,
+            server_admission_not_dispatched: false,
             model: "m".into(),
             exit_code: 0,
             text: "ok".into(),
@@ -6182,6 +7089,585 @@ mod tests {
             stream_capture: None,
             tool_result_class_counts: std::collections::BTreeMap::new(),
         }
+    }
+
+    fn evaluate_execution_fixture(
+        criteria: &[Criterion],
+        outcome: &RunOutcome,
+    ) -> Vec<CriterionResult> {
+        let trace = outcome
+            .stream_capture
+            .as_ref()
+            .and_then(|s| s.execution.as_ref())
+            .map(crate::execution_capture::tests::trace);
+        evaluate_deterministic_with_session(criteria, outcome, trace.as_ref())
+    }
+
+    #[test]
+    fn model_name_output_case_accepts_equivalent_presentations_but_requires_child_custody() {
+        let case = crate::case::Case::from_path(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("cases/subagent_model_selection/flash_model_name_is_output.yaml"),
+        )
+        .unwrap()
+        .bind_model("test-model")
+        .unwrap();
+        let evaluate = |child: &str, answer: &str, fault: &str| {
+            let mut capture =
+                crate::execution_capture::tests::capture_with_child(child, "test-model");
+            match fault {
+                "model" => capture.run_tree.runs[1].runtime.model_name = Some("other-model".into()),
+                "digest" => {
+                    capture.reflection.graph_slice.nodes[0]
+                        .metadata
+                        .as_mut()
+                        .unwrap()["execution_spine"]["facts"][1]["children"][0]["result_sha256"] =
+                        "wrong".into();
+                }
+                "missing_adoption" => {
+                    capture.reflection.graph_slice.nodes[0]
+                        .metadata
+                        .as_mut()
+                        .unwrap()["execution_spine"]["facts"]
+                        .as_array_mut()
+                        .unwrap()
+                        .remove(1);
+                }
+                "no_child" => {
+                    capture.run_tree.runs.truncate(1);
+                    capture.transcript.as_mut().unwrap().items.clear();
+                    capture.reflection.graph_slice.nodes[0]
+                        .metadata
+                        .as_mut()
+                        .unwrap()["execution_spine"]["facts"] = serde_json::json!([]);
+                }
+                _ => {}
+            }
+            let mut outcome = outcome_with_tools(&[]);
+            outcome.run_id = Some("root".into());
+            outcome.text = answer.into();
+            let mut stream = crate::runner::StreamCapture::default();
+            stream.identity_verified = true;
+            stream.execution = Some(capture);
+            outcome.stream_capture = Some(stream);
+            evaluate_execution_fixture(&case.criteria, &outcome)
+                .iter()
+                .all(|result| result.passed)
+        };
+        for child in ["glm-5.2", "\"glm-5.2\""] {
+            for answer in ["glm-5.2", "\"glm-5.2\""] {
+                assert!(evaluate(child, answer, "none"), "{child:?} {answer:?}");
+            }
+        }
+        for (child, answer, fault) in [
+            ("not glm-5.2", "glm-5.2", "none"),
+            ("glm-5.2", "answer: glm-5.2", "none"),
+            ("glm-5.2", "glm-5.2", "model"),
+            ("glm-5.2", "glm-5.2", "digest"),
+            ("glm-5.2", "glm-5.2", "missing_adoption"),
+            ("glm-5.2", "glm-5.2", "no_child"),
+        ] {
+            assert!(
+                !evaluate(child, answer, fault),
+                "{child:?} {answer:?} {fault}"
+            );
+        }
+    }
+
+    #[test]
+    fn child_question_case_keeps_a_separate_efficiency_warning() {
+        let case = crate::case::Case::from_path(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("cases/subagent_model_selection/flash_child_question_parent_answer.yaml"),
+        )
+        .unwrap();
+        assert_eq!(case.timeout_seconds, 180);
+        let duration = case
+            .criteria
+            .iter()
+            .find(|criterion| matches!(criterion, Criterion::DurationBetween { .. }))
+            .unwrap();
+        assert_eq!(criterion_severity(duration), CriterionSeverity::Soft);
+        for (duration_ms, passed) in [(90_000, true), (90_001, false)] {
+            let mut outcome = outcome_with_tools(&[]);
+            outcome.duration_ms = duration_ms;
+            let results =
+                evaluate_deterministic_with_session(std::slice::from_ref(duration), &outcome, None);
+            assert_eq!(results[0].passed, passed, "{duration_ms}");
+        }
+    }
+
+    #[test]
+    fn bounded_value_flow_compares_captured_text_without_numeric_coercion() {
+        let criterion: Criterion = serde_yaml_ng::from_str(
+            r#"
+type: journal_tool_value_flow_bound
+producer: task_output
+producer_document: result
+producer_path: /output
+producer_capture: 'FIRST> ([0-9a-f]{16})(?:\r?\n|\z)'
+producer_filters:
+  - {document: result, path: /output, contains: 'FIRST>'}
+consumer: task_input
+consumer_document: arguments
+consumer_paths: [/input]
+consumer_capture: '\A[ \t]*([0-9a-f]{16})[ \t]*\r?\n\z'
+consumer_filters:
+  - {document: result, path: /input_delivery, equals: written}
+"#,
+        )
+        .unwrap();
+        assert!(validate_criterion(&criterion).is_ok());
+        let test_flow = |output: &str, input: &str, input_first: bool, delivered: bool| {
+            let producer = serde_json::json!({
+                "tool_call_id":"p", "name":"task_output", "ok":true,
+                "args_full":"{}", "result_full":serde_json::json!({"output":format!("FIRST> {output}\n")}).to_string()
+            });
+            let consumer = serde_json::json!({
+                "tool_call_id":"c", "name":"task_input", "ok":true,
+                "args_full":serde_json::json!({"input":input}).to_string(),
+                "result_full":serde_json::json!({"input_delivery": if delivered {"written"} else {"unknown"}}).to_string()
+            });
+            let calls = if input_first {
+                vec![consumer, producer]
+            } else {
+                vec![producer, consumer]
+            };
+            let session = mk_session(&[("turn", serde_json::json!({"tool_calls":calls}))]);
+            evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome_with_tools(&[]),
+                Some(&session),
+            )[0]
+            .passed
+        };
+        assert!(test_flow(
+            "0000000000000001",
+            "0000000000000001\n",
+            false,
+            true
+        ));
+        assert!(test_flow(
+            "1000000000000e00",
+            "1000000000000e00\r\n",
+            false,
+            true
+        ));
+        assert!(!test_flow(
+            "1000000000000e00",
+            "100000000000e001\n",
+            false,
+            true
+        ));
+        assert!(!test_flow(
+            "0000000000000001",
+            "0000000000000001\n",
+            true,
+            true
+        ));
+        assert!(!test_flow(
+            "0000000000000001",
+            "0000000000000001\n",
+            false,
+            false
+        ));
+        assert!(!test_flow(
+            "not-a-challenge",
+            "0000000000000001\n",
+            false,
+            true
+        ));
+        assert!(!test_flow(
+            "0000000000000001",
+            "0000000000000001",
+            false,
+            true
+        ));
+
+        for pattern in ["", "no capture", "(one)(two)", "(", &"x".repeat(513)] {
+            let mut invalid = criterion.clone();
+            if let Criterion::JournalToolValueFlowBound {
+                consumer_capture, ..
+            } = &mut invalid
+            {
+                *consumer_capture = Some(pattern.to_owned());
+            }
+            assert!(validate_criterion(&invalid).is_err(), "{pattern:?}");
+        }
+    }
+
+    #[test]
+    fn interactive_shell_case_requires_a_single_task_and_matching_answers() {
+        let case = crate::case::Case::from_path(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("cases/interactive_shell_next_output.yaml"),
+        )
+        .unwrap();
+        let task = "bg-shell-0123456789abcdef0123456789abcdef";
+        let event = |round: u32, name: &str, args: serde_json::Value, result: &str| {
+            (
+                "llm_round",
+                serde_json::json!({
+                    "run_id":"root", "turn":1, "round":round,
+                    "tool_calls":[{"tool_call_id":format!("call-{round}"), "name":name,
+                        "round":round, "args_full":args.to_string(), "result_full":result,
+                        "ok":true, "disposition":"executed"}]
+                }),
+            )
+        };
+        let events = vec![
+            event(
+                0,
+                "bash",
+                serde_json::json!({"stdin":true,"command":"cd /workspace && python3 challenge.py"}),
+                task,
+            ),
+            event(
+                1,
+                "task_output",
+                serde_json::json!({"task_id":task}),
+                &serde_json::json!({"output_revision":1,"output":"FIRST> 0123456789abcdef\n"}).to_string(),
+            ),
+            event(
+                2,
+                "task_input",
+                serde_json::json!({"task_id":task,"input":"0123456789abcdef\n"}),
+                r#"{"input_delivery":"written"}"#,
+            ),
+            event(
+                3,
+                "task_output",
+                serde_json::json!({"task_id":task,"block":true,"wake_on_output":true,"after_output_revision":1}),
+                &serde_json::json!({"output_revision":2,"output":"SECOND> fedcba9876543210\n"}).to_string(),
+            ),
+            event(
+                4,
+                "task_input",
+                serde_json::json!({"task_id":task,"input":"fedcba9876543210\n"}),
+                r#"{"input_delivery":"written"}"#,
+            ),
+            event(
+                5,
+                "task_output",
+                serde_json::json!({"task_id":task}),
+                &serde_json::json!({"output":"INTERACTIVE_OK", "offset":0, "terminal":true, "status":"completed", "execution":{"execution_fact":"executed", "exit_code":0, "cleanup_authoritative":true}}).to_string(),
+            ),
+        ];
+        let evaluate = |events: &[(&str, serde_json::Value)]| {
+            let mut session = mk_session(events);
+            session.session_id = "session".into();
+            let mut execution = crate::execution_capture::tests::capture();
+            execution.run_tree.runs[0].total_tool_calls = events.len() as _;
+            let mut outcome = outcome_with_tools(&[]);
+            outcome.run_id = Some("root".into());
+            outcome.text = "INTERACTIVE_OK".into();
+            let mut stream = crate::runner::StreamCapture::default();
+            stream.identity_verified = true;
+            stream.execution = Some(execution);
+            outcome.stream_capture = Some(stream);
+            evaluate_deterministic_with_session(&case.criteria, &outcome, Some(&session))
+        };
+        let accepted = evaluate(&events);
+        assert!(accepted.iter().all(|result| result.passed), "{accepted:?}");
+        let sequence_failed = |results: &[CriterionResult]| {
+            results.iter().any(|result| {
+                matches!(result.criterion, Criterion::ExecutionToolSequence { .. })
+                    && !result.passed
+            })
+        };
+
+        for (event_index, replacement) in [
+            (1, ("result_full", serde_json::json!(serde_json::json!({"output":"FIRST> no-code\n", "output_revision":1}).to_string()))),
+            (1, ("result_full", serde_json::json!(serde_json::json!({"output":"", "title":"FIRST> 0123456789abcdef\n", "output_revision":1}).to_string()))),
+            (2, ("args_full", serde_json::json!(serde_json::json!({"task_id":task,"input":"wrong\n"}).to_string()))),
+            (3, ("args_full", serde_json::json!(serde_json::json!({"task_id":task,"block":true,"wake_on_output":true,"after_output_revision":0}).to_string()))),
+            (3, ("result_full", serde_json::json!(serde_json::json!({"output":"", "title":"SECOND> fedcba9876543210\n", "output_revision":2}).to_string()))),
+            (4, ("args_full", serde_json::json!(serde_json::json!({"task_id":"other","input":"fedcba9876543210\n"}).to_string()))),
+            (5, ("result_full", serde_json::json!(serde_json::json!({"output":"noise", "offset":0, "title":"terminal true · completed\nINTERACTIVE_OK", "terminal":true, "status":"failed", "execution":{"execution_fact":"executed", "exit_code":7, "cleanup_authoritative":true}}).to_string()))),
+            (5, ("result_full", serde_json::json!(serde_json::json!({"output":"INTERACTIVE_OK", "offset":0, "terminal":true, "status":"completed", "execution":{"execution_fact":"executed", "exit_code":7, "cleanup_authoritative":true}}).to_string()))),
+            (5, ("result_full", serde_json::json!(serde_json::json!({"output":"INTERACTIVE_OK", "offset":0, "terminal":true, "status":"completed"}).to_string()))),
+            (5, ("result_full", serde_json::json!(serde_json::json!({"output":"INTERACTIVE_OK", "offset":64, "terminal":true, "status":"completed", "execution":{"execution_fact":"executed", "exit_code":0}}).to_string()))),
+        ] {
+            let mut modified = events.clone();
+            modified[event_index].1["tool_calls"][0][replacement.0] = replacement.1;
+            assert!(sequence_failed(&evaluate(&modified)), "event {event_index}");
+        }
+
+        let spliced = vec![
+            events[0].clone(), events[1].clone(),
+            event(2, "task_input", serde_json::json!({"task_id":task,"input":"fedcba9876543210\n"}), r#"{"input_delivery":"written"}"#),
+            events[3].clone(),
+            event(4, "task_input", serde_json::json!({"task_id":task,"input":"0123456789abcdef\n"}), r#"{"input_delivery":"written"}"#),
+            event(5, "task_input", serde_json::json!({"task_id":task,"input":"fedcba9876543210\n"}), r#"{"input_delivery":"written"}"#),
+            event(6, "task_output", serde_json::json!({"task_id":task}), &serde_json::json!({"output":"INTERACTIVE_OK", "offset":0, "terminal":true, "status":"completed", "execution":{"execution_fact":"executed", "exit_code":0}}).to_string()),
+        ];
+        assert!(
+            sequence_failed(&evaluate(&spliced)),
+            "separate pairwise witnesses are not a chain"
+        );
+        for (index, output) in [
+            (1, "<stderr tail>\nFIRST> 0123456789abcdef\n"),
+            (5, "<stderr>\nINTERACTIVE_OK\n</stderr>"),
+        ] {
+            let mut modified = events.clone();
+            let raw = modified[index].1["tool_calls"][0]["result_full"]
+                .as_str()
+                .unwrap();
+            let mut value: serde_json::Value = serde_json::from_str(raw).unwrap();
+            value["output"] = output.into();
+            modified[index].1["tool_calls"][0]["result_full"] = value.to_string().into();
+            assert!(
+                sequence_failed(&evaluate(&modified)),
+                "stderr cannot prove stdout"
+            );
+        }
+    }
+
+    #[test]
+    fn bound_value_flow_all_consumers_requires_one_complete_same_run_owner() {
+        let criterion: Criterion = serde_yaml_ng::from_str(
+            r#"
+type: journal_tool_value_flow_bound
+producer: bash
+producer_document: result
+producer_path: ""
+producer_capture: '(task-[0-9]+)'
+producer_filters:
+  - {document: arguments, path: /command, equals: challenge}
+consumer: task_output
+consumer_document: arguments
+consumer_paths: [/task_id]
+consumer_filters:
+  - {document: arguments, path: /block, equals: true}
+all_consumers: true
+"#,
+        )
+        .unwrap();
+        assert!(validate_criterion(&criterion).is_ok());
+        let event = |round: u32,
+                     run: &str,
+                     id: &str,
+                     name: &str,
+                     args: serde_json::Value,
+                     result: &str,
+                     ok: Option<bool>| {
+            (
+                "llm_round",
+                serde_json::json!({
+                    "run_id":run, "turn":1, "round":round,
+                    "tool_calls":[{"tool_call_id":id, "name":name, "round":round,
+                        "args_full":args.to_string(), "result_full":result,
+                        "ok":ok, "disposition":"executed"}]
+                }),
+            )
+        };
+        let producer = event(
+            0,
+            "root",
+            "p",
+            "bash",
+            serde_json::json!({"command":"challenge"}),
+            "task-1",
+            Some(true),
+        );
+        let consumer = |round, run, id, task_id: serde_json::Value, block, ok| {
+            event(
+                round,
+                run,
+                id,
+                "task_output",
+                serde_json::json!({"task_id":task_id,"block":block}),
+                "ok",
+                ok,
+            )
+        };
+        let good = consumer(
+            1,
+            "root",
+            "c1",
+            serde_json::json!("task-1"),
+            true,
+            Some(true),
+        );
+        let evaluate = |events: Vec<(&str, serde_json::Value)>, incomplete| {
+            let mut session = mk_session(&events);
+            session.session_id = "session".into();
+            session.dropped_lines = u32::from(incomplete);
+            let mut execution = crate::execution_capture::tests::capture();
+            for run in &mut execution.run_tree.runs {
+                run.total_tool_calls = session
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        event.event_type == "llm_round" && event.raw["run_id"] == run.run_id
+                    })
+                    .filter_map(|event| event.raw["tool_calls"].as_array())
+                    .map(Vec::len)
+                    .sum::<usize>() as _;
+            }
+            let mut outcome = outcome_with_tools(&[]);
+            outcome.run_id = Some("root".into());
+            let mut stream = crate::runner::StreamCapture::default();
+            stream.identity_verified = true;
+            stream.execution = Some(execution);
+            outcome.stream_capture = Some(stream);
+            let result = evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome,
+                Some(&session),
+            );
+            (
+                result[0].passed,
+                execution_verification_unavailable(&result[0]),
+            )
+        };
+        assert_eq!(
+            evaluate(vec![producer.clone(), good.clone()], false),
+            (true, false)
+        );
+        assert_eq!(
+            evaluate(vec![good.clone(), producer.clone()], false),
+            (true, false)
+        );
+        for events in [
+            vec![producer.clone()],
+            vec![
+                event(
+                    0,
+                    "root",
+                    "p",
+                    "bash",
+                    serde_json::json!({"command":"challenge"}),
+                    "finished without a task id",
+                    Some(true),
+                ),
+                good.clone(),
+            ],
+            vec![
+                consumer(
+                    0,
+                    "root",
+                    "c0",
+                    serde_json::json!("task-1"),
+                    true,
+                    Some(true),
+                ),
+                event(
+                    1,
+                    "root",
+                    "p",
+                    "bash",
+                    serde_json::json!({"command":"challenge"}),
+                    "task-1",
+                    Some(true),
+                ),
+            ],
+            vec![
+                producer.clone(),
+                good.clone(),
+                consumer(
+                    2,
+                    "root",
+                    "c2",
+                    serde_json::json!("task-2"),
+                    false,
+                    Some(true),
+                ),
+            ],
+            vec![
+                producer.clone(),
+                good.clone(),
+                consumer(2, "root", "c2", serde_json::Value::Null, true, Some(false)),
+            ],
+            vec![
+                producer.clone(),
+                consumer(
+                    0,
+                    "root",
+                    "c1",
+                    serde_json::json!("task-1"),
+                    true,
+                    Some(true),
+                ),
+            ],
+            vec![
+                producer.clone(),
+                consumer(
+                    1,
+                    "child",
+                    "c1",
+                    serde_json::json!("task-1"),
+                    true,
+                    Some(true),
+                ),
+            ],
+            vec![
+                producer.clone(),
+                event(
+                    1,
+                    "root",
+                    "p2",
+                    "bash",
+                    serde_json::json!({"command":"challenge"}),
+                    "task-1",
+                    Some(true),
+                ),
+                good.clone(),
+            ],
+        ] {
+            assert_eq!(evaluate(events, false), (false, false));
+        }
+        assert_eq!(
+            evaluate(
+                vec![
+                    producer.clone(),
+                    consumer(1, "root", "c1", serde_json::json!("task-1"), true, None)
+                ],
+                false
+            ),
+            (false, true)
+        );
+        let orphan = (
+            "turn",
+            serde_json::json!({
+                "run_id":"root", "turn":1,
+                "tool_calls":[{"tool_call_id":"orphan", "name":"task_output", "ok":true,
+                    "args_full":r#"{"task_id":"task-2"}"#, "result_full":"ok"}]
+            }),
+        );
+        assert_eq!(
+            evaluate(vec![producer.clone(), good.clone(), orphan], false),
+            (false, true)
+        );
+        assert_eq!(evaluate(vec![producer, good], true), (false, true));
+
+        let mut incomplete_session = mk_session(&[]);
+        incomplete_session.dropped_lines = 1;
+        let outcome = outcome_with_tools(&["independent"]);
+        let nested = Criterion::AllOf {
+            criteria: vec![Criterion::AnyOf {
+                criteria: vec![criterion.clone()],
+            }],
+        };
+        let result =
+            evaluate_deterministic_with_session(&[nested], &outcome, Some(&incomplete_session));
+        assert!(!result[0].passed);
+        assert!(execution_verification_unavailable(&result[0]));
+
+        let optional: Criterion = serde_yaml_ng::from_str(
+            "type: session_event_count\nevent_type: anything\noptional: true\n",
+        )
+        .unwrap();
+        let alternative = Criterion::AnyOf {
+            criteria: vec![optional, criterion],
+        };
+        let result = evaluate_deterministic_with_session(
+            &[alternative],
+            &outcome,
+            Some(&incomplete_session),
+        );
+        assert!(!result[0].passed);
+        assert!(execution_verification_unavailable(&result[0]));
     }
 
     #[test]
@@ -6245,10 +7731,10 @@ mod tests {
             stream.identity_verified = true;
             stream.execution = Some(capture);
             outcome.stream_capture = Some(stream);
-            let evaluated = evaluate_deterministic(std::slice::from_ref(&criterion), &outcome);
+            let evaluated = evaluate_execution_fixture(std::slice::from_ref(&criterion), &outcome);
             assert_eq!(evaluated[0].passed, passed, "{fault}");
             assert_eq!(
-                execution_verification_unavailable(&evaluated[0], &outcome),
+                execution_verification_unavailable(&evaluated[0]),
                 unavailable,
                 "{fault}"
             );
@@ -6412,10 +7898,10 @@ mod tests {
                     .unwrap()
                     .run_projections = None;
             }
-            let evaluated = evaluate_deterministic(&[requested], &outcome);
+            let evaluated = evaluate_execution_fixture(&[requested], &outcome);
             assert_eq!(evaluated[0].passed, passes, "{fault}");
             assert_eq!(
-                execution_verification_unavailable(&evaluated[0], &outcome),
+                execution_verification_unavailable(&evaluated[0]),
                 unavailable,
                 "{fault}"
             );
@@ -6549,9 +8035,9 @@ mod tests {
             stream.identity_verified = true;
             stream.execution = Some(capture);
             outcome.stream_capture = Some(stream);
-            let result = evaluate_deterministic(std::slice::from_ref(&criterion), &outcome);
+            let result = evaluate_execution_fixture(std::slice::from_ref(&criterion), &outcome);
             assert_eq!(result[0].passed, expected_pass, "{raw}");
-            assert!(!execution_verification_unavailable(&result[0], &outcome));
+            assert!(!execution_verification_unavailable(&result[0]));
             if !expected_pass {
                 assert_eq!(
                     crate::classify::classify(&outcome, &result),
@@ -6582,7 +8068,8 @@ mod tests {
                         }
                         _ => unreachable!(),
                     }
-                    let rejected = evaluate_deterministic(std::slice::from_ref(&criterion), &known);
+                    let rejected =
+                        evaluate_execution_fixture(std::slice::from_ref(&criterion), &known);
                     assert!(!rejected[0].passed, "{tree_change}");
                     assert_eq!(
                         crate::classify::classify(&known, &rejected),
@@ -6597,7 +8084,7 @@ mod tests {
                 equals: serde_json::json!({"value":42}),
             };
             assert_eq!(
-                evaluate_deterministic(&[parent], &outcome)[0].passed,
+                evaluate_execution_fixture(&[parent], &outcome)[0].passed,
                 expected_pass
             );
             let capture = outcome
@@ -6612,7 +8099,9 @@ mod tests {
                 .as_mut()
                 .unwrap()["execution_spine"]["facts"][1]["children"][0]["result_sha256"] =
                 serde_json::json!("wrong");
-            assert!(!evaluate_deterministic(std::slice::from_ref(&criterion), &outcome)[0].passed);
+            assert!(
+                !evaluate_execution_fixture(std::slice::from_ref(&criterion), &outcome)[0].passed
+            );
             outcome
                 .stream_capture
                 .as_mut()
@@ -6621,11 +8110,9 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .transcript = None;
-            let unavailable = evaluate_deterministic(std::slice::from_ref(&criterion), &outcome);
-            assert!(execution_verification_unavailable(
-                &unavailable[0],
-                &outcome
-            ));
+            let unavailable =
+                evaluate_execution_fixture(std::slice::from_ref(&criterion), &outcome);
+            assert!(execution_verification_unavailable(&unavailable[0]));
             assert_eq!(
                 crate::classify::classify(&outcome, &unavailable),
                 crate::classify::FailureClass::InfraVerificationUnavailable
@@ -6667,7 +8154,7 @@ mod tests {
         stream.identity_verified = true;
         stream.execution = Some(capture.clone());
         outcome.stream_capture = Some(stream);
-        assert!(evaluate_deterministic(std::slice::from_ref(&criterion), &outcome)[0].passed);
+        assert!(evaluate_execution_fixture(std::slice::from_ref(&criterion), &outcome)[0].passed);
         capture.run_tree.runs[0].total_tool_calls = 2;
         let page = capture.transcript.as_mut().unwrap();
         let mut second_request = page.items[0].clone();
@@ -6682,7 +8169,7 @@ mod tests {
         page.items[0].tool_calls[0].arguments = r#"{"action":"spawn","prompt":"MARKER-A"}"#.into();
         page.items.extend([second_request, second_result]);
         outcome.stream_capture.as_mut().unwrap().execution = Some(capture);
-        let results = evaluate_deterministic(std::slice::from_ref(&criterion), &outcome);
+        let results = evaluate_execution_fixture(std::slice::from_ref(&criterion), &outcome);
         assert!(!results[0].passed);
         assert_eq!(
             crate::classify::classify(&outcome, &results),
@@ -6704,7 +8191,7 @@ mod tests {
             error_contains: None,
         };
         let check = |outcome: &RunOutcome, criterion: &Criterion| {
-            evaluate_deterministic(std::slice::from_ref(criterion), outcome)[0].passed
+            evaluate_execution_fixture(std::slice::from_ref(criterion), outcome)[0].passed
         };
         assert!(
             !check(&outcome, &absence),
@@ -6742,6 +8229,7 @@ mod tests {
                 tools: vec!["agent".into()],
                 last_ok: None,
                 require_settled: false,
+                steps: vec![],
             }
         ));
         assert!(!check(
@@ -6768,12 +8256,9 @@ mod tests {
             *max = 0;
         }
         let unavailable =
-            evaluate_deterministic(std::slice::from_ref(&negative_predicate), &malformed);
+            evaluate_execution_fixture(std::slice::from_ref(&negative_predicate), &malformed);
         assert!(!unavailable[0].passed);
-        assert!(execution_verification_unavailable(
-            &unavailable[0],
-            &malformed
-        ));
+        assert!(execution_verification_unavailable(&unavailable[0]));
         assert_eq!(
             crate::classify::classify(&malformed, &unavailable),
             crate::classify::FailureClass::InfraVerificationUnavailable
@@ -6793,20 +8278,17 @@ mod tests {
             error_contains: None,
         };
         assert!(check(&outcome, &requested));
-        let evaluated = evaluate_deterministic(std::slice::from_ref(&requested), &outcome);
-        assert!(!execution_verification_unavailable(&evaluated[0], &outcome));
+        let evaluated = evaluate_execution_fixture(std::slice::from_ref(&requested), &outcome);
+        assert!(!execution_verification_unavailable(&evaluated[0]));
         let mut unverified = outcome.clone();
         unverified
             .stream_capture
             .as_mut()
             .unwrap()
             .identity_verified = false;
-        let unavailable = evaluate_deterministic(std::slice::from_ref(&requested), &unverified);
+        let unavailable = evaluate_execution_fixture(std::slice::from_ref(&requested), &unverified);
         assert!(!unavailable[0].passed);
-        assert!(execution_verification_unavailable(
-            &unavailable[0],
-            &unverified
-        ));
+        assert!(execution_verification_unavailable(&unavailable[0]));
         assert!(check(&outcome, &result));
         let mut mixed = outcome.clone();
         let capture = mixed
@@ -6844,10 +8326,10 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .status = Some(status.into());
-            let evaluated = evaluate_deterministic(std::slice::from_ref(&result), &mixed);
+            let evaluated = evaluate_execution_fixture(std::slice::from_ref(&result), &mixed);
             assert_eq!(evaluated[0].passed, available, "{status}");
             if !available {
-                assert!(execution_verification_unavailable(&evaluated[0], &mixed));
+                assert!(execution_verification_unavailable(&evaluated[0]));
             }
         }
         malformed = outcome.clone();
@@ -6863,11 +8345,8 @@ mod tests {
             .unwrap()
             .items[1]
             .content = "{\"value\":42}\ndisplay advisory".into();
-        let unavailable = evaluate_deterministic(std::slice::from_ref(&result), &malformed);
-        assert!(
-            !unavailable[0].passed
-                && execution_verification_unavailable(&unavailable[0], &malformed)
-        );
+        let unavailable = evaluate_execution_fixture(std::slice::from_ref(&result), &malformed);
+        assert!(!unavailable[0].passed && execution_verification_unavailable(&unavailable[0]));
         outcome
             .stream_capture
             .as_mut()
@@ -6885,7 +8364,7 @@ mod tests {
                 criteria: vec![absence.clone()],
             },
         ] {
-            let results = evaluate_deterministic(std::slice::from_ref(&composite), &outcome);
+            let results = evaluate_execution_fixture(std::slice::from_ref(&composite), &outcome);
             assert!(!results[0].passed);
             assert_eq!(
                 crate::classify::classify(&outcome, &results),
@@ -6905,7 +8384,7 @@ mod tests {
                 error_contains: None,
             }],
         };
-        let results = evaluate_deterministic(std::slice::from_ref(&contradiction), &outcome);
+        let results = evaluate_execution_fixture(std::slice::from_ref(&contradiction), &outcome);
         assert!(!results[0].passed);
         assert_eq!(
             crate::classify::classify(&outcome, &results),
@@ -6934,7 +8413,7 @@ mod tests {
                 crate::classify::FailureClass::InfraVerificationUnavailable,
             ),
         ] {
-            let results = evaluate_deterministic(std::slice::from_ref(&composite), &outcome);
+            let results = evaluate_execution_fixture(std::slice::from_ref(&composite), &outcome);
             assert!(!results[0].passed);
             assert_eq!(crate::classify::classify(&outcome, &results), expected);
         }
@@ -6991,9 +8470,10 @@ mod tests {
             ],
             last_ok: Some(true),
             require_settled: true,
+            steps: vec![],
         };
         assert!(
-            !evaluate_deterministic(std::slice::from_ref(&criterion), &outcome)[0].passed,
+            !evaluate_execution_fixture(std::slice::from_ref(&criterion), &outcome)[0].passed,
             "calls before the boundary must not satisfy the sequence"
         );
 
@@ -7017,7 +8497,7 @@ mod tests {
             items[3].tool_result.as_mut().unwrap().status = Some("failed".into());
         }
         assert!(
-            !evaluate_deterministic(std::slice::from_ref(&criterion), &outcome)[0].passed,
+            !evaluate_execution_fixture(std::slice::from_ref(&criterion), &outcome)[0].passed,
             "a failed recovery call must not satisfy last_ok"
         );
         outcome
@@ -7035,7 +8515,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .status = Some("completed".into());
-        assert!(evaluate_deterministic(std::slice::from_ref(&criterion), &outcome)[0].passed);
+        assert!(evaluate_execution_fixture(std::slice::from_ref(&criterion), &outcome)[0].passed);
     }
 
     #[test]
@@ -7043,7 +8523,6 @@ mod tests {
         use astra_turn_core::orchestration::agent_result_wire::render_agent_tool_admission_error_with_kind;
         for (name, model) in [
             ("flash_missing_child_model_fail_closed", "glm-99.99"),
-            ("flash_near_version_must_not_substitute", "glm-5.3"),
             (
                 "flash_rejected_delegation_preserves_parent_tools",
                 "glm-99.99",
@@ -7139,7 +8618,7 @@ mod tests {
             stream.execution = Some(capture);
             outcome.stream_capture = Some(stream);
             assert!(
-                evaluate_deterministic(&criteria, &outcome)
+                evaluate_execution_fixture(&criteria, &outcome)
                     .iter()
                     .all(|result| result.passed),
                 "{name}"
@@ -7228,7 +8707,7 @@ mod tests {
                 if fault == "missing-capture" {
                     candidate.stream_capture = None;
                 }
-                let evaluated = evaluate_deterministic(&criteria, &candidate);
+                let evaluated = evaluate_execution_fixture(&criteria, &candidate);
                 assert_eq!(
                     evaluated.iter().all(|check| check.passed),
                     fault == "scope-binding",
@@ -7268,7 +8747,7 @@ mod tests {
                     );
                 }
                 outcome.stream_capture.as_mut().unwrap().execution = Some(extra);
-                let results = evaluate_deterministic(&criteria, &outcome);
+                let results = evaluate_execution_fixture(&criteria, &outcome);
                 if extra_name == "model_catalog" {
                     assert!(
                         results.iter().all(|result| result.passed),
@@ -7719,16 +9198,40 @@ mod tests {
     #[test]
     fn tool_result_class_count_criterion() {
         let mut out = RunOutcome::new("m");
-        out.tool_result_class_counts.insert("env_failure".into(), 2);
+        out.tool_result_class_counts.insert("failed".into(), 2);
         let results = evaluate_deterministic(
             &[Criterion::ToolResultClassCount {
-                class: "env_failure".into(),
+                class: "failed".into(),
                 min: 1,
                 max: 2,
             }],
             &out,
         );
         assert!(results[0].passed);
+        let missing = crate::runner::parse_json_outcome(
+            r#"{"text":"Partial result.","tool_calls_count":4,"tool_result_class_counts":{},"final_state":"interrupted"}"#,
+            "m",
+        );
+        let zero_failures = [Criterion::ToolResultClassCount {
+            class: "failed".into(),
+            min: 0,
+            max: 0,
+        }];
+        assert!(!evaluate_deterministic(&zero_failures, &missing)[0].passed);
+        assert!(
+            validate_criterion(&Criterion::ToolResultClassCount {
+                class: "execution_error".into(),
+                min: 0,
+                max: 0,
+            })
+            .is_err()
+        );
+        assert!(validate_criterion(&zero_failures[0]).is_ok());
+        let mut observed_zero = missing;
+        observed_zero
+            .tool_result_class_counts
+            .insert("failed".into(), 0);
+        assert!(evaluate_deterministic(&zero_failures, &observed_zero)[0].passed);
     }
 
     #[test]
@@ -7784,6 +9287,38 @@ mod tests {
                     raw: raw.clone(),
                 })
                 .collect(),
+        }
+    }
+
+    #[test]
+    fn skill_case_requires_successful_argument_bound_invocation() {
+        let case: crate::case::Case = serde_yaml_ng::from_str(include_str!(
+            "../cases/skill_discovery_uses_skill_tool.yaml"
+        ))
+        .unwrap();
+        let criterion = case
+            .criteria
+            .iter()
+            .find(|criterion| matches!(criterion, Criterion::JournalToolCallCount { .. }))
+            .unwrap();
+        for ok in [false, true] {
+            let session = mk_session(&[(
+                "turn",
+                serde_json::json!({"tool_calls":[{
+                    "tool_call_id":"skill", "name":"skill", "ok":ok,
+                    "disposition": if ok { "executed" } else { "rejected" },
+                    "args_full":r#"{"skill_name":"analyze-session"}"#
+                }]}),
+            )]);
+            assert_eq!(
+                evaluate_deterministic_with_session(
+                    std::slice::from_ref(criterion),
+                    &outcome_with_tools(&["skill"]),
+                    Some(&session)
+                )[0]
+                .passed,
+                ok
+            );
         }
     }
 
@@ -7923,6 +9458,51 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn workspace_child_read_requires_successful_causal_completion() {
+        let criterion = Criterion::JournalChildToolCallCount {
+            parent: "agent_fanout".into(),
+            child: "read_file".into(),
+            min: 1,
+            max: 1,
+            min_distinct_child_runs: 1,
+        };
+        for (is_error, run, linked, expected) in [
+            (Some(false), "child", true, true),
+            (Some(true), "child", true, false),
+            (None, "child", true, false),
+            (Some(false), "root", true, false),
+            (Some(false), "child", false, false),
+        ] {
+            let capture = mk_session(&[
+                (
+                    "ToolCallStarted",
+                    serde_json::json!({
+                        "event_type": "ToolCallStarted", "event_id": "fanout",
+                        "run_id": "root", "payload": {"tool_name": "agent_fanout"},
+                    }),
+                ),
+                (
+                    "ToolCallCompleted",
+                    serde_json::json!({
+                        "event_type": "ToolCallCompleted", "event_id": "read",
+                        "run_id": run, "caused_by": if linked { vec!["fanout"] } else { vec![] },
+                        "payload": {"tool_name": "read_file", "is_error": is_error},
+                    }),
+                ),
+            ]);
+            let results = evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome_with_tools(&[]),
+                Some(&capture),
+            );
+            assert_eq!(
+                results[0].passed, expected,
+                "is_error={is_error:?}, run={run}, linked={linked}"
+            );
+        }
     }
 
     fn pipeline_feedback_event(
@@ -8641,14 +10221,6 @@ mod tests {
             );
             let mut capture = crate::execution_capture::tests::capture();
             capture.run_tree.runs[1].runtime.model_name = Some(model.clone());
-            capture
-                .reflection
-                .model_requests
-                .terminal
-                .as_mut()
-                .unwrap()
-                .groups[0]
-                .model = model.clone();
             let mut stream = crate::runner::StreamCapture::default();
             stream.identity_verified = true;
             stream.execution = Some(capture.clone());
@@ -9020,37 +10592,6 @@ mod tests {
         );
         assert!(!result[0].passed);
         assert!(result[0].detail.contains("incomplete"));
-    }
-
-    #[test]
-    fn memoria_health_deduplication_is_not_bypassed_by_any_of() {
-        let health_without_settlement = Criterion::SessionSubsystemHealthy {
-            settled_subsystem: None,
-        };
-        assert!(!has_unconditional_memoria_subsystem_health(
-            std::slice::from_ref(&health_without_settlement,)
-        ));
-        let health = Criterion::SessionSubsystemHealthy {
-            settled_subsystem: Some("post_loop_memory".into()),
-        };
-        assert!(has_unconditional_memoria_subsystem_health(
-            std::slice::from_ref(&health,)
-        ));
-        assert!(has_unconditional_memoria_subsystem_health(&[
-            Criterion::AllOf {
-                criteria: vec![health.clone(), Criterion::ExitCode { code: 0 }],
-            },
-        ]));
-        assert!(!has_unconditional_memoria_subsystem_health(&[
-            Criterion::AnyOf {
-                criteria: vec![health_without_settlement, Criterion::ExitCode { code: 0 }],
-            },
-        ]));
-        assert!(!has_unconditional_memoria_subsystem_health(&[
-            Criterion::AnyOf {
-                criteria: vec![health, Criterion::ExitCode { code: 0 }],
-            },
-        ]));
     }
 
     #[test]
@@ -9618,6 +11159,60 @@ mod tests {
     }
 
     #[test]
+    fn journal_call_diagnostics_partition_candidates_without_exposing_values() {
+        let sess = mk_session(&[
+            (
+                "turn",
+                serde_json::json!({"run_id":"root", "tool_calls":[
+                    {"tool_call_id":"match","name":"introspect","ok":true,
+                     "run_id":"root","args_full":r#"{"facet":"private-expected"}"#},
+                    {"tool_call_id":"value","name":"introspect","ok":true,
+                     "run_id":"root","args_full":r#"{"facet":"private-actual"}"#},
+                    {"tool_call_id":"missing","name":"introspect","ok":true,
+                     "run_id":"root","args_full":"{}"},
+                    {"tool_call_id":"type","name":"introspect","ok":true,
+                     "run_id":"root","args_full":r#"{"facet":7}"#},
+                    {"tool_call_id":"failed","name":"introspect","ok":false,
+                     "run_id":"root","args_full":"{}"}
+                ]}),
+            ),
+            (
+                "turn",
+                serde_json::json!({"run_id":"child", "tool_calls":[
+                    {"tool_call_id":"child","name":"introspect","ok":true,"args_full":"{}"}
+                ]}),
+            ),
+        ]);
+        let criterion = Criterion::JournalToolCallCount {
+            name: "introspect".into(),
+            min: 2,
+            max: 2,
+            root_only: true,
+            document: Some(JournalToolDocument::Arguments),
+            path: Some("/facet".into()),
+            equals: Some(serde_json::json!("private-expected")),
+            ok: Some(true),
+        };
+        let mut outcome = outcome_with_tools(&[]);
+        outcome.run_id = Some("root".into());
+        let results = evaluate_deterministic_with_session(&[criterion], &outcome, Some(&sess));
+        assert!(!results[0].passed);
+        let raw = results[0].full_detail.as_deref().unwrap();
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "kind":"journal_count", "min":2, "max":2, "actual":1,
+                "considered":5, "outcome_matches":4, "missing":1,
+                "type_mismatch":1, "value_mismatch":1
+            })
+        );
+        assert!(!raw.contains("private-"));
+        assert!(!raw.contains("facet"));
+        assert!(serde_json::from_str::<JournalDiagnostic>(raw).is_ok());
+    }
+
+    #[test]
     fn durable_tool_success_ratio_reports_raw_execution_health() {
         let sess = mk_session(&[(
             "turn",
@@ -9643,6 +11238,15 @@ mod tests {
         assert!(results[0].passed, "{results:?}");
         assert!(results[0].detail.contains("raw=3/4 (75.0%)"));
         assert!(results[0].detail.contains("adjusted=3/3 (100.0%)"));
+        let diagnostic: serde_json::Value =
+            serde_json::from_str(results[0].full_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            diagnostic,
+            serde_json::json!({
+                "kind":"journal_ratio", "min":1.0, "min_calls":4, "allowed_failures":1,
+                "terminal":4, "succeeded":3, "failed":1, "pending":1, "adjusted_terminal":3
+            })
+        );
 
         let strict = evaluate_deterministic_with_session(
             &[Criterion::JournalToolSuccessRatio {
@@ -10009,6 +11613,8 @@ mod tests {
         );
 
         let bounded = Criterion::JournalToolValueFlowBound {
+            producer_capture: None,
+            consumer_capture: None,
             producer: "memory".into(),
             producer_document: JournalToolDocument::Result,
             producer_path: "/memory_id".into(),
@@ -10043,6 +11649,7 @@ mod tests {
                     contains: None,
                 },
             ],
+            all_consumers: false,
             min_turns_after_producer: None,
             max_turns_after_producer: None,
         };
@@ -10112,6 +11719,84 @@ mod tests {
     }
 
     #[test]
+    fn bounded_value_flow_can_capture_a_scalar_from_a_prior_text_result() {
+        let criterion: Criterion = serde_yaml_ng::from_str(
+            r#"
+type: journal_tool_value_flow_bound
+producer: task_output
+producer_document: result
+producer_path: ""
+producer_capture: 'output_revision ([0-9]+)'
+producer_filters:
+  - {document: result, path: "", contains: FIRST}
+consumer: task_output
+consumer_document: arguments
+consumer_paths: [/after_output_revision]
+consumer_filters:
+  - {document: arguments, path: /block, equals: true}
+"#,
+        )
+        .unwrap();
+        assert!(validate_criterion(&criterion).is_ok());
+        let call = |id: &str, ok: bool, args: serde_json::Value, result: &str| {
+            serde_json::json!({
+                "name":"task_output", "tool_call_id":id, "ok":ok,
+                "args_full":args.to_string(), "result_full":result
+            })
+        };
+        let producer = call(
+            "first",
+            true,
+            serde_json::json!({}),
+            "FIRST output_revision 7",
+        );
+        let consumer = |revision| {
+            call(
+                "next",
+                true,
+                serde_json::json!({"block":true,"after_output_revision":revision}),
+                "SECOND",
+            )
+        };
+        let evaluate = |calls: Vec<serde_json::Value>| {
+            let session = mk_session(&[("turn", serde_json::json!({"tool_calls":calls}))]);
+            evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome_with_tools(&[]),
+                Some(&session),
+            )[0]
+            .passed
+        };
+        assert!(evaluate(vec![producer.clone(), consumer(7)]));
+        assert!(!evaluate(vec![producer.clone(), consumer(8)]));
+        assert!(!evaluate(vec![consumer(7), producer.clone()]));
+        assert!(!evaluate(vec![
+            call(
+                "failed",
+                false,
+                serde_json::json!({}),
+                "FIRST output_revision 7"
+            ),
+            consumer(7)
+        ]));
+        assert!(!evaluate(vec![
+            call("missing", true, serde_json::json!({}), "FIRST"),
+            consumer(7)
+        ]));
+        for pattern in ["no group", "(one)(two)", "("] {
+            let mut invalid = criterion.clone();
+            let Criterion::JournalToolValueFlowBound {
+                producer_capture, ..
+            } = &mut invalid
+            else {
+                unreachable!()
+            };
+            *producer_capture = Some(pattern.into());
+            assert!(validate_criterion(&invalid).is_err());
+        }
+    }
+
+    #[test]
     fn bounded_value_flow_can_require_a_later_visible_turn() {
         let call = |id: &str, action: &str, result: serde_json::Value| {
             let mut args = serde_json::json!({"action": action});
@@ -10129,6 +11814,8 @@ mod tests {
             })
         };
         let criterion = Criterion::JournalToolValueFlowBound {
+            producer_capture: None,
+            consumer_capture: None,
             producer: "memory".into(),
             producer_document: JournalToolDocument::Result,
             producer_path: "/memory_id".into(),
@@ -10163,6 +11850,7 @@ mod tests {
                     contains: None,
                 },
             ],
+            all_consumers: false,
             min_turns_after_producer: Some(1),
             max_turns_after_producer: None,
         };
@@ -10215,6 +11903,8 @@ mod tests {
     #[test]
     fn run_id_flow_binds_previous_root_to_the_prior_turn_producer() {
         let criterion = Criterion::JournalToolValueFlowBound {
+            producer_capture: None,
+            consumer_capture: None,
             producer: "agent".into(),
             producer_document: JournalToolDocument::RunId,
             producer_path: "".into(),
@@ -10233,6 +11923,7 @@ mod tests {
                 equals: Some(serde_json::json!("previous")),
                 contains: None,
             }],
+            all_consumers: false,
             min_turns_after_producer: Some(1),
             max_turns_after_producer: Some(1),
         };
@@ -10908,7 +12599,27 @@ mod tests {
         let one = check(&[&cold], conversation);
         assert!(!one.passed);
         assert_eq!(one.severity, CriterionSeverity::Hard);
-        assert!(check(&[&cold, &warm], conversation).passed);
+        let warm_result = check(&[&cold, &warm], conversation);
+        assert!(warm_result.passed);
+        let diagnostic: CacheScopeDiagnostic =
+            serde_json::from_str(warm_result.full_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(diagnostic.observations, Some(2));
+        assert_eq!(
+            diagnostic.post_cold_cache_read_tokens.as_deref(),
+            Some("9800")
+        );
+        assert_eq!(diagnostic.executions[1].cache_read_tokens, Some(9800));
+        let mut pending = warm.clone();
+        pending.explain_capture.as_mut().unwrap().snapshot_pending = true;
+        let pending_result = check(&[&cold, &pending], conversation);
+        assert!(!pending_result.passed);
+        let diagnostic: CacheScopeDiagnostic =
+            serde_json::from_str(pending_result.full_detail.as_deref().unwrap()).unwrap();
+        assert!(diagnostic.observations.is_none());
+        assert!(matches!(
+            diagnostic.executions[1].capture,
+            CacheScopeCaptureStatus::SnapshotPending
+        ));
         assert!(
             !check(&[&cold, &warm], intra).passed,
             "different turns cannot prove intra-run reuse"
@@ -11068,74 +12779,106 @@ mod tests {
     }
 
     #[test]
-    fn shipped_prefix_cache_case_rejects_low_reads_on_each_warm_turn() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("cases/cache_prefix_provider_stable_system.yaml");
-        let case = crate::case::Case::from_path(&path).expect("load shipped cache case");
-        assert_eq!(case.steps.len(), 3);
-        let weak = cache_request_outcome("weak", "turn", &[(100, 2_400, 0)]);
-        for (index, step) in case.steps.iter().enumerate() {
-            assert!(
-                !step.criteria.is_empty(),
-                "warm step {index} must measure its own cache read"
-            );
-            let results = evaluate_deterministic_with_session(&step.criteria, &weak, None);
-            assert!(
-                results
+    fn shipped_cache_cases_require_observed_reuse_on_every_warm_turn() {
+        for name in [
+            "cache_prefix_provider_stable_system",
+            "cache_volatile_lane_stability",
+        ] {
+            let path =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("cases/{name}.yaml"));
+            let case = crate::case::Case::from_path(&path).expect("load shipped cache case");
+            let warm_steps = case.steps.iter().filter(|step| !step.criteria.is_empty());
+            assert_eq!(warm_steps.clone().count(), 3);
+            for step in warm_steps {
+                // Even a small prefix can be correctly reused. Partial provider
+                // evidence proves measured reads, but cannot prove an exact ratio.
+                let mut partial = cache_request_outcome("warm", "turn", &[(10, 64, 0)]);
+                for event in &mut partial.explain_capture.as_mut().unwrap().events {
+                    if let Some(usage) = &mut event.usage {
+                        usage.basis = astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial;
+                        usage.cache_creation_tokens = None;
+                    }
+                }
+                let results = evaluate_deterministic_with_session(&step.criteria, &partial, None);
+                assert!(
+                    results
+                        .iter()
+                        .filter(|result| result.severity == CriterionSeverity::Hard)
+                        .all(|result| result.passed),
+                    "{name}: {results:?}"
+                );
+                let ratio = results
                     .iter()
-                    .any(|result| !result.passed && result.severity == CriterionSeverity::Hard),
-                "warm step {index} must hard-fail at only 2,400 cache-read tokens: {results:?}"
-            );
-        }
-        let mut strong = cache_request_outcome("strong", "turn", &[(100, 8_500, 0)]);
-        for event in &mut strong.explain_capture.as_mut().unwrap().events {
-            if let Some(usage) = &mut event.usage {
-                usage.basis = astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial;
-                usage.cache_creation_tokens = None;
+                    .find(|result| {
+                        matches!(
+                            result.criterion,
+                            Criterion::ProviderPromptCacheReadRatio { .. }
+                        )
+                    })
+                    .expect("ratio diagnostic");
+                assert_eq!(ratio.severity, CriterionSeverity::Soft);
+                assert!(
+                    !ratio.passed && ratio.detail.contains("evidence unavailable"),
+                    "{ratio:?}"
+                );
+                let mut missing = partial.clone();
+                for event in &mut missing.explain_capture.as_mut().unwrap().events {
+                    if let Some(usage) = &mut event.usage {
+                        usage.cache_read_tokens = None;
+                    }
+                }
+                for invalid in [
+                    cache_request_outcome("zero", "turn", &[(100, 0, 0)]),
+                    missing,
+                ] {
+                    let results =
+                        evaluate_deterministic_with_session(&step.criteria, &invalid, None);
+                    assert!(
+                        results
+                            .iter()
+                            .any(|result| !result.passed
+                                && result.severity == CriterionSeverity::Hard),
+                        "{name}: {results:?}"
+                    );
+                }
+                let churn = cache_request_outcome("churn", "turn", &[(10, 64, 1_000)]);
+                let results = evaluate_deterministic_with_session(&step.criteria, &churn, None);
+                assert!(
+                    results
+                        .iter()
+                        .any(|result| !result.passed && result.severity == CriterionSeverity::Soft),
+                    "{name}: {results:?}"
+                );
             }
-        }
-        for (index, step) in case.steps.iter().enumerate() {
-            let results = evaluate_deterministic_with_session(&step.criteria, &strong, None);
-            assert!(
-                results
-                    .iter()
-                    .any(|result| { result.passed && result.severity == CriterionSeverity::Hard }),
-                "warm step {index} must accept observed partial-provider reads: {results:?}"
-            );
         }
     }
 
     #[test]
-    fn shipped_volatile_lane_case_checks_each_post_correction_turn() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("cases/cache_volatile_lane_stability.yaml");
-        let case = crate::case::Case::from_path(&path).expect("load shipped volatile-lane case");
-        assert_eq!(case.steps.len(), 4);
-
-        let weak = cache_request_outcome("weak", "turn", &[(100, 7_999, 0)]);
-        let mut strong = cache_request_outcome("strong", "turn", &[(100, 8_000, 0)]);
-        for event in &mut strong.explain_capture.as_mut().unwrap().events {
-            if let Some(usage) = &mut event.usage {
-                usage.basis = astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial;
-                usage.cache_creation_tokens = None;
-            }
-        }
-
-        for (index, step) in case.steps.iter().enumerate().skip(1) {
-            let weak_result = evaluate_deterministic_with_session(&step.criteria, &weak, None);
-            assert!(
-                weak_result
-                    .iter()
-                    .any(|result| !result.passed && result.severity == CriterionSeverity::Hard),
-                "post-correction step {index} must hard-fail weak reads: {weak_result:?}"
-            );
-            let strong_result = evaluate_deterministic_with_session(&step.criteria, &strong, None);
-            assert!(
-                strong_result
-                    .iter()
-                    .any(|result| result.passed && result.severity == CriterionSeverity::Hard),
-                "post-correction step {index} must accept observed partial reads: {strong_result:?}"
-            );
+    fn shipped_fanout_case_requires_all_exact_slots_from_canonical_adoption() {
+        let case: crate::case::Case =
+            serde_yaml_ng::from_str(include_str!("../cases/fanout_completion_truth.yaml")).unwrap();
+        let adoption = case
+            .criteria
+            .iter()
+            .filter_map(|criterion| match criterion {
+                Criterion::ExecutionChildResultsAdopted {
+                    children,
+                    fanout_group,
+                } => Some((children, fanout_group)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(adoption.len(), 1);
+        let (children, group) = adoption[0];
+        assert!(
+            matches!(group, Some(FanoutGroupSelector::Id(id)) if id == "fanout-completion-truth")
+        );
+        assert_eq!(children.len(), 3);
+        for (index, token) in ["ALPHA", "BETA", "GAMMA"].into_iter().enumerate() {
+            assert_eq!(children[index].slot_index, Some(index as u32));
+            assert_eq!(children[index].model, "{{model}}");
+            assert!(matches!(&children[index].expected_result,
+                Some(ChildResultExpectation::Text(text)) if text == &format!("FANOUT-EVIDENCE-{token}")));
         }
     }
 
@@ -11310,9 +13053,16 @@ mod tests {
     }
 
     #[test]
-    fn required_prompt_cache_scope_reports_one_witness_after_full_coverage_validation() {
+    fn required_prompt_cache_scope_retains_witness_with_unknown_unrelated_usage() {
         let many = cache_request_outcome("r1", "t1", &[(0, 0, 0); 3]);
-        let witness = cache_request_outcome("r2", "t2", &[(0, 0, 0), (0, 300, 0)]);
+        let mut witness = cache_request_outcome("r2", "t2", &[(0, 0, 0), (0, 300, 0)]);
+        for event in &mut witness.explain_capture.as_mut().unwrap().events {
+            if event.round_index == Some(0)
+                && let Some(usage) = &mut event.usage
+            {
+                usage.cache_read_tokens = None;
+            }
+        }
         let criterion = Criterion::PromptCacheReuseScope {
             scope: PromptCacheReuseScope::IntraTurnRounds,
         };
@@ -11341,8 +13091,65 @@ mod tests {
             None,
             &[&many, &witness, &unknown],
         );
-        assert!(!result[0].passed);
-        assert!(result[0].detail.contains("evidence unavailable"));
+        assert!(
+            result[0].passed,
+            "unknown unrelated counters must not erase a witness"
+        );
+    }
+
+    #[test]
+    fn required_cache_reuse_accepts_unknown_cold_usage_but_not_unknown_warm_usage() {
+        let mut cold = cache_request_outcome("cold", "t1", &[(100, 0, 0)]);
+        for event in &mut cold.explain_capture.as_mut().unwrap().events {
+            if let Some(usage) = &mut event.usage {
+                usage.cache_read_tokens = None;
+            }
+        }
+        let warm = cache_request_outcome("warm", "t2", &[(100, 4864, 0)]);
+        let criterion = Criterion::PromptCacheReuseScope {
+            scope: PromptCacheReuseScope::ConversationTurns,
+        };
+        let check = |a: &RunOutcome, b: &RunOutcome| {
+            evaluate_with_primary_executions(
+                std::slice::from_ref(&criterion),
+                &RunOutcome::new("aggregate"),
+                None,
+                &[a, b],
+            )
+            .remove(0)
+        };
+        assert!(check(&cold, &warm).passed);
+        assert!(
+            !check(&warm, &cold).passed,
+            "cold hit cannot stand in for unknown warm usage"
+        );
+        let zero = cache_request_outcome("zero", "t2", &[(100, 0, 0)]);
+        assert!(!check(&cold, &zero).passed, "unknown must not become a hit");
+        let mut incomplete = cold.clone();
+        incomplete
+            .explain_capture
+            .as_mut()
+            .unwrap()
+            .snapshot_pending = true;
+        assert!(
+            !check(&incomplete, &warm).passed,
+            "cold capture integrity remains required"
+        );
+        let exact = Criterion::PromptCacheTokens {
+            min_read: 1,
+            min_creation: 0,
+            max_creation: None,
+        };
+        assert!(
+            !evaluate_with_primary_executions(
+                &[exact],
+                &RunOutcome::new("aggregate"),
+                None,
+                &[&cold, &warm],
+            )[0]
+            .passed,
+            "exact total still requires complete measurement"
+        );
     }
 
     #[test]

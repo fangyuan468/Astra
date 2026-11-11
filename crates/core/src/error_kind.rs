@@ -26,9 +26,13 @@ pub enum ErrorKind {
     RateLimit,
     /// 402, provider balance or billing limit prevents inference.
     PaymentRequired,
+    /// An explicit provider machine code reports exhausted balance or quota.
+    ProviderQuotaExhausted,
+    /// Provider denied inference (403), without evidence of invalid credentials.
+    ProviderForbidden,
     /// 5xx from provider.
     ServerError,
-    /// 401/403, bad API key or expired token.
+    /// 401 or an explicit invalid-credential code; never inferred from 403 alone.
     Auth,
     /// Prompt too long for the model's context window.
     ContextWindow,
@@ -227,6 +231,8 @@ impl ErrorKind {
         match self {
             Self::RateLimit => "rate_limit",
             Self::PaymentRequired => "payment_required",
+            Self::ProviderQuotaExhausted => "provider_quota_exhausted",
+            Self::ProviderForbidden => "provider_forbidden",
             Self::ServerError => "server_error",
             Self::Auth => "auth",
             Self::ContextWindow => "context_window",
@@ -296,20 +302,26 @@ impl ErrorKind {
     #[must_use]
     pub fn guidance(self) -> &'static str {
         match self {
+            Self::ProviderQuotaExhausted => {
+                "The model provider account has exhausted its balance or quota. \
+                 Do NOT retry or re-authenticate; ask the provider account owner to resolve the restriction."
+            }
+            Self::ProviderForbidden => {
+                "The model provider denied inference. The cause is not known. \
+                 Do NOT retry automatically; ask the model administrator to check the provider rejection."
+            }
             Self::PaymentRequired => {
                 "Model inference requires available credit or a higher billing limit. \
                  Do NOT retry or re-authenticate; resolve the provider billing restriction first."
             }
             Self::RateLimit => {
-                "Rate limit hit. The system will retry automatically. \
-                 Reduce parallel tool calls if this persists."
+                "Rate limit hit. Check the run's recovery status; reduce parallel requests if this persists."
             }
             Self::ServerError => {
-                "LLM provider returned a server error (5xx). \
-                 Retrying automatically with backoff."
+                "LLM provider returned a server error (5xx). Check the run's recovery status before retrying."
             }
             Self::Auth => {
-                "Authentication failed (401/403). \
+                "Authentication failed. \
                  Do NOT retry — credentials need to be refreshed."
             }
             Self::ContextWindow => {
@@ -326,15 +338,14 @@ impl ErrorKind {
             }
             Self::StreamIdle => {
                 "Model stopped sending tokens mid-stream (idle timeout). \
-                 Retrying the same request. If this recurs, try a different model or reduce input size."
+                 Check the run's recovery status; if this recurs, reduce the input size or ask the user about selecting another model."
             }
             Self::ProviderDeadline => {
                 "The current provider inference exceeded its deadline. Preserve partial evidence \
                  and use at most one bounded convergence step when it is safe."
             }
             Self::StreamTransport => {
-                "Connection to the LLM provider was lost mid-stream. \
-                 Retrying automatically."
+                "The model response stream was interrupted. Check the run's recovery status before retrying."
             }
             Self::BudgetExhausted => {
                 "Turn/session time budget exhausted. \
@@ -346,7 +357,7 @@ impl ErrorKind {
             }
             Self::Network => {
                 "Network error (DNS, connection refused, unreachable). \
-                 Retrying with backoff. Check network connectivity if this persists."
+                 Check the run's recovery status and network connectivity if this persists."
             }
             Self::ToolNotFound => {
                 "Tool or resource not found. \
@@ -387,7 +398,7 @@ impl ErrorKind {
             Self::ConnectionPoolExhausted => {
                 "HTTP connection pool saturated (reqwest/hyper). \
                  Reduce parallel LLM requests, check for response body leaks, \
-                 or increase pool_max_size. Retrying with backoff."
+                 or increase pool_max_size. Check the run's recovery status before retrying."
             }
             Self::DatabaseError => {
                 "Database query failed (SQL syntax, deadlock, or pool). \
@@ -418,6 +429,12 @@ impl ErrorKind {
     pub fn diagnosis_hint(self) -> &'static str {
         match self {
             Self::PaymentRequired => "Check the model provider balance and billing limits.",
+            Self::ProviderQuotaExhausted => {
+                "Ask the model provider account owner to check its balance and quota."
+            }
+            Self::ProviderForbidden => {
+                "Ask the model administrator to inspect the provider rejection; a 403 alone does not identify its cause."
+            }
             Self::RateLimit => "Reduce parallel tool calls or raise the provider rate-limit quota.",
             Self::ServerError => {
                 "Transient provider issue. If it persists, switch model or provider."
@@ -538,6 +555,8 @@ impl ErrorKind {
         match s {
             "rate_limit" => Some(Self::RateLimit),
             "payment_required" => Some(Self::PaymentRequired),
+            "provider_quota_exhausted" => Some(Self::ProviderQuotaExhausted),
+            "provider_forbidden" => Some(Self::ProviderForbidden),
             "server_error" => Some(Self::ServerError),
             "auth" => Some(Self::Auth),
             "context_window" => Some(Self::ContextWindow),
@@ -1162,6 +1181,8 @@ mod tests {
     const ALL_VARIANTS: &[ErrorKind] = &[
         ErrorKind::RateLimit,
         ErrorKind::PaymentRequired,
+        ErrorKind::ProviderQuotaExhausted,
+        ErrorKind::ProviderForbidden,
         ErrorKind::ServerError,
         ErrorKind::Auth,
         ErrorKind::ContextWindow,
@@ -1236,9 +1257,16 @@ mod tests {
             ErrorKind::ServerError,
             ErrorKind::StreamIdle,
             ErrorKind::StreamTransport,
+            ErrorKind::ConnectionPoolExhausted,
             ErrorKind::Network,
         ] {
             assert!(kind.is_retryable(), "{kind:?} must be retryable");
+            let guidance = kind.guidance().to_ascii_lowercase();
+            assert!(
+                !guidance.contains("retrying automatically"),
+                "{kind:?}: {guidance}"
+            );
+            assert!(!guidance.contains("will retry"), "{kind:?}: {guidance}");
         }
         // Known non-retryable
         for kind in [

@@ -15,9 +15,11 @@ description: |
 prompt: |
   Use one foreground `agent_fanout(action='start')` group with target_count=1
   and one slot to inspect the current repository. Ask that child to use
-  `read_file` exactly once on the root `Cargo.toml`, read the
-  `[workspace.package]` edition, and report only that edition with a short
-  evidence statement. Do not provide file contents to the child yourself.
+  `read_file` exactly once with {"path":"Cargo.toml","start_line":1,"end_line":120}.
+  Include those exact read arguments in the child brief. This range contains
+  the root `[workspace.package]` section. Ask the child to report the edition's
+  literal numeric value with a short evidence statement. Do not provide file
+  contents or the expected edition to the child yourself.
 
   After the canonical child result is terminal, report the edition and state
   that it came from the child's workspace evidence. Do not inspect the file in

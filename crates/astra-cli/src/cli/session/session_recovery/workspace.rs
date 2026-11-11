@@ -46,21 +46,12 @@ pub(crate) fn context_trace_signal_from_trace(
             latency_ms: trace.memory.retrieval_latency_ms,
         },
     );
-    let history = (trace.history.total_turns_available > 0
-        || !trace.history.turns_retained.is_empty()
-        || !trace.history.turns_compressed.is_empty()
-        || !trace.history.turns_dropped.is_empty())
-    .then_some(
+    let history = trace.history.as_ref().map(|history| {
         astra_services::session_workspace::ContextTraceHistorySignal {
-            total_turns_available: trace.history.total_turns_available,
-            retained_turns: trace.history.turns_retained.len(),
-            compressed_turns: trace.history.turns_compressed.len(),
-            dropped_turns: trace.history.turns_dropped.len(),
-            compression_ratio: trace.history.compression_ratio,
-            tokens_before: trace.history.tokens_before,
-            tokens_after: trace.history.tokens_after,
-        },
-    );
+            retained_groups: history.turns_retained.len(),
+            total_tokens: history.total_tokens,
+        }
+    });
     let budget = (trace.token_budget.max_tokens > 0 || trace.token_budget.total_used > 0)
         .then_some(
             astra_services::session_workspace::ContextTraceBudgetSignal {
@@ -79,14 +70,6 @@ pub(crate) fn context_trace_signal_from_trace(
         history,
         budget,
         timing: None,
-        explanations: trace
-            .explanations
-            .iter()
-            .filter_map(|explanation| {
-                let trimmed = explanation.reasoning.trim();
-                (!trimmed.is_empty()).then(|| trimmed.chars().take(200).collect::<String>())
-            })
-            .collect(),
     }
 }
 
@@ -94,7 +77,7 @@ pub(crate) fn latest_context_trace_signal(
     state: &SessionState,
 ) -> Option<astra_services::session_workspace::ContextTraceSignal> {
     if let Some(trace) = state.latest_context_assembly_trace.as_ref() {
-        return Some(context_trace_signal_from_trace(trace));
+        return Some(context_trace_signal_from_trace(&trace.trace));
     }
     let obs = state.observability_session.as_ref()?;
     let guard = obs.read().ok()?;

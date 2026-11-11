@@ -87,10 +87,13 @@ pub(super) fn build_core_state(
         shared_pool.clone(),
         Arc::clone(&session_context_coordinator),
     ));
-    let session_fork_coordinator = Arc::new(astra_services::DatabaseSessionForkCoordinator::new(
-        shared_pool.clone(),
-        Arc::clone(&session_context_coordinator),
-    ));
+    let session_fork_coordinator = Arc::new(
+        astra_services::DatabaseSessionForkCoordinator::new(
+            shared_pool.clone(),
+            Arc::clone(&session_context_coordinator),
+        )
+        .with_scope_encryptor(Arc::clone(shared_encryptor)),
+    );
 
     AppState::new(
         ServiceInfo::default(),
@@ -109,38 +112,20 @@ pub(super) fn build_core_state(
     )))
     .with_auth_service(auth_service)
     .with_session_service(Arc::new(
-        DatabaseSessionService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_agent_service(Arc::new(
-        DatabaseAgentService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
+        DatabaseSessionService::new(settings.matrixone.clone())
+            .with_pool(shared_pool.clone())
+            .with_scope_encryptor(Arc::clone(shared_encryptor)),
     ))
     .with_event_service(Arc::new(
         DatabaseEventService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_context_service(Arc::new(
-        DatabaseContextService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_decision_service(Arc::new(
-        DatabaseDecisionService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))
     .with_model_service(Arc::new(
         DatabaseModelService::new(settings.matrixone.clone(), Arc::clone(shared_encryptor))
             .with_uc_native(uc_provider)
             .with_pool(shared_pool.clone()),
     ))
-    .with_sandbox_service(Arc::new(
-        DatabaseSandboxService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_data_versioning_service(Arc::new(
-        DatabaseDataVersioningService::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone()),
-    ))
     .with_marketplace_service(Arc::new(
         DatabaseMarketplaceService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_marketplace_stats_service(Arc::new(
-        DatabaseMarketplaceStatsService::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone()),
     ))
     .with_session_audit_service(Arc::new(
         DatabaseSessionAuditService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
@@ -177,16 +162,10 @@ pub(super) fn install_turn_persistence_services(
     state: AppState,
     settings: &AppSettings,
     shared_pool: &SharedPool,
+    memoria_port: Option<Arc<dyn astra_memoria::MemoriaPort>>,
 ) -> AppState {
     state
-        .with_turn_hook_db_writer(Arc::new(
-            DatabaseTurnHookDbWriter::new(settings.matrixone.clone())
-                .with_pool(shared_pool.clone()),
-        ))
-        .with_turn_observer_worker(Arc::new(DatabaseTurnObserverWorker::new(
-            settings.memoria.base_url.clone(),
-            settings.memoria.master_key.clone(),
-        )))
+        .with_turn_observer_worker(Arc::new(DatabaseTurnObserverWorker::new(memoria_port)))
         .with_turn_auxiliary_event_writer(Arc::new(
             DatabaseTurnAuxiliaryEventWriter::new(settings.matrixone.clone())
                 .with_pool(shared_pool.clone()),
@@ -228,7 +207,19 @@ pub(super) fn install_admin_services(
         )))
 }
 
-pub(super) fn install_execution_services(state: AppState, shared_pool: &SharedPool) -> AppState {
+pub(super) fn install_execution_services(
+    mut state: AppState,
+    shared_pool: &SharedPool,
+) -> Result<AppState, Box<dyn std::error::Error>> {
+    match std::env::var("ASTRA_EDGE_CAPACITY_RELAY_ORIGIN") {
+        Ok(origin) => {
+            state = state
+                .with_edge_capacity_relay_origin(origin)
+                .map_err(std::io::Error::other)?
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(error) => return Err(Box::new(error)),
+    }
     let metrics = state.multi_agent_metrics.clone();
     let edge_registry_service: Arc<dyn EdgeRegistryService> = Arc::new(
         DatabaseEdgeRegistryService::from_shared(shared_pool).with_metrics(metrics.clone()),
@@ -242,10 +233,10 @@ pub(super) fn install_execution_services(state: AppState, shared_pool: &SharedPo
         Arc::clone(&edge_registry_service),
         &load_deployment_tool_policy(),
     );
-    state
+    Ok(state
         .with_edge_registry_service(edge_registry_service)
         .with_edge_dispatch_service(edge_dispatch_service)
-        .with_tool_execution_service(tool_execution_service)
+        .with_tool_execution_service(tool_execution_service))
 }
 
 fn build_shared_tool_execution_service(
@@ -291,15 +282,32 @@ mod tests {
 
     #[async_trait]
     impl EdgeDispatchService for AdmittingEdgeDispatch {
-        async fn insert_dispatch(
+        async fn admit_dispatch(
             &self,
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
-            _payload_json: &str,
-        ) -> Result<(), String> {
+            _payload: &serde_json::Value,
+        ) -> Result<
+            astra_services::multi_agent::EdgeDispatchAdmission,
+            astra_services::multi_agent::EdgeDispatchAdmissionError,
+        > {
             self.admissions
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(())
+            Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending)
+        }
+
+        async fn admit_and_claim_direct_dispatch(
+            &self,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+            _edge_agent_id: &str,
+            _payload: &serde_json::Value,
+        ) -> Result<
+            astra_services::multi_agent::EdgeDirectDispatchAdmission,
+            astra_services::multi_agent::EdgeDispatchAdmissionError,
+        > {
+            self.admissions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed)
         }
 
         async fn poll_pending(
@@ -405,7 +413,8 @@ mod tests {
     #[tokio::test]
     async fn shared_tool_execution_service_wires_edge_websocket_transport() {
         let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
         pool.register_with_capabilities(
             "user-1",
             "edge-selected",
@@ -431,6 +440,9 @@ mod tests {
             .await
             .expect("durably admitted edge request is delivered without hanging")
             .expect("edge tool request is delivered");
+        let mut queued = message;
+        queued.mark_attempted();
+        let message = queued.message().clone();
         let (request_id, delivery_generation) = match message {
             astra_server_types::EdgeServerMessage::ToolRequest {
                 request_id,

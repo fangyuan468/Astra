@@ -5,12 +5,6 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-[features]
-# Enables the database-backed CslStore (`DbCslStore`) and its sqlx dependency.
-# Leave disabled when only in-process / file-backed CslStores are needed.
-# Other dependencies still bring SQLx into the build transitively.
-db-store = ["dep:sqlx"]
-
 [dependencies]
 astra-core.workspace = true
 astra-messaging.workspace = true
@@ -32,13 +26,14 @@ dirs = "6.0.0"
 fastrand = "2"
 fnv = "1.0"
 futures-util = { workspace = true }
+pulldown-cmark = "0.12"
 regex = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml_ng.workspace = true
 sha2 = { workspace = true }
-sqlx = { workspace = true, features = ["chrono"], optional = true }
+shell-words = "1.1"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

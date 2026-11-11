@@ -38,6 +38,196 @@ without exposing upstream response bodies or credentials.
 
 Model access and inference defines how Astra presents model capability as a product, binds cloud accounts, resolves an eligible model to a trusted execution path, and records inference usage consistently across Web, CLI, Server, and Edge.
 
+## Provider rejection contract
+
+The shared ordinary-provider HTTP boundary distinguishes authentication (`auth`), an
+explicit provider balance/quota denial (`provider_quota_exhausted`), and a
+provider denial without a proven cause (`provider_forbidden`). HTTP 401 is
+authentication failure. HTTP 403 alone, including `upstream_forbidden`, is not
+evidence of expired credentials or exhausted credit. Only the bounded machine
+codes `invalid_api_key`, `invalid_token`, `authentication_error`,
+`insufficient_quota`, and `insufficient_balance` refine that classification;
+provider message text never does. A quota-coded 429 is terminal, unlike a
+transient rate limit. These access rejections do not trigger automatic retry,
+credential refresh, provider fallback, or a waiting run.
+
+Both streaming and nonstreaming calls preserve these classifications through
+the shared agent loop and failed Run outcome. The negotiated MOI gateway can
+carry the same provider facts using `provider_authentication_failed`,
+`provider_forbidden`, and `provider_quota_exhausted`. Its billing-owner reasons
+(for example `insufficient_credit`) keep their separate versioned contract.
+Provider diagnostics, balances, and echoed credentials never enter public
+error messages. Clients must not infer an end-user billing remedy from a
+provider-account failure. Real input/authorization waits retain their existing
+lifecycle semantics.
+
+## Implemented ChatGPT subscription connection boundary
+
+The personal self-hosted ChatGPT adapter uses the same Offering admission, agent
+backbone, invocation/provider-attempt ledger, tool execution, cancellation,
+canonical history and checkpoint paths as API-key models. `chatgpt` selects
+the shared Responses codec; it does not create another session state machine.
+Administrator-managed and personal API-key Offerings can explicitly select the same Responses
+wire protocol. Protocol selection is independent of credential ownership: API
+keys use their admitted endpoint and headers, while subscriptions retain their
+connection fencing and refresh rules. API-key continuation state is scoped to
+the Offering, provider route, request headers, and credential generation;
+header names are case-insensitive, and invalid or duplicate configured headers
+are rejected at configuration and execution admission. Probe-only and unrelated
+capability changes do not invalidate it. Model checks use
+the selected wire protocol; the ordinary provider default remains unchanged.
+Personal and administrator model creation validates connectivity before storing
+the model. Credential updates are also checked before committing. A failed
+check returns a coded error and leaves existing model configuration and
+activation unchanged; a successful administrator check can activate it.
+Authentication/access, rejected requests, rate limits, upstream failures,
+timeouts and network failures have distinct error codes across both wire
+protocols. Probes do not automatically repeat potentially billable requests
+after uncertain delivery. A Chat Completions 2xx response must be bounded JSON
+without an error; an HTML page or embedded error is not a successful check.
+Personal model configuration stores the protocol separately from the optional
+thinking observation. Credential rotation and concurrent checks are fenced by
+the existing model row. A Responses tool group retains its scoped provider
+evidence across canonical projection; incomplete or inconsistent evidence
+stops the current continuation before provider dispatch. A later human turn can
+continue with the completed canonical tool pairs. No separate continuation
+table or per-request database lookup is introduced.
+An effort accepted by one probe is an observation, not a complete provider
+inventory. Personal Responses models can try an unverified effort; a provider
+rejection is reported without silently changing the requested setting. The
+model default sends no effort override. Subscription catalogs retain their
+declared effort lists; administrator routes without a declaration continue to
+limit explicit controls to observed values.
+Explicit request temperatures are not silently discarded. Internal memory
+judgments express a deterministic sampling preference; when Responses sampling
+support is not established they use the provider default and the admitted
+reasoning policy instead of inventing an unsupported control.
+The completion proxy retains whether temperature was supplied: omission keeps
+the historical `0.1` default for Chat Completions and uses the provider default
+for API-key Responses; an explicitly supplied unsupported value is rejected.
+Subscription completions retain their existing behavior of using provider sampling
+defaults. Older clients that always send a temperature must be upgraded before
+using an API-key Responses Offering.
+The supported deployment and CLI/API contracts are documented in
+[configuration](../reference/configuration.md#chatgpt-subscription-connections),
+[CLI commands](../reference/cli-commands.md#chatgpt-subscription-models), and
+[API reference](../reference/api-reference.md#personal-subscription-connections).
+
+`user_llm_connections` owns one encrypted renewable credential per Astra owner,
+issued client registration and provider subject. Multiple personal model rows
+reference it. A row has exactly one source: API-key ciphertext or connection ID;
+admission rejects malformed combinations. `user_llm_authorizations` owns
+short-lived, owner-bound OAuth attempts, encrypted PKCE verifiers and keyed
+state/nonce digests. Starting an attempt locks the existing Astra account row
+and atomically checks and inserts against an eight-unexpired-pending limit
+shared across service instances; cancellation and expiry release capacity. ID tokens are verified and discarded; only renewable
+credentials are stored encrypted. Credentials never enter serializable routes, catalogs,
+checkpoints or public errors. The CLI relays only the browser callback and uses
+a loopback listener; Server never reads local CLI/Codex credentials.
+
+Valid-token cache hits run concurrently without cold-path admission. At most 64
+cold credential producers pin connection-local rejection and invalidation
+evidence through row reads and refresh settlement; other cold callers wait
+within their existing caller deadlines. Cache and guard storage remain bounded.
+Unpinned eviction cannot invalidate another connection or drop an active
+producer's evidence. A detached refresh retains its producer pin after waiter
+cancellation. Database generation fences remain authoritative across replicas.
+Refresh rotation shares one connection-owned
+task per generation and a database compare-and-set lease plus the rejected
+credential version. Cancelling an inference or its last waiter does not cancel
+the bounded rotation or its credential commit. Discovery/JWKS metadata is cached
+and prepared before taking the lease; the full rotation operation has a
+25-second budget within its 30-second lease: up to 20 seconds for the claim/exchange/persistence and five seconds reserved for fenced failure settlement. Interrupted SQL uses the shared cancellation-safe checkout or transaction owner. Pre-dispatch failures and rejected
+rate-limited refreshes release the lease and preserve credentials. A lost/expired refresh
+outcome requires reauthentication instead of reusing a potentially consumed
+refresh token. A delayed 401 for an older version reuses a committed winner. Connection generations fence reauthorization
+and disconnect against old execution bindings. Disconnect clears ciphertext,
+disables dependent models and cancels local requests; each connection-service instance batches active owner/connection keys in one
+monitor: up to 256 keys per query and four concurrent batches on a two-second
+cadence, with one two-second cycle deadline including queued work. Failed or
+missing observations cancel only the matching entry identities; idle monitors
+stop. Monitor identity reservation and normal handoff use the existing registry;
+task launch happens after unlocking, and destructor cleanup only fails closed.
+Model admission deduplicates connection IDs into one bounded lookup.
+Each request performs a
+fresh fence before accepting completion. The monitor stops with its last request.
+Interrupted delivered requests settle as delivery-unknown through the existing
+attempt owner. A disabled selected default cannot silently choose deployment
+credentials. OAuth identity is never Astra identity or login-session authority.
+
+Model creation, activation and default selection lock and revalidate the probed
+connection generation within their database transaction, before changing model
+rows. Disconnect and reauthorization lock the connection before its authorization
+attempts and dependent models. A stale successful probe cannot re-enable models after disconnect.
+Retry backoff uses the shared provider deadline/cancellation owner and consumes
+the original inference budget.
+Catalog reads and connectivity probes share version-aware 401 recovery. Failed
+and incomplete Responses retain provider identity and usage for settlement.
+Streaming protocols share the physical-attempt runner for sending, retries,
+deadlines, error-body reads and settlement. The Responses adapter owns wire
+decoding and its connection fences, including cancellation during a stream.
+
+Responses uses the [shared runtime role projection](context-and-prompt.md#dynamic-blocks)
+before wire encoding, including direct auxiliary calls. Requests send full
+history with `store:false` and `stream:true`.
+Personal API-key models using the native OpenAI Responses endpoint select the
+existing append-only runtime-context layout at admission. This preserves reusable
+conversation prefixes without dropping optional or required context. Custom
+OpenAI-compatible gateways retain their existing provider defaults because their
+message and caching semantics are not established by the API format alone.
+Functions use the standard flat Responses tool format. Completed provider output items,
+including reasoning and message phase, live in private canonical assistant-message
+metadata before tool execution/final checkpoint. Stateless OpenAI Responses
+returns encrypted reasoning without an `include` override; compatible endpoints
+can instead return replayable `reasoning_text` content. A tool round containing
+a reasoning item without replayable content stops before executing its calls.
+Provider reasoning, including provider-supplied opaque state, is sealed by the
+Server before canonical storage. The capsule is authenticated against the owner,
+session lineage, admitted route, model, item and tool calls; its encoded bytes
+survive credential sanitization. It can contain credential-shaped provider
+reasoning in encrypted form so replay preserves the provider's exact state;
+plaintext remains excluded from public history and diagnostic captures. The inference owner opens it only for an
+authorized continuation. Raw reasoning is omitted from user-visible streams,
+observers and diagnostic artifacts; resume and segment APIs retain only the
+sealed capsule. Function arguments come from the canonical
+assistant tool calls; private metadata retains no second raw argument copy. Resume
+replays them only for the same connection and model; other protocols remove
+that metadata at the existing internal-marker projection boundary. No
+`previous_response_id` thread store or parallel history projection exists.
+Subscription reasoning controls come from `supported_reasoning_levels` in the
+connection's upstream catalog, intersected with the Responses wire protocol's
+supported controls. Creation and explicit checks retain the declared
+effort inventory in the existing configuration-bound model capability snapshot;
+model discovery, exact admission and delegation consume that same inventory.
+Inference performs no catalog fetch. The shared `responses_reasoning` adapter
+emits `reasoning.effort`; Model default omits the field. Unsupported effort,
+binary suppression and token-budget requests fail before provider dispatch.
+
+For a personal API-key model using Responses, the model create/update API also
+accepts `responses_reasoning_history`: `current_turn` only for an endpoint whose
+contract has been verified to need reasoning within the active human turn, or
+`all_turns` to retain it across turns. Omission is conservative. This is a route
+capability, not a setting inferred from the provider's name; changing it adds no
+per-turn database query.
+
+Only completed responses authorize tool dispatch and replayable provider state.
+A typed `max_output_tokens` truncation retains partial text, response identity,
+usage and `length` even without output items. Empty-terminal text fallback
+merges completed parts and partial deltas by output/content index, retaining
+streamed tails without duplicating done text. Ambiguous unindexed mixed text
+fails with streamed deltas, response identity and usage retained rather than
+guessing ownership; done-only text is not recovered on that error path. It creates neither executable
+calls nor continuation metadata, including when individual function items look
+complete. The existing output-cap owner handles continuation or interruption;
+other incomplete reasons remain failures. Explicitly unfinished saved items
+cannot be replayed. Summary acceptance rejects truncated results even when
+partial text is present. A connectivity probe only checks that the configured
+route produced valid output; a typed output-limit response can establish that
+fact without authorizing a complete answer, tool call, or capability.
+When a completed subscription response has an empty output array, the shared
+codec uses its fully received `response.output_item.done` items. Text deltas
+alone cannot establish a replayable response or authorize tools.
+
 ## Ownership
 
 Opt-in Auto chat routing uses the existing authenticated Offering admission
@@ -71,7 +261,7 @@ It does not own:
 - Astra can link a user or organization to TaaS without making TaaS a special agent runtime.
 - A user can explicitly choose Cloud BYOK, where Astra Server encrypts the provider credential and executes inference, or This device, where the secret is never uploaded.
 - Web, CLI, Server Only, and Edge + Server expose the same model and run semantics.
-- Every inference has an immutable execution placement, credential owner, billing owner, policy decision, and durable identity.
+- Every inference has an immutable execution placement, credential owner, billing owner, policy decision and causal owner. Agent calls reuse the durable Run; standalone accounting retains durable invocation identities.
 - Account, entitlement, credential, endpoint, and billing failures are visible and recoverable without corrupting run state.
 - Protocol compatibility and optional generation-parameter capability remain
   separate facts; an OpenAI-compatible route is never assumed to accept every
@@ -146,6 +336,66 @@ as an existing chat-ready model configuration.
 Continuation cursors are scoped to the requested purpose: clients must retain
 the same purpose throughout a drain, as well as checking revision and total.
 
+#### Catalog response compatibility
+
+The two HTTP catalog endpoints retain the complete response field set as the
+frozen format version 2, including `thinking_protocol` and `pricing`. This is a
+catalog API contract, not a promise that older CLI or Edge binaries support the
+current interaction protocol. Deploy matching current clients with the Server. A
+missing `x-astra-model-catalog-version` header and explicit `2` select the
+same frozen format; current thin-client and TypeScript SDK requests negotiate
+the current format `3` on every page.
+Unknown, repeated, or malformed versions (including `1`) return
+`400 model_catalog_version_unsupported`. The response identifies its format
+in the same header and is not cached.
+
+The Server must not infer a catalog version from identity or strip protocol
+metadata needed by consumers of the frozen catalog contract. This response
+shape alone does not grant older clients an execution or interaction guarantee.
+
+Version validation does not authorize access. The response uses the existing
+service-owned authorized catalog, Offering identity, capabilities, access
+policy, pagination, revision, defaults, and execution admission. Unsupported
+explicit reasoning controls are rejected with protocol-specific errors; they are
+never silently translated to a default, toggle, effort, or budget.
+
+Current `ModelListItemResponse`, `ModelListPageResponse`, and
+`ModelAccessProjectionResponse` readers tolerate additive metadata at those
+object boundaries. This is defensive reader behavior for non-authoritative
+metadata, independent of the producer's frozen response obligations; it does
+not replace the historical decoder tests. After an explicitly reviewed support
+baseline change establishes that every supported consumer safely ignores a
+particular class of optional metadata, v2 may be extended within that class.
+The corresponding frozen-consumer coverage must change with that decision;
+current reader tolerance alone is insufficient. Their nested access/status,
+default-resolution, cursor,
+required-field, and typed enum contracts remain strict. This reader tolerance
+is not permission to extend v2 responses: the published 0.2.12 decoder is
+strict, and an independent frozen fixture protects its complete response
+shape. New response fields, type changes, or enum/state values require a new
+explicitly negotiated format while unversioned responses retain the 0.2.12
+contract. Format version 3 is the current production projection: it adds
+`supported_reasoning_efforts` and newer `thinking_protocol` values such as
+`responses_reasoning`. Version 2 remains frozen. An Offering whose thinking
+protocol the frozen 0.2.12 enum cannot name stays listed in v2 — Model
+Access and selection keep working — but its thinking controls are
+conservatively hidden: `thinking_protocol` and `thinking_capability` are
+`null` (unknown/unexpressed), never disguised as a differently meaning
+published protocol, and `supported_reasoning_efforts` is absent. For v2
+clients such an Offering therefore runs only the provider default thinking
+mode; the complete thinking options require explicitly negotiated v3. Every
+other model's existing v2 metadata is unchanged. Future clients may continue
+requesting v2 when its semantics suffice;
+requesting a newer format from an older Server is an explicit compatibility
+failure. A generic HTTP 400 must not trigger automatic downgrade. Any future
+negotiation strategy must recognize the version-specific machine code and
+verify that the selected format can represent the required semantics.
+Authentication, execution requests, approvals, and Edge advertisements are not
+made permissive.
+
+See [current client integration tests](../guides/testing.md#candidate-cli-and-edge-integration)
+for the tested client and Server journeys.
+
 Explicit Offering IDs cannot bypass this policy. Primary chat admission and
 provider-boundary revalidation reject incompatible protocol-purpose pairs before
 provider dispatch, using `model_purpose_unsupported` at HTTP admission. Typed
@@ -212,7 +462,10 @@ their own provider account.
 
 - `POST /me/models` accepts a provider credential once over an authenticated
   TLS connection. Owner identity is derived from the Astra access token; the
-  request cannot select another owner.
+  request cannot select another owner. Failures known to precede the creation
+  transaction include `metadata.model_saved: false`; clients may retain the
+  form for correction. An ambiguous response requires checking the model list
+  before retrying.
 - Astra Server encrypts the credential with the configured secret backend and
   stores only ciphertext in `user_llm_models`.
 - `GET /me/models`, `GET /me/models/{model_id}`, catalog, trace, error, and
@@ -229,22 +482,16 @@ their own provider account.
   existing administrator registry; a host-only entry admits port 443 only.
   The default is `public-https`; invalid configuration fails closed.
 - Custom endpoint policy is rechecked at create, credential rotation, probe,
-  activation, and inference admission. Each outbound attempt pins a freshly
-  validated public DNS address set and forbids redirects. DNS queries go directly
-  to system-configured nameservers instead of OS synthetic-address caches;
-  `ASTRA_BYOK_DNS_SERVERS` optionally selects comma-separated DNS IPs (ports
-  optional); prefix an entry with `tcp://` for TCP-only DNS without a UDP
-  attempt or UDP fallback. This is an explicit operator route, not automatic
-  retry of rejected private/Fake-IP answers. Nameserver priority is preserved
-  instead of racing answers from different DNS servers. There is no hardcoded
-  public DNS or OS resolver fallback.
-  Direct egress is the default. Operators may set `ASTRA_BYOK_PROXY_URL` to an
-  HTTP/HTTPS CONNECT or SOCKS5/SOCKS5h proxy. A request-owned authenticated
-  loopback adapter sends only validated public IP targets to that proxy,
-  retaining the origin hostname for end-to-end TLS, SNI and Host. SOCKS5h does
-  not delegate target DNS. Dropping the client cancels its tunnel tasks.
-  Ambient proxy variables cannot override this route; proxy failure never
-  falls back to direct access. Private/Fake-IP DNS answers remain rejected.
+  activation, and inference admission. Each outbound attempt resolves with the
+  Server's system DNS, validates every address as public, pins the result, and
+  forbids redirects. `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` select the same
+  Server egress configuration as other providers. For proxied requests, a
+  shared tunnel listener authenticates each request's short-lived route and
+  sends only its validated IP targets to the proxy while retaining the origin
+  hostname for TLS, SNI and Host. Dropping the client revokes its route and
+  cancels its connections. Proxy failure never falls back to direct access. If system
+  DNS returns private or Fake-IP addresses, the operator must configure it to
+  return public addresses; proxy DNS cannot bypass validation.
 - Authenticated `POST /me/models/validate-endpoint` accepts only `base_url` and
   returns `204` after URL, policy, and DNS checks, without provider HTTP traffic,
   credentials, or stored model state. CLI runs it immediately after custom URL
@@ -256,8 +503,12 @@ their own provider account.
   default selection and a hidden key. Explicit flags and `--api-key-stdin`
   support non-interactive configuration. Custom endpoints reuse the existing
   OpenAI transport; adding user ownership does not create another agent loop.
-- Inference admission revalidates `(user_id, offering_id, is_active)` and
-  decrypts the current credential immediately before provider execution.
+- Inference admission validates `(user_id, offering_id, is_active)` and
+  materializes the route and credential. Server agent Runs reuse that exact
+  admission for at most 30 seconds from its original admission timestamp;
+  configuration-cache hits do not extend it. At the next provider boundary
+  after expiry, owner-scoped revalidation refreshes or rejects the material.
+  Recovery and explicit selection changes require a new admission.
   Server child fanout admits a bounded set of distinct Offerings with batched
   owner-scoped and deployment reads, preserving per-Offering freshness without
   one database round trip per child. The all-or-nothing batch is validated
@@ -350,6 +601,14 @@ measurement separately as `last_request_input_tokens` or nested
 `last_request_usage.input_total_tokens`. CLI context observers forward that
 validated measurement independently of complete billing lanes, including
 updates that arrive while those lanes remain unknown.
+Run input totals include each settled attempt fact’s validated inclusive input
+once, including auxiliary calls and failed attempts. The portion not assigned to known
+billing lanes is retained separately through continuation; it never becomes fresh
+input or proves a zero cache-hit rate. Missing measurements remain incomplete
+evidence, while known lane subtotals still count toward the run budget. Older
+handoffs without this observed subtotal remain readable, without claiming complete
+measurement. Handoffs written by a newer binary are not a downgrade format:
+upgrade execution workers before assigning them runs written by the new version.
 
 ```text
 Primary agent       120k tokens   Personal Cloud
@@ -716,7 +975,8 @@ A logical inference and a physical provider request are distinct:
 - `InferenceInvocation` is the budget, lifecycle, and aggregate-usage unit.
 - `ProviderAttempt` is one actual request, including provider request ID and delivery certainty.
 
-Every invocation has exactly one durable owner scope:
+Every request has exactly one causal owner scope. A scope is attribution,
+not an additional lease or state machine:
 
 ```rust
 enum InferenceOwnerScope {
@@ -738,21 +998,152 @@ enum InferenceOwnerScope {
 }
 ```
 
-Primary agent and subagent inference is run-owned. Work that is genuinely
-outside an active run—such as pre-turn memory reranking or post-turn memory
-extraction—is session-owned. Both scopes verify the authenticated user's
-durable ownership before provider I/O. Producers must never invent a run ID to
+Primary agent, subagent, summary and classification calls within a Run reuse
+that Run's execution authority. Work outside an active Run, including standalone
+completion calls and post-turn extraction, retains its session-owned accounting
+boundary. Offering admission and authenticated ownership precede provider I/O. Producers must never invent a run ID to
 make auxiliary work billable, and consumers must never infer ownership from an
 operation label or prompt text.
 
-A forked skill retains its parent run/session and execution authority. Its
-inference operation identity derives from the canonical child turn chain,
-which includes the outer invocation identity. Distinct forks cannot alias the
-same inference invocation; replay of one outer invocation retains its identity.
+A forked skill retains its parent run/session and execution authority. Physical
+requests have request-local identities; they are observations, not durable
+execution grants. Tool invocation identity and custody remain durable.
 
-Server persists route, admitted invocation, and first provider-attempt identity before contacting the provider.
+Standalone accounting persists invocation and provider-attempt identity before
+contacting the provider. Agent requests do not persist a second invocation,
+provider-attempt lease, request-context pair, canonical transition WAL or recovery
+debt. Their observations feed the existing trace and usage projection.
 
 Retries reuse the logical invocation but create a new provider attempt. The invocation ID is sent upstream as an idempotency key only when the final provider explicitly supports that contract. If delivery may have occurred and the provider cannot answer idempotently, the result is `DeliveryUnknown`; Astra does not blindly retry or claim zero usage.
+
+### Agent request execution boundary
+
+The canonical transport prepares immutable provider bytes once. The existing
+Run authority fences physical attempts using its shared cancellation, pause,
+lease-loss and deadline controls. Main responses and auxiliary summaries use
+the same transport observer; auxiliary calls do not allocate durable attempt
+pairs or retry database identity collisions. Offering revalidation and provider
+capacity policy remain at their existing owners.
+
+Physical attempts retain exact wire identity, dispatch, terminal and qualified
+usage observations in process. Missing usage remains unknown. Trace persistence
+must not become a prerequisite for consuming a model response. A process crash
+may lose in-flight model output and diagnostics; users may need to resend or
+continue. There is no per-model-request replay or recovery promise. Explicit
+handoff checkpoints carry their complete checked continuation without loading a
+provider-attempt WAL. Run/Context commits and tool side-effect admission and
+deduplication keep their independent contracts.
+
+### DSML tool-call decoding
+
+The OpenAI-compatible response boundary uses the existing turn-core tool-call
+decoder for explicit DeepSeek DSML emitted in the text channel. Call recovery
+and streaming/final visible-text projection share one markup lexer. It recognizes
+`tool_calls`, `function_calls`, and V4.1 `calls` wrappers with the published
+single-delimiter format and the observed doubled-delimiter spelling. Markdown
+code spans, quote/list-contained fences, and indented code remain literal data.
+HTML elements, comments, CDATA, declarations and processing instructions also
+own literal content. CommonMark determines block ownership at the start of a
+line, including block names recognized before the tag closes. A terminator ends
+its block after the closing line; other HTML blocks end at a blank line.
+Matching inline elements and quote/list exits release their literal context.
+Container prefixes and reserved tags use resumable cursors, with completed
+prefix bytes checkpointed across chunks. One exact incremental grammar owns
+both complete and partial tag recognition; suffixed DSML names such as
+`invoke-example` are ordinary text. A fence consumes only its opening containers;
+blank lines may omit list indentation without ending that fence.
+CommonMark also validates the fence opening line and info string. Block
+interruption and fence entry share the same checkpointed backtick lookahead:
+a later backtick in the info string can invalidate the candidate fence.
+Backticks in a tilde fence's info string do not affect ownership.
+Tabs retain physical columns and virtual padding. Indentation within established
+containers can be streamed once its meaning is settled. Indentation after a new
+marker remains provisional until the new block is known. Indented paragraph
+continuations retain inline delimiter state; actual code blocks remain literal.
+DSML, bare `invoke`/`parameter`, and legacy `tool_call` tags share one indexed
+scope stack. Parameter bodies are not independent tool-call sources. Every
+invocation owns its full subtree before name/argument validation, including
+malformed unnamed openers and nested wrappers from another syntax family;
+nested content cannot escape as another call. Only DSML invocations can be
+recovered independently inside a DSML calls wrapper.
+When an invocation body or a typed DSML parameter starts with a JSON object,
+array or string, matching delimiters, quotes and escapes determine where the
+value ends. Protocol spellings inside JSON strings remain argument data even
+when they match an enclosing close tag. An invocation still requires an
+argument object; a typed parameter is decoded as a JSON value.
+Invocation and parameter attributes come only from their own lexical opening
+tags; descendants and quoted values of other attributes cannot supply a name.
+Both invocation families use the shared bounded argument decoder, retaining
+invalid named bodies for existing pre-execution feedback.
+Complete-input scans use a cursor and compact once per batch; long indentation,
+delimiter runs, closing-fence whitespace, and unfinished tags do not rescan their
+accumulated prefix on each delta. Candidate decoding walks the ordered tokens
+instead of rescanning earlier families' owned ranges for each candidate.
+DSML projection precedes legacy bare-XML cleanup, and carries literal ranges
+through that cleanup so argument markup cannot consume answer text and examples
+remain unchanged. Escaped tag openers and their
+matching markup are literal scopes within their CommonMark block, never
+executable invocations. An unmatched escaped opener cannot absorb a real call in
+a later block. Per-kind scope
+indexes make unmatched closers constant-time and matching pops amortized linear.
+Physical line-prefix state follows every byte consumed, including newlines inside
+tags. LF and CRLF use the same line and blank facts; a CRLF pair split across
+deltas keeps its container context while awaiting the LF. Raw text and parameter bytes
+remain unchanged. A new empty item can take its first block on the next line;
+a blank separator before that block ends the empty item. The block probe
+retains the first unmatched container's shape so CommonMark can distinguish a
+sibling item from a setext underline without reparsing the deeper nesting for
+each lazy continuation. After a possible
+inline code opener, the stream publishes prose before potential markup and
+releases the prefix when there is no competing delimiter to reconsider.
+Matching runs make any remaining tail literal; at a block boundary or EOF the
+lexer replays an unmatched tail once with indexed delimiter runs, including
+when indentation consumes the last bytes of the response. This allows
+real calls outside matched spans to be recovered. The existing CommonMark parser
+determines paragraph continuation, heading boundaries and new container facts.
+When it rejects a provisional container, that marker is scanned as content,
+so a marker-only paragraph line cannot be mistaken for a blank line.
+Structural prefixes are classified through their
+first inline payload character: ordinary list, heading and punctuation-led
+prose streams before newline or EOF. Ambiguous marker-only prefixes remain
+pending until their structure can be determined. This does not change tool
+dispatch or admission.
+
+Native structured calls take precedence. Recovered calls remain subject to the
+exact request tool surface and the ordinary argument, capability, policy and
+approval boundaries; decoding grants no execution authority. String parameters
+retain their bytes and `string="false"` values require valid JSON. Incomplete or
+undecodable named invocations retain invalid argument evidence for the existing
+pre-execution rejection/model-feedback path, rather than becoming empty calls.
+Orphan protocol closers are removed from visible text without inventing a tool
+call or triggering a model retry. The normalized completion feeds the existing
+canonical history and transcript paths; raw provider diagnostics are unchanged.
+
+### Provider timeout ownership
+
+Ordinary agent streaming calls use rolling transport-idle and semantic-progress
+watchdogs, not a default whole-response wall-clock limit. Text, reasoning, and
+authorized tool argument progress refresh semantic liveness; heartbeats alone
+do not. The shared OpenAI-compatible, Anthropic and Bedrock collectors retain
+cancellation, response-size limits, and bounded terminal draining.
+Terminal draining has a fixed deadline, at most 500ms after the first terminal
+signal. Empty events and duplicate terminal signals cannot extend that window.
+Bedrock returns as soon as both `messageStop` and usage metadata are present;
+missing metadata at the deadline remains a partial transport failure.
+Anthropic completes immediately on `message_stop` and does not enter a tail wait.
+
+The HTTP transport must not add a hidden total body timeout, including for
+user-owned compatible endpoints. An explicit caller budget or positive
+`ASTRA_LLM_TOTAL_BUDGET_S` override still limits the logical call across retries
+and leaves its existing terminalization reserve. Without such a limit, setup
+and retries are bounded until a response starts, and ledger operations have
+independent bounded waits; they do not consume a progressing stream's lifetime.
+Non-stream, auxiliary inference, model checks, and run/resource deadlines retain
+their own limits. Unknown provider delivery is still not blindly retried.
+An unset, empty, or whitespace-only total-budget variable leaves ordinary
+streaming uncapped. Invalid nonempty values produce an actionable
+`InvalidRequest` before streaming attempt admission, rather than selecting a
+default cap.
 
 ## Control plane and data plane
 
@@ -762,7 +1153,7 @@ Client / Web / CLI
         ▼
 ┌──────────────── Astra control plane ────────────────┐
 │ principal · effective catalog · policy · resolver   │
-│ budget admission · durable route/invocation         │
+│ budget admission · Run execution authority         │
 └──────────────────────┬──────────────────────────────┘
                        │ canonical inference request
               ┌────────┴────────┐
@@ -811,6 +1202,27 @@ enum InferenceStreamEvent {
 ```
 
 Provider adapters translate the canonical contract to OpenAI, Anthropic, Bedrock, local, or other supported protocols. Adapter differences do not leak into agent state-machine behavior.
+
+The OpenAI-compatible usage normalizer also accepts the documented
+[OpenCode usage extension](https://dev.opencode.ai/v2/docs/console/api/inference#cost).
+`opencode.tokens.input`, `cache_read`, and `output` are disjoint fresh input,
+cached input, and output evidence. Output already includes reasoning. The checked
+sum of `cache_write_5m` and `cache_write_1h` is cache-creation evidence only when
+both counts are reported; a missing lifetime is unknown, not zero. Mirrored
+generic and OpenCode fields must agree, and a complete input partition must
+match an inclusive prompt total. A reported write lifetime contributes to the
+input lower bound even when the full write count is unknown. If that bound
+exceeds the inclusive prompt total in one raw sample, later stream updates
+cannot qualify that attempt's input usage. The generic fields retain their
+existing inclusive or disjoint semantics; Anthropic-shaped OpenAI-compatible
+responses reconcile the extension through the same OpenAI usage normalizer.
+Aliases are decoded independently: null fields carry no evidence, and reported
+`input_tokens`/`output_tokens` remain subject to reconciliation even when
+`prompt_tokens`/`completion_tokens` are also present.
+The existing streaming collector retains
+partial cumulative samples and rejects invalid or contradictory raw evidence.
+This extends usage normalization, not the model invocation protocol or billing
+authority; it does not introduce another run lifecycle.
 
 OpenAI-compatible response decoding accepts string `reasoning_content` and
 `reasoning` fields in both streamed deltas and non-streaming assistant messages.
@@ -885,6 +1297,26 @@ support policy: a binary protocol supports `On`/`Off`, not an invented effort or
 token budget. Explicit effort and budget requests are rejected when unsupported,
 never silently converted to a toggle. An unsuffixed model preserves its default;
 `(thinking:on)` and `(thinking:off)` retain explicit intent across surfaces.
+
+An authenticated provider using `capability_descriptors.model_gateway` can
+supply an exact gateway-wire declaration in `metadata.reasoning_control`:
+
+```json
+{"protocol":"reasoning_effort","supported_efforts":["low","high","max"]}
+```
+
+The provider must derive this declaration from the selected model's catalog,
+not from the turn's requested effort. Astra accepts it only at the existing
+provider-authorized gateway admission boundary. The protocol must be
+`reasoning_effort`, and efforts must be a nonempty, unique subset of
+`low`, `medium`, `high`, and `max`. Malformed declarations fail admission.
+Omission leaves gateway reasoning capability unknown; it does not enable an
+explicit effort. The admitted execution retains the exact inventory through
+primary and auxiliary routes, delegation validation, and final provider calls.
+An explicit adaptive effort must be a member and is emitted unchanged. The
+bounded auxiliary policy may select low only if low is declared. This contract
+is additive inside the existing metadata map and does not alter ordinary
+catalog Offering admission or require a reasoning declaration for default chat.
 
 The unconnected per-turn complexity dampener (`TurnComplexitySignals`,
 `scale_for_turn`, and `capped_at`) is retired from the source API; requested
@@ -1099,11 +1531,11 @@ the complete quirks object.
 
 `ASTRA_INTROSPECTION_TOTAL_BUDGET_S` defaults to 8 seconds, capped by the global
 LLM budget, for no-tool introspection provider execution. It uses the existing
-provider-attempt deadline/settlement owner, not an outer cancelling timeout.
+shared transport budget and the existing Run cancellation/deadline authority.
 Primary and other purposes retain their budgets. This is **not** an eight-second
-end-to-end TTFT guarantee: pre-provider durable admission and post-provider
-logical settlement have their own lifecycle costs. Existing auxiliary failure
-handling remains responsible for degraded Work admission.
+end-to-end TTFT guarantee: Offering authorization and context assembly precede
+provider execution. Existing auxiliary failure handling remains responsible for
+degraded Work admission.
 The provider work allowance leaves a tail reserve for durable terminalization.
 That reserve is not a separate maximum for database settlement: an early provider
 response leaves its unused time available for settlement until the same logical
@@ -1456,26 +1888,30 @@ An extreme mode where prompt and agent state never reach Astra Server requires a
 - UI model changes affect only a later inference boundary, never an active provider request.
 - Subagents may use purpose-specific Offerings only within inherited data and billing policy.
 - If access expires, only branches needing another inference pause; completed transcript and task state remain readable.
-- Repair resumes from durable invocation state and does not relaunch completed children.
+- Repair uses Run checkpoints and durable tool custody; an in-flight model request
+  is not recoverable. Completed children are not relaunched.
 - Agent Workbench shows actual model, Model Access, state, and usage for each branch.
 
 ### Execution-authority boundaries
 
 The following boundaries are normative for every inference surface:
 
-1. **Offering admission owns route material.** A run may remember the selected
-   effective Offering ID, but it must not treat a previously decrypted route as
-   authorization for a later provider request. Immediately before each provider
-   request, Server revalidates the Offering and materializes the current route and
-   credential generation. This check occurs per request, never per streamed token.
-   A disabled Offering therefore blocks the next request; credential and endpoint
-   rotation therefore affect the next request without restarting the run.
-2. **The durable ledger owns inference termination.** Admission returns a
-   cancellation-safe invocation handle. Exactly one supervisor owns its deadline
-   and provider attempt. Dropping, aborting, or timing out the caller converges the
-   attempt to `DeliveryUnknown` after provider I/O begins, or `Cancelled` before
-   provider I/O begins, and then settles the logical invocation. Callers must not
-   wrap the same operation in an independent competing timeout.
+1. **Offering admission owns route material.** A Server agent Run may reuse
+   the exact admitted Offering, route and credential for at most 30 seconds from
+   the original admission. Every provider boundary checks that admission clock;
+   resolving a cached configuration or reconstructing a host cannot renew it.
+   After expiry, the next provider boundary performs owner-scoped revalidation:
+   a disabled Offering is rejected, and credential or endpoint rotation refreshes
+   the route without restarting the Run. Recovery and explicit selection changes
+   require new admission. Standalone inference surfaces retain their own fresh
+   request admission; neither a selection-cache hit nor an Offering ID alone
+   authorizes provider execution.
+2. **The existing execution owner controls inference.** Agent calls borrow the
+   Run's cancellation, pause, lease-loss and original deadline. They add no
+   persistent inference owner or settlement debt. Standalone accounting retains
+   its cancellation-safe invocation supervisor and truthful delivery uncertainty.
+   Dropped agent requests retain only observations already published; persistence
+   and exact request recovery are not a second execution authority.
 3. **Each API surface owns its producer identity.** Public completion proxy calls
    are session-owned auxiliary inference, not arbitrary internal run or harness
    work. Server derives their producer namespace, purpose, and durable scope from a
@@ -1518,8 +1954,8 @@ tests use MatrixOne plus a controllable mock provider and prove observable cause
   new material;
 - abort a non-streaming call after the provider accepts it and assert durable
   provider-attempt and logical-invocation terminals;
-- retry the same auxiliary request concurrently and assert one producer-owned
-  durable identity;
+- retry an agent auxiliary request concurrently and assert distinct observed
+  physical identities under the same Run authority, without an inference DB owner;
 - reject public attempts to claim run, harness, or internal producer ownership;
 - independently admit an explicitly selected child Offering, while an unselected
   child inherits the parent's Offering.
@@ -1589,6 +2025,23 @@ Server instances remain horizontally replaceable:
 - no database query occurs per token or stream chunk;
 - hundreds of simultaneous sessions do not serialize on one global lock.
 
+Deployment-model selection currently uses a disposable 30-second cache, capped
+at 256 entries, 4 MiB of conservative retained-allocation accounting and 128 KiB
+per entry. Accounting includes keys, string/vector capacities and JSON container
+allowances; it is not a whole-process RSS limit. Larger configurations remain
+usable without being cached. Expired entries may supply the existing database-error
+fallback until eviction; inactive, missing or unauthorized selections do not gain
+that fallback. Model-name and Offering-ID namespaces remain distinct.
+
+Sixty-four fixed process-local mutexes coalesce selection misses without retaining
+per-key locks after cancellation. Hash collisions can serialize unrelated cold
+fills; cache hits do not wait for a fill lock. Existing caller deadlines and
+admission budgets still apply. Invalidation clears values without replacing locks
+or cancelling in-flight fills, and is not a cross-Server revocation protocol.
+The selection cache is not execution authority. Provider execution requires an
+admitted execution; Server agent Runs reuse it only within the original
+30-second admission window, then perform owner-scoped database revalidation.
+
 Prompt-cache identity includes actual provider, upstream model, connection, trust scope, and cache protocol. Per-turn runtime feedback remains outside the stable prompt prefix.
 
 ## Observability and audit
@@ -1607,6 +2060,11 @@ Inference spans and durable facts include non-secret identifiers for:
 Metrics include resolution latency/errors, active/queued inference, provider 401/429/5xx, TaaS link/billing/credential health, Edge disconnect/recovery, per-purpose usage, fallback, and optional-inference degradation.
 
 Audit covers instance registration, binding/link/revoke, Offering publication, policy change, emergency revoke, route/fallback reason, and billing-owner changes. It references secret IDs but never secret values.
+
+SSE decoders join an event's `data` fields before JSON decoding. At clean EOF,
+a final valid payload is processed through the same validation as a framed
+event; a provider response still requires its semantic terminal. The Astra
+control stream also uses terminal evidence to settle already-running Edge work.
 
 ## Test obligations
 
@@ -1706,9 +2164,12 @@ Cover Web, CLI + Server, Server Only, and Edge + Server:
 - All inference purposes use one resolver and invocation contract.
 - OpenAI-compatible protocol selection alone never authorizes an optional
   provider request field or value.
-- Every upstream request is attributable to a durable provider attempt.
+- Every upstream request has exact physical-attempt observations under its causal
+  owner. Agent observations may be lost on process failure; standalone accounting
+  retains durable provider attempts.
 - No client can select an endpoint, credential, or placement directly.
-- Refresh, reconnect, process crash, credential rotation, and Server failover preserve truthful run state.
+- Refresh and reconnect preserve committed Run state. Process failure does not
+  manufacture model delivery, usage or output that was not committed.
 - Online tests validate multi-tenant isolation and actual TaaS/MatrixOne contracts.
 
 Cache-break diagnosis consumes dispatched provider-attempt receipts with exact
@@ -1727,3 +2188,14 @@ system, tool, and cache-marker hashes remain diagnostic metadata; they never
 substitute for provider-final identities in structural break classification.
 Protocol changes are attributed separately; protocol-native marker changes are
 represented by the exact component identity that contains those markers.
+
+### Typed judgment generation allowance
+
+Typed completion callers distinguish the minimum serialized answer budget from
+total generation allowance. The shared judgment request provides a bounded
+8,192-token total allowance for ordinary judgments, covering reasoning and the
+answer together. Larger answer envelopes retain their explicit minimum and remain
+subject to the transport and model limits. Model admission
+still checks the complete answer minimum, and Server dispatch caps total generation
+at the admitted model limit. Non-normal finishes remain unscorable; increasing the
+allowance never turns a truncated response into a judgment.

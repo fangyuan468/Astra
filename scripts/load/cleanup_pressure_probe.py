@@ -26,17 +26,9 @@ RESULT_RE = re.compile(r"^CLEANUP_PRESSURE_RESULT\s+({.*})$", re.MULTILINE)
 PROFILE_DEFAULTS = {
     "smoke": {
         "queue_rows": 2_005,
-        "csl_rows": 2_005,
-        "prompt_rows": 2_005,
-        "prompt_keep_rows": 64,
-        "prompt_fresh_rows": 64,
     },
     "pressure": {
         "queue_rows": 10_000,
-        "csl_rows": 10_000,
-        "prompt_rows": 10_000,
-        "prompt_keep_rows": 256,
-        "prompt_fresh_rows": 256,
     },
 }
 
@@ -78,10 +70,6 @@ def profile_defaults(profile: str) -> dict[str, int]:
 def build_commands(args: argparse.Namespace) -> list[ProbeCommand]:
     defaults = profile_defaults(args.profile)
     queue_rows = args.queue_rows or defaults["queue_rows"]
-    csl_rows = args.csl_rows or defaults["csl_rows"]
-    prompt_rows = args.prompt_rows or defaults["prompt_rows"]
-    prompt_keep_rows = args.prompt_keep_rows or defaults["prompt_keep_rows"]
-    prompt_fresh_rows = args.prompt_fresh_rows or defaults["prompt_fresh_rows"]
     base = safe_database_name(args.database_base)
 
     common_env = {
@@ -105,50 +93,6 @@ def build_commands(args: argparse.Namespace) -> list[ProbeCommand]:
                 "-p",
                 "astra-messaging",
                 "db_transport::tests::db_cleanup_expired_pressure_probe",
-                "--",
-                "--ignored",
-                "--exact",
-                "--nocapture",
-            ],
-        ),
-        ProbeCommand(
-            name="conversation_log",
-            database=safe_database_name(f"{base}_csl"),
-            env={
-                **common_env,
-                "ASTRA_DATABASE": f"{base}_csl",
-                "ASTRA_CLEANUP_PRESSURE_CSL_ROWS": str(csl_rows),
-            },
-            command=[
-                *manifest,
-                "-p",
-                "astra-turn-core",
-                "--features",
-                "db-store",
-                "conversation_log::db_store::tests::db_truncate_gc_pressure_probe",
-                "--",
-                "--ignored",
-                "--exact",
-                "--nocapture",
-            ],
-        ),
-        ProbeCommand(
-            name="prompt_retention",
-            database=safe_database_name(f"{base}_prompt"),
-            env={
-                **common_env,
-                "ASTRA_DATABASE": f"{base}_prompt",
-                "ASTRA_CLEANUP_PRESSURE_PROMPT_ROWS": str(prompt_rows),
-                "ASTRA_CLEANUP_PRESSURE_PROMPT_KEEP_ROWS": str(prompt_keep_rows),
-                "ASTRA_CLEANUP_PRESSURE_PROMPT_FRESH_ROWS": str(prompt_fresh_rows),
-            },
-            command=[
-                *manifest,
-                "-p",
-                "astra-services",
-                "--test",
-                "prompt_retention_db_it",
-                "prompt_retention_pressure_probe",
                 "--",
                 "--ignored",
                 "--exact",
@@ -190,7 +134,10 @@ def build_summary(args: argparse.Namespace, command_results: list[dict[str, Any]
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "profile": args.profile,
         "database_base": args.database_base,
-        "ok": all(result["returncode"] == 0 for result in command_results),
+        "ok": bool(command_results) and all(
+            result["returncode"] == 0 and len(result.get("results", [])) == 1
+            for result in command_results
+        ),
         "commands": command_results,
     }
 
@@ -204,10 +151,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="base MatrixOne database name; must contain 'test' or 'smoke'",
     )
     parser.add_argument("--queue-rows", type=int, help="expired agent_message_queue rows")
-    parser.add_argument("--csl-rows", type=int, help="conversation_log rows before truncate boundary")
-    parser.add_argument("--prompt-rows", type=int, help="eligible prompt_request_records rows")
-    parser.add_argument("--prompt-keep-rows", type=int, help="active-session prompt rows to guard")
-    parser.add_argument("--prompt-fresh-rows", type=int, help="fresh inactive prompt rows to retain")
     parser.add_argument(
         "--output-dir",
         type=Path,

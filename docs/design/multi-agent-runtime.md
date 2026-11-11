@@ -86,7 +86,7 @@ these process-local deadline decisions.
 ## Agent profile
 
 Ordinary `agent.agent_type` and fanout slot/default `agent_type` select a builtin
-persona; omission uses the bounded read-only default. The shared child admission
+persona; omission inherits the parent-authorized capabilities. The shared child admission
 owns model authorization, inherited permissions, lineage, recursion and capacity
 before any child starts. Fork children retain their protected prohibition on
 further delegation across recovery, independently of prefix availability.
@@ -231,3 +231,10 @@ Parent should receive:
 - Deep delegation depth limit.
 - Provider constraints inherited correctly.
 - Child result survives parent resume.
+
+Ordinary Server chat installs the existing durable-agent reconciler without
+discovering Session-wide Run history. Explicit agent tools and remote-child waits
+load through the spawner's canonical reconciliation path. Same-Run execution
+handoff restores durable children before reattaching fan-in; process-local child
+completion remains in memory. Starting a new conversation turn is not a durable
+agent-recovery operation.

@@ -10,85 +10,10 @@ use astra_turn_core::thinking_config::ThinkingEffort;
 use astra_turn_types::InferencePurpose;
 
 use super::client::{LlmCall, OwnedLlmExecutionRoute};
-use super::durable::DurableInferenceLedger;
+use super::durable::DurableInferenceRunAuthority;
+use super::run_scoped::RunScopedProviderObserver;
 
 use super::client::{auxiliary_execution_budget, global_llm_client, llm_nonstream_timeout};
-
-#[derive(Clone)]
-struct DurableSummaryExecution {
-    ledger: DurableInferenceLedger,
-    base_scope: astra_turn_types::InferenceInvocationScope,
-    attempt_allocator: DurableSummaryAttemptAllocator,
-}
-
-/// Host-scoped allocator for auxiliary inference identities.
-///
-/// Every call reserves two adjacent identities because durable admission may
-/// consume `N` while resolving an ambiguous commit and retry provider delivery
-/// exactly once as `N + 1`. The allocator is intentionally shareable across
-/// independently constructed clients for the same host/run, not merely clones
-/// of one client.
-#[derive(Clone, Default)]
-pub(crate) struct DurableSummaryAttemptAllocator {
-    next_logical_attempt_by_scope: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
-    #[cfg(test)]
-    initial_next_logical_attempt: u64,
-}
-
-impl DurableSummaryAttemptAllocator {
-    fn reserve_pair_at_least(
-        &self,
-        scope_key: &str,
-        durable_pair_base: u32,
-    ) -> Result<u32, String> {
-        if !durable_pair_base.is_multiple_of(2) {
-            return Err("durable summary logical attempt cursor is not pair-aligned".to_string());
-        }
-        let mut cursors = self
-            .next_logical_attempt_by_scope
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let next = cursors.entry(scope_key.to_string()).or_insert({
-            #[cfg(test)]
-            {
-                self.initial_next_logical_attempt
-            }
-            #[cfg(not(test))]
-            {
-                0
-            }
-        });
-        *next = (*next).max(u64::from(durable_pair_base));
-        let requested = u32::try_from(*next)
-            .map_err(|_| "durable summary logical attempt space is exhausted".to_string())?;
-        requested
-            .checked_add(1)
-            .ok_or_else(|| "durable summary logical attempt space is exhausted".to_string())?;
-        *next = next
-            .checked_add(2)
-            .ok_or_else(|| "durable summary logical attempt space is exhausted".to_string())?;
-        Ok(requested)
-    }
-
-    #[cfg(test)]
-    fn with_next_logical_attempt(next_logical_attempt: u64) -> Self {
-        Self {
-            next_logical_attempt_by_scope: Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            initial_next_logical_attempt: next_logical_attempt,
-        }
-    }
-}
-
-const MAX_DURABLE_SUMMARY_CURSOR_COLLISIONS: usize = 8;
-
-#[derive(Clone)]
-enum SummaryExecution {
-    Durable(Box<DurableSummaryExecution>),
-    #[cfg(test)]
-    Direct,
-}
 
 /// Final temperature decision for one auxiliary inference call.
 ///
@@ -158,44 +83,42 @@ pub(crate) struct RuntimeSummaryClient {
     max_output_tokens: usize,
     prompt_cache_tools: Vec<Value>,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
-    execution: SummaryExecution,
+    authority: DurableInferenceRunAuthority,
+    interrupted_usage_sink: Option<astra_turn_core::cloud_summary::InterruptedSummaryUsageSink>,
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    observations: Option<(
+        crate::server::provider_test_support::ProviderObservationsFixture,
+        astra_turn_types::InferenceInvocationScope,
+    )>,
 }
 
 impl RuntimeSummaryClient {
-    fn attempt_allocator_scope_key(
-        base_scope: &astra_turn_types::InferenceInvocationScope,
-        purpose: InferencePurpose,
-        route: &OwnedLlmExecutionRoute,
-    ) -> Result<String, String> {
-        serde_json::to_string(&serde_json::json!({
-            "scope": base_scope.clone().with_logical_attempt(0),
-            "purpose": purpose.as_str(),
-            "model": &route.model_name,
-            "wire_model": route.wire_model_name.as_deref(),
-            "provider": &route.provider,
-        }))
-        .map_err(|error| format!("serialize durable summary allocator scope: {error}"))
-    }
-
     #[must_use]
-    pub(crate) fn new_with_attempt_allocator(
+    pub(crate) fn new(
         route: OwnedLlmExecutionRoute,
         max_output_tokens: usize,
-        ledger: DurableInferenceLedger,
-        base_scope: astra_turn_types::InferenceInvocationScope,
-        attempt_allocator: DurableSummaryAttemptAllocator,
+        authority: DurableInferenceRunAuthority,
     ) -> Self {
         Self {
             route,
             max_output_tokens,
             prompt_cache_tools: Vec::new(),
             cache_capability: None,
-            execution: SummaryExecution::Durable(Box::new(DurableSummaryExecution {
-                ledger,
-                base_scope,
-                attempt_allocator,
-            })),
+            authority,
+            interrupted_usage_sink: None,
+            #[cfg(any(test, feature = "e2e-hooks"))]
+            observations: None,
         }
+    }
+
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    pub(crate) fn with_observations(
+        mut self,
+        observations: crate::server::provider_test_support::ProviderObservationsFixture,
+        scope: astra_turn_types::InferenceInvocationScope,
+    ) -> Self {
+        self.observations = Some((observations, scope));
+        self
     }
 
     /// Reuse the main inference request's stable tool projection and exact
@@ -233,6 +156,7 @@ impl RuntimeSummaryClient {
                 .thinking_capability
                 .map(|capability| capability.as_str()),
             protocol,
+            route.supported_reasoning_efforts.as_deref(),
         )
     }
 
@@ -285,6 +209,13 @@ impl RuntimeSummaryClient {
                     SummaryTemperatureEmission::Explicit(value),
                     SummaryGenerationPolicyProvenance::OfferingCapability,
                 )
+            } else if route.inference_protocol
+                == Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses)
+            {
+                (
+                    SummaryTemperatureEmission::ProviderDefault,
+                    SummaryGenerationPolicyProvenance::ConservativeProtocolDefault,
+                )
             } else if protocol == astra_core::model_wire::thinking::ThinkingProtocol::Moonshot {
                 (
                     SummaryTemperatureEmission::ProviderDefault,
@@ -312,25 +243,120 @@ impl RuntimeSummaryClient {
             temperature_provenance,
         })
     }
+}
 
-    /// Low-level provider-adapter constructor for unit tests. Production
-    /// summary paths must use [`Self::new`] so auxiliary calls cannot bypass
-    /// durable admission and usage settlement.
-    #[cfg(test)]
-    #[must_use]
-    pub fn new_direct_for_test(route: OwnedLlmExecutionRoute, max_output_tokens: usize) -> Self {
-        Self {
-            route,
-            max_output_tokens,
-            prompt_cache_tools: Vec::new(),
-            cache_capability: None,
-            execution: SummaryExecution::Direct,
+/// The observer already owns per-attempt snapshots; dropping a call transfers
+/// those facts synchronously to the existing accounting owner, once.
+struct InterruptedUsageGuard<'a> {
+    observer: &'a RunScopedProviderObserver,
+    sink: Option<&'a astra_turn_core::cloud_summary::InterruptedSummaryUsageSink>,
+    armed: bool,
+}
+
+impl Drop for InterruptedUsageGuard<'_> {
+    fn drop(&mut self) {
+        let Some(sink) = self.sink.filter(|_| self.armed) else {
+            return;
+        };
+        sink(interrupted_usage(&self.observer.facts()));
+    }
+}
+
+fn interrupted_usage(
+    facts: &[super::client::ProviderAttemptObservation],
+) -> astra_turn_core::cloud_summary::InterruptedSummaryUsage {
+    let mut observed = 0u64;
+    let mut input_was_measured = false;
+    let mut numeric = crate::turn::token_usage::TokenUsage::default();
+    let mut qualified: Option<astra_turn_types::CanonicalTokenUsage> = None;
+    let mut observed_lanes = [false; 4];
+    for fact in facts {
+        input_was_measured |= fact.measured_input_tokens.is_some();
+        observed = observed.saturating_add(fact.observed_input_tokens());
+        if let Some(usage) = fact.qualified_usage {
+            for (seen, value) in observed_lanes.iter_mut().zip([
+                usage.input_tokens(),
+                usage.cached_input_tokens(),
+                usage.cache_creation_tokens(),
+                usage.output_tokens(),
+            ]) {
+                *seen |= value.is_some();
+            }
+            numeric.input_tokens = numeric
+                .input_tokens
+                .saturating_add(usage.input_tokens().unwrap_or(0));
+            numeric.cached_input_tokens = numeric
+                .cached_input_tokens
+                .saturating_add(usage.cached_input_tokens().unwrap_or(0));
+            numeric.cache_creation_tokens = numeric
+                .cache_creation_tokens
+                .saturating_add(usage.cache_creation_tokens().unwrap_or(0));
+            numeric.output_tokens = numeric
+                .output_tokens
+                .saturating_add(usage.output_tokens().unwrap_or(0));
+            qualified = Some(match qualified {
+                None => usage,
+                Some(total) => total.checked_add(usage).unwrap_or_else(|_| {
+                    astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
+                        .expect("unknown usage")
+                }),
+            });
         }
     }
+    let known_input = numeric.normalized_prompt_cache_usage().total_input_tokens();
+    let mut usage = numeric.to_json_map();
+    // Numeric subtotals are lower bounds, never canonical evidence.
+    usage.remove("total_tokens");
+    for (seen, key) in observed_lanes.into_iter().zip([
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_creation_tokens",
+        "output_tokens",
+    ]) {
+        if !seen {
+            usage.remove(key);
+        }
+    }
+    astra_turn_core::cloud_summary::InterruptedSummaryUsage {
+        usage,
+        input_was_measured,
+        qualified_usage: qualified,
+        unpartitioned_input_tokens: observed.saturating_sub(known_input),
+    }
+}
+
+// Match the usage map that the summary projection actually returns.
+fn summary_unpartitioned_input(
+    observed_input_tokens: u64,
+    result: &Result<super::client::LlmCallResult, astra_core::ClassifiedError>,
+) -> u64 {
+    let counted = match result {
+        Ok(result) => crate::turn::token_usage::TokenUsage::from_partial_json_map(&result.usage),
+        Err(error) => error
+            .details_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|details| {
+                details
+                    .get("usage")
+                    .and_then(Value::as_object)
+                    .map(crate::turn::token_usage::TokenUsage::from_partial_json_map)
+            })
+            .unwrap_or_default(),
+    };
+    observed_input_tokens
+        .saturating_sub(counted.normalized_prompt_cache_usage().total_input_tokens())
 }
 
 #[async_trait]
 impl SummaryLlmClient for RuntimeSummaryClient {
+    fn set_interrupted_usage_sink(
+        &mut self,
+        sink: astra_turn_core::cloud_summary::InterruptedSummaryUsageSink,
+    ) {
+        self.interrupted_usage_sink = Some(sink);
+    }
+
     async fn summarize(
         &self,
         purpose: InferencePurpose,
@@ -351,101 +377,92 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             temperature_provenance = policy.temperature_provenance.as_str(),
             "resolved auxiliary generation policy"
         );
-        let (result, execution_provenance, qualified_usage) = match &self.execution {
-            SummaryExecution::Durable(execution) => {
-                let DurableSummaryExecution {
-                    ledger,
-                    base_scope,
-                    attempt_allocator,
-                } = execution.as_ref();
-                let allocator_scope_key =
-                    Self::attempt_allocator_scope_key(base_scope, purpose, &self.route)
-                        .map_err(contract_error)?;
-                let mut collisions = 0;
-                loop {
-                    let durable_pair_base = ledger
-                        .next_logical_attempt_pair_base(
-                            base_scope.clone(),
-                            purpose,
-                            &self.route.model_name,
-                            self.route
-                                .wire_model_name
-                                .as_deref()
-                                .unwrap_or(&self.route.model_name),
-                            &self.route.provider,
-                        )
-                        .await?;
-                    // Reserve both identities in one short, non-async critical
-                    // section. No allocator lock may span provider or database I/O.
-                    let requested_logical_attempt = attempt_allocator
-                        .reserve_pair_at_least(&allocator_scope_key, durable_pair_base)
-                        .map_err(contract_error)?;
-                    let call = LlmCall {
-                        purpose,
-                        messages,
-                        tools: &self.prompt_cache_tools,
-                        cache_capability: self.cache_capability,
-                        route: self.route.borrowed(),
-                        max_output_tokens: Some(self.max_output_tokens),
-                        temperature,
-                        thinking,
-                    };
-                    let scope = base_scope.with_logical_attempt(requested_logical_attempt);
-                    let outcome = if self.route.provider == "typesafe" {
-                        ledger
-                            .execute_nonstream(
-                                global_llm_client(),
-                                scope,
-                                call,
-                                auxiliary_execution_budget(purpose, llm_nonstream_timeout()),
-                            )
-                            .await
-                    } else {
-                        ledger.execute_stream_no_tool_choice(scope, call).await
-                    };
-                    debug_assert!(
-                        outcome.logical_attempt() <= requested_logical_attempt.saturating_add(1),
-                        "durable summary recovery exceeded its reserved identity pair"
-                    );
-                    if outcome.admission_identity_is_occupied()
-                        && outcome.qualified_usage.is_none()
-                        && collisions < MAX_DURABLE_SUMMARY_CURSOR_COLLISIONS
-                    {
-                        collisions += 1;
-                        continue;
-                    }
-                    let execution_provenance = outcome.invocation_id().map(|invocation_id| {
-                        astra_turn_core::cloud_summary::SummaryExecutionProvenance {
-                            invocation_id: invocation_id.to_string(),
-                            model_name: self.route.model_name.clone(),
-                            provider: self.route.provider.clone(),
-                        }
-                    });
-                    let qualified_usage = outcome.qualified_usage;
-                    break (outcome.into_result(), execution_provenance, qualified_usage);
-                }
-            }
-            #[cfg(test)]
-            SummaryExecution::Direct => (
-                crate::turn::llm::client::call_llm_nonstream_no_tool_choice(
-                    global_llm_client(),
-                    LlmCall {
-                        purpose,
-                        messages,
-                        tools: &self.prompt_cache_tools,
-                        cache_capability: self.cache_capability,
-                        route: self.route.borrowed(),
-                        max_output_tokens: Some(self.max_output_tokens),
-                        temperature,
-                        thinking,
-                    },
-                    auxiliary_execution_budget(purpose, llm_nonstream_timeout()),
-                )
-                .await,
-                None,
-                None,
-            ),
+        let observer = RunScopedProviderObserver::new(self.authority.clone());
+        #[cfg(any(test, feature = "e2e-hooks"))]
+        let observer = match self.observations.clone() {
+            Some((observations, scope)) => observer.with_observations(observations, scope),
+            None => observer,
         };
+        let mut interrupted_guard = InterruptedUsageGuard {
+            observer: &observer,
+            sink: self.interrupted_usage_sink.as_ref(),
+            armed: true,
+        };
+        let call = LlmCall {
+            purpose,
+            messages,
+            tools: &self.prompt_cache_tools,
+            cache_capability: self.cache_capability,
+            route: self.route.borrowed(),
+            max_output_tokens: Some(self.max_output_tokens),
+            temperature,
+            thinking,
+        };
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let execute = async {
+            if self.route.provider == "typesafe" {
+                super::client::call_llm_nonstream_with_attempt_observer_and_tool_choice(
+                    global_llm_client(),
+                    call,
+                    auxiliary_execution_budget(purpose, llm_nonstream_timeout()),
+                    Some(&observer),
+                    super::client::RuntimeToolChoice::None,
+                )
+                .await
+            } else {
+                let prepared = super::client::prepare_streaming_call(
+                    call,
+                    super::client::RuntimeToolChoice::None,
+                )?;
+                super::client::call_prepared_llm_and_collect_with_stream_callback(
+                    prepared,
+                    super::client::LlmCancel::None,
+                    None,
+                    Some(&observer),
+                    None,
+                )
+                .await
+            }
+        };
+        // The Run already owns cancellation, lease loss and deadline. Model
+        // calls borrow that authority instead of creating another DB lease.
+        let (result, fenced) = tokio::select! {
+            biased;
+            error = self.authority.wait_for_local_fence("auxiliary model request") => (Err(error), true),
+            result = execute => (result, false),
+        };
+        let execution_provenance =
+            Some(astra_turn_core::cloud_summary::SummaryExecutionProvenance {
+                invocation_id: request_id,
+                model_name: self.route.model_name.clone(),
+                provider: self.route.provider.clone(),
+            });
+        let facts = observer.facts();
+        interrupted_guard.armed = false;
+        let input_was_measured = facts
+            .iter()
+            .any(|fact| fact.measured_input_tokens.is_some());
+        let observed_input_tokens = facts.iter().fold(0u64, |total, fact| {
+            total.saturating_add(fact.observed_input_tokens())
+        });
+        let interrupted = (fenced
+            || result
+                .as_ref()
+                .is_err_and(|error| error.kind == astra_core::ErrorKind::ContextWindow))
+        .then(|| interrupted_usage(&facts));
+        let unpartitioned_input_tokens = interrupted.as_ref().map_or_else(
+            || summary_unpartitioned_input(observed_input_tokens, &result),
+            |usage| usage.unpartitioned_input_tokens,
+        );
+        let qualified_usage = facts
+            .into_iter()
+            .filter_map(|fact| fact.qualified_usage)
+            .reduce(|left, right| {
+                left.checked_add(right).unwrap_or_else(|_| {
+                    astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
+                        .expect("unknown usage is valid")
+                })
+            });
         match result {
             // A no-tool provider response that nevertheless contains a native
             // or degraded call is a completed transport with invalid
@@ -454,6 +471,8 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             // repair path. No call from this private adapter is executable.
             Ok(result) if !result.tool_calls.is_empty() || result.full_text.trim().is_empty() => {
                 Ok(SummaryResponse {
+                    input_was_measured,
+                    unpartitioned_input_tokens,
                     judgment_provenance: result.judgment_provenance,
                     model_used: result.model_used,
                     text: String::new(),
@@ -465,6 +484,8 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                 })
             }
             Ok(result) => Ok(SummaryResponse {
+                input_was_measured,
+                unpartitioned_input_tokens,
                 judgment_provenance: result.judgment_provenance,
                 model_used: result.model_used,
                 text: result.full_text,
@@ -476,14 +497,19 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             }),
             Err(error) if error.kind == astra_core::ErrorKind::ContextWindow => {
                 Ok(SummaryResponse {
+                    input_was_measured,
+                    unpartitioned_input_tokens,
                     judgment_provenance: None,
                     model_used: String::new(),
                     text: String::new(),
                     is_ptl_error: true,
                     finish_reason: None,
-                    usage: serde_json::Map::new(),
+                    usage: interrupted
+                        .as_ref()
+                        .map(|usage| usage.usage.clone())
+                        .unwrap_or_default(),
                     qualified_usage,
-                    // The durable outcome can identify the invocation even
+                    // The local request id can identify the invocation even
                     // when the provider rejected the request for context
                     // length. Keep that identity for semantic diagnostics;
                     // it does not turn the failed response into a decision.
@@ -501,6 +527,11 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                     .filter(Value::is_object)
                     .unwrap_or_else(|| serde_json::json!({}));
                 details["qualified_usage"] = usage.to_json();
+                details["unpartitioned_input_tokens"] = unpartitioned_input_tokens.into();
+                details["input_was_measured"] = input_was_measured.into();
+                if let Some(interrupted) = interrupted {
+                    details["usage"] = Value::Object(interrupted.usage);
+                }
                 Err(error.with_details_json(details.to_string()))
             }
         }
@@ -514,161 +545,27 @@ mod tests {
 
     use axum::{Router, body::Body, response::Response, routing::post};
 
-    use super::super::durable::InferenceLedgerPersistence as _;
     use super::*;
 
-    #[derive(Default)]
-    struct RecoverFirstAdmissionPersistence {
-        inner: super::super::durable::TestInferenceLedgerPersistence,
-        admitted_logical_attempts: std::sync::Mutex<Vec<u32>>,
-        admitted_invocation_ids: std::sync::Mutex<Vec<String>>,
-        recover_attempt_zero: std::sync::atomic::AtomicBool,
-        admission_conflicts: AtomicU32,
-        cursor_barrier: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
-        cursor_barrier_reads_remaining: AtomicU32,
-        successful_commit_ack_delay: Option<std::time::Duration>,
+    fn test_client(route: OwnedLlmExecutionRoute, max: usize) -> RuntimeSummaryClient {
+        RuntimeSummaryClient::new(route, max, summary_authority())
     }
 
-    #[async_trait]
-    impl super::super::durable::InferenceLedgerPersistence for RecoverFirstAdmissionPersistence {
-        async fn next_logical_attempt_pair_base(
-            &self,
-            _input: &astra_services::InferenceInvocationInput,
-        ) -> astra_services::ServiceResult<u32> {
-            let max = self
-                .admitted_logical_attempts
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .copied()
-                .max();
-            let next = match max {
-                None => Ok(0),
-                Some(max) => (max / 2)
-                    .checked_add(1)
-                    .and_then(|pair| pair.checked_mul(2))
-                    .ok_or_else(|| {
-                        astra_services::ServiceError::conflict(
-                            "durable inference logical-attempt pair space is exhausted",
-                        )
-                    }),
-            }?;
-            let wait_at_cursor_barrier = self
-                .cursor_barrier_reads_remaining
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok();
-            let cursor_barrier = if wait_at_cursor_barrier {
-                self.cursor_barrier
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone()
-            } else {
-                None
-            };
-            if let Some(barrier) = cursor_barrier {
-                barrier.wait().await;
-            }
-            Ok(next)
-        }
-
-        async fn admit_invocation(
-            &self,
-            plan: &astra_services::InferenceInvocationPlan,
-        ) -> astra_services::ServiceResult<()> {
-            if let Err(error) = self.inner.admit_invocation(plan).await {
-                if error.kind == astra_services::ServiceErrorKind::Conflict {
-                    self.admission_conflicts.fetch_add(1, Ordering::SeqCst);
+    fn summary_provider_response(mut response: Value) -> Response {
+        for choice in response["choices"].as_array_mut().unwrap() {
+            let mut delta = choice.as_object_mut().unwrap().remove("message").unwrap();
+            if let Some(calls) = delta.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                for (index, call) in calls.iter_mut().enumerate() {
+                    call["index"] = serde_json::json!(index);
                 }
-                return Err(error);
             }
-            self.admitted_logical_attempts
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(plan.logical_attempt());
-            self.admitted_invocation_ids
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(plan.invocation_id().to_string());
-            if self.recover_attempt_zero.load(Ordering::Acquire) && plan.logical_attempt() == 0 {
-                // Model a committed N admission whose acknowledgement never
-                // reached the caller. Foreground recovery closes N and retries
-                // exactly once as N+1.
-                std::future::pending().await
-            } else {
-                Ok(())
-            }
+            choice["delta"] = delta;
+            choice["index"] = serde_json::json!(0);
         }
-
-        async fn settle_uncertain_admission(
-            &self,
-            plan: &astra_services::InferenceInvocationPlan,
-            terminal: &astra_services::InferenceInvocationTerminal,
-        ) -> astra_services::ServiceResult<(
-            astra_services::InferenceInvocationAdmissionResolution,
-            Option<astra_services::InferenceScopeRejection>,
-        )> {
-            self.inner.settle_uncertain_admission(plan, terminal).await
-        }
-
-        async fn declare_settlement(
-            &self,
-            plan: &astra_services::InferenceInvocationPlan,
-            terminal: &astra_services::InferenceInvocationTerminal,
-        ) -> astra_services::ServiceResult<()> {
-            self.inner.declare_settlement(plan, terminal).await
-        }
-
-        async fn declare_attempt_settlement(
-            &self,
-            plan: &astra_services::InferenceInvocationPlan,
-            attempt: &astra_services::InferenceProviderAttemptPlan,
-            terminal: &astra_services::InferenceInvocationTerminal,
-            provider_delivery_state: astra_services::InferenceProviderDeliveryState,
-        ) -> astra_services::ServiceResult<()> {
-            self.inner
-                .declare_attempt_settlement(plan, attempt, terminal, provider_delivery_state)
-                .await
-        }
-
-        async fn finish_invocation(
-            &self,
-            plan: &astra_services::InferenceInvocationPlan,
-            terminal: &astra_services::InferenceInvocationTerminal,
-        ) -> astra_services::ServiceResult<()> {
-            self.inner.finish_invocation(plan, terminal).await
-        }
-
-        async fn begin_provider_attempt(
-            &self,
-            attempt: &astra_services::InferenceProviderAttemptPlan,
-        ) -> astra_services::ServiceResult<()> {
-            self.inner.begin_provider_attempt(attempt).await
-        }
-
-        async fn finish_provider_attempt(
-            &self,
-            attempt: &astra_services::InferenceProviderAttemptPlan,
-            terminal: &astra_services::InferenceInvocationTerminal,
-        ) -> astra_services::ServiceResult<()> {
-            self.inner.finish_provider_attempt(attempt, terminal).await
-        }
-
-        async fn finish_successful_provider_attempt_and_invocation(
-            &self,
-            plan: &astra_services::InferenceInvocationPlan,
-            attempt: &astra_services::InferenceProviderAttemptPlan,
-            terminal: &astra_services::InferenceInvocationTerminal,
-        ) -> astra_services::ServiceResult<()> {
-            self.inner
-                .finish_successful_provider_attempt_and_invocation(plan, attempt, terminal)
-                .await?;
-            if let Some(delay) = self.successful_commit_ack_delay {
-                tokio::time::sleep(delay).await;
-            }
-            Ok(())
-        }
+        Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from(format!("data: {response}\n\ndata: [DONE]\n\n")))
+            .unwrap()
     }
 
     async fn spawn_summary_test_server(app: Router) -> String {
@@ -714,6 +611,11 @@ mod tests {
 
     fn summary_execution(base_url: String) -> astra_services::AdmittedModelExecution {
         astra_services::AdmittedModelExecution {
+            responses_reasoning_history: None,
+            inference_protocol: None,
+            response_scope: None,
+            subscription: None,
+            admitted_at: std::time::Instant::now(),
             price_snapshot: None,
             offering_id: "summary-offering".to_string(),
             source_identity: None,
@@ -726,8 +628,8 @@ mod tests {
             provider: "openai".to_string(),
             cache_capability: None,
             thinking_capability: None,
-            reasoning_efforts: None,
             fixed_temperature: None,
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             request_body_overrides: None,
             context_window: Some(8_192),
@@ -740,6 +642,9 @@ mod tests {
 
     fn summary_route(execution: &astra_services::AdmittedModelExecution) -> OwnedLlmExecutionRoute {
         OwnedLlmExecutionRoute {
+            inference_protocol: None,
+            response_scope: None,
+            subscription: execution.subscription.clone(),
             model_name: execution.model_name.clone(),
             wire_model_name: None,
             api_key: execution.api_key.clone(),
@@ -747,6 +652,7 @@ mod tests {
             provider: execution.provider.clone(),
             thinking_capability: None,
             fixed_temperature: execution.fixed_temperature,
+            supported_reasoning_efforts: execution.supported_reasoning_efforts.clone(),
             thinking_protocol: execution.thinking_protocol,
             header_overrides: HashMap::new(),
             request_body_overrides: None,
@@ -755,19 +661,8 @@ mod tests {
         }
     }
 
-    fn summary_scope() -> astra_turn_types::InferenceInvocationScope {
-        astra_turn_types::InferenceInvocationScope::Run {
-            session_id: "summary-session".to_string(),
-            run_id: "summary-run".to_string(),
-            turn: 1,
-            round: 1,
-            operation_id: "summary_repair".to_string(),
-            logical_attempt: 0,
-        }
-    }
-
     #[tokio::test]
-    async fn typesafe_request_judgment_uses_durable_nonstream_and_reports_usage() {
+    async fn typesafe_request_judgment_uses_run_authority_and_reports_usage() {
         let app = Router::new().route("/v1/systemone", post(|axum::Json(body): axum::Json<Value>| async move {
             assert_eq!(body["model"], "configured-jev");
             assert!(body.get("messages").is_none());
@@ -781,22 +676,8 @@ mod tests {
         execution.provider = "typesafe".into();
         execution.model_name = "configured-jev".into();
         execution.offering_id = "configured-judgment-offering".into();
-        let persistence = Arc::new(RecoverFirstAdmissionPersistence::default());
-        let ledger = DurableInferenceLedger::required_with_persistence(
-            None,
-            Some(&execution),
-            "summary-user",
-            Some(persistence.clone()),
-        )
-        .unwrap()
-        .with_run_authority(summary_authority());
-        let client = RuntimeSummaryClient::new_with_attempt_allocator(
-            summary_route(&execution),
-            1024,
-            ledger,
-            summary_scope(),
-            DurableSummaryAttemptAllocator::default(),
-        );
+        let client =
+            RuntimeSummaryClient::new(summary_route(&execution), 1024, summary_authority());
         let request = astra_services::work_admission_classification_request(&Default::default());
         let response = client
             .summarize(
@@ -823,17 +704,10 @@ mod tests {
         );
         assert_eq!(response.usage["input_tokens"], 123);
         assert_eq!(response.usage["output_tokens"], 19);
-        let provenance = response.execution.expect("durable execution provenance");
+        let provenance = response.execution.expect("execution provenance");
         assert_eq!(provenance.model_name, "configured-jev");
         assert_eq!(provenance.provider, "typesafe");
-        assert_eq!(
-            provenance.invocation_id,
-            persistence.admitted_invocation_ids.lock().unwrap()[0]
-        );
-        assert_eq!(
-            *persistence.admitted_logical_attempts.lock().unwrap(),
-            vec![0]
-        );
+        assert!(uuid::Uuid::parse_str(&provenance.invocation_id).is_ok());
     }
 
     #[tokio::test]
@@ -886,13 +760,8 @@ mod tests {
             });
             let mut execution = summary_execution(spawn_summary_test_server(app).await);
             execution.provider = provider.into();
-            let ledger = DurableInferenceLedger::required_with_persistence(
-                None, Some(&execution), "summary-user",
-                Some(Arc::new(RecoverFirstAdmissionPersistence::default())),
-            ).unwrap().with_run_authority(summary_authority());
-            let client = RuntimeSummaryClient::new_with_attempt_allocator(
-                summary_route(&execution), 1024, ledger, summary_scope(),
-                DurableSummaryAttemptAllocator::default(),
+            let client = RuntimeSummaryClient::new(
+                summary_route(&execution), 1024, summary_authority(),
             );
             let response = client.summarize(InferencePurpose::Introspection,
                 &astra_services::work_admission_classification_messages(&request),
@@ -923,6 +792,9 @@ mod tests {
         thinking_capability: Option<astra_services::models::ThinkingCapability>,
     ) -> OwnedLlmExecutionRoute {
         OwnedLlmExecutionRoute {
+            inference_protocol: None,
+            response_scope: None,
+            subscription: None,
             model_name: "test-model".to_string(),
             wire_model_name: None,
             api_key: String::new(),
@@ -930,6 +802,7 @@ mod tests {
             provider: "openai".to_string(),
             thinking_capability,
             fixed_temperature: None,
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             header_overrides: HashMap::new(),
             request_body_overrides: None,
@@ -1208,13 +1081,9 @@ mod tests {
                             "message": {"role": "assistant", "content": "structured summary"},
                             "finish_reason": "stop"
                         }],
-                        "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+                        "usage": {"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens": 10, "completion_tokens": 2}
                     });
-                    Response::builder()
-                        .status(200)
-                        .header("content-type", "application/json")
-                        .body(Body::from(response.to_string()))
-                        .expect("summary provider response")
+                    summary_provider_response(response)
                 }
             }),
         );
@@ -1235,7 +1104,7 @@ mod tests {
                 astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
             reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
         };
-        let client = RuntimeSummaryClient::new_direct_for_test(summary_route(&execution), 64)
+        let client = test_client(summary_route(&execution), 64)
             .with_prompt_cache_context(tools.clone(), cache_capability);
         let messages = vec![
             serde_json::json!({"role": "system", "content": "stable prefix"}),
@@ -1267,110 +1136,72 @@ mod tests {
         assert_eq!(body.get("tool_choice"), Some(&Value::String("none".into())));
     }
 
-    async fn summary_with_commit_ack_delay(
-        delay: std::time::Duration,
-    ) -> (
-        Result<SummaryResponse, astra_core::ClassifiedError>,
-        u32,
-        Vec<u32>,
-    ) {
-        let requests = Arc::new(AtomicU32::new(0));
-        let handler_requests = requests.clone();
-        let app = Router::new().route(
-            "/chat/completions",
-            post(move || {
-                let requests = handler_requests.clone();
-                async move {
-                    requests.fetch_add(1, Ordering::SeqCst);
-                    let event = serde_json::json!({
-                        "id": "slow-commit-summary",
-                        "choices": [{"index":0,"delta":{"content":
-                            "{\"work_lifecycle\":\"not_required\",\"execution_topology\":\"primary\"}"},
-                            "finish_reason":"stop"}],
-                        "usage":{"prompt_tokens":100,"completion_tokens":12,
-                            "prompt_tokens_details":{"cached_tokens":64}}
-                    });
-                    Response::builder().status(200)
-                        .header("content-type", "text/event-stream")
-                        .body(Body::from(format!("data: {event}\n\ndata: [DONE]\n\n")))
-                        .unwrap()
-                }
-            }),
-        );
+    #[test]
+    fn summary_error_projection_retains_input_not_returned_in_raw_usage() {
+        for (kind, expected) in [
+            (astra_core::ErrorKind::ContextWindow, 60),
+            (astra_core::ErrorKind::Cancelled, 60),
+        ] {
+            let error = astra_core::ClassifiedError::new(kind, "provider rejected the summary")
+                .with_details_json(
+                    serde_json::json!({"usage":{"cached_input_tokens":40}}).to_string(),
+                );
+            assert_eq!(summary_unpartitioned_input(100, &Err(error)), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_only_summary_retains_inclusive_input_without_fabricating_billing_lanes() {
+        let app = Router::new().route("/chat/completions", post(|| async {
+            summary_provider_response(serde_json::json!({
+                "choices": [{"message": {"role":"assistant", "content":"summary"}, "finish_reason":"stop"}],
+                "usage": {"prompt_tokens":17,"completion_tokens":2}
+            }))
+        }));
         let execution = summary_execution(spawn_summary_test_server(app).await);
-        let persistence = Arc::new(RecoverFirstAdmissionPersistence {
-            successful_commit_ack_delay: Some(delay),
-            ..Default::default()
-        });
-        let ledger = DurableInferenceLedger::required_with_persistence(
-            None,
-            Some(&execution),
-            "summary-user",
-            Some(persistence.clone()),
-        )
-        .unwrap()
-        .with_run_authority(summary_authority());
-        let client = RuntimeSummaryClient::new_with_attempt_allocator(
-            summary_route(&execution),
-            1_024,
-            ledger,
-            summary_scope(),
-            DurableSummaryAttemptAllocator::default(),
-        );
-        let summary = client
+        let summary = test_client(summary_route(&execution), 64)
             .summarize(
-                InferencePurpose::Introspection,
-                &[serde_json::json!({"role":"user","content":"Classify this direct answer request"})],
+                InferencePurpose::RequiredCompaction,
+                &[serde_json::json!({"role":"user","content":"summarize"})],
             )
-            .await;
-        let attempts = persistence
-            .admitted_logical_attempts
-            .lock()
-            .unwrap()
-            .clone();
-        (summary, requests.load(Ordering::SeqCst), attempts)
+            .await
+            .unwrap();
+        assert_eq!(summary.text, "summary");
+        assert!(summary.input_was_measured);
+        assert_eq!(summary.unpartitioned_input_tokens, 17);
+        let usage = summary.qualified_usage.unwrap();
+        assert_eq!(usage.input_tokens(), None);
+        assert_eq!(usage.cached_input_tokens(), None);
+        assert_eq!(usage.cache_creation_tokens(), None);
+        assert_eq!(usage.output_tokens(), Some(2));
     }
 
     #[tokio::test]
-    async fn durable_summary_receives_success_and_usage_after_slow_commit_ack() {
-        let (summary, requests, attempts) =
-            summary_with_commit_ack_delay(std::time::Duration::from_secs(1)).await;
-        let summary =
-            summary.expect("unused provider time remains available for commit acknowledgement");
-        astra_services::parse_work_admission_response(&summary.text).unwrap();
-        let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(&summary.usage);
-        assert_eq!(usage.input_tokens, 36);
-        assert_eq!(usage.cached_input_tokens, 64);
-        assert_eq!(usage.output_tokens, 12);
-        assert_eq!(requests, 1);
-        assert_eq!(attempts, vec![0]);
-    }
-
-    #[tokio::test]
-    async fn durable_summary_timeout_preserves_error_kind_and_provider_usage() {
-        let (summary, requests, attempts) =
-            summary_with_commit_ack_delay(std::time::Duration::from_secs(9)).await;
-        let error =
-            summary.expect_err("a late durable success cannot authorize foreground delivery");
-        assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
-        let details: Value = serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            details["deadline"]["phase"],
-            "provider_attempt_terminalization"
-        );
-        let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(
-            details["usage"].as_object().unwrap(),
-        );
-        assert_eq!(
-            (
-                usage.input_tokens,
-                usage.cached_input_tokens,
-                usage.output_tokens
-            ),
-            (36, 64, 12)
-        );
-        assert_eq!(requests, 1);
-        assert_eq!(attempts, vec![0]);
+    async fn summary_distinguishes_missing_input_measurement_from_zero() {
+        for input in [None, Some(0), Some(17)] {
+            let mut response = serde_json::json!({"choices":[{"message":{"role":"assistant","content":"summary"},"finish_reason":"stop"}]});
+            if let Some(input) = input {
+                response["usage"] = serde_json::json!({"prompt_tokens":input});
+            }
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move || {
+                    let response = response.clone();
+                    async move { summary_provider_response(response) }
+                }),
+            );
+            let execution = summary_execution(spawn_summary_test_server(app).await);
+            let summary = test_client(summary_route(&execution), 64)
+                .summarize(
+                    InferencePurpose::RequiredCompaction,
+                    &[serde_json::json!({"role":"user","content":"summarize"})],
+                )
+                .await
+                .unwrap();
+            assert_eq!(summary.input_was_measured, input.is_some());
+            assert_eq!(summary.unpartitioned_input_tokens, input.unwrap_or(0));
+            assert!(summary.usage.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -1414,13 +1245,9 @@ mod tests {
                             },
                             "finish_reason": "stop"
                         }],
-                        "usage": {"prompt_tokens": 10, "completion_tokens": 30}
+                        "usage": {"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens": 10, "completion_tokens": 30}
                     });
-                    Response::builder()
-                        .status(200)
-                        .header("content-type", "application/json")
-                        .body(Body::from(response.to_string()))
-                        .expect("strict provider response")
+                    summary_provider_response(response)
                 }
             }),
         );
@@ -1431,26 +1258,8 @@ mod tests {
         // SSRF enforcement and cannot target this local fixture.
         for provider in ["mock-openai-compatible", "openai"] {
             execution.provider = provider.to_string();
-            for streaming in [false, true] {
-                let client = if streaming {
-                    let ledger = DurableInferenceLedger::required_with_persistence(
-                        None,
-                        Some(&execution),
-                        "summary-user",
-                        Some(Arc::new(RecoverFirstAdmissionPersistence::default())),
-                    )
-                    .unwrap()
-                    .with_run_authority(summary_authority());
-                    RuntimeSummaryClient::new_with_attempt_allocator(
-                        summary_route(&execution),
-                        1_024,
-                        ledger,
-                        summary_scope(),
-                        DurableSummaryAttemptAllocator::default(),
-                    )
-                } else {
-                    RuntimeSummaryClient::new_direct_for_test(summary_route(&execution), 1_024)
-                };
+            {
+                let client = test_client(summary_route(&execution), 1_024);
                 let messages = vec![serde_json::json!({
                     "role": "user",
                     "content": "Decide whether this turn needs durable Work"
@@ -1480,8 +1289,8 @@ mod tests {
         }
         assert_eq!(
             provider_requests.load(Ordering::SeqCst),
-            4,
-            "one request per provider and transport, no retry/fallback"
+            2,
+            "one request per provider, no retry/fallback"
         );
     }
 
@@ -1493,7 +1302,7 @@ mod tests {
             assert!(body.get("reasoning_effort").is_none());
             assert!(body.get("temperature").is_none());
             assert_eq!(body["max_completion_tokens"], 1024);
-            axum::Json(serde_json::json!({"choices":[{"message":{"content":"decision"},"finish_reason":"stop"}]}))
+            summary_provider_response(serde_json::json!({"choices":[{"message":{"content":"decision"},"finish_reason":"stop"}]}))
         }));
         let execution = summary_execution(spawn_summary_test_server(app).await);
         let mut route = summary_route(&execution);
@@ -1501,7 +1310,7 @@ mod tests {
         route.thinking_capability = Some(astra_services::models::ThinkingCapability::Both);
         route.thinking_protocol =
             Some(astra_core::model_wire::thinking::ThinkingProtocol::Moonshot);
-        let client = RuntimeSummaryClient::new_direct_for_test(route, 1024);
+        let client = test_client(route, 1024);
         assert_eq!(
             client
                 .summarize(
@@ -1534,11 +1343,7 @@ mod tests {
                             "finish_reason": "stop"
                         }]
                     });
-                    Response::builder()
-                        .status(200)
-                        .header("content-type", "application/json")
-                        .body(Body::from(response.to_string()))
-                        .expect("configured provider response")
+                    summary_provider_response(response)
                 }
             }),
         );
@@ -1549,7 +1354,7 @@ mod tests {
             "temperature".to_string(),
             serde_json::json!(0.7),
         )]));
-        let client = RuntimeSummaryClient::new_direct_for_test(route, 128);
+        let client = test_client(route, 128);
 
         client
             .summarize(
@@ -1586,17 +1391,13 @@ mod tests {
                         },
                         "finish_reason": "tool_calls"
                     }],
-                    "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+                    "usage": {"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens": 7, "completion_tokens": 3}
                 });
-                Response::builder()
-                    .status(200)
-                    .header("content-type", "application/json")
-                    .body(Body::from(response.to_string()))
-                    .expect("summary provider response")
+                summary_provider_response(response)
             }),
         );
         let execution = summary_execution(spawn_summary_test_server(app).await);
-        let client = RuntimeSummaryClient::new_direct_for_test(summary_route(&execution), 64);
+        let client = test_client(summary_route(&execution), 64);
         let summary = client
             .summarize(
                 InferencePurpose::Introspection,
@@ -1610,167 +1411,6 @@ mod tests {
         assert_eq!(
             summary.usage.get("input_tokens").and_then(Value::as_u64),
             Some(7)
-        );
-    }
-
-    #[test]
-    fn summary_attempt_allocator_is_shared_only_within_the_exact_scope() {
-        let allocator = DurableSummaryAttemptAllocator::default();
-        assert_eq!(
-            allocator
-                .reserve_pair_at_least("scope-a", 0)
-                .expect("first scope-a pair"),
-            0
-        );
-        assert_eq!(
-            allocator
-                .reserve_pair_at_least("scope-a", 0)
-                .expect("second scope-a pair"),
-            2
-        );
-        assert_eq!(
-            allocator
-                .reserve_pair_at_least("scope-b", 0)
-                .expect("independent scope-b pair"),
-            0,
-            "one noisy scope must not consume another scope's logical identity space"
-        );
-    }
-
-    #[tokio::test]
-    async fn recovered_malformed_summary_repairs_under_next_authoritative_attempt() {
-        let provider_requests = Arc::new(AtomicU32::new(0));
-        let provider_requests_for_handler = provider_requests.clone();
-        let app = Router::new().route(
-            "/chat/completions",
-            post(move || {
-                let provider_requests = provider_requests_for_handler.clone();
-                async move {
-                    let request_index = provider_requests.fetch_add(1, Ordering::SeqCst);
-                    let content = if request_index == 0 {
-                        "not-json"
-                    } else {
-                        r#"{"summary":"repaired"}"#
-                    };
-                    let event = serde_json::json!({
-                        "choices": [{
-                            "delta": {"content": content},
-                            "finish_reason": "stop"
-                        }]
-                    });
-                    Response::builder()
-                        .status(200)
-                        .header("content-type", "text/event-stream")
-                        .body(Body::from(format!("data: {event}\n\ndata: [DONE]\n\n")))
-                        .expect("summary provider response")
-                }
-            }),
-        );
-        let base_url = spawn_summary_test_server(app).await;
-        let execution = astra_services::AdmittedModelExecution {
-            price_snapshot: None,
-            offering_id: "summary-offering".to_string(),
-            source_identity: None,
-            access_kind: astra_services::ModelAccessKind::SelfHosted,
-            execution_placement: astra_services::ModelExecutionPlacement::Server,
-            model_name: "summary-model".to_string(),
-            wire_model_name: None,
-            api_key: "summary-key".to_string(),
-            base_url: base_url.clone(),
-            provider: "openai".to_string(),
-            cache_capability: None,
-            thinking_capability: None,
-            reasoning_efforts: None,
-            fixed_temperature: None,
-            thinking_protocol: None,
-            request_body_overrides: None,
-            context_window: Some(8_192),
-            max_completion_tokens: Some(1_024),
-            header_overrides: HashMap::new(),
-            completions_url_override: None,
-            request_timeout_ms: None,
-        };
-        let persistence = Arc::new(RecoverFirstAdmissionPersistence::default());
-        persistence
-            .recover_attempt_zero
-            .store(true, Ordering::Release);
-        let ledger = DurableInferenceLedger::required_with_persistence(
-            None,
-            Some(&execution),
-            "summary-user",
-            Some(persistence.clone()),
-        )
-        .expect("durable summary ledger")
-        .with_run_authority(super::super::durable::DurableInferenceRunAuthority::new(
-            0,
-            "summary-owner",
-            0,
-            None,
-            None,
-            None,
-        ));
-        let client = RuntimeSummaryClient::new_with_attempt_allocator(
-            OwnedLlmExecutionRoute {
-                model_name: execution.model_name.clone(),
-                wire_model_name: None,
-                api_key: execution.api_key.clone(),
-                base_url,
-                provider: execution.provider.clone(),
-                thinking_capability: None,
-                fixed_temperature: None,
-                thinking_protocol: None,
-                header_overrides: HashMap::new(),
-                request_body_overrides: None,
-                completions_url_override: None,
-                request_timeout: None,
-            },
-            64,
-            ledger,
-            astra_turn_types::InferenceInvocationScope::Run {
-                session_id: "summary-session".to_string(),
-                run_id: "summary-run".to_string(),
-                turn: 1,
-                round: 1,
-                operation_id: "summary_repair".to_string(),
-                logical_attempt: 0,
-            },
-            DurableSummaryAttemptAllocator::default(),
-        );
-        let messages = vec![serde_json::json!({"role": "user", "content": "summarize"})];
-
-        let malformed = client
-            .summarize(InferencePurpose::Introspection, &messages)
-            .await
-            .expect("recovered provider response");
-        assert_eq!(malformed.text, "not-json");
-        let repaired = client
-            .summarize(InferencePurpose::Introspection, &messages)
-            .await
-            .expect("repair response");
-
-        assert_eq!(repaired.text, r#"{"summary":"repaired"}"#);
-        assert_eq!(provider_requests.load(Ordering::SeqCst), 2);
-        let admitted_invocation_ids = persistence
-            .admitted_invocation_ids
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        assert_eq!(
-            malformed.execution.as_ref().unwrap().invocation_id,
-            admitted_invocation_ids[1],
-            "the first response must name recovered N+1 rather than requested N"
-        );
-        assert_eq!(
-            repaired.execution.as_ref().unwrap().invocation_id,
-            admitted_invocation_ids[2]
-        );
-        assert_eq!(
-            *persistence
-                .admitted_logical_attempts
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            vec![0, 1, 2],
-            "repair must advance after the authoritative recovered N+1 identity"
         );
     }
 
@@ -1805,22 +1445,8 @@ mod tests {
                 &execution.model_name,
             ),
         });
-        let persistence = Arc::new(RecoverFirstAdmissionPersistence::default());
-        let ledger = DurableInferenceLedger::required_with_persistence(
-            None,
-            Some(&execution),
-            "summary-user",
-            Some(persistence),
-        )
-        .expect("test ledger")
-        .with_run_authority(summary_authority());
-        let client = RuntimeSummaryClient::new_with_attempt_allocator(
-            summary_route(&execution),
-            1_024,
-            ledger,
-            summary_scope(),
-            DurableSummaryAttemptAllocator::default(),
-        );
+        let client =
+            RuntimeSummaryClient::new(summary_route(&execution), 1_024, summary_authority());
         let messages = astra_services::work_admission_judge_messages(
             &astra_services::TurnIntentJudgeContext {
                 message: "今天星期几".to_string(),
@@ -1854,7 +1480,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn independent_summary_clients_share_disjoint_pairs_without_serializing_provider_io() {
+    async fn independent_summary_clients_do_not_serialize_provider_io() {
         let active_requests = Arc::new(AtomicU32::new(0));
         let max_active_requests = Arc::new(AtomicU32::new(0));
         let provider_requests = Arc::new(AtomicU32::new(0));
@@ -1890,208 +1516,159 @@ mod tests {
             }),
         );
         let execution = summary_execution(spawn_summary_test_server(app).await);
-        let persistence = Arc::new(RecoverFirstAdmissionPersistence::default());
-        let ledger = DurableInferenceLedger::required_with_persistence(
-            None,
-            Some(&execution),
-            "summary-user",
-            Some(persistence.clone()),
-        )
-        .expect("durable summary ledger")
-        .with_run_authority(summary_authority());
-        let allocator = DurableSummaryAttemptAllocator::default();
-        let first = RuntimeSummaryClient::new_with_attempt_allocator(
-            summary_route(&execution),
-            64,
-            ledger.clone(),
-            summary_scope(),
-            allocator.clone(),
-        );
-        let second = RuntimeSummaryClient::new_with_attempt_allocator(
-            summary_route(&execution),
-            64,
-            ledger,
-            summary_scope(),
-            allocator,
-        );
+        let first = RuntimeSummaryClient::new(summary_route(&execution), 64, summary_authority());
+        let second = RuntimeSummaryClient::new(summary_route(&execution), 64, summary_authority());
         let messages = vec![serde_json::json!({"role": "user", "content": "summarize"})];
 
         let (first_result, second_result) = tokio::join!(
             first.summarize(InferencePurpose::Introspection, &messages),
             second.summarize(InferencePurpose::Introspection, &messages),
         );
-        assert_eq!(first_result.expect("first summary").text, "summary");
-        assert_eq!(second_result.expect("second summary").text, "summary");
-        let mut attempts = persistence
-            .admitted_logical_attempts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        attempts.sort_unstable();
-        assert_eq!(attempts, vec![0, 2]);
+        let first = first_result.expect("first summary");
+        let second = second_result.expect("second summary");
+        assert_eq!(first.text, "summary");
+        assert_eq!(second.text, "summary");
+        assert_ne!(
+            first.execution.unwrap().invocation_id,
+            second.execution.unwrap().invocation_id
+        );
         assert_eq!(provider_requests.load(Ordering::SeqCst), 2);
         assert_eq!(
             max_active_requests.load(Ordering::SeqCst),
             2,
-            "the identity allocator must not hold its mutex across provider I/O"
+            "independent calls must overlap provider I/O"
         );
     }
 
     #[tokio::test]
-    async fn exhausted_summary_attempt_pair_fails_closed_before_admission_or_provider_io() {
-        let execution = summary_execution("http://127.0.0.1:1".to_string());
-        let persistence = Arc::new(RecoverFirstAdmissionPersistence::default());
-        let ledger = DurableInferenceLedger::required_with_persistence(
-            None,
-            Some(&execution),
-            "summary-user",
-            Some(persistence.clone()),
-        )
-        .expect("durable summary ledger")
-        .with_run_authority(summary_authority());
-        let client = RuntimeSummaryClient::new_with_attempt_allocator(
-            summary_route(&execution),
-            64,
-            ledger,
-            summary_scope(),
-            DurableSummaryAttemptAllocator::with_next_logical_attempt(u64::from(u32::MAX)),
-        );
-        let messages = vec![serde_json::json!({"role": "user", "content": "summarize"})];
-
+    async fn cancelled_run_never_dispatches_auxiliary_model_request() {
+        let requests = Arc::new(AtomicU32::new(0));
+        let route = summary_route(&summary_execution(
+            spawn_counted_summary_server(requests.clone(), std::time::Duration::ZERO).await,
+        ));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let authority =
+            DurableInferenceRunAuthority::new(1, "owner", 0, Some(cancelled), None, None);
+        let client = RuntimeSummaryClient::new(route, 64, authority);
         let error = client
+            .summarize(
+                InferencePurpose::Introspection,
+                &[serde_json::json!({"role":"user","content":"summarize"})],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn lost_run_owner_interrupts_inflight_auxiliary_request() {
+        let requests = Arc::new(AtomicU32::new(0));
+        let route = summary_route(&summary_execution(
+            spawn_counted_summary_server(requests.clone(), std::time::Duration::from_secs(10))
+                .await,
+        ));
+        let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let authority =
+            DurableInferenceRunAuthority::new(1, "owner", 0, None, None, Some(lost.clone()));
+        let client = RuntimeSummaryClient::new(route, 64, authority);
+        let input = [serde_json::json!({"role":"user","content":"summarize"})];
+        let request = client.summarize(InferencePurpose::Introspection, &input);
+        let lose_owner = async {
+            while requests.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            lost.store(true, Ordering::Release);
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(request, lose_owner)
+        })
+        .await
+        .expect("owner loss must stop a request that is already in flight");
+        assert_eq!(
+            result.unwrap_err().kind,
+            astra_core::ErrorKind::ContractViolation
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[allow(dead_code)]
+    mod fixture {
+        use astra_services as services;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../services/tests/common/chatgpt_fixture.rs"
+        ));
+    }
+
+    // A ChatGPT subscription summary is encoded by the Responses codec; the
+    // captured request body must carry the client's output budget.
+    #[tokio::test]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database; no live provider"]
+    async fn summary_budget_is_encoded_as_max_output_tokens_on_the_responses_wire() {
+        use astra_services::chatgpt::ChatgptConfig;
+        use astra_services::{
+            DatabaseModelService, FernetTokenEncryptor, ModelService, UserModelCreateRequestData,
+        };
+
+        let mut settings = astra_core::MatrixOneSettings::from_env();
+        crate::isolated_database::require_isolated_database(&settings.database);
+        settings.db_pool_max_connections = 4;
+        settings.db_pool_min_connections = 0;
+        astra_services::storage::ensure_core_schema(&settings, "mysql")
+            .await
+            .unwrap();
+        let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+        let provider = fixture::ProviderFixture::start().await;
+        let key = Arc::new(FernetTokenEncryptor::new("summary-responses-budget-key").unwrap());
+        let service = DatabaseModelService::new(settings, key)
+            .with_pool(pool.clone())
+            .with_chatgpt_config(ChatgptConfig::for_test(&provider.base));
+        let owner = format!("summary-{}", uuid::Uuid::new_v4());
+        fixture::ensure_owner(pool.get(), &owner).await;
+        let connection = provider.connect(&service, &owner).await;
+        let model = service
+            .create_user_model(
+                owner.clone(),
+                UserModelCreateRequestData {
+                    inference_protocol: None,
+                    responses_reasoning_history: None,
+                    connection_id: Some(connection),
+                    name: "summary".into(),
+                    provider: "chatgpt".into(),
+                    model: "fixture-model".into(),
+                    base_url: None,
+                    // Subscription contract: a ChatGPT connection with no API
+                    // key and no custom endpoint (mutually exclusive).
+                    api_key: String::new(),
+                    context_window: 128000,
+                    is_default: true,
+                },
+            )
+            .await
+            .unwrap();
+        let admitted = service
+            .admit_model_offering(owner, model.model_id)
+            .await
+            .unwrap();
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "Summarize the fixture conversation."
+        })];
+        let client = RuntimeSummaryClient::new(summary_route(&admitted), 777, summary_authority());
+        // Model creation/admission already probed the fixture /responses wire
+        // ("Reply briefly with OK."); isolate the summary call itself.
+        let probed_requests = provider.state.requests.lock().unwrap().len();
+        let response = client
             .summarize(InferencePurpose::Introspection, &messages)
             .await
-            .expect_err("N without an available N+1 recovery identity must fail closed");
-        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
-        assert!(error.message.contains("logical attempt space is exhausted"));
-        assert!(
-            persistence
-                .admitted_logical_attempts
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty(),
-            "overflow must fail before durable admission and provider I/O"
-        );
-    }
-
-    #[tokio::test]
-    async fn reconstructed_host_allocator_starts_after_durable_prior_pair() {
-        let provider_requests = Arc::new(AtomicU32::new(0));
-        let execution = summary_execution(
-            spawn_counted_summary_server(
-                provider_requests.clone(),
-                std::time::Duration::from_millis(1),
-            )
-            .await,
-        );
-        let persistence = Arc::new(RecoverFirstAdmissionPersistence::default());
-        let ledger = DurableInferenceLedger::required_with_persistence(
-            None,
-            Some(&execution),
-            "summary-user",
-            Some(persistence.clone()),
-        )
-        .expect("durable summary ledger")
-        .with_run_authority(summary_authority());
-        let messages = vec![serde_json::json!({"role": "user", "content": "summarize"})];
-
-        RuntimeSummaryClient::new_with_attempt_allocator(
-            summary_route(&execution),
-            64,
-            ledger.clone(),
-            summary_scope(),
-            DurableSummaryAttemptAllocator::default(),
-        )
-        .summarize(InferencePurpose::Introspection, &messages)
-        .await
-        .expect("prior host summary");
-        RuntimeSummaryClient::new_with_attempt_allocator(
-            summary_route(&execution),
-            64,
-            ledger,
-            summary_scope(),
-            DurableSummaryAttemptAllocator::default(),
-        )
-        .summarize(InferencePurpose::Introspection, &messages)
-        .await
-        .expect("reconstructed host summary");
-
-        assert_eq!(provider_requests.load(Ordering::SeqCst), 2);
+            .unwrap();
+        assert_eq!(response.text, "OK");
+        let requests = provider.state.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), probed_requests + 1, "{requests:?}");
         assert_eq!(
-            *persistence
-                .admitted_logical_attempts
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            vec![0, 2],
-            "a fresh in-memory allocator must derive its next pair from durable history"
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_fresh_allocators_reread_after_typed_identity_collision() {
-        let provider_requests = Arc::new(AtomicU32::new(0));
-        let execution = summary_execution(
-            spawn_counted_summary_server(
-                provider_requests.clone(),
-                std::time::Duration::from_millis(10),
-            )
-            .await,
-        );
-        let persistence = Arc::new(RecoverFirstAdmissionPersistence::default());
-        *persistence
-            .cursor_barrier
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(Arc::new(tokio::sync::Barrier::new(2)));
-        persistence
-            .cursor_barrier_reads_remaining
-            .store(2, Ordering::Release);
-        let ledger = DurableInferenceLedger::required_with_persistence(
-            None,
-            Some(&execution),
-            "summary-user",
-            Some(persistence.clone()),
-        )
-        .expect("durable summary ledger")
-        .with_run_authority(summary_authority());
-        let first = RuntimeSummaryClient::new_with_attempt_allocator(
-            summary_route(&execution),
-            64,
-            ledger.clone(),
-            summary_scope(),
-            DurableSummaryAttemptAllocator::default(),
-        );
-        let second = RuntimeSummaryClient::new_with_attempt_allocator(
-            summary_route(&execution),
-            64,
-            ledger,
-            summary_scope(),
-            DurableSummaryAttemptAllocator::default(),
-        );
-        let messages = vec![serde_json::json!({"role": "user", "content": "summarize"})];
-
-        let (first_result, second_result) = tokio::join!(
-            first.summarize(InferencePurpose::Introspection, &messages),
-            second.summarize(InferencePurpose::Introspection, &messages),
-        );
-        first_result.expect("first fresh-host summary");
-        second_result.expect("collision loser advances to the next durable pair");
-        let mut attempts = persistence
-            .admitted_logical_attempts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        attempts.sort_unstable();
-        assert_eq!(attempts, vec![0, 2]);
-        assert_eq!(
-            provider_requests.load(Ordering::SeqCst),
-            2,
-            "the losing identity collision must not authorize duplicate provider I/O"
-        );
-        assert_eq!(
-            persistence.admission_conflicts.load(Ordering::SeqCst),
-            1,
-            "the fresh-host loser must exercise typed occupied recovery"
+            requests[probed_requests]["max_output_tokens"],
+            serde_json::json!(777),
+            "the summary output budget must reach the Responses request body: {requests:?}"
         );
     }
 }

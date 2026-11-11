@@ -199,6 +199,14 @@ pub fn session_memory_finalize(id: &str) -> String {
     format!("/sessions/{}/memory/finalize", model_segment(id))
 }
 
+pub fn session_run_activity(session_id: &str, run_id: &str) -> String {
+    format!(
+        "/sessions/{}/runs/{}/activity",
+        model_segment(session_id),
+        model_segment(run_id)
+    )
+}
+
 pub fn session_close(id: &str) -> String {
     format!("/sessions/{id}/close")
 }
@@ -285,6 +293,11 @@ pub fn session_artifact_download(session_id: &str, artifact_id: &str) -> Option<
 }
 
 /// A safe path segment contains only alphanumeric, `-`, `_`, or `.` characters
+/// Read-only execution-settlement observation for an exact run.
+pub fn chat_run_cancel(run_id: &str) -> String {
+    format!("{}/cancel", chat_run(run_id))
+}
+
 /// and is non-empty. Rejects `/`, `..`, `?`, `#`, `%`, etc.
 fn is_safe_path_segment(s: &str) -> bool {
     !s.is_empty()
@@ -317,6 +330,11 @@ pub fn chat_run_stream(run_id: &str) -> String {
 #[inline]
 pub fn chat_run_user_intents(run_id: &str) -> String {
     format!("/chat/runs/{run_id}/intents")
+}
+
+#[inline]
+pub fn chat_run_user_intent(run_id: &str, intent_id: &str) -> String {
+    format!("/chat/runs/{run_id}/intents/{intent_id}")
 }
 
 #[inline]
@@ -406,14 +424,6 @@ pub const MEMORY_SEARCH: &str = "/memory/search";
 pub const MEMORY_RETRIEVE: &str = "/memory/retrieve";
 pub const MEMORY_PURGE: &str = "/memory/purge";
 
-/// Context snapshots (`GET/POST /context`, `GET /context/{id}`).
-pub const CONTEXT: &str = "/context";
-
-#[inline]
-pub fn context_capture(context_capture_id: &str) -> String {
-    format!("/context/{context_capture_id}")
-}
-
 /// Lightweight LLM proxy for verification judge / edge components.
 pub const COMPLETIONS: &str = "/v1/chat/completions";
 
@@ -484,6 +494,10 @@ pub fn chat_run_permission_mode(run_id: &str) -> String {
     format!("{}/permission-mode", chat_run(run_id))
 }
 
+pub fn chat_run_model(run_id: &str) -> String {
+    format!("{}/model", chat_run(run_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,7 +528,6 @@ mod tests {
             MEMORY_SEARCH,
             MEMORY_RETRIEVE,
             MEMORY_PURGE,
-            CONTEXT,
             COMPLETIONS,
             ADMIN_INIT,
             ADMIN_REGISTER,
@@ -714,13 +727,6 @@ mod tests {
     #[test]
     fn skill_versions_path() {
         assert_eq!(skill_versions("bash"), "/skills/bash/versions");
-    }
-
-    // --- Context path ---
-
-    #[test]
-    fn context_capture_path() {
-        assert_eq!(context_capture("cap1"), "/context/cap1");
     }
 
     // --- Audit paths ---

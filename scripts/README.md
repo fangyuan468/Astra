@@ -187,13 +187,9 @@ database, browser, and Edge metrics from the same deployment window.
 
 ### `scripts/load/cleanup_pressure_probe.py`
 Runs ignored live MatrixOne cleanup pressure probes for the current retention
-hot paths: `agent_message_queue`, `conversation_log`, and prompt retention.
+hot path: `agent_message_queue`.
 The runner captures per-probe stdout/stderr and writes `summary.json` under
 `tmp/cleanup-pressure/`.
-
-The prompt probe mixes three classes in one run: expired inactive rows that must
-be deleted, expired active-session rows that must be guarded, and fresh inactive
-rows that must remain until the retention age is reached.
 
 Use only against disposable test databases. The default database base contains
 `test`, and the script refuses names that do not contain `test` or `smoke`.
@@ -201,7 +197,7 @@ Use only against disposable test databases. The default database base contains
 ```sh
 make test-cleanup-pressure
 python3 scripts/load/cleanup_pressure_probe.py --profile smoke
-python3 scripts/load/cleanup_pressure_probe.py --profile pressure --queue-rows 20000 --csl-rows 20000 --prompt-rows 20000 --prompt-fresh-rows 512
+python3 scripts/load/cleanup_pressure_probe.py --profile pressure --queue-rows 20000
 ```
 
 ### `scripts/load/durable_event_pressure_probe.py`
