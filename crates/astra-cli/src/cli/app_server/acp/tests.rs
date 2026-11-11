@@ -453,6 +453,136 @@ fn replay_excludes_system_and_tool_payloads() {
 
 #[serial_test::serial]
 #[tokio::test]
+async fn new_session_waits_for_a_concurrent_native_refresh() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use rsa::{pkcs1::EncodeRsaPrivateKey, traits::PublicKeyParts};
+    use wiremock::matchers::header;
+
+    let _home = crate::test_utils::HomeGuard::temp();
+    let _credentials = crate::tests::isolate_credentials();
+    let root = tempfile::tempdir().unwrap();
+    let store = astra_credentials::native::NativeStore::with_directory(root.path().join("native"));
+    let mock = MockServer::start().await;
+    let issuer = format!("{}/realms/moi", mock.uri());
+    let mut session = crate::cli::native_auth::test_session();
+    session.environment.issuer = issuer.clone();
+    session.environment.astra_url = mock.uri();
+    session.environment.moi_url = format!("{}/newmoi", mock.uri());
+    session.environment.authorization_endpoint = format!("{issuer}/protocol/openid-connect/auth");
+    session.environment.token_endpoint = format!("{issuer}/protocol/openid-connect/token");
+    session.environment.revocation_endpoint = format!("{issuer}/protocol/openid-connect/revoke");
+    session.environment.jwks_uri = format!("{issuer}/protocol/openid-connect/certs");
+    session.expires_at = astra_credentials::native::unix_now().unwrap() - 1;
+    let (session, _) = store.publish(session).unwrap();
+    let binding = crate::cli::native_auth::binding_for_test(store.clone(), session.clone());
+    let _active = crate::cli::native_auth::install_active_for_test(binding.clone());
+    let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+        &binding.profile_name(),
+        Some(&session.astra_user_id),
+    )
+    .unwrap();
+
+    let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let der = key.to_pkcs1_der().unwrap();
+    let now = astra_credentials::native::unix_now().unwrap();
+    let mut jwt_header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    jwt_header.kid = Some("acp-test".into());
+    let rotated = jsonwebtoken::encode(
+        &jwt_header,
+        &json!({"iss":issuer, "sub":session.subject, "sid":session.session_id,
+            "azp":"astra-cli", "aud":["astra-api","aistudio-api"],
+            "iat":now, "exp":now + 900}),
+        &jsonwebtoken::EncodingKey::from_rsa_der(der.as_bytes()),
+    )
+    .unwrap();
+    Mock::given(method("POST"))
+        .and(path("/realms/moi/protocol/openid-connect/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(1))
+                .set_body_json(
+                    json!({"access_token":rotated, "refresh_token":"synthetic-rotated",
+                    "expires_in":900, "token_type":"Bearer"}),
+                ),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/realms/moi/protocol/openid-connect/certs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"keys":[{
+            "kty":"RSA", "alg":"RS256", "use":"sig", "kid":"acp-test",
+            "n":URL_SAFE_NO_PAD.encode(key.n().to_bytes_be()),
+            "e":URL_SAFE_NO_PAD.encode(key.e().to_bytes_be())
+        }]})))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let id = uuid::Uuid::new_v4().to_string();
+    Mock::given(method("POST"))
+        .and(path("/sessions"))
+        .and(header("authorization", format!("Bearer {rotated}")))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"session_id":id})))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .and(header("authorization", format!("Bearer {rotated}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[],
+            "limit":200, "total":0, "catalog_revision":"test", "next_cursor":null})))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let rotating = tokio::spawn({
+        let binding = binding.clone();
+        async move { binding.access_token().await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !store.current().unwrap().refresh_pending {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("refresh reached the pending state");
+    assert!(get_profile_and_token(None).is_err());
+    let (mut server, output) = server();
+    server.ctx.api = astra_thin_client::ThinClient::new(&mock.uri(), None)
+        .unwrap()
+        .with_bearer_provider(binding);
+    let cancel = CancellationToken::new();
+    let preparation = tokio::spawn({
+        let ctx = server.ctx.clone();
+        let cancel = cancel.clone();
+        async move { prepare_turn_auth(&ctx, &cancel).await }
+    });
+    tokio::task::yield_now().await;
+    cancel.cancel();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), preparation)
+            .await
+            .expect("cancelling a turn must not wait for a concurrent refresh")
+            .unwrap()
+            .is_err()
+    );
+    initialize(&mut server).await;
+    server
+        .receive(
+            &json!({"jsonrpc":"2.0", "id":"new", "method":"session/new",
+        "params":{"cwd":server.cwd, "mcpServers":[]}})
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    rotating.await.unwrap().unwrap();
+    assert_eq!(output.lock().unwrap()[1]["result"]["sessionId"], id);
+    assert!(!store.current().unwrap().refresh_pending);
+    mock.verify().await;
+}
+
+#[serial_test::serial]
+#[tokio::test]
 async fn new_session_uses_server_identity_and_authoritative_model_catalog() {
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     let _home = crate::test_utils::HomeGuard::temp();

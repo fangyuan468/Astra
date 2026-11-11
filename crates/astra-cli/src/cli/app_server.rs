@@ -545,7 +545,13 @@ async fn prepare_turn_auth(
     ctx: &ServerContext,
     cancel: &CancellationToken,
 ) -> Result<(String, Option<CliOwnerAuthSnapshot>), AppServerFailure> {
-    let (_, _, _, token) = get_profile_and_token(ctx.auth_profile.as_deref())?;
+    let token = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(AppServerFailure::turn_failed(
+            "Edge registration interrupted before chat",
+        )),
+        result = refreshed_profile_token(ctx) => result?,
+    };
     // Registration's native bearer provider may rotate the selected token.
     // Freeze its owner first; never recapture a later login from the old token.
     let owner =
@@ -569,6 +575,26 @@ async fn prepare_turn_auth(
         token
     };
     Ok((token, owner))
+}
+
+async fn refreshed_profile_token(ctx: &ServerContext) -> Result<String, AppServerFailure> {
+    // Pending native rotations deliberately hide the token snapshot. Wait for
+    // the existing credential owner before reading the bound profile so that
+    // a concurrent refresh is not mistaken for a signed-out session.
+    if let Some(binding) = crate::cli::native_auth::active() {
+        binding.access_token().await.map_err(|error| {
+            AppServerFailure::turn_failed(error.access_miss().startup_warning())
+        })?;
+        if !crate::cli::native_auth::active().is_some_and(|current| Arc::ptr_eq(&binding, &current))
+        {
+            return Err(AppServerFailure::turn_failed(
+                astra_credentials::native::AccessMiss::AccountChanged.startup_warning(),
+            ));
+        }
+    }
+    get_profile_and_token(ctx.auth_profile.as_deref())
+        .map(|(_, _, _, token)| token)
+        .map_err(Into::into)
 }
 
 async fn run_turn(

@@ -377,9 +377,10 @@ impl AcpServer {
         validate_cwd(params, &self.cwd)?;
         let mcp_servers = parse_mcp_servers(params)?;
         let state = Arc::new(Mutex::new(AppState::default()));
-        let token = get_profile_and_token(self.ctx.auth_profile.as_deref())
-            .map_err(|_| error(-32000, "Run astra login in a terminal before starting ACP"))?
-            .3;
+        let token = tokio::time::timeout(SESSION_BIND_TIMEOUT, refreshed_profile_token(&self.ctx))
+            .await
+            .map_err(|_| error(-32000, "Sign-in refresh timed out; try again"))?
+            .map_err(failure_error)?;
         let session_id = if method == "session/load" {
             let id = required_string(params, "sessionId")?.to_owned();
             if let Some(existing) = self.sessions.get(&id)
