@@ -343,8 +343,10 @@ frozen format version 2, including `thinking_protocol` and `pricing`. This is a
 catalog API contract, not a promise that older CLI or Edge binaries support the
 current interaction protocol. Deploy matching current clients with the Server. A
 missing `x-astra-model-catalog-version` header and explicit `2` select the
-same frozen format; current thin-client and TypeScript SDK requests negotiate
-the current format `3` on every page.
+same frozen format. The CLI first requests format `3`; when an older server
+explicitly rejects that version on the first page, it retries in format `2`
+and keeps that format for the complete projection. Other errors are not
+retried as version mismatches. The TypeScript SDK requests format `3`.
 Unknown, repeated, or malformed versions (including `1`) return
 `400 model_catalog_version_unsupported`. The response identifies its format
 in the same header and is not cached.

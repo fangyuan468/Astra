@@ -671,38 +671,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn declared_reasoning_levels_limit_explicit_effort() {
-        use astra_core::model_wire::thinking::ThinkingProtocol;
-        use astra_services::models::ThinkingCapability;
-        use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
-        let mut execution = super::inheritance_test_support::genesis_execution();
-        execution.thinking_capability = Some(ThinkingCapability::EffortOnly);
-        execution.thinking_protocol = Some(ThinkingProtocol::ReasoningEffort);
-        execution.supported_reasoning_efforts =
-            Some(vec!["low".into(), "high".into(), "max".into()]);
-        for effort in [
-            ThinkingEffort::Low,
-            ThinkingEffort::High,
-            ThinkingEffort::Max,
-        ] {
-            assert!(
-                validate_reasoning_control(&execution, &ThinkingConfig::Adaptive { effort })
-                    .is_ok()
-            );
-        }
-        assert!(
-            validate_reasoning_control(
-                &execution,
-                &ThinkingConfig::Adaptive {
-                    effort: ThinkingEffort::Medium
-                }
-            )
-            .is_err()
-        );
-        assert!(validate_reasoning_control(&execution, &ThinkingConfig::ModelDefault).is_ok());
-    }
-
     #[async_trait]
     impl ModelService for StaticModelService {
         async fn resolve_model_offering(

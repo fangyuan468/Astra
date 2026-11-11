@@ -667,6 +667,25 @@ impl ThinClient {
         cursor: Option<(&str, &str, &str)>,
         purpose: astra_core::model_wire::purpose::ModelCatalogPurpose,
     ) -> Result<Response, ThinClientError> {
+        self.get_models_page_response_version_timeout(
+            token,
+            timeout,
+            cursor,
+            purpose,
+            astra_server_types::MODEL_CATALOG_VERSION,
+        )
+        .await
+    }
+
+    /// Fetch a page in a specific catalog format after version negotiation.
+    pub async fn get_models_page_response_version_timeout(
+        &self,
+        token: &str,
+        timeout: Duration,
+        cursor: Option<(&str, &str, &str)>,
+        purpose: astra_core::model_wire::purpose::ModelCatalogPurpose,
+        version: &str,
+    ) -> Result<Response, ThinClientError> {
         let url = self.url(paths::MODELS)?;
         tracing::debug!(
             target: "astra_cli::http_proxy",
@@ -680,10 +699,7 @@ impl ThinClient {
             .http
             .get(url.clone())
             .headers(self.auth_headers_for(Some(token)).await?)
-            .header(
-                astra_server_types::MODEL_CATALOG_VERSION_HEADER,
-                astra_server_types::MODEL_CATALOG_VERSION,
-            )
+            .header(astra_server_types::MODEL_CATALOG_VERSION_HEADER, version)
             .timeout(timeout)
             .query(&[("purpose", purpose.as_str())]);
         if let Some((provider, model_name, model_id)) = cursor {
@@ -726,15 +742,29 @@ impl ThinClient {
         timeout: Duration,
         cursor: Option<(&str, &str, &str)>,
     ) -> Result<Response, ThinClientError> {
+        self.get_model_access_page_response_version_timeout(
+            token,
+            timeout,
+            cursor,
+            astra_server_types::MODEL_CATALOG_VERSION,
+        )
+        .await
+    }
+
+    /// Fetch an access projection in a specific negotiated catalog format.
+    pub async fn get_model_access_page_response_version_timeout(
+        &self,
+        token: &str,
+        timeout: Duration,
+        cursor: Option<(&str, &str, &str)>,
+        version: &str,
+    ) -> Result<Response, ThinClientError> {
         let url = self.url(paths::MODEL_ACCESS)?;
         let mut request = self
             .http
             .get(url)
             .headers(self.auth_headers_for(Some(token)).await?)
-            .header(
-                astra_server_types::MODEL_CATALOG_VERSION_HEADER,
-                astra_server_types::MODEL_CATALOG_VERSION,
-            )
+            .header(astra_server_types::MODEL_CATALOG_VERSION_HEADER, version)
             .timeout(timeout);
         if let Some((provider, model_name, model_id)) = cursor {
             request = request.query(&[

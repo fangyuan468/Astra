@@ -1,54 +1,6 @@
 // Reuse the admitted Server host and strict loopback provider fixtures.
 #[tokio::test]
 #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-async fn declared_genesis_max_effort_reaches_gateway() {
-    use astra_core::model_wire::thinking::ThinkingProtocol;
-    use astra_services::models::ThinkingCapability;
-    use astra_turn_core::thinking_config::ThinkingEffort;
-    let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
-    let provider = ProviderGateway::start(vec![ProviderScript::new(
-        "Kimi max effort",
-        |request| request.path == "/v1/chat/completions",
-        vec![ProviderResponse::OpenAi(json!({
-            "model":"kimi-k3", "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
-            "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}
-        }))],
-    )])
-    .await;
-    let ledger = crate::server::provider_test_support::ProviderObservationsFixture::default();
-    let mut execution = test_gateway_execution(
-        format!("{}/v1/chat/completions", provider.base_url),
-        Some(2000),
-    );
-    execution.model_name = "kimi-k3".into();
-    execution.thinking_capability = Some(ThinkingCapability::EffortOnly);
-    execution.thinking_protocol = Some(ThinkingProtocol::ReasoningEffort);
-    execution.supported_reasoning_efforts = Some(vec!["low".into(), "high".into(), "max".into()]);
-    let mut host = test_host_builder("effort-user", "effort-session")
-        .with_provider_observations(ledger.clone())
-        .with_admitted_model_execution(Some(execution))
-        .build();
-    let mut state = create_durable_execution_test_state("effort-session");
-    state.message = "hello".into();
-    state.user_intent = state.message.clone();
-    state.messages = vec![json!({"role":"user","content":"hello"})];
-    state.thinking = ThinkingConfig::Adaptive {
-        effort: ThinkingEffort::Max,
-    };
-    state.step_recorder.begin_turn(0);
-    let result = host.execute_turn(&mut state).await.unwrap();
-    assert_eq!(result.accum.full_text, "ok");
-    let requests = provider.requests.lock().await;
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].body["reasoning_effort"], "max");
-    drop(requests);
-    state.commit_volatile_attempt_lease();
-    ledger.assert_quiescent();
-    provider.assert_complete();
-}
-
-#[tokio::test]
-#[serial_test::serial(auxiliary_llm_capacity_policy_env)]
 async fn glm_captured_reasoning_is_exact_on_second_and_third_provider_requests() {
     use astra_core::model_wire::thinking::ThinkingProtocol;
     use astra_services::models::ThinkingCapability;

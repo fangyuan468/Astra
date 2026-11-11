@@ -502,6 +502,15 @@ pub(crate) async fn load_server_model_catalog(
         .map_err(|error| error.to_string())
 }
 
+fn catalog_version_unsupported(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::BAD_REQUEST
+        && serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| value.get("error_code")?.as_str().map(str::to_owned))
+            .as_deref()
+            == Some("model_catalog_version_unsupported")
+}
+
 /// Fetch and validate the complete public model catalog once. Interactive
 /// pickers and server-governed model selection must share this pagination and
 /// protocol-validation path; otherwise a client can make different decisions
@@ -517,6 +526,7 @@ pub(crate) async fn fetch_server_model_catalog(
     let mut total = None;
     let mut revision = None;
     let mut seen_cursors = HashSet::new();
+    let mut version = astra_server_types::MODEL_CATALOG_VERSION;
     loop {
         if let Some(current) = &cursor {
             if !seen_cursors.insert(current.clone()) {
@@ -533,16 +543,26 @@ pub(crate) async fn fetch_server_model_catalog(
             )
         });
         let response = api
-            .get_models_page_response_timeout(
+            .get_models_page_response_version_timeout(
                 tok,
                 astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT,
                 cursor_tuple,
                 purpose,
+                version,
             )
             .await?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            // Older servers explicitly reject v3; keep one version for the
+            // whole paginated projection rather than mixing wire formats.
+            if cursor.is_none()
+                && version == astra_server_types::MODEL_CATALOG_VERSION
+                && catalog_version_unsupported(status, &body)
+            {
+                version = astra_server_types::MODEL_CATALOG_VERSION_V2;
+                continue;
+            }
             return Err(ModelCatalogError::Request(
                 astra_thin_client::ThinClientError::Api { status, body },
             ));
@@ -677,6 +697,7 @@ async fn load_server_model_access(
     let mut expected_revision = None;
     let mut expected_total = None;
     let mut seen_cursors = HashSet::new();
+    let mut version = astra_server_types::MODEL_CATALOG_VERSION;
     loop {
         if let Some(current) = &cursor {
             if !seen_cursors.insert(current.clone()) {
@@ -693,10 +714,11 @@ async fn load_server_model_access(
             )
         });
         let response = api
-            .get_model_access_page_response_timeout(
+            .get_model_access_page_response_version_timeout(
                 token,
                 astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT,
                 cursor_tuple,
+                version,
             )
             .await
             .map_err(|error| {
@@ -725,7 +747,18 @@ async fn load_server_model_access(
                 astra_core::ClassifiedError::new(kind, message)
             })?;
         if !response.status().is_success() {
-            return Err(model_catalog_http_error(response.status()));
+            let status = response.status();
+            if cursor.is_none()
+                && version == astra_server_types::MODEL_CATALOG_VERSION
+                && status == reqwest::StatusCode::BAD_REQUEST
+            {
+                let body = response.text().await.unwrap_or_default();
+                if catalog_version_unsupported(status, &body) {
+                    version = astra_server_types::MODEL_CATALOG_VERSION_V2;
+                    continue;
+                }
+            }
+            return Err(model_catalog_http_error(status));
         }
         let bytes = response
             .bytes()
@@ -2685,7 +2718,7 @@ mod tests {
         ModelListCursor, ModelListItemResponse, session_journal,
     };
     use tempfile::tempdir;
-    use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+    use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     struct EnvGuard {
@@ -3078,6 +3111,114 @@ mod tests {
         .await
         .expect("second-page Offering should resolve");
         assert_eq!(selection.offering_id, "offer-second");
+    }
+
+    #[tokio::test]
+    async fn catalog_negotiation_uses_legacy_format_only_after_explicit_rejection() {
+        let mock = MockServer::start().await;
+        let version_header = astra_server_types::MODEL_CATALOG_VERSION_HEADER;
+        for route in ["/models", "/model-access"] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .and(header(version_header, "3"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error_code": "model_catalog_version_unsupported"
+                })))
+                .expect(1)
+                .mount(&mock)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header(version_header, "2"))
+            .and(query_param_is_missing("after_provider"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [catalog_entry("offer-first", "first-model", true, 8_192)],
+                "next_cursor": {"provider":"openai", "model_name":"first-model", "model_id":"offer-first"},
+                "limit": 50, "total": 2, "catalog_revision":"sha256:test"
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header(version_header, "2"))
+            .and(query_param("after_offering_id", "offer-first"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [catalog_entry("offer-second", "second-model", true, 16_384)],
+                "next_cursor": null, "limit": 50, "total": 2, "catalog_revision":"sha256:test"
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/model-access"))
+            .and(header(version_header, "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(access_projection(
+                vec![catalog_entry("offer-first", "first-model", true, 8_192)],
+                Some("offer-first"),
+            )))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+        let (models, _) = super::fetch_server_model_catalog(
+            &api,
+            Some("token"),
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+        )
+        .await
+        .unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[1].offering_id, "offer-second");
+        let access = super::load_server_model_access(&api, "token")
+            .await
+            .unwrap();
+        assert_eq!(access.default_offering_id.as_deref(), Some("offer-first"));
+    }
+
+    #[tokio::test]
+    async fn catalog_negotiation_does_not_retry_other_bad_requests() {
+        let mock = MockServer::start().await;
+        for route in ["/models", "/model-access"] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .and(header(
+                    astra_server_types::MODEL_CATALOG_VERSION_HEADER,
+                    "3",
+                ))
+                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error_code": "invalid_cursor"
+                })))
+                .expect(1)
+                .mount(&mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(route))
+                .and(header(
+                    astra_server_types::MODEL_CATALOG_VERSION_HEADER,
+                    "2",
+                ))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&mock)
+                .await;
+        }
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+        assert!(
+            super::fetch_server_model_catalog(
+                &api,
+                Some("token"),
+                astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            super::load_server_model_access(&api, "token")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
